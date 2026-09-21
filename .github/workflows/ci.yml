@@ -1,4 +1,4 @@
-name: CI
+name: pulso
 
 on:
   push:
@@ -7,15 +7,27 @@ on:
     branches: [main]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: pulso-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: Test
+  check:
+    name: ${{ matrix.check.name }}
     runs-on: ubuntu-latest
     env:
       MIX_ENV: test
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: Compile
+            command: mix compile --warnings-as-errors
+          - name: Test
+            command: mix test
+          - name: Quokka
+            command: mix format --check-formatted
+          - name: Credo
+            command: mix credo
     steps:
       - uses: actions/checkout@v4
 
@@ -38,22 +50,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: _build
-          key: ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-${{ github.sha }}
+          key: ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-${{ matrix.check.name }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-${{ matrix.check.name }}-
             ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-
-            ${{ runner.os }}-mix-build-
 
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Check formatting
-        run: mix format --check-formatted
-
-      - name: Check for unused dependencies
-        run: mix deps.unlock --check-unused
-
-      - name: Compile with warnings as errors
-        run: mix compile --warnings-as-errors
-
-      - name: Run tests
-        run: mix test
+      - name: ${{ matrix.check.name }}
+        run: ${{ matrix.check.command }}

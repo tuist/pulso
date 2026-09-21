@@ -6,14 +6,13 @@ defmodule Pulso.MCP.Tools do
   @tools [
     %{
       "name" => "query_logs",
-      "description" =>
-        "Run a LogQL query against the configured Loki backend and return the matching log lines.",
+      "description" => "Run a LogQL query against the configured Loki backend and return the matching log lines.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "query" => %{
             "type" => "string",
-            "description" => "LogQL expression, for example: {app=\"web\"} |= \"error\""
+            "description" => ~s(LogQL expression, for example: {app="web"} |= "error")
           },
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000},
           "direction" => %{"type" => "string", "enum" => ["backward", "forward"]}

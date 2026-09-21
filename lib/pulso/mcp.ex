@@ -8,6 +8,8 @@ defmodule Pulso.MCP do
   narrowly-scoped surfaces (see the project brief).
   """
 
+  alias Pulso.MCP.Tools
+
   @protocol_version "2025-06-18"
   @server_info %{"name" => "pulso", "version" => "0.1.0"}
 
@@ -29,7 +31,7 @@ defmodule Pulso.MCP do
     end
   end
 
-  def dispatch(_), do: {:reply, error(nil, -32600, "Invalid Request")}
+  def dispatch(_), do: {:reply, error(nil, -32_600, "Invalid Request")}
 
   defp handle("initialize", _params) do
     {:ok,
@@ -41,13 +43,13 @@ defmodule Pulso.MCP do
   end
 
   defp handle("tools/list", _params) do
-    {:ok, %{"tools" => Pulso.MCP.Tools.list()}}
+    {:ok, %{"tools" => Tools.list()}}
   end
 
   defp handle("tools/call", %{"name" => name} = params) do
     arguments = Map.get(params, "arguments", %{})
 
-    case Pulso.MCP.Tools.call(name, arguments) do
+    case Tools.call(name, arguments) do
       {:ok, content} ->
         {:ok, %{"content" => content, "isError" => false}}
 
@@ -61,7 +63,7 @@ defmodule Pulso.MCP do
   end
 
   defp handle("ping", _params), do: {:ok, %{}}
-  defp handle(_unknown, _params), do: {:error, -32601, "Method not found"}
+  defp handle(_unknown, _params), do: {:error, -32_601, "Method not found"}
 
   defp ok(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
 

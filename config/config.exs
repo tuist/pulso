@@ -7,8 +7,13 @@
 # General application configuration
 import Config
 
-config :pulso,
-  generators: [timestamp_type: :utc_datetime]
+# Configure Elixir's Logger
+config :logger, :default_formatter,
+  format: "$time $metadata[$level] $message\n",
+  metadata: [:request_id]
+
+# Use Jason for JSON parsing in Phoenix
+config :phoenix, :json_library, Jason
 
 config :pulso, Pulso.Loki, base_url: "http://localhost:3100"
 
@@ -23,13 +28,8 @@ config :pulso, PulsoWeb.Endpoint,
   pubsub_server: Pulso.PubSub,
   live_view: [signing_salt: "AAeCXBT1"]
 
-# Configure Elixir's Logger
-config :logger, :default_formatter,
-  format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
-
-# Use Jason for JSON parsing in Phoenix
-config :phoenix, :json_library, Jason
+config :pulso,
+  generators: [timestamp_type: :utc_datetime]
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

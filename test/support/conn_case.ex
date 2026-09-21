@@ -19,15 +19,15 @@ defmodule PulsoWeb.ConnCase do
 
   using do
     quote do
+      use PulsoWeb, :verified_routes
+
+      import Phoenix.ConnTest
+      import Plug.Conn
+      import PulsoWeb.ConnCase
       # The default endpoint for testing
       @endpoint PulsoWeb.Endpoint
 
-      use PulsoWeb, :verified_routes
-
       # Import conveniences for testing with connections
-      import Plug.Conn
-      import Phoenix.ConnTest
-      import PulsoWeb.ConnCase
     end
   end
 

@@ -37,8 +37,6 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
 
-  config :pulso, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
-
   config :pulso, PulsoWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
@@ -49,6 +47,8 @@ if config_env() == :prod do
       ip: {0, 0, 0, 0, 0, 0, 0, 0}
     ],
     secret_key_base: secret_key_base
+
+  config :pulso, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
   # ## SSL Support
   #

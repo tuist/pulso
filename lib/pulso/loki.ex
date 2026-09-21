@@ -32,8 +32,7 @@ defmodule Pulso.Loki do
 
   defp put_time(params, _key, nil), do: params
 
-  defp put_time(params, key, %DateTime{} = dt),
-    do: Map.put(params, key, DateTime.to_unix(dt, :nanosecond))
+  defp put_time(params, key, %DateTime{} = dt), do: Map.put(params, key, DateTime.to_unix(dt, :nanosecond))
 
   defp put_time(params, key, ns) when is_integer(ns), do: Map.put(params, key, ns)
 
@@ -44,8 +43,7 @@ defmodule Pulso.Loki do
 
   defp handle({:ok, %Req.Response{status: 200, body: body}}), do: {:ok, body}
 
-  defp handle({:ok, %Req.Response{status: status, body: body}}),
-    do: {:error, {:http, status, body}}
+  defp handle({:ok, %Req.Response{status: status, body: body}}), do: {:error, {:http, status, body}}
 
   defp handle({:error, reason}), do: {:error, reason}
 
