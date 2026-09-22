@@ -5,15 +5,15 @@ defmodule Pulso.Application do
 
   use Application
 
+  alias Pulso.Storage.Memory
+
   @impl true
   def start(_type, _args) do
     children = [
       PulsoWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Pulso.PubSub},
-      # Start a worker by calling: Pulso.Worker.start_link(arg)
-      # {Pulso.Worker, arg},
-      # Start to serve requests, typically the last entry
+      Memory,
       PulsoWeb.Endpoint
     ]
 

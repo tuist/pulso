@@ -15,8 +15,6 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
-config :pulso, Pulso.Loki, base_url: "http://localhost:3100"
-
 # Configure the endpoint
 config :pulso, PulsoWeb.Endpoint,
   url: [host: "localhost"],

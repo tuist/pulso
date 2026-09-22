@@ -9,5 +9,6 @@ defmodule PulsoWeb.Router do
     pipe_through :api
 
     post "/mcp", MCPController, :rpc
+    post "/v1/logs", OTLPController, :logs
   end
 end
