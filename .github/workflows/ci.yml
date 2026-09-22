@@ -55,14 +55,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-deps-
 
-      - name: Cache build
-        uses: actions/cache@v4
-        with:
-          path: _build
-          key: ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-${{ matrix.check.name }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-${{ matrix.check.name }}-
-            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-
+      # NOTE: We deliberately do NOT cache _build. Rustler produces the NIF
+      # shared object as a compile-time side effect via `use Rustler`, and
+      # Mix's incremental compile does not track it. A restored _build makes
+      # Mix think the modules are up to date and skip re-running Rustler,
+      # even when the .so is absent. Rust compilation stays fast thanks to
+      # Swatinem/rust-cache keeping native/pulso_object_store/target warm.
 
       - name: Install dependencies
         run: mix deps.get
@@ -106,15 +104,6 @@ jobs:
           key: ${{ runner.os }}-mix-deps-${{ hashFiles('mix.lock') }}
           restore-keys: |
             ${{ runner.os }}-mix-deps-
-
-      - name: Cache build
-        uses: actions/cache@v4
-        with:
-          path: _build
-          key: ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-integration-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-integration-
-            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-
 
       - name: Start MinIO
         run: |
