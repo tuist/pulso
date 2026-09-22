@@ -18,7 +18,7 @@ The architecture is documented in **[`docs/architecture.md`](./docs/architecture
 
 ## 🚀 Getting started
 
-The Erlang and Elixir toolchains are pinned in [`mise.toml`](./mise.toml). With [mise](https://mise.jdx.dev/) installed:
+The Erlang, Elixir, and Rust toolchains are needed to build Pulso. Erlang and Elixir are pinned in [`mise.toml`](./mise.toml); a stable Rust toolchain (from `rustup` or your package manager) covers the NIF. With [mise](https://mise.jdx.dev/) installed:
 
 ```sh
 mise install
@@ -26,13 +26,35 @@ mix setup
 mix test
 ```
 
+The first build compiles the Rust NIF under [`native/pulso_object_store`](./native/pulso_object_store) and copies the shared object into `priv/native/`. Subsequent builds are incremental.
+
 To boot the app locally:
 
 ```sh
 mix phx.server
 ```
 
-The MCP endpoint is exposed at `POST /mcp`. It speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`).
+- OTLP/HTTP JSON logs land at `POST /v1/logs`. Tenant is picked up from `X-Scope-OrgID` (Loki/Cortex convention), defaulting to `default`.
+- The MCP endpoint is exposed at `POST /mcp`. It speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`).
+
+## 🐳 Local S3 (MinIO)
+
+The Rust NIF talks to any S3-compatible endpoint. [`docker-compose.yml`](./docker-compose.yml) brings up MinIO and preseeds a bucket:
+
+```sh
+docker compose up -d
+```
+
+- API on `http://localhost:9000`, console on `http://localhost:9001` (`minioadmin` / `minioadmin`).
+- Preseeded bucket: `pulso`.
+
+To run the integration test suite against MinIO:
+
+```sh
+PULSO_INTEGRATION=1 mix test --only integration
+```
+
+Every `PULSO_MINIO_*` variable defaults to the values docker-compose sets up, so no other environment is needed when running against the local stack.
 
 ## 🛠️ Development
 

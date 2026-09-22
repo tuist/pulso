@@ -38,6 +38,15 @@ jobs:
           otp-version: "29.1"
           elixir-version: "1.20.4-otp-29"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/pulso_object_store -> target
+          key: ${{ matrix.check.name }}
+
       - name: Cache deps
         uses: actions/cache@v4
         with:
@@ -60,3 +69,79 @@ jobs:
 
       - name: ${{ matrix.check.name }}
         run: ${{ matrix.check.command }}
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+      PULSO_INTEGRATION: "1"
+      PULSO_MINIO_ENDPOINT: "http://localhost:9000"
+      PULSO_MINIO_BUCKET: "pulso"
+      PULSO_MINIO_REGION: "us-east-1"
+      PULSO_MINIO_ACCESS_KEY_ID: "minioadmin"
+      PULSO_MINIO_SECRET_ACCESS_KEY: "minioadmin"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.1"
+          elixir-version: "1.20.4-otp-29"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/pulso_object_store -> target
+          key: integration
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-mix-deps-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-deps-
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: _build
+          key: ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-integration-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-integration-
+            ${{ runner.os }}-mix-build-${{ hashFiles('mix.lock') }}-
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not start in time"
+          docker logs minio
+          exit 1
+
+      - name: Create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url http://localhost:9000 s3 mb s3://pulso
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run integration tests
+        run: mix test --only integration

@@ -1,0 +1,21 @@
+[package]
+name = "pulso_object_store"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+name = "pulso_object_store"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+object_store = { version = "0.12", features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+once_cell = "1"
+bytes = "1"
+futures = "0.3"
+
+[profile.release]
+lto = true

@@ -25,3 +25,7 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 pulso-*.tar
 
+# Rustler compiles crates under native/*/target/ and copies the produced
+# shared object into priv/native/. Both are build artifacts.
+native/*/target/
+/priv/native/
