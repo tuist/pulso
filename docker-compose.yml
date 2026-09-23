@@ -1,39 +1,54 @@
 # Local development stack for Pulso.
 #
-# `docker compose up -d` gives you MinIO on http://localhost:9000 with a
-# preseeded bucket named `pulso`. The console is on http://localhost:9001
-# (user/password: minioadmin/minioadmin).
+# `docker compose up -d` gives you a RustFS (S3-compatible) server on
+# http://localhost:9000 with a preseeded bucket named `pulso`. The console is
+# on http://localhost:9001 (user/password: rustfsadmin/rustfsadmin).
+#
+# RustFS is used instead of MinIO because MinIO's community edition is no
+# longer actively maintained. Pulso only talks to the S3 API, so any
+# S3-compatible backend works; RustFS is a drop-in that stays maintained.
 
 services:
-  minio:
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
+  rustfs:
+    image: rustfs/rustfs:latest
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     ports:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      - rustfs-data:/data
 
-  minio-init:
-    image: quay.io/minio/mc:latest
+  rustfs-init:
+    image: amazon/aws-cli:2
     depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-        mc alias set local http://minio:9000 minioadmin minioadmin;
-        mc mb --ignore-existing local/pulso;
-        mc anonymous set none local/pulso;
-        echo 'pulso bucket ready';
-      "
+      - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          if aws --endpoint-url http://rustfs:9000 s3 mb s3://pulso 2>/dev/null; then
+            echo "pulso bucket created"
+            exit 0
+          fi
+          if aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket pulso 2>/dev/null; then
+            echo "pulso bucket already exists"
+            exit 0
+          fi
+          echo "waiting for rustfs..."
+          sleep 2
+        done
+        echo "gave up waiting for rustfs" >&2
+        exit 1
 
 volumes:
-  minio-data:
+  rustfs-data:

@@ -3,9 +3,11 @@ defmodule Pulso.Storage do
   Behaviour for log storage backends and the runtime dispatcher.
 
   The active adapter is read from application configuration at call time so it
-  can be swapped in tests without recompiling. In step 1 the default adapter is
-  `Pulso.Storage.Memory`; step 2 will introduce an S3-backed adapter and demote
-  Memory to a test-only backend.
+  can be swapped in tests without recompiling. In dev and prod the default
+  adapter is `Pulso.Storage.S3` (step 2). Tests fall back to
+  `Pulso.Storage.Memory` because no adapter is configured. Step 3 will replace
+  the flat NDJSON layout of the S3 adapter with columnar segments and a
+  manifest that supports conditional writes.
   """
 
   alias Pulso.Record.Log

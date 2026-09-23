@@ -2,10 +2,10 @@ defmodule Pulso.Storage.Memory do
   @moduledoc """
   In-memory log storage backed by a public ETS table.
 
-  Step 1 default adapter. Meant to prove the ingest → storage → query spine
-  end to end without dragging in Rust, Parquet, or S3. Step 2 will replace it
-  with a real S3-backed adapter; this module will move to `test/support/` and
-  keep serving the test suite.
+  Test-only adapter as of step 2. Meant to prove the ingest → storage → query
+  spine end to end without dragging in Rust, Parquet, or S3. Dev and prod use
+  `Pulso.Storage.S3`; this module stays wired as the default in `mix test`
+  because `config/test.exs` sets no adapter override.
 
   Records for each tenant are kept in a private list-per-tenant, appended to
   as batches arrive and scanned linearly on query. That is deliberately naive:

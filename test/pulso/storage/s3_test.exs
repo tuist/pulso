@@ -1,0 +1,128 @@
+defmodule Pulso.Storage.S3Test do
+  # Round-trips logs through the real S3-compatible endpoint (RustFS via
+  # docker-compose). Only runs with PULSO_INTEGRATION=1; plain `mix test`
+  # skips it. See test/test_helper.exs.
+
+  use ExUnit.Case, async: false
+
+  alias Pulso.ObjectStore
+  alias Pulso.Record.Log
+  alias Pulso.Storage.S3
+
+  @moduletag :integration
+
+  setup do
+    config = %{
+      bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
+      region: System.get_env("PULSO_S3_REGION", "us-east-1"),
+      access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
+      secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),
+      allow_http: true
+    }
+
+    Application.put_env(:pulso, Pulso.Storage.S3, config)
+
+    tenant = "test-#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      # The adapter writes objects under `tenants/<tenant>/logs/`; clean up so
+      # a re-run starts empty.
+      case ObjectStore.list(config, "tenants/#{tenant}/logs/") do
+        {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
+        _ -> :ok
+      end
+    end)
+
+    {:ok, config: config, tenant: tenant}
+  end
+
+  defp record(ts, opts \\ []) do
+    %Log{
+      timestamp_ns: ts,
+      severity_text: Keyword.get(opts, :severity_text),
+      service: Keyword.get(opts, :service),
+      body: Keyword.get(opts, :body),
+      attributes: Keyword.get(opts, :attributes, %{}),
+      resource: Keyword.get(opts, :resource, %{})
+    }
+  end
+
+  test "append then query round-trips log records", %{tenant: tenant} do
+    assert :ok =
+             S3.append(tenant, [
+               record(10, service: "api", body: "hello"),
+               record(20, service: "web", body: "world")
+             ])
+
+    assert {:ok, records} = S3.query(tenant, [])
+    assert Enum.map(records, & &1.timestamp_ns) == [20, 10]
+    assert Enum.map(records, & &1.service) == ["web", "api"]
+    assert Enum.map(records, & &1.body) == ["world", "hello"]
+  end
+
+  test "records for one tenant are invisible to another", %{tenant: tenant, config: config} do
+    other = "test-other-#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      case ObjectStore.list(config, "tenants/#{other}/logs/") do
+        {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
+        _ -> :ok
+      end
+    end)
+
+    assert :ok = S3.append(tenant, [record(1)])
+    assert :ok = S3.append(other, [record(2)])
+
+    assert {:ok, [%Log{timestamp_ns: 1}]} = S3.query(tenant, [])
+    assert {:ok, [%Log{timestamp_ns: 2}]} = S3.query(other, [])
+  end
+
+  test "filters by time range and service", %{tenant: tenant} do
+    assert :ok =
+             S3.append(tenant, [
+               record(10, service: "api"),
+               record(20, service: "web"),
+               record(30, service: "api"),
+               record(40, service: "api")
+             ])
+
+    assert {:ok, records} = S3.query(tenant, start_ts: 15, end_ts: 35, service: "api")
+    assert Enum.map(records, & &1.timestamp_ns) == [30]
+  end
+
+  test "applies limit", %{tenant: tenant} do
+    assert :ok = S3.append(tenant, [record(1), record(2), record(3), record(4)])
+    assert {:ok, records} = S3.query(tenant, limit: 2)
+    assert length(records) == 2
+    assert Enum.map(records, & &1.timestamp_ns) == [4, 3]
+  end
+
+  test "populates observed_timestamp_ns when the record does not carry one", %{tenant: tenant} do
+    before_append = System.system_time(:nanosecond)
+    assert :ok = S3.append(tenant, [record(1)])
+    after_append = System.system_time(:nanosecond)
+
+    assert {:ok, [%Log{observed_timestamp_ns: observed}]} = S3.query(tenant, [])
+    assert observed >= before_append and observed <= after_append
+  end
+
+  test "preserves NDJSON-hostile bodies through the round trip", %{tenant: tenant} do
+    tricky = "line1\nline2\t\"quoted\"\r\nline3"
+    assert :ok = S3.append(tenant, [record(1, body: tricky)])
+    assert {:ok, [%Log{body: ^tricky}]} = S3.query(tenant, [])
+  end
+
+  test "append with an empty batch is a no-op", %{tenant: tenant, config: config} do
+    assert :ok = S3.append(tenant, [])
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert keys == []
+  end
+
+  test "rejects tenant names that could escape the prefix" do
+    for bad <- ["../evil", "foo/bar", "foo bar", "", String.duplicate("a", 200)] do
+      assert {:error, {:invalid_tenant, ^bad}} = S3.append(bad, [record(1)])
+      assert {:error, {:invalid_tenant, ^bad}} = S3.query(bad, [])
+    end
+  end
+end

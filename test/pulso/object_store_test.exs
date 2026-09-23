@@ -1,8 +1,8 @@
 defmodule Pulso.ObjectStoreTest do
-  # This module talks to a live MinIO endpoint via the Rust NIF.
-  # It only runs when the caller opts in with PULSO_INTEGRATION=1 (see
-  # test/test_helper.exs), so plain `mix test` on a machine without
-  # docker-compose still passes.
+  # This module talks to a live S3-compatible endpoint (RustFS by default via
+  # docker-compose.yml) through the Rust NIF. It only runs when the caller
+  # opts in with PULSO_INTEGRATION=1 (see test/test_helper.exs), so plain
+  # `mix test` on a machine without docker-compose still passes.
 
   use ExUnit.Case, async: false
 
@@ -12,11 +12,11 @@ defmodule Pulso.ObjectStoreTest do
 
   setup do
     config = %{
-      bucket: System.get_env("PULSO_MINIO_BUCKET", "pulso"),
-      endpoint: System.get_env("PULSO_MINIO_ENDPOINT", "http://localhost:9000"),
-      region: System.get_env("PULSO_MINIO_REGION", "us-east-1"),
-      access_key_id: System.get_env("PULSO_MINIO_ACCESS_KEY_ID", "minioadmin"),
-      secret_access_key: System.get_env("PULSO_MINIO_SECRET_ACCESS_KEY", "minioadmin"),
+      bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
+      region: System.get_env("PULSO_S3_REGION", "us-east-1"),
+      access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
+      secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),
       allow_http: true
     }
 

@@ -22,6 +22,37 @@ end
 
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Log storage adapter. Tests keep the in-memory adapter (see config/test.exs);
+# dev and prod use the S3 adapter against any S3-compatible endpoint. RustFS
+# runs locally via docker-compose.yml — the dev defaults below match its
+# out-of-the-box credentials. Prod requires the env vars to be set explicitly.
+case config_env() do
+  :dev ->
+    config :pulso, Pulso.Storage, adapter: Pulso.Storage.S3
+
+    config :pulso, Pulso.Storage.S3,
+      bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
+      region: System.get_env("PULSO_S3_REGION", "us-east-1"),
+      access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
+      secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),
+      allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "true") in ["1", "true", "yes"]
+
+  :prod ->
+    config :pulso, Pulso.Storage, adapter: Pulso.Storage.S3
+
+    config :pulso, Pulso.Storage.S3,
+      bucket: System.fetch_env!("PULSO_S3_BUCKET"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT"),
+      region: System.fetch_env!("PULSO_S3_REGION"),
+      access_key_id: System.fetch_env!("PULSO_S3_ACCESS_KEY_ID"),
+      secret_access_key: System.fetch_env!("PULSO_S3_SECRET_ACCESS_KEY"),
+      allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "false") in ["1", "true", "yes"]
+
+  :test ->
+    :noop
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
