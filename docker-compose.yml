@@ -12,14 +12,19 @@ services:
   rustfs:
     image: rustfs/rustfs:latest
     environment:
+      # RUSTFS_VOLUMES is required — without it RustFS exits at startup.
+      # The `{0..3}` template creates four storage volumes under /data.
+      RUSTFS_VOLUMES: /data/rustfs{0..3}
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
+    # Bind to loopback only so the well-known dev credentials cannot be reached
+    # from another host on the LAN.
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - rustfs-data:/data
 

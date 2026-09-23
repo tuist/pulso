@@ -42,7 +42,7 @@ defmodule Pulso.Application do
 
     case adapter do
       nil -> [Memory]
-      Pulso.Storage.Memory -> [Memory]
+      Memory -> [Memory]
       _ -> []
     end
   end

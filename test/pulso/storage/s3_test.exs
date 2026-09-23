@@ -21,7 +21,7 @@ defmodule Pulso.Storage.S3Test do
       allow_http: true
     }
 
-    Application.put_env(:pulso, Pulso.Storage.S3, config)
+    Application.put_env(:pulso, S3, config)
 
     tenant = "test-#{System.unique_integer([:positive])}"
 

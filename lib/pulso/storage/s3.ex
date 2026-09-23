@@ -8,10 +8,18 @@ defmodule Pulso.Storage.S3 do
   so a batch cannot land outside its own prefix. `query/2` lists the tenant's
   prefix, downloads every object, decodes NDJSON, filters and sorts in Elixir.
 
-  This is deliberately naive. Step 3 replaces the flat NDJSON layout with
-  columnar segments and a manifest that supports conditional writes; the
-  point of step 2 is only to prove logs round-trip through real object
-  storage against the `Pulso.ObjectStore` NIF.
+  Known limits of this adapter, deferred to step 3 (segments + manifest CAS):
+
+    * **Not idempotent.** An `append` that succeeds but whose response is lost
+      will be duplicated by a retry — each call generates a fresh random
+      object key. Step 3 introduces a manifest with conditional writes.
+    * **Unbounded query work.** Every query lists and downloads every object
+      under the tenant prefix before applying `limit`. Fine for a small tenant
+      or a smoke test; not fine at scale.
+    * **No cross-tenant authentication.** Tenant validation here only prevents
+      key-escape; it does not verify that the caller is *allowed* to read or
+      write the tenant they named. Auth belongs at the ingest boundary.
+    * **No columnar layout.** Records go on the wire as NDJSON, not Parquet.
   """
 
   @behaviour Pulso.Storage
@@ -26,13 +34,17 @@ defmodule Pulso.Storage.S3 do
   @sort_key_width 20
 
   @impl Pulso.Storage
-  def append(_tenant, []), do: :ok
+  def append(tenant, []) when is_binary(tenant) do
+    # Validate even on empty so an adversarial tenant name is rejected on the
+    # first attempt, not only once a real record survives OTLP decoding.
+    validate_tenant(tenant)
+  end
 
   def append(tenant, records) when is_binary(tenant) and is_list(records) do
     with :ok <- validate_tenant(tenant),
-         normalized <- normalize(records),
-         payload when is_binary(payload) <- encode(normalized),
-         key <- object_key(tenant, batch_sort_ns(normalized)) do
+         normalized = normalize(records),
+         {:ok, payload} <- encode(normalized) do
+      key = object_key(tenant, batch_sort_ns(normalized))
       ObjectStore.put(config!(), key, payload)
     end
   end
@@ -40,7 +52,7 @@ defmodule Pulso.Storage.S3 do
   @impl Pulso.Storage
   def query(tenant, opts) when is_binary(tenant) and is_list(opts) do
     with :ok <- validate_tenant(tenant),
-         config <- config!(),
+         config = config!(),
          {:ok, keys} <- ObjectStore.list(config, prefix(tenant)),
          {:ok, records} <- fetch_records(config, keys) do
       filtered =
@@ -81,18 +93,35 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp encode(records) do
-    records
-    |> Enum.map(&(Jason.encode!(Map.from_struct(&1)) <> "\n"))
-    |> IO.iodata_to_binary()
+    encoded =
+      Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
+        case Jason.encode(Map.from_struct(record)) do
+          {:ok, line} -> {:cont, {:ok, [[line, "\n"] | acc]}}
+          {:error, reason} -> {:halt, {:error, {:encode_failed, reason}}}
+        end
+      end)
+
+    with {:ok, lines} <- encoded do
+      {:ok, lines |> Enum.reverse() |> IO.iodata_to_binary()}
+    end
   end
 
   defp fetch_records(config, keys) do
-    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+    # Accumulate batches as a list of lists then flatten once, so a large
+    # tenant does not pay O(n^2) list concatenation. Any get error halts the
+    # query — silently skipping would hide backend outages. Distinguishing a
+    # since-deleted key from a real failure requires typed errors from the
+    # NIF (step 3, once compaction can delete out from under a reader).
+    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, batches} ->
       case ObjectStore.get(config, key) do
-        {:ok, blob} -> {:cont, {:ok, acc ++ decode(blob)}}
+        {:ok, blob} -> {:cont, {:ok, [decode(blob) | batches]}}
         {:error, _} = err -> {:halt, err}
       end
     end)
+    |> case do
+      {:ok, batches} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
+      {:error, _} = err -> err
+    end
   end
 
   defp decode(blob) do

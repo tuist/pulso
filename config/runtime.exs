@@ -16,6 +16,8 @@ import Config
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
+alias Pulso.Storage.S3
+
 if System.get_env("PHX_SERVER") do
   config :pulso, PulsoWeb.Endpoint, server: true
 end
@@ -28,9 +30,9 @@ config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env(
 # out-of-the-box credentials. Prod requires the env vars to be set explicitly.
 case config_env() do
   :dev ->
-    config :pulso, Pulso.Storage, adapter: Pulso.Storage.S3
+    config :pulso, Pulso.Storage, adapter: S3
 
-    config :pulso, Pulso.Storage.S3,
+    config :pulso, S3,
       bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
       endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
       region: System.get_env("PULSO_S3_REGION", "us-east-1"),
@@ -39,14 +41,27 @@ case config_env() do
       allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "true") in ["1", "true", "yes"]
 
   :prod ->
-    config :pulso, Pulso.Storage, adapter: Pulso.Storage.S3
+    require_env = fn name ->
+      case System.get_env(name) do
+        value when is_binary(value) and value != "" ->
+          value
 
-    config :pulso, Pulso.Storage.S3,
-      bucket: System.fetch_env!("PULSO_S3_BUCKET"),
+        _ ->
+          raise """
+          environment variable #{name} is missing or empty.
+          Pulso.Storage.S3 requires bucket/region/credentials in prod.
+          """
+      end
+    end
+
+    config :pulso, Pulso.Storage, adapter: S3
+
+    config :pulso, S3,
+      bucket: require_env.("PULSO_S3_BUCKET"),
       endpoint: System.get_env("PULSO_S3_ENDPOINT"),
-      region: System.fetch_env!("PULSO_S3_REGION"),
-      access_key_id: System.fetch_env!("PULSO_S3_ACCESS_KEY_ID"),
-      secret_access_key: System.fetch_env!("PULSO_S3_SECRET_ACCESS_KEY"),
+      region: require_env.("PULSO_S3_REGION"),
+      access_key_id: require_env.("PULSO_S3_ACCESS_KEY_ID"),
+      secret_access_key: require_env.("PULSO_S3_SECRET_ACCESS_KEY"),
       allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "false") in ["1", "true", "yes"]
 
   :test ->
