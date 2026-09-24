@@ -58,10 +58,26 @@ defmodule Pulso.OTLP.LogsTest do
             ], 0} = Logs.decode(payload)
   end
 
-  test "falls back to observedTimeUnixNano when timeUnixNano is absent" do
-    # Per the OTLP data model, `time_unix_nano` MAY be absent. The
-    # receiver should use `observed_time_unix_nano` in that case.
-    # Rejecting valid records would be silent data loss.
+  test "preserves absent timestamps as nil so storage can backfill deterministically" do
+    # OTLP allows both timestamps to be absent, and a zero value means
+    # "unknown". The decoder does NOT invent a wall-clock value here —
+    # that would defeat the caller_content_hash for a retry. The storage
+    # adapter fills in a stored timestamp later.
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{"logRecords" => [%{"body" => %{"stringValue" => "no ts"}}]}
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}], 0} =
+             Logs.decode(payload)
+  end
+
+  test "preserves an observed-only timestamp verbatim" do
     payload = %{
       "resourceLogs" => [
         %{
@@ -79,26 +95,34 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{timestamp_ns: 42, observed_timestamp_ns: 42, body: "only observed"}], 0} =
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 42, body: "only observed"}], 0} =
              Logs.decode(payload)
   end
 
-  test "falls back to the current wall clock when both timestamps are absent" do
-    before_call = System.system_time(:nanosecond)
-
+  test "folds a zero timestamp to nil per the OTLP spec" do
+    # `time_unix_nano: 0` means "unknown", identical in meaning to the
+    # field being absent. If the decoder left it as 0, the record would
+    # be stored at the Unix epoch and vanish from time-bounded queries.
     payload = %{
       "resourceLogs" => [
         %{
           "scopeLogs" => [
-            %{"logRecords" => [%{"body" => %{"stringValue" => "no ts at all"}}]}
+            %{
+              "logRecords" => [
+                %{
+                  "timeUnixNano" => "0",
+                  "observedTimeUnixNano" => "1700000000000000000",
+                  "body" => %{"stringValue" => "zero ts"}
+                }
+              ]
+            }
           ]
         }
       ]
     }
 
-    assert {[%Log{timestamp_ns: ts, observed_timestamp_ns: nil}], 0} = Logs.decode(payload)
-    after_call = System.system_time(:nanosecond)
-    assert ts >= before_call and ts <= after_call
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 1_700_000_000_000_000_000}], 0} =
+             Logs.decode(payload)
   end
 
   test "counts a non-map logRecords entry as rejected" do

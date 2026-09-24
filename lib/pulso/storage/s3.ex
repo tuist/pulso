@@ -78,14 +78,16 @@ defmodule Pulso.Storage.S3 do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
     with :ok <- validate_tenant(tenant),
-         # The idempotency hash is derived from the caller-provided records
-         # BEFORE `normalize/1` fills in a wall-clock `observed_timestamp_ns`.
-         # A legitimate retry has identical records; the normalizer would
-         # otherwise inject a fresh `now` and defeat the fingerprint.
+         # Both the fingerprint AND the sort-key prefix are derived from the
+         # caller-provided records BEFORE `normalize/1` fills any wall-clock
+         # timestamps. A legitimate retry then produces the same object key
+         # in full — the sort_ns prefix and the idempotency suffix are both
+         # stable, so the second PUT overwrites the first as intended.
          {:ok, caller_hash} = caller_content_hash(records),
+         sort_ns = caller_sort_ns(records),
          {:ok, normalized} <- normalize(records),
          {:ok, payload} <- encode(normalized) do
-      key = object_key(tenant, batch_sort_ns(normalized), caller_hash, idempotency_key)
+      key = object_key(tenant, sort_ns, caller_hash, idempotency_key)
       ObjectStore.put(config!(), key, payload)
     end
   end
@@ -124,9 +126,17 @@ defmodule Pulso.Storage.S3 do
       %Log{} = record, {:ok, acc} ->
         with {:ok, attrs} <- sanitize_map(record.attributes || %{}),
              {:ok, resource} <- sanitize_map(record.resource || %{}) do
+          observed_ts = record.observed_timestamp_ns || now
+
+          # OTLP allows both timestamps to be absent (or explicitly zero,
+          # which the decoder folds to nil). We backfill: prefer the
+          # observed timestamp, then wall clock. This runs AFTER the
+          # caller_content_hash, so retries with identical raw records
+          # still hash to the same fingerprint.
           normalized = %{
             record
-            | observed_timestamp_ns: record.observed_timestamp_ns || now,
+            | timestamp_ns: record.timestamp_ns || observed_ts,
+              observed_timestamp_ns: observed_ts,
               attributes: attrs,
               resource: resource
           }
@@ -204,14 +214,15 @@ defmodule Pulso.Storage.S3 do
   defp stringify_key(k) when is_integer(k), do: Integer.to_string(k)
   defp stringify_key(k), do: inspect(k)
 
-  defp batch_sort_ns(records) do
-    # Pick the smallest `timestamp_ns` — the caller-provided event time.
-    # `observed_timestamp_ns` is fresh-now on each retry, so keying on it
-    # would make identical retries land on different objects even under an
-    # idempotency key. `timestamp_ns` is required by OTLP and stable per
-    # request, so retries with the same batch produce the same sort_ns.
+  # Pick the smallest caller-supplied `timestamp_ns` for the object key
+  # prefix. Runs on records BEFORE normalization so a retry with identical
+  # caller input produces the same sort_ns. A record with no timestamp
+  # contributes 0, which parks the object at the head of the tenant
+  # listing — good enough for the fallback case and, importantly,
+  # deterministic across retries.
+  defp caller_sort_ns(records) do
     records
-    |> Enum.map(& &1.timestamp_ns)
+    |> Enum.map(fn %Log{timestamp_ns: ts} -> ts || 0 end)
     |> Enum.min()
   end
 

@@ -61,25 +61,18 @@ defmodule Pulso.OTLP.Logs do
 
   defp decode_resource_logs(_), do: {[], 0}
 
-  # Per the OTLP logs data model, `time_unix_nano` MAY be absent when the
-  # emitter cannot determine an event time. In that case the receiver
-  # should fall back to `observed_time_unix_nano`, and if that is also
-  # absent, to the current wall clock. Rejecting for missing time_unix_nano
-  # would silently drop valid records — a partial-success response makes it
-  # worse because the sender is asked NOT to retry.
+  # Per the OTLP logs data model, both `time_unix_nano` and
+  # `observed_time_unix_nano` MAY be absent, and a value of 0 explicitly
+  # means "unknown". The decoder preserves the caller's intent verbatim
+  # (nil for absent or 0). The storage adapter fills a stored timestamp
+  # later so that (a) the caller_content_hash is stable across retries
+  # even when both timestamps are absent, and (b) records with only an
+  # observed time are not lost or misplaced at the Unix epoch.
   defp decode_log_record(%{} = record, resource_attrs, service) do
-    observed = nano(record["observedTimeUnixNano"])
-
-    timestamp_ns =
-      case nano(record["timeUnixNano"]) do
-        nil -> observed || System.system_time(:nanosecond)
-        ns -> ns
-      end
-
     {:ok,
      %Log{
-       timestamp_ns: timestamp_ns,
-       observed_timestamp_ns: observed,
+       timestamp_ns: nano_or_nil(record["timeUnixNano"]),
+       observed_timestamp_ns: nano_or_nil(record["observedTimeUnixNano"]),
        severity_number: record["severityNumber"],
        severity_text: record["severityText"],
        service: service,
@@ -93,17 +86,22 @@ defmodule Pulso.OTLP.Logs do
 
   defp decode_log_record(_, _, _), do: :error
 
-  defp nano(nil), do: nil
-  defp nano(value) when is_integer(value), do: value
+  # OTLP: a `*_unix_nano` value of 0 signals "unknown", identical in
+  # meaning to the field being absent. Fold both into nil so downstream
+  # code has one shape to reason about.
+  defp nano_or_nil(nil), do: nil
+  defp nano_or_nil(0), do: nil
+  defp nano_or_nil(value) when is_integer(value), do: value
 
-  defp nano(value) when is_binary(value) do
+  defp nano_or_nil(value) when is_binary(value) do
     case Integer.parse(value) do
+      {0, ""} -> nil
       {int, ""} -> int
       _ -> nil
     end
   end
 
-  defp nano(_), do: nil
+  defp nano_or_nil(_), do: nil
 
   defp attributes(%{"attributes" => kvs}) when is_list(kvs) do
     Map.new(kvs, fn

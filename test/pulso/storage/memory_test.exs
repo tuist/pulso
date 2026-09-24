@@ -62,6 +62,22 @@ defmodule Pulso.Storage.MemoryTest do
     assert observed >= before_append and observed <= after_append
   end
 
+  test "backfills a nil timestamp_ns from the observed timestamp" do
+    # OTLP allows `time_unix_nano` to be absent. Storage picks up the
+    # observed timestamp when the caller supplied one.
+    :ok = Storage.append("t", [%Log{timestamp_ns: nil, observed_timestamp_ns: 42}])
+    assert {:ok, [%Log{timestamp_ns: 42, observed_timestamp_ns: 42}]} = Storage.query("t")
+  end
+
+  test "backfills a nil timestamp_ns from the wall clock when observed is absent too" do
+    before_append = System.system_time(:nanosecond)
+    :ok = Storage.append("t", [%Log{timestamp_ns: nil, observed_timestamp_ns: nil}])
+    after_append = System.system_time(:nanosecond)
+
+    assert {:ok, [%Log{timestamp_ns: ts}]} = Storage.query("t")
+    assert ts >= before_append and ts <= after_append
+  end
+
   test "equal timestamps are broken by observed_timestamp_ns then trace_id" do
     # Guard against a limit response depending on adapter-internal insertion
     # order. Two adapters must sort ties the same way; both delegate to

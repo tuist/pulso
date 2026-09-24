@@ -35,7 +35,13 @@ defmodule Pulso.Storage.Memory do
 
     normalized =
       for %Log{} = record <- records do
-        %{record | observed_timestamp_ns: record.observed_timestamp_ns || now}
+        observed = record.observed_timestamp_ns || now
+
+        %{
+          record
+          | timestamp_ns: record.timestamp_ns || observed,
+            observed_timestamp_ns: observed
+        }
       end
 
     existing =
