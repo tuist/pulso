@@ -74,11 +74,15 @@ jobs:
     env:
       MIX_ENV: test
       PULSO_INTEGRATION: "1"
-      PULSO_MINIO_ENDPOINT: "http://localhost:9000"
-      PULSO_MINIO_BUCKET: "pulso"
-      PULSO_MINIO_REGION: "us-east-1"
-      PULSO_MINIO_ACCESS_KEY_ID: "minioadmin"
-      PULSO_MINIO_SECRET_ACCESS_KEY: "minioadmin"
+      # RustFS in docker-compose binds to these host ports by default (see
+      # mise/utilities/dev_instance_env.sh for the local per-worktree scheme).
+      PULSO_RUSTFS_API_PORT: "11100"
+      PULSO_RUSTFS_CONSOLE_PORT: "12100"
+      PULSO_S3_ENDPOINT: "http://localhost:11100"
+      PULSO_S3_BUCKET: "pulso"
+      PULSO_S3_REGION: "us-east-1"
+      PULSO_S3_ACCESS_KEY_ID: "rustfsadmin"
+      PULSO_S3_SECRET_ACCESS_KEY: "rustfsadmin"
     steps:
       - uses: actions/checkout@v4
 
@@ -105,29 +109,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-deps-
 
-      - name: Start MinIO
+      - name: Start RustFS via docker compose
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest server /data
-          for _ in $(seq 1 30); do
-            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
-              echo "MinIO is up"
+          docker compose up -d rustfs
+          for _ in $(seq 1 60); do
+            if curl -sf "http://localhost:${PULSO_RUSTFS_API_PORT}/" > /dev/null 2>&1 \
+              || curl -sf -o /dev/null -w '%{http_code}' "http://localhost:${PULSO_RUSTFS_API_PORT}/" | grep -qE '^(200|403|404)$'; then
+              echo "RustFS is up"
               exit 0
             fi
             sleep 1
           done
-          echo "MinIO did not start in time"
-          docker logs minio
+          echo "RustFS did not start in time"
+          docker compose logs rustfs
           exit 1
 
       - name: Create bucket
         env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
-        run: aws --endpoint-url http://localhost:9000 s3 mb s3://pulso
+          AWS_ACCESS_KEY_ID: ${{ env.PULSO_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.PULSO_S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.PULSO_S3_REGION }}
+        run: aws --endpoint-url "http://localhost:${PULSO_RUSTFS_API_PORT}" s3 mb "s3://${PULSO_S3_BUCKET}"
 
       - name: Install dependencies
         run: mix deps.get
