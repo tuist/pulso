@@ -61,7 +61,11 @@ jobs:
 
       - name: Build the NIF
         id: build-crate
-        uses: philss/rustler-precompiled-action@v1.1.4
+        # Pin to the commit SHA for `philss/rustler-precompiled-action` at
+        # tag v1.1.4. CodeQL flagged the tag-only pin as an
+        # immutable-action risk (a maintainer or attacker could move the
+        # tag). Bump this SHA when upgrading the action.
+        uses: philss/rustler-precompiled-action@853ac56183f29a080304df3ff8a194b5bbdc24cc
         with:
           project-name: pulso_object_store
           project-version: ${{ steps.extract.outputs.version }}
@@ -71,7 +75,9 @@ jobs:
           project-dir: "native/pulso_object_store"
 
       - name: Upload artifact to the release
-        uses: softprops/action-gh-release@v2
+        # Pin to the commit SHA for `softprops/action-gh-release` at
+        # tag v2. Same rationale as above.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: |
             ${{ steps.build-crate.outputs.file-path }}
