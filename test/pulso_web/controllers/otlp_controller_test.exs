@@ -82,7 +82,7 @@ defmodule PulsoWeb.OTLPControllerTest do
 
   test "POST /v1/logs surfaces rejected records via partialSuccess per the OTLP spec",
        %{conn: conn} do
-    # One valid record + one missing timeUnixNano. The receiver must
+    # One valid record + one malformed (non-map) entry. The receiver must
     # signal the drop rather than acknowledging silently — otherwise the
     # sender never retries the record that was never stored.
     payload = %{
@@ -92,7 +92,7 @@ defmodule PulsoWeb.OTLPControllerTest do
             %{
               "logRecords" => [
                 %{"timeUnixNano" => "1700000000000000000", "body" => %{"stringValue" => "ok"}},
-                %{"body" => %{"stringValue" => "missing ts"}}
+                "not-a-map"
               ]
             }
           ]
@@ -107,7 +107,6 @@ defmodule PulsoWeb.OTLPControllerTest do
 
     body = json_response(conn, 200)
     assert %{"partialSuccess" => %{"rejectedLogRecords" => 1}} = body
-    assert body["partialSuccess"]["errorMessage"] =~ "timeUnixNano"
   end
 
   test "POST /v1/logs passes the Idempotency-Key header through", %{conn: conn} do

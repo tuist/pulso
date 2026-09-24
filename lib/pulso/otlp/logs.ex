@@ -61,38 +61,37 @@ defmodule Pulso.OTLP.Logs do
 
   defp decode_resource_logs(_), do: {[], 0}
 
+  # Per the OTLP logs data model, `time_unix_nano` MAY be absent when the
+  # emitter cannot determine an event time. In that case the receiver
+  # should fall back to `observed_time_unix_nano`, and if that is also
+  # absent, to the current wall clock. Rejecting for missing time_unix_nano
+  # would silently drop valid records — a partial-success response makes it
+  # worse because the sender is asked NOT to retry.
   defp decode_log_record(%{} = record, resource_attrs, service) do
-    case timestamp(record["timeUnixNano"]) do
-      {:ok, ts} ->
-        {:ok,
-         %Log{
-           timestamp_ns: ts,
-           observed_timestamp_ns: nano(record["observedTimeUnixNano"]),
-           severity_number: record["severityNumber"],
-           severity_text: record["severityText"],
-           service: service,
-           body: any_value(record["body"]),
-           trace_id: nil_if_empty(record["traceId"]),
-           span_id: nil_if_empty(record["spanId"]),
-           attributes: attributes(record),
-           resource: resource_attrs
-         }}
+    observed = nano(record["observedTimeUnixNano"])
 
-      _ ->
-        :error
-    end
+    timestamp_ns =
+      case nano(record["timeUnixNano"]) do
+        nil -> observed || System.system_time(:nanosecond)
+        ns -> ns
+      end
+
+    {:ok,
+     %Log{
+       timestamp_ns: timestamp_ns,
+       observed_timestamp_ns: observed,
+       severity_number: record["severityNumber"],
+       severity_text: record["severityText"],
+       service: service,
+       body: any_value(record["body"]),
+       trace_id: nil_if_empty(record["traceId"]),
+       span_id: nil_if_empty(record["spanId"]),
+       attributes: attributes(record),
+       resource: resource_attrs
+     }}
   end
 
   defp decode_log_record(_, _, _), do: :error
-
-  defp timestamp(nil), do: :error
-
-  defp timestamp(value) do
-    case nano(value) do
-      nil -> :error
-      ns -> {:ok, ns}
-    end
-  end
 
   defp nano(nil), do: nil
   defp nano(value) when is_integer(value), do: value

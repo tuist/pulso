@@ -92,8 +92,7 @@ defmodule PulsoWeb.OTLPController do
     %{
       "partialSuccess" => %{
         "rejectedLogRecords" => rejected,
-        "errorMessage" =>
-          "#{rejected} log record(s) rejected; #{accepted} accepted. Cause: missing or malformed timeUnixNano."
+        "errorMessage" => "#{rejected} log record(s) rejected; #{accepted} accepted. Cause: malformed logRecord entry."
       }
     }
   end

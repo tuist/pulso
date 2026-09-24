@@ -58,14 +58,59 @@ defmodule Pulso.OTLP.LogsTest do
             ], 0} = Logs.decode(payload)
   end
 
-  test "counts records rejected for a missing timestamp" do
+  test "falls back to observedTimeUnixNano when timeUnixNano is absent" do
+    # Per the OTLP data model, `time_unix_nano` MAY be absent. The
+    # receiver should use `observed_time_unix_nano` in that case.
+    # Rejecting valid records would be silent data loss.
     payload = %{
       "resourceLogs" => [
         %{
           "scopeLogs" => [
             %{
               "logRecords" => [
-                %{"body" => %{"stringValue" => "no ts"}},
+                %{
+                  "observedTimeUnixNano" => "42",
+                  "body" => %{"stringValue" => "only observed"}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{timestamp_ns: 42, observed_timestamp_ns: 42, body: "only observed"}], 0} =
+             Logs.decode(payload)
+  end
+
+  test "falls back to the current wall clock when both timestamps are absent" do
+    before_call = System.system_time(:nanosecond)
+
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{"logRecords" => [%{"body" => %{"stringValue" => "no ts at all"}}]}
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{timestamp_ns: ts, observed_timestamp_ns: nil}], 0} = Logs.decode(payload)
+    after_call = System.system_time(:nanosecond)
+    assert ts >= before_call and ts <= after_call
+  end
+
+  test "counts a non-map logRecords entry as rejected" do
+    # A logRecord entry that is not a map is genuinely malformed — the
+    # decoder cannot invent fields, so it counts toward rejected.
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{
+              "logRecords" => [
+                "not-a-map",
                 %{"timeUnixNano" => "1", "body" => %{"stringValue" => "ok"}}
               ]
             }
