@@ -80,7 +80,7 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 ## Conventions
 
 - **HTTP client**: use `Req`. Never `HTTPoison`, `Tesla`, `:httpc`, or `Finch` directly.
-- **JSON**: `Jason` (Phoenix's configured library).
+- **JSON**: use Elixir's built-in `JSON` module (Elixir 1.18+), never `Jason`. Phoenix's `:json_library` is set to `JSON` in `config/config.exs`, and a Credo rule (`Credo.Check.Warning.ForbiddenModule`) fails CI on any direct `Jason.*` reference. Jason may still appear as a transitive dep of `phoenix` or a dev dep, but no code in `lib/`, `config/`, or `test/` may call it.
 - **New backends** go under `Pulso.<Backend>` (e.g. `Pulso.Mimir`, `Pulso.Tempo`), with the same read-only-first shape as `Pulso.Loki`. Every read function must accept a `:base_url` override in opts.
 - **MCP tools** live in `Pulso.MCP.Tools`. Each tool has an `inputSchema`, and its `call/2` clause returns `{:ok, [content_block]}` or `{:error, reason}`. Content blocks follow the MCP shape: `%{"type" => "text", "text" => "..."}`.
 - **Alerting** (when added): each rule is its own supervised process, cluster-wide singleton via Horde. Rules that require exactly-once firing route through `ra`.
