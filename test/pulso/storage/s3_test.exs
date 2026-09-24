@@ -26,9 +26,9 @@ defmodule Pulso.Storage.S3Test do
     tenant = "test-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # The adapter writes objects under `tenants/<tenant>/logs/`; clean up so
+      # The adapter writes objects under `tenants/<tenant>/v1/logs/`; clean up so
       # a re-run starts empty.
-      case ObjectStore.list(config, "tenants/#{tenant}/logs/") do
+      case ObjectStore.list(config, "tenants/#{tenant}/v1/logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
@@ -65,7 +65,7 @@ defmodule Pulso.Storage.S3Test do
     other = "test-other-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      case ObjectStore.list(config, "tenants/#{other}/logs/") do
+      case ObjectStore.list(config, "tenants/#{other}/v1/logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
@@ -115,7 +115,7 @@ defmodule Pulso.Storage.S3Test do
 
   test "append with an empty batch is a no-op", %{tenant: tenant, config: config} do
     assert :ok = S3.append(tenant, [])
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v1/logs/")
     assert keys == []
   end
 
@@ -139,7 +139,7 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
     assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
 
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v1/logs/")
     assert length(keys) == 1
 
     assert {:ok, records} = S3.query(tenant, [])
@@ -157,7 +157,7 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, batch)
     assert :ok = S3.append(tenant, batch)
 
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v1/logs/")
     assert length(keys) == 2
   end
 
@@ -170,7 +170,7 @@ defmodule Pulso.Storage.S3Test do
 
     # Delete one of the objects between our own list and get, mimicking a
     # compaction / retention job racing with a query.
-    assert {:ok, [first | _]} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert {:ok, [first | _]} = ObjectStore.list(config, "tenants/#{tenant}/v1/logs/")
     assert :ok = ObjectStore.delete(config, first)
 
     # Query should still return the surviving records, not error.

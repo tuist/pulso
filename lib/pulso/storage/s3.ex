@@ -39,13 +39,16 @@ defmodule Pulso.Storage.S3 do
 
   ## Key format stability
 
-  The exact object-key format is deliberately not a public API. Changing
-  the hashing scheme, the delimiter, or the sort-key width invalidates
-  cross-version idempotency: a retry landing on a newer server would not
-  find its earlier write and would create a duplicate. Any change to the
-  format needs a migration plan (either a rolling upgrade that reads both
-  formats during a window, or an explicit break with a version bump on the
-  storage schema).
+  Every object lives under a versioned prefix (`tenants/<tenant>/v1/…`).
+  Within one schema version, the exact suffix format is deliberately not
+  a public API. It is derived from `:erlang.term_to_binary(_,
+  [:deterministic])`, which is stable within an OTP release but is not
+  guaranteed to survive a major OTP upgrade (per the erts release notes,
+  the algorithm can change intentionally). Any change to the fingerprint,
+  the delimiter, or the sort-key width bumps the schema version — new
+  writes go to `v2/`, old objects stay at `v1/`, and a compaction job
+  migrates at its own pace. The reader can be taught to look at both
+  during the migration window.
   """
 
   @behaviour Pulso.Storage
@@ -267,7 +270,14 @@ defmodule Pulso.Storage.S3 do
     }
   end
 
-  defp prefix(tenant), do: "tenants/#{tenant}/logs/"
+  # Schema version segment. Baked into every object key so a future change
+  # to the key format (a new fingerprint algorithm, a different sort key
+  # width) can coexist with v1 objects rather than orphan them. Bump the
+  # version, keep readers that recognize both, and let a compaction job
+  # migrate the old prefix at leisure.
+  @schema_version "v1"
+
+  defp prefix(tenant), do: "tenants/#{tenant}/#{@schema_version}/logs/"
 
   # `caller_hash` is a 16-hex fingerprint of the pre-normalization records
   # from `caller_content_hash/1`. The pre-normalization form matters:
@@ -308,11 +318,13 @@ defmodule Pulso.Storage.S3 do
   #    version idempotency safe.
   #
   # `:erlang.term_to_binary/2` with `:deterministic` gives us the canonical
-  # form for free: map keys are sorted, atoms and integers are encoded
-  # canonically, and the format is stable across OTP versions from OTP 24.1
-  # onward. That is much stronger than `Jason.encode/1`, which serializes
-  # map keys in `Map.to_list/1` order — a non-canonical order that can
-  # change with Elixir's map representation (small map -> hash map, GC).
+  # form for free within an OTP release: map keys are sorted, atoms and
+  # integers are encoded canonically, and the same term always produces
+  # the same bytes. That is stronger than `Jason.encode/1` (map keys emit
+  # in `Map.to_list/1` order, which is not canonical and can shift when a
+  # small map promotes to a hash map). It is NOT guaranteed across major
+  # OTP upgrades — see the module docstring's "Key format stability"
+  # section for how a version bump migrates old objects when that happens.
   @doc false
   @spec caller_content_hash([Log.t()]) :: {:ok, String.t()}
   def caller_content_hash(records) when is_list(records) do

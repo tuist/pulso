@@ -93,6 +93,14 @@ defmodule Pulso.Storage.S3UnitTest do
       refute String.starts_with?(k2, "tenants/alpha/")
     end
 
+    test "the key path carries a schema version segment" do
+      # v1 is the current write format. A future format change bumps to
+      # v2/ so old objects can be migrated at their own pace rather than
+      # orphaned. Guarding this at the key level catches an accidental
+      # removal of the versioning.
+      assert String.starts_with?(S3.object_key("acme", 100, "p", "req-1"), "tenants/acme/v1/logs/")
+    end
+
     test "keys sort chronologically by sort_ns within a tenant" do
       k_early = S3.object_key("acme", 100, "p", "req-1")
       k_late = S3.object_key("acme", 200, "p", "req-1")
