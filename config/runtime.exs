@@ -16,6 +16,7 @@ import Config
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
+alias Pulso.Auth.SharedSecret
 alias Pulso.Storage.S3
 
 if System.get_env("PHX_SERVER") do
@@ -34,7 +35,10 @@ case config_env() do
 
     config :pulso, S3,
       bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
-      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
+      # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
+      # The fallback matches the docker-compose default host port when mise
+      # is not in the loop.
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9195"),
       region: System.get_env("PULSO_S3_REGION", "us-east-1"),
       access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
       secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),
@@ -53,6 +57,34 @@ case config_env() do
           """
       end
     end
+
+    # Tenant tokens. Expected shape: a JSON object mapping tenant name to
+    # "sha256$<hex-of-sha256-of-token>". Deployments compute the hash offline
+    # and store only the digest in env, never the plaintext token.
+    tokens =
+      case System.get_env("PULSO_TENANT_TOKENS") do
+        blob when is_binary(blob) and blob != "" ->
+          case Jason.decode(blob) do
+            {:ok, map} when is_map(map) ->
+              map
+
+            {:ok, _} ->
+              raise "PULSO_TENANT_TOKENS must decode to a JSON object"
+
+            {:error, reason} ->
+              raise "PULSO_TENANT_TOKENS is not valid JSON: #{inspect(reason)}"
+          end
+
+        _ ->
+          raise """
+          environment variable PULSO_TENANT_TOKENS is missing or empty.
+          Pulso.Auth.SharedSecret requires at least one tenant token in prod.
+          """
+      end
+
+    config :pulso, Pulso.Auth,
+      module: SharedSecret,
+      tokens: tokens
 
     config :pulso, Pulso.Storage, adapter: S3
 

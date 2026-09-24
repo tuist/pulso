@@ -61,4 +61,17 @@ defmodule Pulso.Storage.MemoryTest do
     assert {:ok, [%Log{observed_timestamp_ns: observed}]} = Storage.query("t")
     assert observed >= before_append and observed <= after_append
   end
+
+  test "equal timestamps are broken by observed_timestamp_ns then trace_id" do
+    # Guard against a limit response depending on adapter-internal insertion
+    # order. Two adapters must sort ties the same way; both delegate to
+    # Pulso.Storage.SortOrder.
+    a = %Log{timestamp_ns: 10, observed_timestamp_ns: 100, trace_id: "aaa"}
+    b = %Log{timestamp_ns: 10, observed_timestamp_ns: 300, trace_id: "aaa"}
+    c = %Log{timestamp_ns: 10, observed_timestamp_ns: 200, trace_id: "bbb"}
+
+    :ok = Storage.append("t", [a, b, c])
+    assert {:ok, sorted} = Storage.query("t")
+    assert Enum.map(sorted, & &1.observed_timestamp_ns) == [300, 200, 100]
+  end
 end

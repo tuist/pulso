@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{Error as ObjectStoreError, ObjectStore, PutPayload};
 use once_cell::sync::Lazy;
 use rustler::{Atom, Binary, Env, Error, NifResult, OwnedBinary};
 use std::sync::Arc;
@@ -44,6 +44,17 @@ struct StoreConfig {
 
 fn nif_error<E: std::fmt::Display>(err: E) -> Error {
     Error::Term(Box::new(err.to_string()))
+}
+
+// A NotFound response from the object store surfaces as the atom
+// `:not_found` on the Elixir side. Everything else stays as a string
+// message so the caller keeps the underlying context (permission denied,
+// throttling, timeout, etc.).
+fn map_object_store_error(err: ObjectStoreError) -> Error {
+    match err {
+        ObjectStoreError::NotFound { .. } => Error::Term(Box::new(atoms::not_found())),
+        other => Error::Term(Box::new(other.to_string())),
+    }
 }
 
 fn build_store(config: &StoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
@@ -87,7 +98,7 @@ fn get<'a>(env: Env<'a>, config: StoreConfig, key: String) -> NifResult<(Atom, B
             let obj = store.get(&path).await?;
             obj.bytes().await
         })
-        .map_err(nif_error)?;
+        .map_err(map_object_store_error)?;
 
     let mut owned = OwnedBinary::new(bytes.len())
         .ok_or_else(|| Error::Term(Box::new("failed to allocate binary")))?;
@@ -103,7 +114,7 @@ fn delete(config: StoreConfig, key: String) -> NifResult<Atom> {
 
     RUNTIME
         .block_on(async { store.delete(&path).await })
-        .map_err(nif_error)?;
+        .map_err(map_object_store_error)?;
 
     Ok(atoms::ok())
 }

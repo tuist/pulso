@@ -18,6 +18,7 @@ defmodule Pulso.Storage.Memory do
   use GenServer
 
   alias Pulso.Record.Log
+  alias Pulso.Storage.SortOrder
 
   @table __MODULE__
 
@@ -57,7 +58,7 @@ defmodule Pulso.Storage.Memory do
       records
       |> filter_by_time(Keyword.get(opts, :start_ts), Keyword.get(opts, :end_ts))
       |> filter_by_service(Keyword.get(opts, :service))
-      |> Enum.sort_by(& &1.timestamp_ns, :desc)
+      |> SortOrder.sort()
       |> take_limit(Keyword.get(opts, :limit))
 
     {:ok, filtered}

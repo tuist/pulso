@@ -1,8 +1,11 @@
 # Local development stack for Pulso.
 #
-# `docker compose up -d` gives you a RustFS (S3-compatible) server on
-# http://localhost:9000 with a preseeded bucket named `pulso`. The console is
-# on http://localhost:9001 (user/password: rustfsadmin/rustfsadmin).
+# `docker compose up -d` gives you a RustFS (S3-compatible) server with a
+# preseeded bucket named `pulso`. The published ports are derived from
+# PULSO_RUSTFS_API_PORT / PULSO_RUSTFS_CONSOLE_PORT, which
+# mise/utilities/dev_instance_env.sh scopes per git worktree so parallel
+# worktrees do not collide. Defaults (9195 / 9198) apply when the vars are
+# not set. Credentials for the console: rustfsadmin / rustfsadmin.
 #
 # RustFS is used instead of MinIO because MinIO's community edition is no
 # longer actively maintained. Pulso only talks to the S3 API, so any
@@ -21,10 +24,11 @@ services:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
     # Bind to loopback only so the well-known dev credentials cannot be reached
-    # from another host on the LAN.
+    # from another host on the LAN. Host ports come from the per-worktree env
+    # to keep multiple checkouts from fighting over 9000/9001.
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${PULSO_RUSTFS_API_PORT:-9195}:9000"
+      - "127.0.0.1:${PULSO_RUSTFS_CONSOLE_PORT:-9198}:9001"
     volumes:
       - rustfs-data:/data
 

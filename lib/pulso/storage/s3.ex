@@ -3,22 +3,29 @@ defmodule Pulso.Storage.S3 do
   S3-backed log storage. Step 2 adapter.
 
   Each `append/2` writes one NDJSON object under a tenant-scoped prefix
-  (`tenants/<tenant>/logs/<sort_key>.ndjson`). Tenant isolation is enforced by
-  key construction: tenant names are validated against a conservative charset
-  so a batch cannot land outside its own prefix. `query/2` lists the tenant's
-  prefix, downloads every object, decodes NDJSON, filters and sorts in Elixir.
+  (`tenants/<tenant>/logs/<sort_ns>-<content_hash>.ndjson`). Tenant isolation
+  is enforced by key construction: tenant names are validated against a
+  conservative charset so a batch cannot land outside its own prefix. The
+  key's suffix is a truncated SHA-256 of the encoded payload, which makes
+  identical retries land on the same object — a client that PUTs the same
+  batch twice under a lost-response retry does not create a duplicate.
 
-  Known limits of this adapter, deferred to step 3 (segments + manifest CAS):
+  `query/2` lists the tenant prefix, downloads every object, decodes NDJSON,
+  filters, and sorts. Order matches `Pulso.Storage.Memory`: `timestamp_ns`
+  descending, then `observed_timestamp_ns` descending, then `trace_id`, then
+  `body`, so equal-timestamp ties resolve identically across adapters.
+  A `NotFound` for a key that was listed but disappeared before the fetch
+  (concurrent retention, compaction, another process deleting) is skipped
+  rather than aborting the query.
 
-    * **Not idempotent.** An `append` that succeeds but whose response is lost
-      will be duplicated by a retry — each call generates a fresh random
-      object key. Step 3 introduces a manifest with conditional writes.
-    * **Unbounded query work.** Every query lists and downloads every object
-      under the tenant prefix before applying `limit`. Fine for a small tenant
-      or a smoke test; not fine at scale.
-    * **No cross-tenant authentication.** Tenant validation here only prevents
-      key-escape; it does not verify that the caller is *allowed* to read or
-      write the tenant they named. Auth belongs at the ingest boundary.
+  Known limits, deferred to step 3 (segments + manifest):
+
+    * **Unbounded query work when `limit` is set.** Without per-batch time
+      metadata this adapter cannot safely skip objects: a batch written
+      recently may contain an old-timestamp record, so scanning every
+      object is required to preserve the sort semantics. Step 3's segment
+      manifest will carry min/max `timestamp_ns` per segment and let the
+      query short-circuit.
     * **No columnar layout.** Records go on the wire as NDJSON, not Parquet.
   """
 
@@ -26,12 +33,15 @@ defmodule Pulso.Storage.S3 do
 
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
+  alias Pulso.Storage.SortOrder
 
   @tenant_regex ~r/\A[A-Za-z0-9_.\-]{1,128}\z/
   # 20 decimal digits fits a u64 nanosecond timestamp (max ~1.84e19). Zero-padding
-  # this way makes the S3 list order roughly chronological, which lets query
-  # short-circuit once the sort/limit is satisfied in a later step.
+  # keeps S3's UTF-8 list order chronological by write time (`sort_ns`).
   @sort_key_width 20
+  # 16 hex chars = 64 bits from SHA-256. Collision probability is negligible
+  # for the volumes any single tenant will produce in a step-2 adapter.
+  @content_hash_width 16
 
   @impl Pulso.Storage
   def append(tenant, []) when is_binary(tenant) do
@@ -44,7 +54,7 @@ defmodule Pulso.Storage.S3 do
     with :ok <- validate_tenant(tenant),
          normalized = normalize(records),
          {:ok, payload} <- encode(normalized) do
-      key = object_key(tenant, batch_sort_ns(normalized))
+      key = object_key(tenant, batch_sort_ns(normalized), payload)
       ObjectStore.put(config!(), key, payload)
     end
   end
@@ -59,7 +69,7 @@ defmodule Pulso.Storage.S3 do
         records
         |> filter_by_time(Keyword.get(opts, :start_ts), Keyword.get(opts, :end_ts))
         |> filter_by_service(Keyword.get(opts, :service))
-        |> Enum.sort_by(& &1.timestamp_ns, :desc)
+        |> SortOrder.sort()
         |> take_limit(Keyword.get(opts, :limit))
 
       {:ok, filtered}
@@ -80,13 +90,39 @@ defmodule Pulso.Storage.S3 do
     now = System.system_time(:nanosecond)
 
     for %Log{} = record <- records do
-      %{record | observed_timestamp_ns: record.observed_timestamp_ns || now}
+      %{
+        record
+        | observed_timestamp_ns: record.observed_timestamp_ns || now,
+          attributes: sanitize_map(record.attributes || %{}),
+          resource: sanitize_map(record.resource || %{})
+      }
     end
   end
 
+  # Force every attribute/resource map key to be a string and drop nils. OTLP
+  # decoding already produces string keys, but a caller building `%Log{}`
+  # directly (or a future backend surface) could hand us atoms or integers.
+  # Encoding those with Jason coerces them to strings, so two logical keys
+  # can silently collapse on the round trip. Doing the coercion here makes
+  # the write path deterministic and the decode path lossless.
+  @doc false
+  @spec sanitize_map(map()) :: map()
+  def sanitize_map(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {stringify_key(k), sanitize_value(v)} end)
+  end
+
+  defp stringify_key(k) when is_binary(k), do: k
+  defp stringify_key(k) when is_atom(k), do: Atom.to_string(k)
+  defp stringify_key(k) when is_integer(k), do: Integer.to_string(k)
+  defp stringify_key(k), do: inspect(k)
+
+  defp sanitize_value(v) when is_map(v), do: sanitize_map(v)
+  defp sanitize_value(v) when is_list(v), do: Enum.map(v, &sanitize_value/1)
+  defp sanitize_value(v), do: v
+
   defp batch_sort_ns(records) do
-    # Pick the smallest observed_timestamp_ns so the first key in a listing is
-    # the earliest batch. Every record is normalized, so this is never nil.
+    # Pick the smallest observed_timestamp_ns so identical retries hash into
+    # the same object key. Every record is normalized, so this is never nil.
     records
     |> Enum.map(& &1.observed_timestamp_ns)
     |> Enum.min()
@@ -108,13 +144,13 @@ defmodule Pulso.Storage.S3 do
 
   defp fetch_records(config, keys) do
     # Accumulate batches as a list of lists then flatten once, so a large
-    # tenant does not pay O(n^2) list concatenation. Any get error halts the
-    # query — silently skipping would hide backend outages. Distinguishing a
-    # since-deleted key from a real failure requires typed errors from the
-    # NIF (step 3, once compaction can delete out from under a reader).
+    # tenant does not pay O(n^2) list concatenation. A `:not_found` for a
+    # key that vanished after `list` is treated as "raced with a delete" and
+    # skipped; anything else halts the query so an outage is not hidden.
     Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, batches} ->
       case ObjectStore.get(config, key) do
         {:ok, blob} -> {:cont, {:ok, [decode(blob) | batches]}}
+        {:error, :not_found} -> {:cont, {:ok, batches}}
         {:error, _} = err -> {:halt, err}
       end
     end)
@@ -149,8 +185,10 @@ defmodule Pulso.Storage.S3 do
 
   defp prefix(tenant), do: "tenants/#{tenant}/logs/"
 
-  defp object_key(tenant, sort_ns) do
-    "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{rand_suffix()}.ndjson"
+  @doc false
+  @spec object_key(String.t(), non_neg_integer(), binary()) :: String.t()
+  def object_key(tenant, sort_ns, payload) when is_binary(tenant) and is_binary(payload) do
+    "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{content_hash(payload)}.ndjson"
   end
 
   defp zero_pad(ns) when is_integer(ns) and ns >= 0 do
@@ -159,8 +197,11 @@ defmodule Pulso.Storage.S3 do
     |> String.pad_leading(@sort_key_width, "0")
   end
 
-  defp rand_suffix do
-    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  defp content_hash(payload) do
+    :sha256
+    |> :crypto.hash(payload)
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, @content_hash_width)
   end
 
   defp filter_by_time(records, nil, nil), do: records

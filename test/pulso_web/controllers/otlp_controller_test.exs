@@ -1,6 +1,7 @@
 defmodule PulsoWeb.OTLPControllerTest do
   use PulsoWeb.ConnCase, async: false
 
+  alias Pulso.Auth.SharedSecret
   alias Pulso.Record.Log
   alias Pulso.Storage
   alias Pulso.Storage.Memory
@@ -65,5 +66,64 @@ defmodule PulsoWeb.OTLPControllerTest do
 
     assert json_response(conn, 200) == %{}
     assert {:ok, []} = Storage.query("default")
+  end
+
+  describe "with Pulso.Auth.SharedSecret enabled" do
+    setup do
+      hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
+
+      Application.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{"acme" => "sha256$#{hex}"}
+      )
+
+      on_exit(fn -> Application.delete_env(:pulso, Pulso.Auth) end)
+      :ok
+    end
+
+    test "accepts the correct token", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("x-scope-orgid", "acme")
+        |> put_req_header("authorization", "Bearer the-token")
+        |> post(~p"/v1/logs", payload())
+
+      assert json_response(conn, 200) == %{}
+      assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query("acme")
+    end
+
+    test "rejects a request with a bad token", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("x-scope-orgid", "acme")
+        |> put_req_header("authorization", "Bearer wrong")
+        |> post(~p"/v1/logs", payload())
+
+      assert json_response(conn, 401) == %{"error" => "invalid_token"}
+      assert {:ok, []} = Storage.query("acme")
+    end
+
+    test "rejects a tenant with no configured token", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("x-scope-orgid", "unknown")
+        |> put_req_header("authorization", "Bearer the-token")
+        |> post(~p"/v1/logs", payload())
+
+      assert json_response(conn, 401) == %{"error" => "unknown_tenant"}
+    end
+
+    test "rejects a request with no authorization header", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("x-scope-orgid", "acme")
+        |> post(~p"/v1/logs", payload())
+
+      assert json_response(conn, 401) == %{"error" => "missing_token"}
+    end
   end
 end

@@ -125,4 +125,49 @@ defmodule Pulso.Storage.S3Test do
       assert {:error, {:invalid_tenant, ^bad}} = S3.query(bad, [])
     end
   end
+
+  test "identical batches are idempotent — retrying does not duplicate", %{
+    tenant: tenant,
+    config: config
+  } do
+    # Content-addressed object keys mean the same batch written twice lands
+    # on the same key. This is the retry story for step 2.
+    payload = [record(1, body: "same", service: "api")]
+
+    assert :ok = S3.append(tenant, payload)
+    assert :ok = S3.append(tenant, payload)
+
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert length(keys) == 1
+
+    assert {:ok, records} = S3.query(tenant, [])
+    assert length(records) == 1
+  end
+
+  test "a key deleted after listing does not fail the query", %{
+    tenant: tenant,
+    config: config
+  } do
+    assert :ok = S3.append(tenant, [record(1), record(2)])
+    assert :ok = S3.append(tenant, [record(3)])
+
+    # Delete one of the objects between our own list and get, mimicking a
+    # compaction / retention job racing with a query.
+    assert {:ok, [first | _]} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert :ok = ObjectStore.delete(config, first)
+
+    # Query should still return the surviving records, not error.
+    assert {:ok, remaining} = S3.query(tenant, [])
+    assert length(remaining) >= 1
+  end
+
+  test "equal timestamps sort deterministically across adapters", %{tenant: tenant} do
+    a = %Log{timestamp_ns: 10, observed_timestamp_ns: 100, trace_id: "aaa"}
+    b = %Log{timestamp_ns: 10, observed_timestamp_ns: 300, trace_id: "aaa"}
+    c = %Log{timestamp_ns: 10, observed_timestamp_ns: 200, trace_id: "bbb"}
+
+    assert :ok = S3.append(tenant, [a, b, c])
+    assert {:ok, sorted} = S3.query(tenant, [])
+    assert Enum.map(sorted, & &1.observed_timestamp_ns) == [300, 200, 100]
+  end
 end
