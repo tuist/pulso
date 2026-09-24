@@ -138,13 +138,14 @@ export PULSO_DEV_INSTANCE_ROOT="${PROJECT_ROOT}"
 # and the ExUnit port (4002).
 export PORT="$((4000 + suffix))"
 
-# RustFS via docker-compose. The API and console ports use base ports
-# 1000 apart so two suffixes N and N+3 (tuist's convention had this bug)
-# cannot accidentally claim the same TCP port. Ranges: 9100..9999 for the
-# S3 API, 10100..10999 for the console. 9000 itself is left free so a
-# ClickHouse install on 9000 keeps working.
-export PULSO_RUSTFS_API_PORT="$((9000 + suffix))"
-export PULSO_RUSTFS_CONSOLE_PORT="$((10000 + suffix))"
+# RustFS via docker-compose. Ranges are 1000 apart so two suffixes N and
+# N+3 cannot accidentally claim the same TCP port. Bases picked to avoid
+# common developer defaults on macOS: ClickHouse (9000), Node.js debugger
+# (9229), Prometheus (9090), Grafana (3000), gRPC dev (50051).
+#     API:      11100..11999
+#     Console:  12100..12999
+export PULSO_RUSTFS_API_PORT="$((11000 + suffix))"
+export PULSO_RUSTFS_CONSOLE_PORT="$((12000 + suffix))"
 
 # What the Elixir app reads. runtime.exs reads PULSO_S3_ENDPOINT verbatim.
 export PULSO_S3_ENDPOINT="http://localhost:${PULSO_RUSTFS_API_PORT}"

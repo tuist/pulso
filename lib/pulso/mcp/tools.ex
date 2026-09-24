@@ -64,21 +64,23 @@ defmodule Pulso.MCP.Tools do
   def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
   def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
 
-  # Every tool that names a tenant runs it through `Pulso.Auth.verify/2`. The
-  # MCP dispatch is the same JSON-RPC transport for read and write; without
-  # this hop the ingest boundary's auth check would be bypassable via the
-  # read path.
-  defp verify(%{conn: conn}, tenant) when not is_nil(conn) do
+  # Every tool that names a tenant runs it through `Pulso.Auth.verify/2`.
+  # MCP is the same JSON-RPC transport for read and write; without this hop
+  # the ingest boundary's auth check would be bypassable via the read path.
+  #
+  # A missing conn falls through to a fresh `%Plug.Conn{}`. When the active
+  # auth module is `Pulso.Auth.Open` (dev/test default) that still returns
+  # :ok. When it is `Pulso.Auth.SharedSecret` (prod) it fails, closed —
+  # there is no in-process caller that legitimately reaches this path
+  # without a conn under real auth.
+  defp verify(context, tenant) do
+    conn = Map.get(context, :conn) || %Plug.Conn{}
+
     case Auth.verify(conn, tenant) do
       :ok -> :ok
       {:error, reason} -> {:error, {:unauthorized, reason}}
     end
   end
-
-  # No conn (e.g. an in-process caller writing a test): keep the default-open
-  # behavior so unit tests do not need to build a fake connection. Callers
-  # that reach the network path always have a conn.
-  defp verify(_context, _tenant), do: :ok
 
   defp put_opt(opts, _key, nil), do: opts
   defp put_opt(opts, key, value), do: Keyword.put(opts, key, value)

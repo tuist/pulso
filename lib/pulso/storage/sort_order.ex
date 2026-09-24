@@ -32,8 +32,15 @@ defmodule Pulso.Storage.SortOrder do
     }
   end
 
+  # `body` is `String.t() | nil` by the internal Log spec, but the OTLP
+  # decoder can produce integers, booleans, or lists when an incoming
+  # record uses those OTLP `AnyValue` shapes. Rather than crash the sort,
+  # coerce any non-string, non-nil term to a string so it still tiebreaks
+  # deterministically. `inspect/1` gives a stable, bounded representation
+  # for every Elixir term.
   defp presence_pair(nil), do: {0, ""}
   defp presence_pair(value) when is_binary(value), do: {1, value}
+  defp presence_pair(value), do: {1, inspect(value)}
 
   defp compare_desc(a, b), do: a >= b
 end

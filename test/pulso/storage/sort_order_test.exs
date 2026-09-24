@@ -53,6 +53,19 @@ defmodule Pulso.Storage.SortOrderTest do
     assert Enum.map(result, & &1.trace_id) == ["aaa", nil]
   end
 
+  test "a non-string body sorts without crashing" do
+    # OTLP `AnyValue` can produce a body that is not a String — an
+    # integer, a boolean, a list. The sort layer must not crash on those;
+    # sorting is for stability, not for user-facing order.
+    int_body = %Log{timestamp_ns: 10, observed_timestamp_ns: 5, body: 42}
+    list_body = %Log{timestamp_ns: 10, observed_timestamp_ns: 5, body: [1, 2, 3]}
+    bool_body = %Log{timestamp_ns: 10, observed_timestamp_ns: 5, body: true}
+    string_body = %Log{timestamp_ns: 10, observed_timestamp_ns: 5, body: "z"}
+    nil_body = %Log{timestamp_ns: 10, observed_timestamp_ns: 5, body: nil}
+
+    assert [_, _, _, _, _] = SortOrder.sort([int_body, list_body, bool_body, string_body, nil_body])
+  end
+
   test "nil and empty string in the same position are distinguishable" do
     # Prior version collapsed `nil` and `""` into the same sort key, so two
     # otherwise-identical records could reorder unpredictably. Now `nil`

@@ -71,6 +71,18 @@ defmodule Pulso.MCP.ToolsTest do
                Tools.call("query_logs", %{"tenant" => "acme"}, %{conn: %Plug.Conn{}})
     end
 
+    test "fails closed when no conn is passed at all" do
+      # Previous version had a "no conn = allow" fallback for in-process
+      # callers. That was a bypass: any code path that forgot the context
+      # would silently read another tenant's data under shared-secret
+      # auth. Now the fallback constructs an empty %Plug.Conn{}, which
+      # SharedSecret.verify sees as :missing_token.
+      Storage.append("acme", [%Log{timestamp_ns: 1}])
+
+      assert {:error, {:unauthorized, :missing_token}} =
+               Tools.call("query_logs", %{"tenant" => "acme"}, %{})
+    end
+
     test "rejects a query_logs call with a bad token" do
       Storage.append("acme", [%Log{timestamp_ns: 1}])
 

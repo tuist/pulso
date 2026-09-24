@@ -38,7 +38,7 @@ case config_env() do
       # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
       # The fallback matches the docker-compose default host port when mise
       # is not in the loop.
-      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9100"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:11100"),
       region: System.get_env("PULSO_S3_REGION", "us-east-1"),
       access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
       secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),

@@ -69,6 +69,16 @@ defmodule Pulso.Storage.S3UnitTest do
       refute k1 == k2
     end
 
+    test "the same idempotency key with different content produces different objects" do
+      # A caller who reuses an idempotency key with a different payload is
+      # almost certainly buggy. We must not silently overwrite the earlier
+      # write with the newer one; distinct content should land on distinct
+      # keys.
+      k1 = S3.object_key("acme", 100, "payload-a", "req-1")
+      k2 = S3.object_key("acme", 100, "payload-b", "req-1")
+      refute k1 == k2
+    end
+
     test "the idempotency key is scoped by tenant" do
       # A shared idempotency key across tenants must not collide.
       k1 = S3.object_key("alpha", 100, "p", "req-1")

@@ -185,10 +185,13 @@ defmodule Pulso.Storage.S3 do
   defp stringify_key(k), do: inspect(k)
 
   defp batch_sort_ns(records) do
-    # Pick the smallest observed_timestamp_ns so identical retries hash into
-    # the same object key. Every record is normalized, so this is never nil.
+    # Pick the smallest `timestamp_ns` — the caller-provided event time.
+    # `observed_timestamp_ns` is fresh-now on each retry, so keying on it
+    # would make identical retries land on different objects even under an
+    # idempotency key. `timestamp_ns` is required by OTLP and stable per
+    # request, so retries with the same batch produce the same sort_ns.
     records
-    |> Enum.map(& &1.observed_timestamp_ns)
+    |> Enum.map(& &1.timestamp_ns)
     |> Enum.min()
   end
 
@@ -259,7 +262,12 @@ defmodule Pulso.Storage.S3 do
         # no-op overwrite. Distinct producers that pick the same key are
         # explicitly claiming "these two calls are the same write".
         <<key::binary>> when byte_size(key) > 0 ->
-          "idem-" <> stable_hash(tenant <> "\0" <> key)
+          # The hash covers tenant, key, AND content hash so a caller who
+          # accidentally reuses a key with different content does not
+          # silently overwrite the prior write — the two calls produce
+          # different objects. Same content + same key still collapses,
+          # which is the point of idempotency.
+          "idem-" <> stable_hash(tenant <> "\0" <> key <> "\0" <> content_hash(payload))
 
         # No idempotency key: the caller is fine with a retry producing a
         # duplicate. A random suffix guarantees distinct writes even when
