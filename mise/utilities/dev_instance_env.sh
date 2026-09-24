@@ -149,3 +149,10 @@ export PULSO_RUSTFS_CONSOLE_PORT="$((12000 + suffix))"
 
 # What the Elixir app reads. runtime.exs reads PULSO_S3_ENDPOINT verbatim.
 export PULSO_S3_ENDPOINT="http://localhost:${PULSO_RUSTFS_API_PORT}"
+
+# Compile the Rust NIF from source in this checkout instead of trying to
+# fetch a precompiled artifact from GitHub Releases (which is what
+# `mix deps.get` of Pulso as a hex package does). This is what proves
+# every branch keeps building the source; consumers who install Pulso
+# elsewhere leave this unset and download the release artifact.
+export PULSO_NIF_FORCE_BUILD="1"

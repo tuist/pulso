@@ -80,28 +80,16 @@ fn put(config: StoreConfig, key: String, data: Binary) -> NifResult<Atom> {
     let store = build_store(&config)?;
     let path = Path::from(key);
 
-    // Zero-copy hand-off of the Erlang binary to `object_store`. `Bytes::
-    // from_static` normally requires `&'static [u8]`, and we do not have
-    // one — the slice's real lifetime is `data`'s NIF-call lifetime. The
-    // transmute lies to the compiler about lifetime; the runtime invariant
-    // that keeps this sound is:
-    //
-    //   1. `RUNTIME.block_on(...)` completes before this NIF returns.
-    //   2. The `PutPayload` (and therefore every `Bytes` clone inside the
-    //      HTTP client) is dropped when the future returned by
-    //      `store.put(...)` resolves.
-    //   3. The Erlang binary's memory stays valid for the entire duration
-    //      of the NIF call (Erlang refcounts the underlying heap; it can
-    //      only be released after the NIF returns).
-    //
-    // As long as we never spawn the S3 request onto a background task or
-    // otherwise let `Bytes` outlive `block_on`, no dangling reference
-    // reaches the Rust side. The alternative — `Bytes::copy_from_slice` —
-    // adds one full-payload memcpy per PUT, which showed up on the hot
-    // path once ingest throughput started climbing.
-    let slice: &[u8] = data.as_slice();
-    let static_slice: &'static [u8] = unsafe { std::mem::transmute(slice) };
-    let payload: PutPayload = Bytes::from_static(static_slice).into();
+    // One memcpy from the Erlang binary heap into a `Bytes` we hand off
+    // to `object_store`. The obvious zero-copy alternative (extend the
+    // Rustler slice's lifetime to `'static` and use `Bytes::from_static`)
+    // is unsound in general: reqwest's retry middleware can clone the
+    // body, and there is no API guarantee that every hyper-side reference
+    // is dropped before `store.put(...).await` returns. Any clone that
+    // outlives the NIF call becomes a use-after-free against Erlang's
+    // binary heap. Removing this copy properly needs `enif_keep_binary`,
+    // which Rustler 0.38 does not expose — track upstream and revisit.
+    let payload: PutPayload = Bytes::copy_from_slice(data.as_slice()).into();
 
     RUNTIME
         .block_on(store.put(&path, payload))

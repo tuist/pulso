@@ -127,12 +127,17 @@ defmodule Pulso.Storage.S3UnitTest do
       assert %{key: ^key, min_ts: 100, max_ts: 500} = S3.parse_segment(key)
     end
 
-    test "parse_segment returns nil bounds for a key that does not match the v2 shape" do
-      # A v1 key (or any pre-schema-bump layout) still parses to a segment
-      # record — bounds are nil, which the pruner treats as "always fetch",
-      # so we can never silently drop a legitimate object because we did
-      # not recognize its key format.
-      assert %{key: "tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson", min_ts: nil, max_ts: nil} =
+    test "parse_segment returns nil bounds for a v1 key (pre-min/max schema)" do
+      # A v1 key still parses to a segment record — bounds are nil, which
+      # the pruner treats as "always fetch", so an upgrade from v1 to v2
+      # never silently drops legitimate objects: they get scanned on
+      # every query until a compaction re-keys them into the current
+      # schema.
+      assert %{
+               key: "tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson",
+               min_ts: nil,
+               max_ts: nil
+             } =
                S3.parse_segment("tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson")
     end
 

@@ -87,7 +87,7 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 - **Ingestion** (when added): pull-based via Broadway/GenStage. No unbounded process mailboxes.
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
 - **Rust NIF distribution**: the `pulso_object_store` NIF ships via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for the target triples in `lib/pulso/object_store/nif.ex` and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.
-- **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT hands `object_store` a `Bytes` that reads straight from the Erlang binary heap via a documented `block_on`-bounded lifetime extension (zero copies). Do not spawn the S3 request onto a background task; the zero-copy invariant assumes the future completes before the NIF returns.
+- **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT currently copies once into a `Bytes` via `Bytes::copy_from_slice` — the obvious zero-copy path (`Bytes::from_static` via a lifetime-extended slice) is unsound because reqwest's retry middleware can clone the payload past the NIF call. A proper zero-copy PUT needs `enif_keep_binary`, which Rustler 0.38 does not expose yet.
 
 ## Development workflow
 

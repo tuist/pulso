@@ -46,6 +46,13 @@ defmodule Pulso.Storage.S3 do
       wins; a caller who accidentally reuses an idempotency key with
       different content gets a distinct object, so nothing is lost, but
       neither request sees the other's write.
+    * **Key bounds are trusted for pruning.** `parse_segment/1` reads
+      `[min_ts, max_ts]` off the key and uses them without cross-checking
+      the object's contents. This holds because every writer goes through
+      `object_key/5`, which derives bounds from the records themselves.
+      A hand-crafted key with false bounds could hide records from
+      time-bounded queries; that requires write access to the tenant
+      prefix, which is enforced at the ingest and IAM layer.
 
   ## Key format stability
 
@@ -110,13 +117,14 @@ defmodule Pulso.Storage.S3 do
 
     with :ok <- validate_tenant(tenant),
          config = config!(),
-         {:ok, keys} <- ObjectStore.list(config, prefix(tenant)) do
-      # Parse [min_ts, max_ts] from every key. A key we cannot parse (e.g.
-      # written under a hypothetical schema/format we do not recognize) is
-      # kept without bounds so it is always fetched — the safe default.
-      # Then prune by time bounds and iterate newest max_ts first so a
-      # limited query can stop as soon as the k-th largest timestamp in
-      # the accumulator is guaranteed to beat every remaining segment.
+         {:ok, keys} <- list_readable_prefixes(config, tenant) do
+      # Parse [min_ts, max_ts] from every key. A key we cannot parse (a
+      # v1 key from before the schema bump, or a hypothetical future
+      # format) is kept with `nil` bounds so it is always fetched — the
+      # safe default. Then prune by time bounds and iterate newest max_ts
+      # first so a limited query can stop as soon as the k-th largest
+      # timestamp in the accumulator is guaranteed to beat every
+      # remaining segment.
       segments =
         keys
         |> Enum.map(&parse_segment/1)
@@ -132,6 +140,32 @@ defmodule Pulso.Storage.S3 do
           err
       end
     end
+  end
+
+  # Reads span every currently-readable schema version so an upgrade from
+  # v1 to v2 does not orphan already-written objects. New writes always go
+  # to the current @schema_version prefix; readable versions live at the
+  # legacy prefixes below and are treated as unknown-bounds segments (see
+  # `parse_segment/1`), so a query still finds their records — it just
+  # cannot skip them at LIST time.
+  defp list_readable_prefixes(config, tenant) do
+    readable_prefixes(tenant)
+    |> Enum.reduce_while({:ok, []}, fn prefix, {:ok, acc} ->
+      case ObjectStore.list(config, prefix) do
+        {:ok, keys} -> {:cont, {:ok, keys ++ acc}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  # v1: the sort_ns-only key format from before the min/max bounds
+  # encoding. Any keys under this prefix still round-trip correctly — the
+  # unknown-bounds fallback in `parse_segment/1` means the pruner keeps
+  # them and the reader fetches them for every query.
+  @readable_legacy_prefixes ["v1"]
+
+  defp readable_prefixes(tenant) do
+    [prefix(tenant) | Enum.map(@readable_legacy_prefixes, &"tenants/#{tenant}/#{&1}/logs/")]
   end
 
   # -- helpers -----------------------------------------------------------------
