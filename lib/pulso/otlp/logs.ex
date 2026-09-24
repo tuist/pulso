@@ -43,23 +43,30 @@ defmodule Pulso.OTLP.Logs do
     resource_attrs = attributes(resource_logs["resource"])
     service = resource_attrs["service.name"]
 
-    Enum.reduce(scope_logs, {[], 0}, fn sl, {records, rejected} ->
-      raw = sl["logRecords"] || []
-
-      {sl_records, sl_rejected} =
-        Enum.reduce(raw, {[], 0}, fn record, {rs, rj} ->
-          case decode_log_record(record, resource_attrs, service) do
-            {:ok, r} -> {[r | rs], rj}
-            :error -> {rs, rj + 1}
-          end
-        end)
-
-      {[Enum.reverse(sl_records) | records], rejected + sl_rejected}
-    end)
+    scope_logs
+    |> Enum.reduce({[], 0}, fn sl, acc -> decode_scope_logs(sl, resource_attrs, service, acc) end)
     |> then(fn {records, rejected} -> {records |> Enum.reverse() |> List.flatten(), rejected} end)
   end
 
   defp decode_resource_logs(_), do: {[], 0}
+
+  defp decode_scope_logs(scope_logs, resource_attrs, service, {records, rejected}) do
+    raw = scope_logs["logRecords"] || []
+
+    {sl_records, sl_rejected} =
+      Enum.reduce(raw, {[], 0}, fn record, acc ->
+        decode_and_collect(record, resource_attrs, service, acc)
+      end)
+
+    {[Enum.reverse(sl_records) | records], rejected + sl_rejected}
+  end
+
+  defp decode_and_collect(record, resource_attrs, service, {rs, rj}) do
+    case decode_log_record(record, resource_attrs, service) do
+      {:ok, r} -> {[r | rs], rj}
+      :error -> {rs, rj + 1}
+    end
+  end
 
   # Per the OTLP logs data model, both `time_unix_nano` and
   # `observed_time_unix_nano` MAY be absent, and a value of 0 explicitly

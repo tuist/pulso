@@ -151,51 +151,43 @@ defmodule Pulso.Storage.S3 do
   @doc false
   @spec sanitize_map(map()) :: {:ok, map()} | {:error, {:attribute_key_collision, [String.t()]}}
   def sanitize_map(map) when is_map(map) do
-    Enum.reduce_while(map, {:ok, %{}}, fn {k, v}, {:ok, acc} ->
-      string_key = stringify_key(k)
-
-      cond do
-        Map.has_key?(acc, string_key) ->
-          {:halt, {:error, {:attribute_key_collision, [string_key]}}}
-
-        is_map(v) ->
-          case sanitize_map(v) do
-            {:ok, sanitized} -> {:cont, {:ok, Map.put(acc, string_key, sanitized)}}
-            err -> {:halt, err}
-          end
-
-        is_list(v) ->
-          case sanitize_list(v) do
-            {:ok, sanitized} -> {:cont, {:ok, Map.put(acc, string_key, sanitized)}}
-            err -> {:halt, err}
-          end
-
-        true ->
-          {:cont, {:ok, Map.put(acc, string_key, v)}}
-      end
-    end)
+    Enum.reduce_while(map, {:ok, %{}}, &insert_sanitized/2)
   end
 
+  defp insert_sanitized({k, v}, {:ok, acc}) do
+    string_key = stringify_key(k)
+
+    if Map.has_key?(acc, string_key) do
+      {:halt, {:error, {:attribute_key_collision, [string_key]}}}
+    else
+      put_sanitized(acc, string_key, v)
+    end
+  end
+
+  defp put_sanitized(acc, key, value) do
+    case sanitize_value(value) do
+      {:ok, sanitized} -> {:cont, {:ok, Map.put(acc, key, sanitized)}}
+      err -> {:halt, err}
+    end
+  end
+
+  defp sanitize_value(v) when is_map(v), do: sanitize_map(v)
+  defp sanitize_value(v) when is_list(v), do: sanitize_list(v)
+  defp sanitize_value(v), do: {:ok, v}
+
   defp sanitize_list(list) do
-    Enum.reduce_while(list, {:ok, []}, fn
-      v, {:ok, acc} when is_map(v) ->
-        case sanitize_map(v) do
-          {:ok, sanitized} -> {:cont, {:ok, [sanitized | acc]}}
-          err -> {:halt, err}
-        end
-
-      v, {:ok, acc} when is_list(v) ->
-        case sanitize_list(v) do
-          {:ok, sanitized} -> {:cont, {:ok, [sanitized | acc]}}
-          err -> {:halt, err}
-        end
-
-      v, {:ok, acc} ->
-        {:cont, {:ok, [v | acc]}}
-    end)
+    list
+    |> Enum.reduce_while({:ok, []}, &prepend_sanitized/2)
     |> case do
       {:ok, sanitized} -> {:ok, Enum.reverse(sanitized)}
       err -> err
+    end
+  end
+
+  defp prepend_sanitized(value, {:ok, acc}) do
+    case sanitize_value(value) do
+      {:ok, sanitized} -> {:cont, {:ok, [sanitized | acc]}}
+      err -> {:halt, err}
     end
   end
 

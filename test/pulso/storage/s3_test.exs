@@ -181,7 +181,7 @@ defmodule Pulso.Storage.S3Test do
 
     # Query should still return the surviving records, not error.
     assert {:ok, remaining} = S3.query(tenant, [])
-    assert length(remaining) >= 1
+    assert remaining != []
   end
 
   test "equal timestamps sort deterministically across adapters", %{tenant: tenant} do
