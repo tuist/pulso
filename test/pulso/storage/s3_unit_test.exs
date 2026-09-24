@@ -38,61 +38,78 @@ defmodule Pulso.Storage.S3UnitTest do
     end
   end
 
-  describe "content-addressed object keys" do
-    test "the same payload maps to the same key so retries do not duplicate" do
-      # Two callers PUT the same batch; if the response of the first is lost
-      # and the second retries, the deterministic key means both PUTs land on
-      # the same object and the second is a no-op overwrite.
-      k1 = S3.object_key("acme", 100, "same-batch")
-      k2 = S3.object_key("acme", 100, "same-batch")
+  describe "object key construction" do
+    test "with an idempotency key, the same call maps to the same key" do
+      k1 = S3.object_key("acme", 100, "payload", "req-1")
+      k2 = S3.object_key("acme", 100, "payload", "req-1")
       assert k1 == k2
     end
 
-    test "different payloads map to different keys" do
-      k1 = S3.object_key("acme", 100, "batch-a")
-      k2 = S3.object_key("acme", 100, "batch-b")
+    test "with an idempotency key, different keys map to different objects" do
+      k1 = S3.object_key("acme", 100, "payload", "req-1")
+      k2 = S3.object_key("acme", 100, "payload", "req-2")
       refute k1 == k2
     end
 
+    test "without an idempotency key, identical payloads still map to distinct objects" do
+      # This is the "two legitimate producers happen to have identical bytes"
+      # case Codex flagged in review 2: content-addressing alone would
+      # silently drop one. With no idempotency key we always take a random
+      # suffix so distinct calls always land on distinct objects.
+      k1 = S3.object_key("acme", 100, "payload", nil)
+      k2 = S3.object_key("acme", 100, "payload", nil)
+      refute k1 == k2
+    end
+
+    test "an empty-string idempotency key is treated as absent" do
+      # Prevents a client that sends `Idempotency-Key: ` from accidentally
+      # collapsing every batch onto one key.
+      k1 = S3.object_key("acme", 100, "payload", "")
+      k2 = S3.object_key("acme", 100, "payload", "")
+      refute k1 == k2
+    end
+
+    test "the idempotency key is scoped by tenant" do
+      # A shared idempotency key across tenants must not collide.
+      k1 = S3.object_key("alpha", 100, "p", "req-1")
+      k2 = S3.object_key("beta", 100, "p", "req-1")
+      refute String.replace(k1, "alpha", "beta") == k2
+    end
+
     test "different tenants never share a prefix" do
-      # Substring is enough — S3 list uses prefix, so any escape would show
-      # up as a shared prefix here.
-      k1 = S3.object_key("alpha", 100, "shared")
-      k2 = S3.object_key("beta", 100, "shared")
+      k1 = S3.object_key("alpha", 100, "p", "req-1")
+      k2 = S3.object_key("beta", 100, "p", "req-1")
       refute String.starts_with?(k1, "tenants/beta/")
       refute String.starts_with?(k2, "tenants/alpha/")
     end
 
     test "keys sort chronologically by sort_ns within a tenant" do
-      k_early = S3.object_key("acme", 100, "x")
-      k_late = S3.object_key("acme", 200, "x")
-      # S3 list returns keys in UTF-8 byte order; zero-padding puts earlier
-      # timestamps first.
+      k_early = S3.object_key("acme", 100, "p", "req-1")
+      k_late = S3.object_key("acme", 200, "p", "req-1")
       assert k_early < k_late
     end
   end
 
   describe "attribute sanitization" do
     test "coerces non-string map keys to strings recursively" do
-      sanitized =
-        S3.sanitize_map(%{
-          :status => 200,
-          "nested" => %{404 => "missing", :ref => "abc"},
-          "list" => [%{true => 1}]
-        })
+      assert {:ok, sanitized} =
+               S3.sanitize_map(%{
+                 :status => 200,
+                 "nested" => %{404 => "missing", :ref => "abc"},
+                 "list" => [%{true => 1}]
+               })
 
       assert Map.has_key?(sanitized, "status")
       assert sanitized["nested"] == %{"404" => "missing", "ref" => "abc"}
       assert sanitized["list"] == [%{"true" => 1}]
     end
 
-    test "collapses keys that stringify to the same value" do
-      # This is a hazard the sanitizer surfaces rather than hides: if two
-      # keys collapse, the map loses a pair. Documenting it as expected here
-      # means a future callsite that relies on distinct integer/string keys
-      # will have to model that at its own layer.
-      sanitized = S3.sanitize_map(%{1 => "int", "1" => "string"})
-      assert map_size(sanitized) == 1
+    test "rejects rather than collapses keys that stringify to the same value" do
+      # A previous version silently dropped one value on collision. Codex
+      # flagged the risk (map size decreases without a diagnostic). Now we
+      # return an explicit error so the caller can surface it.
+      assert {:error, {:attribute_key_collision, _}} =
+               S3.sanitize_map(%{1 => "int", "1" => "string"})
     end
   end
 end

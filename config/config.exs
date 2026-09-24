@@ -7,6 +7,8 @@
 # General application configuration
 import Config
 
+alias Pulso.Auth.Open
+
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
@@ -14,6 +16,11 @@ config :logger, :default_formatter,
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
+
+# Explicit auth default. Environment-specific configs override; prod requires
+# a runtime override to `Pulso.Auth.SharedSecret` via runtime.exs — an unset
+# release still raises rather than falling back to open access.
+config :pulso, Pulso.Auth, module: Open
 
 # Configure the endpoint
 config :pulso, PulsoWeb.Endpoint,

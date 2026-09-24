@@ -20,7 +20,6 @@ defmodule Pulso.Auth do
   """
 
   alias Plug.Conn
-  alias Pulso.Auth.Open
 
   @type reason :: :missing_token | :invalid_token | :unknown_tenant | term()
 
@@ -34,8 +33,28 @@ defmodule Pulso.Auth do
   @spec module() :: module()
   def module do
     case Application.get_env(:pulso, __MODULE__) do
-      nil -> Open
-      env -> Keyword.get(env, :module, Open)
+      nil ->
+        raise """
+        Pulso.Auth is not configured. This should never happen — config/config.exs
+        sets `Pulso.Auth.Open` as the compile-time default. Refusing to accept
+        traffic rather than fail open.
+        """
+
+      env ->
+        case Keyword.get(env, :module) do
+          nil ->
+            raise "Pulso.Auth :module key is not set. See config/config.exs."
+
+          :must_configure_at_runtime ->
+            raise """
+            Pulso.Auth is still set to the prod sentinel `:must_configure_at_runtime`.
+            runtime.exs must set `config :pulso, Pulso.Auth, module: Pulso.Auth.SharedSecret, tokens: %{...}`
+            before the app accepts traffic.
+            """
+
+          mod when is_atom(mod) ->
+            mod
+        end
     end
   end
 end

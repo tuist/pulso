@@ -52,4 +52,15 @@ defmodule Pulso.Storage.SortOrderTest do
     result = SortOrder.sort([without_trace, with_trace])
     assert Enum.map(result, & &1.trace_id) == ["aaa", nil]
   end
+
+  test "nil and empty string in the same position are distinguishable" do
+    # Prior version collapsed `nil` and `""` into the same sort key, so two
+    # otherwise-identical records could reorder unpredictably. Now `nil`
+    # sorts after every real string, including `""`.
+    with_empty = log(10, observed: 5, trace_id: "", body: "z")
+    without = log(10, observed: 5, trace_id: nil, body: "z")
+
+    result = SortOrder.sort([without, with_empty])
+    assert Enum.map(result, & &1.trace_id) == ["", nil]
+  end
 end

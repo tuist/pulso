@@ -28,7 +28,9 @@ defmodule Pulso.Storage.Memory do
   end
 
   @impl Pulso.Storage
-  def append(tenant, records) when is_binary(tenant) and is_list(records) do
+  def append(tenant, records, _opts \\ []) when is_binary(tenant) and is_list(records) do
+    # Memory ignores :idempotency_key — it's a test adapter, and repeat
+    # tests reset state between cases anyway.
     now = System.system_time(:nanosecond)
 
     normalized =

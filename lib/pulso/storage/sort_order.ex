@@ -16,18 +16,24 @@ defmodule Pulso.Storage.SortOrder do
     Enum.sort_by(records, &sort_key/1, &compare_desc/2)
   end
 
+  # Each string-shaped tiebreaker becomes `{presence_flag, value}` so a nil
+  # sorts *after* every real string in descending order, and — crucially —
+  # never collapses with an empty string. `1` for present, `0` for nil:
+  # descending order places `1 > 0` first, so real strings win the tie and
+  # a nil-vs-"" comparison sees a real difference in the first element of
+  # the pair.
   defp sort_key(%Log{} = r) do
     {
       r.timestamp_ns || 0,
       r.observed_timestamp_ns || 0,
-      # Strings compare lexicographically. Descending sort is what the caller
-      # asked for, so we invert the two lower-priority string tiebreakers by
-      # negating the comparison in `compare_desc/2`.
-      r.trace_id || "",
-      r.span_id || "",
-      r.body || ""
+      presence_pair(r.trace_id),
+      presence_pair(r.span_id),
+      presence_pair(r.body)
     }
   end
+
+  defp presence_pair(nil), do: {0, ""}
+  defp presence_pair(value) when is_binary(value), do: {1, value}
 
   defp compare_desc(a, b), do: a >= b
 end

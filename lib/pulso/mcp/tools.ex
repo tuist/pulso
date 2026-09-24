@@ -7,6 +7,7 @@ defmodule Pulso.MCP.Tools do
   `docs/architecture.md`.
   """
 
+  alias Pulso.Auth
   alias Pulso.Record.Log
   alias Pulso.Storage
 
@@ -43,8 +44,10 @@ defmodule Pulso.MCP.Tools do
   @spec list() :: [map()]
   def list, do: @tools
 
-  @spec call(String.t(), map()) :: {:ok, [map()]} | {:error, term()}
-  def call("query_logs", %{"tenant" => tenant} = args) when is_binary(tenant) do
+  @spec call(String.t(), map(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
+  def call(name, args, context \\ %{})
+
+  def call("query_logs", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
     opts =
       []
       |> put_opt(:start_ts, args["start_ts_ns"])
@@ -52,13 +55,30 @@ defmodule Pulso.MCP.Tools do
       |> put_opt(:limit, args["limit"])
       |> put_opt(:service, args["service"])
 
-    with {:ok, records} <- Storage.query(tenant, opts) do
+    with :ok <- verify(context, tenant),
+         {:ok, records} <- Storage.query(tenant, opts) do
       {:ok, [%{"type" => "text", "text" => Jason.encode!(Enum.map(records, &encode_record/1))}]}
     end
   end
 
-  def call("query_logs", _args), do: {:error, {:invalid_arguments, "tenant is required"}}
-  def call(name, _args), do: {:error, {:unknown_tool, name}}
+  def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
+  def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
+
+  # Every tool that names a tenant runs it through `Pulso.Auth.verify/2`. The
+  # MCP dispatch is the same JSON-RPC transport for read and write; without
+  # this hop the ingest boundary's auth check would be bypassable via the
+  # read path.
+  defp verify(%{conn: conn}, tenant) when not is_nil(conn) do
+    case Auth.verify(conn, tenant) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:unauthorized, reason}}
+    end
+  end
+
+  # No conn (e.g. an in-process caller writing a test): keep the default-open
+  # behavior so unit tests do not need to build a fake connection. Callers
+  # that reach the network path always have a conn.
+  defp verify(_context, _tenant), do: :ok
 
   defp put_opt(opts, _key, nil), do: opts
   defp put_opt(opts, key, value), do: Keyword.put(opts, key, value)

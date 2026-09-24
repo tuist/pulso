@@ -27,8 +27,8 @@ services:
     # from another host on the LAN. Host ports come from the per-worktree env
     # to keep multiple checkouts from fighting over 9000/9001.
     ports:
-      - "127.0.0.1:${PULSO_RUSTFS_API_PORT:-9195}:9000"
-      - "127.0.0.1:${PULSO_RUSTFS_CONSOLE_PORT:-9198}:9001"
+      - "127.0.0.1:${PULSO_RUSTFS_API_PORT:-9100}:9000"
+      - "127.0.0.1:${PULSO_RUSTFS_CONSOLE_PORT:-10100}:9001"
     volumes:
       - rustfs-data:/data
 

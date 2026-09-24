@@ -14,6 +14,15 @@ defmodule Pulso.Storage do
   alias Pulso.Storage.Memory
 
   @type tenant :: String.t()
+  @type append_opts :: [
+          # Opt-in idempotency: two `append` calls with the same tenant and
+          # the same idempotency_key resolve to the same underlying object
+          # so a retry does not duplicate. Callers who want distinct writes
+          # for identical payloads (e.g. two producers with genuinely
+          # different events that happen to serialize the same) simply
+          # omit the key.
+          {:idempotency_key, String.t()}
+        ]
   @type query_opts :: [
           {:start_ts, non_neg_integer()}
           | {:end_ts, non_neg_integer()}
@@ -21,11 +30,11 @@ defmodule Pulso.Storage do
           | {:service, String.t()}
         ]
 
-  @callback append(tenant, [Log.t()]) :: :ok | {:error, term()}
+  @callback append(tenant, [Log.t()], append_opts) :: :ok | {:error, term()}
   @callback query(tenant, query_opts) :: {:ok, [Log.t()]} | {:error, term()}
 
-  @spec append(tenant, [Log.t()]) :: :ok | {:error, term()}
-  def append(tenant, records), do: adapter().append(tenant, records)
+  @spec append(tenant, [Log.t()], append_opts) :: :ok | {:error, term()}
+  def append(tenant, records, opts \\ []), do: adapter().append(tenant, records, opts)
 
   @spec query(tenant, query_opts) :: {:ok, [Log.t()]} | {:error, term()}
   def query(tenant, opts \\ []), do: adapter().query(tenant, opts)

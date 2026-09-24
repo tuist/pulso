@@ -1,6 +1,7 @@
 defmodule PulsoWeb.OTLPControllerTest do
   use PulsoWeb.ConnCase, async: false
 
+  alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
   alias Pulso.Record.Log
   alias Pulso.Storage
@@ -68,6 +69,33 @@ defmodule PulsoWeb.OTLPControllerTest do
     assert {:ok, []} = Storage.query("default")
   end
 
+  test "POST /v1/logs returns 400 for a tenant name that would escape the prefix",
+       %{conn: conn} do
+    conn =
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-scope-orgid", "bad/name")
+      |> post(~p"/v1/logs", payload())
+
+    assert json_response(conn, 400) == %{"error" => "invalid_tenant"}
+  end
+
+  test "POST /v1/logs passes the Idempotency-Key header through", %{conn: conn} do
+    # The Idempotency-Key header should end up in Storage.append opts. Two
+    # POSTs with the same key + same payload are the same write to the store,
+    # so downstream queries see one record even if two arrived over the wire.
+    # (The Memory adapter ignores :idempotency_key, so we only assert the
+    # controller accepts the header; S3 adapter coverage of the actual
+    # dedup lives in s3_test.exs.)
+    conn =
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("idempotency-key", "req-1")
+      |> post(~p"/v1/logs", payload())
+
+    assert json_response(conn, 200) == %{}
+  end
+
   describe "with Pulso.Auth.SharedSecret enabled" do
     setup do
       hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
@@ -77,7 +105,10 @@ defmodule PulsoWeb.OTLPControllerTest do
         tokens: %{"acme" => "sha256$#{hex}"}
       )
 
-      on_exit(fn -> Application.delete_env(:pulso, Pulso.Auth) end)
+      on_exit(fn ->
+        Application.put_env(:pulso, Pulso.Auth, module: Open)
+      end)
+
       :ok
     end
 

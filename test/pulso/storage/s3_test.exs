@@ -126,22 +126,39 @@ defmodule Pulso.Storage.S3Test do
     end
   end
 
-  test "identical batches are idempotent — retrying does not duplicate", %{
+  test "same idempotency_key deduplicates identical retries", %{
     tenant: tenant,
     config: config
   } do
-    # Content-addressed object keys mean the same batch written twice lands
-    # on the same key. This is the retry story for step 2.
-    payload = [record(1, body: "same", service: "api")]
+    # Opt-in idempotency: a caller that wants retry safety passes the same
+    # idempotency_key on the retry. The object key becomes deterministic,
+    # so the second PUT overwrites the first with identical content and no
+    # duplicate appears at query time.
+    batch = [record(1, body: "same", service: "api")]
 
-    assert :ok = S3.append(tenant, payload)
-    assert :ok = S3.append(tenant, payload)
+    assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
+    assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
 
     assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
     assert length(keys) == 1
 
     assert {:ok, records} = S3.query(tenant, [])
     assert length(records) == 1
+  end
+
+  test "without an idempotency_key identical batches remain distinct writes", %{
+    tenant: tenant,
+    config: config
+  } do
+    # If a caller doesn't opt in, two producers with byte-identical payloads
+    # must not silently collapse — that would drop data.
+    batch = [record(1, body: "same", service: "api")]
+
+    assert :ok = S3.append(tenant, batch)
+    assert :ok = S3.append(tenant, batch)
+
+    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/logs/")
+    assert length(keys) == 2
   end
 
   test "a key deleted after listing does not fail the query", %{

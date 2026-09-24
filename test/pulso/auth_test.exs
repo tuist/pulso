@@ -6,7 +6,10 @@ defmodule Pulso.AuthTest do
   alias Pulso.Auth.SharedSecret
 
   setup do
-    on_exit(fn -> Application.delete_env(:pulso, Auth) end)
+    # Restore the compile-time default (module: Pulso.Auth.Open, set in
+    # config/config.exs) after each test so we do not poison subsequent
+    # tests that rely on the default.
+    on_exit(fn -> Application.put_env(:pulso, Auth, module: Open) end)
     :ok
   end
 
@@ -17,9 +20,19 @@ defmodule Pulso.AuthTest do
   end
 
   describe "Pulso.Auth.module/0" do
-    test "falls back to Pulso.Auth.Open when nothing is configured" do
+    test "raises when nothing is configured — refuses to silently fail open" do
       Application.delete_env(:pulso, Auth)
-      assert Auth.module() == Open
+      # config.exs sets an explicit default. Reaching this branch means
+      # someone deleted it; the correct response is a loud crash, not a
+      # quiet accept-everything.
+      assert_raise RuntimeError, ~r/Pulso.Auth is not configured/, fn ->
+        Auth.module()
+      end
+    end
+
+    test "raises when the prod sentinel is still in place" do
+      Application.put_env(:pulso, Auth, module: :must_configure_at_runtime)
+      assert_raise RuntimeError, ~r/must_configure_at_runtime/, fn -> Auth.module() end
     end
 
     test "returns the configured module" do

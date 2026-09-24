@@ -2,21 +2,30 @@ defmodule Pulso.Storage.S3 do
   @moduledoc """
   S3-backed log storage. Step 2 adapter.
 
-  Each `append/2` writes one NDJSON object under a tenant-scoped prefix
-  (`tenants/<tenant>/logs/<sort_ns>-<content_hash>.ndjson`). Tenant isolation
-  is enforced by key construction: tenant names are validated against a
-  conservative charset so a batch cannot land outside its own prefix. The
-  key's suffix is a truncated SHA-256 of the encoded payload, which makes
-  identical retries land on the same object — a client that PUTs the same
-  batch twice under a lost-response retry does not create a duplicate.
+  Each `append/3` writes one NDJSON object under a tenant-scoped prefix
+  (`tenants/<tenant>/logs/<sort_ns>-<suffix>.ndjson`). Tenant isolation is
+  enforced by key construction: tenant names are validated against a
+  conservative charset so a batch cannot land outside its own prefix.
+
+  The key suffix depends on whether the caller supplied an
+  `idempotency_key`:
+
+    * **With `idempotency_key`** — the suffix is a deterministic hash of
+      `tenant || idempotency_key`. Two `append` calls with the same key
+      resolve to the same object, so a lost-response retry does not
+      duplicate. Two producers that pick the same idempotency key are
+      explicitly claiming "these are the same write" — semantics that
+      match Stripe's `Idempotency-Key` and RFC 9457.
+    * **Without `idempotency_key`** — the suffix mixes a truncated content
+      hash with random bytes. Distinct calls always produce distinct
+      objects (no accidental collapse of two identical-content batches).
+      Retries in this mode duplicate — callers who need dedup must opt in.
 
   `query/2` lists the tenant prefix, downloads every object, decodes NDJSON,
-  filters, and sorts. Order matches `Pulso.Storage.Memory`: `timestamp_ns`
-  descending, then `observed_timestamp_ns` descending, then `trace_id`, then
-  `body`, so equal-timestamp ties resolve identically across adapters.
-  A `NotFound` for a key that was listed but disappeared before the fetch
-  (concurrent retention, compaction, another process deleting) is skipped
-  rather than aborting the query.
+  filters, and sorts. Order is shared with `Pulso.Storage.Memory` via
+  `Pulso.Storage.SortOrder`. A `NotFound` for a key that was listed but
+  disappeared before the fetch (concurrent retention, compaction, another
+  process deleting) is skipped rather than aborting the query.
 
   Known limits, deferred to step 3 (segments + manifest):
 
@@ -44,17 +53,19 @@ defmodule Pulso.Storage.S3 do
   @content_hash_width 16
 
   @impl Pulso.Storage
-  def append(tenant, []) when is_binary(tenant) do
+  def append(tenant, records, opts \\ [])
+
+  def append(tenant, [], _opts) when is_binary(tenant) do
     # Validate even on empty so an adversarial tenant name is rejected on the
     # first attempt, not only once a real record survives OTLP decoding.
     validate_tenant(tenant)
   end
 
-  def append(tenant, records) when is_binary(tenant) and is_list(records) do
+  def append(tenant, records, opts) when is_binary(tenant) and is_list(records) do
     with :ok <- validate_tenant(tenant),
-         normalized = normalize(records),
+         {:ok, normalized} <- normalize(records),
          {:ok, payload} <- encode(normalized) do
-      key = object_key(tenant, batch_sort_ns(normalized), payload)
+      key = object_key(tenant, batch_sort_ns(normalized), payload, Keyword.get(opts, :idempotency_key))
       ObjectStore.put(config!(), key, payload)
     end
   end
@@ -89,36 +100,89 @@ defmodule Pulso.Storage.S3 do
   defp normalize(records) do
     now = System.system_time(:nanosecond)
 
-    for %Log{} = record <- records do
-      %{
-        record
-        | observed_timestamp_ns: record.observed_timestamp_ns || now,
-          attributes: sanitize_map(record.attributes || %{}),
-          resource: sanitize_map(record.resource || %{})
-      }
+    Enum.reduce_while(records, {:ok, []}, fn
+      %Log{} = record, {:ok, acc} ->
+        with {:ok, attrs} <- sanitize_map(record.attributes || %{}),
+             {:ok, resource} <- sanitize_map(record.resource || %{}) do
+          normalized = %{
+            record
+            | observed_timestamp_ns: record.observed_timestamp_ns || now,
+              attributes: attrs,
+              resource: resource
+          }
+
+          {:cont, {:ok, [normalized | acc]}}
+        else
+          err -> {:halt, err}
+        end
+    end)
+    |> case do
+      {:ok, records} -> {:ok, Enum.reverse(records)}
+      err -> err
     end
   end
 
-  # Force every attribute/resource map key to be a string and drop nils. OTLP
+  # Coerce every attribute/resource map key to a string, recursively. OTLP
   # decoding already produces string keys, but a caller building `%Log{}`
   # directly (or a future backend surface) could hand us atoms or integers.
-  # Encoding those with Jason coerces them to strings, so two logical keys
-  # can silently collapse on the round trip. Doing the coercion here makes
-  # the write path deterministic and the decode path lossless.
+  # If two logical keys coerce to the same string (`%{1 => a, "1" => b}`) we
+  # refuse — silently dropping either value would surprise a reader looking
+  # at either the original struct or the JSON-encoded record.
   @doc false
-  @spec sanitize_map(map()) :: map()
+  @spec sanitize_map(map()) :: {:ok, map()} | {:error, {:attribute_key_collision, [String.t()]}}
   def sanitize_map(map) when is_map(map) do
-    Map.new(map, fn {k, v} -> {stringify_key(k), sanitize_value(v)} end)
+    Enum.reduce_while(map, {:ok, %{}}, fn {k, v}, {:ok, acc} ->
+      string_key = stringify_key(k)
+
+      cond do
+        Map.has_key?(acc, string_key) ->
+          {:halt, {:error, {:attribute_key_collision, [string_key]}}}
+
+        is_map(v) ->
+          case sanitize_map(v) do
+            {:ok, sanitized} -> {:cont, {:ok, Map.put(acc, string_key, sanitized)}}
+            err -> {:halt, err}
+          end
+
+        is_list(v) ->
+          case sanitize_list(v) do
+            {:ok, sanitized} -> {:cont, {:ok, Map.put(acc, string_key, sanitized)}}
+            err -> {:halt, err}
+          end
+
+        true ->
+          {:cont, {:ok, Map.put(acc, string_key, v)}}
+      end
+    end)
+  end
+
+  defp sanitize_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn
+      v, {:ok, acc} when is_map(v) ->
+        case sanitize_map(v) do
+          {:ok, sanitized} -> {:cont, {:ok, [sanitized | acc]}}
+          err -> {:halt, err}
+        end
+
+      v, {:ok, acc} when is_list(v) ->
+        case sanitize_list(v) do
+          {:ok, sanitized} -> {:cont, {:ok, [sanitized | acc]}}
+          err -> {:halt, err}
+        end
+
+      v, {:ok, acc} ->
+        {:cont, {:ok, [v | acc]}}
+    end)
+    |> case do
+      {:ok, sanitized} -> {:ok, Enum.reverse(sanitized)}
+      err -> err
+    end
   end
 
   defp stringify_key(k) when is_binary(k), do: k
   defp stringify_key(k) when is_atom(k), do: Atom.to_string(k)
   defp stringify_key(k) when is_integer(k), do: Integer.to_string(k)
   defp stringify_key(k), do: inspect(k)
-
-  defp sanitize_value(v) when is_map(v), do: sanitize_map(v)
-  defp sanitize_value(v) when is_list(v), do: Enum.map(v, &sanitize_value/1)
-  defp sanitize_value(v), do: v
 
   defp batch_sort_ns(records) do
     # Pick the smallest observed_timestamp_ns so identical retries hash into
@@ -186,9 +250,26 @@ defmodule Pulso.Storage.S3 do
   defp prefix(tenant), do: "tenants/#{tenant}/logs/"
 
   @doc false
-  @spec object_key(String.t(), non_neg_integer(), binary()) :: String.t()
-  def object_key(tenant, sort_ns, payload) when is_binary(tenant) and is_binary(payload) do
-    "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{content_hash(payload)}.ndjson"
+  @spec object_key(String.t(), non_neg_integer(), binary(), String.t() | nil) :: String.t()
+  def object_key(tenant, sort_ns, payload, idempotency_key) when is_binary(tenant) and is_binary(payload) do
+    suffix =
+      case idempotency_key do
+        # Opt-in idempotency: a retry of the same batch under the same key
+        # deterministically lands on the same object, so the second PUT is a
+        # no-op overwrite. Distinct producers that pick the same key are
+        # explicitly claiming "these two calls are the same write".
+        <<key::binary>> when byte_size(key) > 0 ->
+          "idem-" <> stable_hash(tenant <> "\0" <> key)
+
+        # No idempotency key: the caller is fine with a retry producing a
+        # duplicate. A random suffix guarantees distinct writes even when
+        # payload and timestamp collide. `content_hash` is still mixed in
+        # so a corrupted binary at least sorts predictably.
+        _ ->
+          "rand-" <> content_hash(payload) <> "-" <> rand_hex()
+      end
+
+    "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{suffix}.ndjson"
   end
 
   defp zero_pad(ns) when is_integer(ns) and ns >= 0 do
@@ -202,6 +283,17 @@ defmodule Pulso.Storage.S3 do
     |> :crypto.hash(payload)
     |> Base.encode16(case: :lower)
     |> binary_part(0, @content_hash_width)
+  end
+
+  defp stable_hash(bin) do
+    :sha256
+    |> :crypto.hash(bin)
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, @content_hash_width)
+  end
+
+  defp rand_hex do
+    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 
   defp filter_by_time(records, nil, nil), do: records
