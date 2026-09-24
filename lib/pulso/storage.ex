@@ -4,10 +4,10 @@ defmodule Pulso.Storage do
 
   The active adapter is read from application configuration at call time so it
   can be swapped in tests without recompiling. In dev and prod the default
-  adapter is `Pulso.Storage.S3` (step 2). Tests fall back to
-  `Pulso.Storage.Memory` because no adapter is configured. Step 3 will replace
-  the flat NDJSON layout of the S3 adapter with columnar segments and a
-  manifest that supports conditional writes.
+  adapter is `Pulso.Storage.S3` — see that module for the schema layout and
+  its `[min_ts, max_ts]` per-segment key bounds that let `query/2` skip
+  objects outside a time range without a separate manifest. Tests fall back
+  to `Pulso.Storage.Memory` because no adapter is configured.
   """
 
   alias Pulso.Record.Log

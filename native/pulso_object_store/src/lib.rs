@@ -13,7 +13,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, PutPayload};
 use once_cell::sync::Lazy;
-use rustler::{Atom, Binary, Env, Error, NifResult, OwnedBinary};
+use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -79,10 +79,20 @@ fn build_store(config: &StoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
 fn put(config: StoreConfig, key: String, data: Binary) -> NifResult<Atom> {
     let store = build_store(&config)?;
     let path = Path::from(key);
+
+    // One memcpy from the Erlang binary heap into a `Bytes` we hand off
+    // to `object_store`. The obvious zero-copy alternative (extend the
+    // Rustler slice's lifetime to `'static` and use `Bytes::from_static`)
+    // is unsound in general: reqwest's retry middleware can clone the
+    // body, and there is no API guarantee that every hyper-side reference
+    // is dropped before `store.put(...).await` returns. Any clone that
+    // outlives the NIF call becomes a use-after-free against Erlang's
+    // binary heap. Removing this copy properly needs `enif_keep_binary`,
+    // which Rustler 0.38 does not expose — track upstream and revisit.
     let payload: PutPayload = Bytes::copy_from_slice(data.as_slice()).into();
 
     RUNTIME
-        .block_on(async { store.put(&path, payload).await })
+        .block_on(store.put(&path, payload))
         .map_err(nif_error)?;
 
     Ok(atoms::ok())
@@ -93,18 +103,46 @@ fn get<'a>(env: Env<'a>, config: StoreConfig, key: String) -> NifResult<(Atom, B
     let store = build_store(&config)?;
     let path = Path::from(key);
 
-    let bytes = RUNTIME
+    // Get the object metadata first so we know the target binary size.
+    let obj = RUNTIME
+        .block_on(store.get(&path))
+        .map_err(map_object_store_error)?;
+    let size = obj.meta.size as usize;
+
+    // Allocate the destination binary on the Erlang heap (via `NewBinary`)
+    // and stream the object body directly into it. The alternative —
+    // `GetResult::bytes()` — first collects every chunk into an
+    // intermediate `BytesMut` on the Rust heap; cutting that saves one
+    // full-payload allocation and copy at the boundary.
+    let mut new_binary = NewBinary::new(env, size);
+    let dst = new_binary.as_mut_slice();
+    let mut offset: usize = 0;
+
+    RUNTIME
         .block_on(async {
-            let obj = store.get(&path).await?;
-            obj.bytes().await
+            let mut stream = obj.into_stream();
+            while let Some(chunk) = stream.try_next().await? {
+                let end = offset + chunk.len();
+                if end > size {
+                    return Err(ObjectStoreError::Generic {
+                        store: "pulso_object_store",
+                        source: format!("body exceeded declared size ({} > {})", end, size).into(),
+                    });
+                }
+                dst[offset..end].copy_from_slice(&chunk);
+                offset = end;
+            }
+            if offset != size {
+                return Err(ObjectStoreError::Generic {
+                    store: "pulso_object_store",
+                    source: format!("body shorter than declared size ({} < {})", offset, size).into(),
+                });
+            }
+            Ok(())
         })
         .map_err(map_object_store_error)?;
 
-    let mut owned = OwnedBinary::new(bytes.len())
-        .ok_or_else(|| Error::Term(Box::new("failed to allocate binary")))?;
-    owned.as_mut_slice().copy_from_slice(&bytes);
-
-    Ok((atoms::ok(), Binary::from_owned(owned, env)))
+    Ok((atoms::ok(), Binary::from(new_binary)))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

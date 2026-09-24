@@ -1,0 +1,85 @@
+name: release
+
+# Cuts precompiled NIF artifacts for `Pulso.ObjectStore.NIF` and attaches
+# them to the matching GitHub Release. Once artifacts are up, downstream
+# consumers of Pulso install without a Cargo toolchain: `rustler_precompiled`
+# fetches the .tar.gz for their target from
+# `github.com/tuist/pulso/releases/download/v<version>/`.
+#
+# Triggered by any `v*` tag push (release-driven). To rebuild artifacts for
+# an existing release, re-run this workflow via workflow_dispatch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build and attach artifacts to (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_release:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nif: ["2.16"]
+        job:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, use-cross: false }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, use-cross: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, use-cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, use-cross: true }
+          # macos-13 was retired by GitHub in Dec 2025 (macos-14 and newer
+          # runners are Apple Silicon). x86_64-apple-darwin builds would
+          # need a hosted or self-managed Intel Mac; drop that target
+          # until we add one — Apple Silicon users are covered.
+          - { target: aarch64-apple-darwin, os: macos-14, use-cross: false }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project info
+        id: extract
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${{ inputs.version }}"
+            version="${version#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "could not determine version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the NIF
+        id: build-crate
+        # Pin to the commit SHA for `philss/rustler-precompiled-action` at
+        # tag v1.1.4. CodeQL flagged the tag-only pin as an
+        # immutable-action risk (a maintainer or attacker could move the
+        # tag). Bump this SHA when upgrading the action.
+        uses: philss/rustler-precompiled-action@853ac56183f29a080304df3ff8a194b5bbdc24cc
+        with:
+          project-name: pulso_object_store
+          project-version: ${{ steps.extract.outputs.version }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          use-cross: ${{ matrix.job.use-cross }}
+          project-dir: "native/pulso_object_store"
+
+      - name: Upload artifact to the release
+        # Pin to the commit SHA for `softprops/action-gh-release` at
+        # tag v2. Same rationale as above.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: |
+            ${{ steps.build-crate.outputs.file-path }}
+          tag_name: v${{ steps.extract.outputs.version }}
+          fail_on_unmatched_files: true

@@ -16,6 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MIX_ENV: test
+      # Compile the NIF from source so we prove every branch keeps
+      # building the Rust crate. Downstream consumers unset this and
+      # download the precompiled artifact matching the mix version.
+      PULSO_NIF_FORCE_BUILD: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +78,7 @@ jobs:
     env:
       MIX_ENV: test
       PULSO_INTEGRATION: "1"
+      PULSO_NIF_FORCE_BUILD: "1"
       # RustFS in docker-compose binds to these host ports by default (see
       # mise/utilities/dev_instance_env.sh for the local per-worktree scheme).
       PULSO_RUSTFS_API_PORT: "11100"
