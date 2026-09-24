@@ -211,9 +211,11 @@ defmodule Pulso.Storage.S3 do
   defp encode(records) do
     encoded =
       Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
-        case Jason.encode(Map.from_struct(record)) do
-          {:ok, line} -> {:cont, {:ok, [[line, "\n"] | acc]}}
-          {:error, reason} -> {:halt, {:error, {:encode_failed, reason}}}
+        try do
+          line = JSON.encode!(Map.from_struct(record))
+          {:cont, {:ok, [[line, "\n"] | acc]}}
+        rescue
+          e -> {:halt, {:error, {:encode_failed, e}}}
         end
       end)
 
@@ -247,7 +249,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp decode_line(line) do
-    map = Jason.decode!(line)
+    map = JSON.decode!(line)
 
     %Log{
       timestamp_ns: Map.fetch!(map, "timestamp_ns"),
@@ -313,7 +315,7 @@ defmodule Pulso.Storage.S3 do
   # `:erlang.term_to_binary/2` with `:deterministic` gives us the canonical
   # form for free within an OTP release: map keys are sorted, atoms and
   # integers are encoded canonically, and the same term always produces
-  # the same bytes. That is stronger than `Jason.encode/1` (map keys emit
+  # the same bytes. That is stronger than a JSON encoder (map keys emit
   # in `Map.to_list/1` order, which is not canonical and can shift when a
   # small map promotes to a hash map). It is NOT guaranteed across major
   # OTP upgrades — see the module docstring's "Key format stability"

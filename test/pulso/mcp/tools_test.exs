@@ -27,7 +27,7 @@ defmodule Pulso.MCP.ToolsTest do
       ])
 
     assert {:ok, [%{"type" => "text", "text" => text}]} = Tools.call("query_logs", %{"tenant" => "acme"})
-    assert [%{"body" => "two"}, %{"body" => "one"}] = Jason.decode!(text)
+    assert [%{"body" => "two"}, %{"body" => "one"}] = JSON.decode!(text)
   end
 
   test "query_logs applies service and limit filters" do
@@ -41,7 +41,7 @@ defmodule Pulso.MCP.ToolsTest do
     assert {:ok, [%{"text" => text}]} =
              Tools.call("query_logs", %{"tenant" => "acme", "service" => "api", "limit" => 1})
 
-    assert [%{"body" => "c", "service" => "api"}] = Jason.decode!(text)
+    assert [%{"body" => "c", "service" => "api"}] = JSON.decode!(text)
   end
 
   test "query_logs errors when tenant is missing" do
@@ -100,7 +100,7 @@ defmodule Pulso.MCP.ToolsTest do
       assert {:ok, [%{"text" => text}]} =
                Tools.call("query_logs", %{"tenant" => "acme"}, %{conn: conn})
 
-      assert [%{"body" => "ok"}] = Jason.decode!(text)
+      assert [%{"body" => "ok"}] = JSON.decode!(text)
     end
   end
 end

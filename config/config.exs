@@ -14,8 +14,9 @@ config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
-# Use Jason for JSON parsing in Phoenix
-config :phoenix, :json_library, Jason
+# Use Elixir's built-in JSON module for Phoenix (avoids the Jason dependency;
+# see AGENTS.md conventions).
+config :phoenix, :json_library, JSON
 
 # Explicit auth default. Environment-specific configs override; prod requires
 # a runtime override to `Pulso.Auth.SharedSecret` via runtime.exs — an unset

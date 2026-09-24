@@ -57,7 +57,7 @@ defmodule Pulso.MCP.Tools do
 
     with :ok <- verify(context, tenant),
          {:ok, records} <- Storage.query(tenant, opts) do
-      {:ok, [%{"type" => "text", "text" => Jason.encode!(Enum.map(records, &encode_record/1))}]}
+      {:ok, [%{"type" => "text", "text" => JSON.encode!(Enum.map(records, &encode_record/1))}]}
     end
   end
 

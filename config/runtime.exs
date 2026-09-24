@@ -64,7 +64,7 @@ case config_env() do
     tokens =
       case System.get_env("PULSO_TENANT_TOKENS") do
         blob when is_binary(blob) and blob != "" ->
-          case Jason.decode(blob) do
+          case JSON.decode(blob) do
             {:ok, map} when is_map(map) ->
               map
 
