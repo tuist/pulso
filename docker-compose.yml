@@ -15,9 +15,12 @@ services:
   rustfs:
     image: rustfs/rustfs:latest
     environment:
-      # RUSTFS_VOLUMES is required — without it RustFS exits at startup.
-      # The `{0..3}` template creates four storage volumes under /data.
-      RUSTFS_VOLUMES: /data/rustfs{0..3}
+      # RUSTFS_VOLUMES is required — without it RustFS exits at startup. We
+      # run single-volume in dev and CI; the 4-volume erasure layout that
+      # RustFS ships in its own compose expects four distinct physical disks
+      # and refuses to start when they resolve to the same st_dev (any
+      # laptop or CI runner).
+      RUSTFS_VOLUMES: /data/rustfs0
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
