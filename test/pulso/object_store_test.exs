@@ -13,7 +13,7 @@ defmodule Pulso.ObjectStoreTest do
   setup do
     config = %{
       bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
-      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:9000"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:11100"),
       region: System.get_env("PULSO_S3_REGION", "us-east-1"),
       access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
       secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),

@@ -100,6 +100,53 @@ defmodule Pulso.Storage.S3UnitTest do
     end
   end
 
+  describe "caller_content_hash" do
+    test "identical caller-provided records produce the same fingerprint" do
+      records = [
+        %Log{timestamp_ns: 1, service: "api", body: "hello"},
+        %Log{timestamp_ns: 2, service: "web", body: "world"}
+      ]
+
+      assert {:ok, h1} = S3.caller_content_hash(records)
+      assert {:ok, h2} = S3.caller_content_hash(records)
+      assert h1 == h2
+    end
+
+    test "observed_timestamp_ns does not influence the fingerprint" do
+      # This is the behavior we actually need. Two retries whose only
+      # difference is `observed_timestamp_ns` (filled in by `normalize` on
+      # each call, so distinct across retries) must still produce the same
+      # fingerprint so the idempotency-key path lands on the same object.
+      without_obs = [%Log{timestamp_ns: 1, body: "same"}]
+      with_obs = [%Log{timestamp_ns: 1, observed_timestamp_ns: 999, body: "same"}]
+
+      assert {:ok, h1} = S3.caller_content_hash(without_obs)
+      assert {:ok, h2} = S3.caller_content_hash(with_obs)
+      assert h1 == h2
+    end
+
+    test "every caller-controlled field influences the fingerprint" do
+      base = [%Log{timestamp_ns: 1, service: "api", body: "same"}]
+      diff_body = [%Log{timestamp_ns: 1, service: "api", body: "different"}]
+      diff_service = [%Log{timestamp_ns: 1, service: "web", body: "same"}]
+      diff_ts = [%Log{timestamp_ns: 2, service: "api", body: "same"}]
+
+      {:ok, h_base} = S3.caller_content_hash(base)
+      {:ok, h_body} = S3.caller_content_hash(diff_body)
+      {:ok, h_service} = S3.caller_content_hash(diff_service)
+      {:ok, h_ts} = S3.caller_content_hash(diff_ts)
+
+      refute h_base == h_body
+      refute h_base == h_service
+      refute h_base == h_ts
+    end
+
+    test "returns encode error for a non-UTF-8 body" do
+      assert {:error, {:encode_failed, _}} =
+               S3.caller_content_hash([%Log{timestamp_ns: 1, body: <<255>>}])
+    end
+  end
+
   describe "attribute sanitization" do
     test "coerces non-string map keys to strings recursively" do
       assert {:ok, sanitized} =

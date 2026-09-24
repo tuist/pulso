@@ -36,6 +36,16 @@ defmodule Pulso.Storage.S3 do
       manifest will carry min/max `timestamp_ns` per segment and let the
       query short-circuit.
     * **No columnar layout.** Records go on the wire as NDJSON, not Parquet.
+
+  ## Key format stability
+
+  The exact object-key format is deliberately not a public API. Changing
+  the hashing scheme, the delimiter, or the sort-key width invalidates
+  cross-version idempotency: a retry landing on a newer server would not
+  find its earlier write and would create a duplicate. Any change to the
+  format needs a migration plan (either a rolling upgrade that reads both
+  formats during a window, or an explicit break with a version bump on the
+  storage schema).
   """
 
   @behaviour Pulso.Storage
@@ -62,10 +72,21 @@ defmodule Pulso.Storage.S3 do
   end
 
   def append(tenant, records, opts) when is_binary(tenant) and is_list(records) do
+    idempotency_key = Keyword.get(opts, :idempotency_key)
+
     with :ok <- validate_tenant(tenant),
+         # The idempotency hash comes from the caller-provided records
+         # BEFORE `normalize/1` fills in `observed_timestamp_ns` with the
+         # current wall clock. Otherwise a legitimate retry (same records,
+         # no observed_ts set by the caller) would produce a different
+         # payload byte sequence per call, and the deterministic idempotent
+         # suffix would change. `caller_content_hash/1` computes on the
+         # pre-normalization records; the STORED payload still carries
+         # `observed_timestamp_ns` as ingest metadata.
+         {:ok, caller_hash} <- caller_content_hash(records),
          {:ok, normalized} <- normalize(records),
          {:ok, payload} <- encode(normalized) do
-      key = object_key(tenant, batch_sort_ns(normalized), payload, Keyword.get(opts, :idempotency_key))
+      key = object_key(tenant, batch_sort_ns(normalized), caller_hash, idempotency_key)
       ObjectStore.put(config!(), key, payload)
     end
   end
@@ -252,45 +273,74 @@ defmodule Pulso.Storage.S3 do
 
   defp prefix(tenant), do: "tenants/#{tenant}/logs/"
 
+  # `caller_hash` is a 16-hex fingerprint of the pre-normalization records
+  # from `caller_content_hash/1`. The pre-normalization form matters:
+  # `normalize/1` fills in a fresh wall-clock `observed_timestamp_ns` on
+  # every call, so hashing after normalization would make identical retries
+  # produce different keys even under an idempotency key.
   @doc false
-  @spec object_key(String.t(), non_neg_integer(), binary(), String.t() | nil) :: String.t()
-  def object_key(tenant, sort_ns, payload, idempotency_key) when is_binary(tenant) and is_binary(payload) do
+  @spec object_key(String.t(), non_neg_integer(), String.t(), String.t() | nil) :: String.t()
+  def object_key(tenant, sort_ns, caller_hash, idempotency_key) when is_binary(tenant) and is_binary(caller_hash) do
     suffix =
       case idempotency_key do
-        # Opt-in idempotency: a retry of the same batch under the same key
-        # deterministically lands on the same object, so the second PUT is a
-        # no-op overwrite. Distinct producers that pick the same key are
-        # explicitly claiming "these two calls are the same write".
         <<key::binary>> when byte_size(key) > 0 ->
-          # The hash covers tenant, key, AND content hash so a caller who
-          # accidentally reuses a key with different content does not
-          # silently overwrite the prior write — the two calls produce
-          # different objects. Same content + same key still collapses,
-          # which is the point of idempotency.
-          "idem-" <> stable_hash(tenant <> "\0" <> key <> "\0" <> content_hash(payload))
+          # Mixes tenant, key, and caller_hash. A client that accidentally
+          # reuses an idempotency key with different content produces a
+          # different object (no silent overwrite). Same content + same key
+          # collapses onto one object, which is the point of idempotency.
+          "idem-" <> stable_hash(tenant <> "\0" <> key <> "\0" <> caller_hash)
 
-        # No idempotency key: the caller is fine with a retry producing a
-        # duplicate. A random suffix guarantees distinct writes even when
-        # payload and timestamp collide. `content_hash` is still mixed in
-        # so a corrupted binary at least sorts predictably.
         _ ->
-          "rand-" <> content_hash(payload) <> "-" <> rand_hex()
+          # No idempotency key: the caller accepts duplicates on retry. A
+          # random suffix guarantees distinct writes even when payload and
+          # timestamp collide.
+          "rand-" <> caller_hash <> "-" <> rand_hex()
       end
 
     "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{suffix}.ndjson"
+  end
+
+  # Fingerprint of the raw caller records, deliberately excluding fields the
+  # normalizer will fill in (`observed_timestamp_ns`). Two calls that pass
+  # the same records produce the same fingerprint; changing anything the
+  # caller controls (body, service, attributes, timestamp_ns) changes it.
+  @doc false
+  @spec caller_content_hash([Log.t()]) :: {:ok, String.t()} | {:error, term()}
+  def caller_content_hash(records) when is_list(records) do
+    payload_terms =
+      Enum.map(records, fn %Log{} = r ->
+        %{
+          "timestamp_ns" => r.timestamp_ns,
+          "severity_number" => r.severity_number,
+          "severity_text" => r.severity_text,
+          "service" => r.service,
+          "body" => r.body,
+          "trace_id" => r.trace_id,
+          "span_id" => r.span_id,
+          "attributes" => r.attributes,
+          "resource" => r.resource
+        }
+      end)
+
+    case Jason.encode(payload_terms) do
+      {:ok, bin} ->
+        digest =
+          :sha256
+          |> :crypto.hash(bin)
+          |> Base.encode16(case: :lower)
+          |> binary_part(0, @content_hash_width)
+
+        {:ok, digest}
+
+      {:error, reason} ->
+        {:error, {:encode_failed, reason}}
+    end
   end
 
   defp zero_pad(ns) when is_integer(ns) and ns >= 0 do
     ns
     |> Integer.to_string()
     |> String.pad_leading(@sort_key_width, "0")
-  end
-
-  defp content_hash(payload) do
-    :sha256
-    |> :crypto.hash(payload)
-    |> Base.encode16(case: :lower)
-    |> binary_part(0, @content_hash_width)
   end
 
   defp stable_hash(bin) do
