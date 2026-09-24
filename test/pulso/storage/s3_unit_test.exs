@@ -112,17 +112,34 @@ defmodule Pulso.Storage.S3UnitTest do
       assert h1 == h2
     end
 
-    test "observed_timestamp_ns does not influence the fingerprint" do
-      # This is the behavior we actually need. Two retries whose only
-      # difference is `observed_timestamp_ns` (filled in by `normalize` on
-      # each call, so distinct across retries) must still produce the same
-      # fingerprint so the idempotency-key path lands on the same object.
-      without_obs = [%Log{timestamp_ns: 1, body: "same"}]
-      with_obs = [%Log{timestamp_ns: 1, observed_timestamp_ns: 999, body: "same"}]
+    test "two calls with observed_timestamp_ns left nil produce the same fingerprint" do
+      # This is the retry-safety case: OTLP callers commonly omit
+      # `observedTimeUnixNano`. Two retries both arrive with nil, both hash
+      # to the same value, and the idempotency-key path deduplicates. The
+      # normalizer fills in a wall clock later, but that happens AFTER the
+      # fingerprint is computed.
+      r = [%Log{timestamp_ns: 1, body: "same"}]
 
-      assert {:ok, h1} = S3.caller_content_hash(without_obs)
-      assert {:ok, h2} = S3.caller_content_hash(with_obs)
+      assert {:ok, h1} = S3.caller_content_hash(r)
+      assert {:ok, h2} = S3.caller_content_hash(r)
       assert h1 == h2
+    end
+
+    test "a caller-set observed_timestamp_ns IS part of the fingerprint" do
+      # If the caller explicitly declares an observed timestamp, that is
+      # part of the record they authored. A "retry" that changes it is a
+      # distinct write; silently overwriting the earlier value would lose
+      # data.
+      no_obs = [%Log{timestamp_ns: 1, body: "same"}]
+      with_obs_a = [%Log{timestamp_ns: 1, observed_timestamp_ns: 100, body: "same"}]
+      with_obs_b = [%Log{timestamp_ns: 1, observed_timestamp_ns: 200, body: "same"}]
+
+      {:ok, h_none} = S3.caller_content_hash(no_obs)
+      {:ok, h_a} = S3.caller_content_hash(with_obs_a)
+      {:ok, h_b} = S3.caller_content_hash(with_obs_b)
+
+      refute h_none == h_a
+      refute h_a == h_b
     end
 
     test "every caller-controlled field influences the fingerprint" do
@@ -141,9 +158,29 @@ defmodule Pulso.Storage.S3UnitTest do
       refute h_base == h_ts
     end
 
-    test "returns encode error for a non-UTF-8 body" do
-      assert {:error, {:encode_failed, _}} =
-               S3.caller_content_hash([%Log{timestamp_ns: 1, body: <<255>>}])
+    test "a map with keys inserted in different orders produces the same fingerprint" do
+      # `:erlang.term_to_binary(_, [:deterministic])` sorts map keys before
+      # encoding. Without that, two logically-equal records could hash
+      # differently just because the caller inserted attributes in a
+      # different order — which would defeat idempotent retries across
+      # heterogeneous producers.
+      order_a = %{"a" => 1, "b" => 2, "c" => 3}
+      order_b = order_a |> Map.delete("a") |> Map.put("a", 1)
+
+      r_a = [%Log{timestamp_ns: 1, attributes: order_a}]
+      r_b = [%Log{timestamp_ns: 1, attributes: order_b}]
+
+      {:ok, h_a} = S3.caller_content_hash(r_a)
+      {:ok, h_b} = S3.caller_content_hash(r_b)
+      assert h_a == h_b
+    end
+
+    test "a non-UTF-8 body still fingerprints without crashing" do
+      # `:erlang.term_to_binary` handles any Elixir term, including binaries
+      # that are not valid UTF-8. The stored payload's `encode/1` still
+      # surfaces `:encode_failed` at write time — we just don't need to
+      # trip that path here.
+      assert {:ok, _} = S3.caller_content_hash([%Log{timestamp_ns: 1, body: <<255>>}])
     end
   end
 

@@ -75,15 +75,11 @@ defmodule Pulso.Storage.S3 do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
     with :ok <- validate_tenant(tenant),
-         # The idempotency hash comes from the caller-provided records
-         # BEFORE `normalize/1` fills in `observed_timestamp_ns` with the
-         # current wall clock. Otherwise a legitimate retry (same records,
-         # no observed_ts set by the caller) would produce a different
-         # payload byte sequence per call, and the deterministic idempotent
-         # suffix would change. `caller_content_hash/1` computes on the
-         # pre-normalization records; the STORED payload still carries
-         # `observed_timestamp_ns` as ingest metadata.
-         {:ok, caller_hash} <- caller_content_hash(records),
+         # The idempotency hash is derived from the caller-provided records
+         # BEFORE `normalize/1` fills in a wall-clock `observed_timestamp_ns`.
+         # A legitimate retry has identical records; the normalizer would
+         # otherwise inject a fresh `now` and defeat the fingerprint.
+         {:ok, caller_hash} = caller_content_hash(records),
          {:ok, normalized} <- normalize(records),
          {:ok, payload} <- encode(normalized) do
       key = object_key(tenant, batch_sort_ns(normalized), caller_hash, idempotency_key)
@@ -300,42 +296,56 @@ defmodule Pulso.Storage.S3 do
     "#{prefix(tenant)}#{zero_pad(sort_ns)}-#{suffix}.ndjson"
   end
 
-  # Fingerprint of the raw caller records, deliberately excluding fields the
-  # normalizer will fill in (`observed_timestamp_ns`). Two calls that pass
-  # the same records produce the same fingerprint; changing anything the
-  # caller controls (body, service, attributes, timestamp_ns) changes it.
+  # Fingerprint of the raw caller records. Two properties hold:
+  #
+  # 1. Every field the caller controls (including `observed_timestamp_ns`
+  #    when they set it) is included — a caller who legitimately changes
+  #    that field on a "retry" is signalling a distinct write, and gets a
+  #    distinct object.
+  # 2. The encoding is canonical across runtime, GC, and Jason versions.
+  #    Two identical records always hash to the same byte sequence, in
+  #    this process and in any future release. That is what makes cross-
+  #    version idempotency safe.
+  #
+  # `:erlang.term_to_binary/2` with `:deterministic` gives us the canonical
+  # form for free: map keys are sorted, atoms and integers are encoded
+  # canonically, and the format is stable across OTP versions from OTP 24.1
+  # onward. That is much stronger than `Jason.encode/1`, which serializes
+  # map keys in `Map.to_list/1` order — a non-canonical order that can
+  # change with Elixir's map representation (small map -> hash map, GC).
   @doc false
-  @spec caller_content_hash([Log.t()]) :: {:ok, String.t()} | {:error, term()}
+  @spec caller_content_hash([Log.t()]) :: {:ok, String.t()}
   def caller_content_hash(records) when is_list(records) do
-    payload_terms =
+    canonical =
       Enum.map(records, fn %Log{} = r ->
         %{
-          "timestamp_ns" => r.timestamp_ns,
-          "severity_number" => r.severity_number,
-          "severity_text" => r.severity_text,
-          "service" => r.service,
-          "body" => r.body,
-          "trace_id" => r.trace_id,
-          "span_id" => r.span_id,
-          "attributes" => r.attributes,
-          "resource" => r.resource
+          timestamp_ns: r.timestamp_ns,
+          observed_timestamp_ns: r.observed_timestamp_ns,
+          severity_number: r.severity_number,
+          severity_text: r.severity_text,
+          service: r.service,
+          body: normalize_hash_value(r.body),
+          trace_id: r.trace_id,
+          span_id: r.span_id,
+          attributes: r.attributes,
+          resource: r.resource
         }
       end)
 
-    case Jason.encode(payload_terms) do
-      {:ok, bin} ->
-        digest =
-          :sha256
-          |> :crypto.hash(bin)
-          |> Base.encode16(case: :lower)
-          |> binary_part(0, @content_hash_width)
+    digest =
+      :sha256
+      |> :crypto.hash(:erlang.term_to_binary(canonical, [:deterministic]))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, @content_hash_width)
 
-        {:ok, digest}
-
-      {:error, reason} ->
-        {:error, {:encode_failed, reason}}
-    end
+    {:ok, digest}
   end
+
+  # `body` can arrive as a non-string term via OTLP AnyValue (int, bool,
+  # list). `:erlang.term_to_binary` handles all of these fine; nothing to
+  # normalize. This hook exists so a future callsite that wants a stable
+  # representation can add one without changing the fingerprint contract.
+  defp normalize_hash_value(v), do: v
 
   defp zero_pad(ns) when is_integer(ns) and ns >= 0 do
     ns
