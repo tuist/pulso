@@ -40,14 +40,14 @@ defmodule Pulso.Storage.S3UnitTest do
 
   describe "object key construction" do
     test "with an idempotency key, the same call maps to the same key" do
-      k1 = S3.object_key("acme", 100, "payload", "req-1")
-      k2 = S3.object_key("acme", 100, "payload", "req-1")
+      k1 = S3.object_key("acme", 100, 200, "payload", "req-1")
+      k2 = S3.object_key("acme", 100, 200, "payload", "req-1")
       assert k1 == k2
     end
 
     test "with an idempotency key, different keys map to different objects" do
-      k1 = S3.object_key("acme", 100, "payload", "req-1")
-      k2 = S3.object_key("acme", 100, "payload", "req-2")
+      k1 = S3.object_key("acme", 100, 200, "payload", "req-1")
+      k2 = S3.object_key("acme", 100, 200, "payload", "req-2")
       refute k1 == k2
     end
 
@@ -56,16 +56,16 @@ defmodule Pulso.Storage.S3UnitTest do
       # case Codex flagged in review 2: content-addressing alone would
       # silently drop one. With no idempotency key we always take a random
       # suffix so distinct calls always land on distinct objects.
-      k1 = S3.object_key("acme", 100, "payload", nil)
-      k2 = S3.object_key("acme", 100, "payload", nil)
+      k1 = S3.object_key("acme", 100, 200, "payload", nil)
+      k2 = S3.object_key("acme", 100, 200, "payload", nil)
       refute k1 == k2
     end
 
     test "an empty-string idempotency key is treated as absent" do
       # Prevents a client that sends `Idempotency-Key: ` from accidentally
       # collapsing every batch onto one key.
-      k1 = S3.object_key("acme", 100, "payload", "")
-      k2 = S3.object_key("acme", 100, "payload", "")
+      k1 = S3.object_key("acme", 100, 200, "payload", "")
+      k2 = S3.object_key("acme", 100, 200, "payload", "")
       refute k1 == k2
     end
 
@@ -74,37 +74,98 @@ defmodule Pulso.Storage.S3UnitTest do
       # almost certainly buggy. We must not silently overwrite the earlier
       # write with the newer one; distinct content should land on distinct
       # keys.
-      k1 = S3.object_key("acme", 100, "payload-a", "req-1")
-      k2 = S3.object_key("acme", 100, "payload-b", "req-1")
+      k1 = S3.object_key("acme", 100, 200, "payload-a", "req-1")
+      k2 = S3.object_key("acme", 100, 200, "payload-b", "req-1")
       refute k1 == k2
     end
 
     test "the idempotency key is scoped by tenant" do
       # A shared idempotency key across tenants must not collide.
-      k1 = S3.object_key("alpha", 100, "p", "req-1")
-      k2 = S3.object_key("beta", 100, "p", "req-1")
+      k1 = S3.object_key("alpha", 100, 200, "p", "req-1")
+      k2 = S3.object_key("beta", 100, 200, "p", "req-1")
       refute String.replace(k1, "alpha", "beta") == k2
     end
 
     test "different tenants never share a prefix" do
-      k1 = S3.object_key("alpha", 100, "p", "req-1")
-      k2 = S3.object_key("beta", 100, "p", "req-1")
+      k1 = S3.object_key("alpha", 100, 200, "p", "req-1")
+      k2 = S3.object_key("beta", 100, 200, "p", "req-1")
       refute String.starts_with?(k1, "tenants/beta/")
       refute String.starts_with?(k2, "tenants/alpha/")
     end
 
-    test "the key path carries a schema version segment" do
-      # v1 is the current write format. A future format change bumps to
-      # v2/ so old objects can be migrated at their own pace rather than
+    test "the key path carries the v2 schema version segment" do
+      # v2 is the current write format. A future format change bumps to
+      # v3/ so old objects can be migrated at their own pace rather than
       # orphaned. Guarding this at the key level catches an accidental
       # removal of the versioning.
-      assert String.starts_with?(S3.object_key("acme", 100, "p", "req-1"), "tenants/acme/v1/logs/")
+      assert String.starts_with?(
+               S3.object_key("acme", 100, 200, "p", "req-1"),
+               "tenants/acme/v2/logs/"
+             )
     end
 
-    test "keys sort chronologically by sort_ns within a tenant" do
-      k_early = S3.object_key("acme", 100, "p", "req-1")
-      k_late = S3.object_key("acme", 200, "p", "req-1")
+    test "keys sort chronologically by min_ts within a tenant" do
+      k_early = S3.object_key("acme", 100, 200, "p", "req-1")
+      k_late = S3.object_key("acme", 200, 300, "p", "req-1")
       assert k_early < k_late
+    end
+
+    test "the key path includes both min_ts and max_ts so query can prune at LIST time" do
+      # The min_ts and max_ts segments are the whole point of the v2
+      # layout — they let `query/2` skip GETs on segments outside the
+      # requested time range. Guard the shape so a refactor cannot
+      # silently regress the query short-circuit.
+      key = S3.object_key("acme", 42, 999, "p", "req-1")
+
+      assert key =~ ~r|/logs/00000000000000000042-00000000000000000999-|
+    end
+  end
+
+  describe "segment parsing and time pruning" do
+    test "parse_segment extracts min_ts and max_ts from a v2 key" do
+      key = S3.object_key("acme", 100, 500, "p", "req-1")
+      assert %{key: ^key, min_ts: 100, max_ts: 500} = S3.parse_segment(key)
+    end
+
+    test "parse_segment returns nil bounds for a key that does not match the v2 shape" do
+      # A v1 key (or any pre-schema-bump layout) still parses to a segment
+      # record — bounds are nil, which the pruner treats as "always fetch",
+      # so we can never silently drop a legitimate object because we did
+      # not recognize its key format.
+      assert %{key: "tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson", min_ts: nil, max_ts: nil} =
+               S3.parse_segment("tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson")
+    end
+
+    test "prune_by_time drops segments strictly outside the requested range" do
+      segments = [
+        %{key: "s1", min_ts: 0, max_ts: 50},
+        %{key: "s2", min_ts: 100, max_ts: 200},
+        %{key: "s3", min_ts: 300, max_ts: 400}
+      ]
+
+      # Range [80, 250] overlaps only s2.
+      assert [%{key: "s2"}] = S3.prune_by_time(segments, 80, 250)
+    end
+
+    test "prune_by_time treats a segment as inside when start_ts hits its max_ts exactly" do
+      segments = [%{key: "s", min_ts: 100, max_ts: 200}]
+      assert [%{key: "s"}] = S3.prune_by_time(segments, 200, nil)
+    end
+
+    test "prune_by_time keeps unknown-bounds segments — they are always fetched" do
+      segments = [
+        %{key: "known", min_ts: 0, max_ts: 50},
+        %{key: "unknown", min_ts: nil, max_ts: nil}
+      ]
+
+      # Range [1000, 2000] excludes `known` but preserves `unknown` (we do
+      # not know whether it overlaps).
+      assert [%{key: "unknown"}] = S3.prune_by_time(segments, 1000, 2000)
+    end
+
+    test "prune_by_time returns everything when both bounds are nil" do
+      segments = [%{key: "s1", min_ts: 0, max_ts: 50}, %{key: "s2", min_ts: 100, max_ts: 200}]
+      assert ^segments = S3.prune_by_time(segments, nil, nil)
     end
   end
 
