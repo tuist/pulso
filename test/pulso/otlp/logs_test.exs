@@ -4,9 +4,9 @@ defmodule Pulso.OTLP.LogsTest do
   alias Pulso.OTLP.Logs
   alias Pulso.Record.Log
 
-  test "returns [] for a payload without resourceLogs" do
-    assert Logs.decode(%{}) == []
-    assert Logs.decode(%{"resourceLogs" => "not-a-list"}) == []
+  test "returns {[], 0} for a payload without resourceLogs" do
+    assert Logs.decode(%{}) == {[], 0}
+    assert Logs.decode(%{"resourceLogs" => "not-a-list"}) == {[], 0}
   end
 
   test "decodes a full record with resource, attributes, and body" do
@@ -42,23 +42,27 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert [
-             %Log{
-               timestamp_ns: 1_700_000_000_000_000_000,
-               observed_timestamp_ns: 1_700_000_000_000_000_001,
-               severity_number: 9,
-               severity_text: "INFO",
-               service: "api",
-               body: "hello",
-               trace_id: "abc",
-               span_id: "def",
-               attributes: %{"user.id" => "u1"},
-               resource: %{"service.name" => "api", "deploy.env" => "prod"}
-             }
-           ] = Logs.decode(payload)
+    assert {[
+              %Log{
+                timestamp_ns: 1_700_000_000_000_000_000,
+                observed_timestamp_ns: 1_700_000_000_000_000_001,
+                severity_number: 9,
+                severity_text: "INFO",
+                service: "api",
+                body: "hello",
+                trace_id: "abc",
+                span_id: "def",
+                attributes: %{"user.id" => "u1"},
+                resource: %{"service.name" => "api", "deploy.env" => "prod"}
+              }
+            ], 0} = Logs.decode(payload)
   end
 
-  test "skips records without a timestamp" do
+  test "preserves absent timestamps as nil so storage can backfill deterministically" do
+    # OTLP allows both timestamps to be absent, and a zero value means
+    # "unknown". The decoder does NOT invent a wall-clock value here —
+    # that would defeat the caller_content_hash for a retry. The storage
+    # adapter fills in a stored timestamp later.
     payload = %{
       "resourceLogs" => [
         %{
@@ -69,7 +73,77 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert Logs.decode(payload) == []
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}], 0} =
+             Logs.decode(payload)
+  end
+
+  test "preserves an observed-only timestamp verbatim" do
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{
+              "logRecords" => [
+                %{
+                  "observedTimeUnixNano" => "42",
+                  "body" => %{"stringValue" => "only observed"}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 42, body: "only observed"}], 0} =
+             Logs.decode(payload)
+  end
+
+  test "folds a zero timestamp to nil per the OTLP spec" do
+    # `time_unix_nano: 0` means "unknown", identical in meaning to the
+    # field being absent. If the decoder left it as 0, the record would
+    # be stored at the Unix epoch and vanish from time-bounded queries.
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{
+              "logRecords" => [
+                %{
+                  "timeUnixNano" => "0",
+                  "observedTimeUnixNano" => "1700000000000000000",
+                  "body" => %{"stringValue" => "zero ts"}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 1_700_000_000_000_000_000}], 0} =
+             Logs.decode(payload)
+  end
+
+  test "counts a non-map logRecords entry as rejected" do
+    # A logRecord entry that is not a map is genuinely malformed — the
+    # decoder cannot invent fields, so it counts toward rejected.
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{
+              "logRecords" => [
+                "not-a-map",
+                %{"timeUnixNano" => "1", "body" => %{"stringValue" => "ok"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {[%Log{body: "ok"}], 1} = Logs.decode(payload)
   end
 
   test "decodes AnyValue variants in attributes" do
@@ -111,7 +185,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert [%Log{attributes: attrs}] = Logs.decode(payload)
+    assert {[%Log{attributes: attrs}], 0} = Logs.decode(payload)
     assert attrs["s"] == "x"
     assert attrs["i"] == 42
     assert attrs["b"] == true
@@ -141,7 +215,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    records = Logs.decode(payload)
+    assert {records, 0} = Logs.decode(payload)
     assert length(records) == 4
     assert Enum.map(records, & &1.service) == ["a", "a", "a", "b"]
     assert Enum.map(records, & &1.timestamp_ns) == [1, 2, 3, 4]

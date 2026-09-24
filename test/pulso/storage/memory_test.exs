@@ -53,12 +53,42 @@ defmodule Pulso.Storage.MemoryTest do
     assert Enum.map(records, & &1.timestamp_ns) == [4, 3]
   end
 
-  test "populates observed_timestamp_ns when the record does not carry one" do
-    before_append = System.system_time(:nanosecond)
-    :ok = Storage.append("t", [record(1)])
-    after_append = System.system_time(:nanosecond)
+  test "nil-timestamp records do not leak through time-bounded queries" do
+    # Guards a subtle Elixir term-ordering trap: nil >= 5 returns true
+    # because atoms sort above integers. Without an explicit is_integer
+    # guard in filter_by_time, nil-ts records would slip past every
+    # start_ts filter.
+    :ok = Storage.append("t", [%Log{timestamp_ns: nil}, record(100)])
 
-    assert {:ok, [%Log{observed_timestamp_ns: observed}]} = Storage.query("t")
-    assert observed >= before_append and observed <= after_append
+    assert {:ok, [%Log{timestamp_ns: 100}]} = Storage.query("t", start_ts: 50)
+    assert {:ok, [%Log{timestamp_ns: 100}]} = Storage.query("t", end_ts: 200)
+
+    # But an unbounded query still returns them.
+    assert {:ok, records} = Storage.query("t")
+    assert Enum.any?(records, &is_nil(&1.timestamp_ns))
+  end
+
+  test "stores records verbatim without wall-clock backfill" do
+    # Prior versions injected `now` when a timestamp was nil. That was
+    # dropped because injecting a fresh timestamp per call breaks the
+    # retry-idempotency story in the S3 adapter — the second PUT under
+    # the same idempotency key would overwrite the first with a later
+    # timestamp. Memory is the test-only adapter and mirrors the same
+    # contract for consistency.
+    :ok = Storage.append("t", [%Log{timestamp_ns: nil, observed_timestamp_ns: nil}])
+    assert {:ok, [%Log{timestamp_ns: nil, observed_timestamp_ns: nil}]} = Storage.query("t")
+  end
+
+  test "equal timestamps are broken by observed_timestamp_ns then trace_id" do
+    # Guard against a limit response depending on adapter-internal insertion
+    # order. Two adapters must sort ties the same way; both delegate to
+    # Pulso.Storage.SortOrder.
+    a = %Log{timestamp_ns: 10, observed_timestamp_ns: 100, trace_id: "aaa"}
+    b = %Log{timestamp_ns: 10, observed_timestamp_ns: 300, trace_id: "aaa"}
+    c = %Log{timestamp_ns: 10, observed_timestamp_ns: 200, trace_id: "bbb"}
+
+    :ok = Storage.append("t", [a, b, c])
+    assert {:ok, sorted} = Storage.query("t")
+    assert Enum.map(sorted, & &1.observed_timestamp_ns) == [300, 200, 100]
   end
 end

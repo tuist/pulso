@@ -142,6 +142,16 @@
           {Credo.Check.Warning.BoolOperationOnSameValues, []},
           {Credo.Check.Warning.Dbg, []},
           {Credo.Check.Warning.ExpensiveEmptyEnumCheck, []},
+          # Pulso uses Elixir's built-in `JSON` module (Elixir 1.18+); the
+          # `Jason` dependency is only present transitively for optional deps
+          # of other libraries. Any direct `Jason.*` reference in our code
+          # should fail CI. See AGENTS.md > Conventions.
+          {Credo.Check.Warning.ForbiddenModule,
+           [
+             modules: [
+               {Jason, "Use Elixir's built-in `JSON` module instead of Jason (see AGENTS.md)."}
+             ]
+           ]},
           {Credo.Check.Warning.IExPry, []},
           {Credo.Check.Warning.IoInspect, []},
           {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, []},

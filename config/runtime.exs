@@ -16,11 +16,89 @@ import Config
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
+alias Pulso.Auth.SharedSecret
+alias Pulso.Storage.S3
+
 if System.get_env("PHX_SERVER") do
   config :pulso, PulsoWeb.Endpoint, server: true
 end
 
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+
+# Log storage adapter. Tests keep the in-memory adapter (see config/test.exs);
+# dev and prod use the S3 adapter against any S3-compatible endpoint. RustFS
+# runs locally via docker-compose.yml — the dev defaults below match its
+# out-of-the-box credentials. Prod requires the env vars to be set explicitly.
+case config_env() do
+  :dev ->
+    config :pulso, Pulso.Storage, adapter: S3
+
+    config :pulso, S3,
+      bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
+      # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
+      # The fallback matches the docker-compose default host port when mise
+      # is not in the loop.
+      endpoint: System.get_env("PULSO_S3_ENDPOINT", "http://localhost:11100"),
+      region: System.get_env("PULSO_S3_REGION", "us-east-1"),
+      access_key_id: System.get_env("PULSO_S3_ACCESS_KEY_ID", "rustfsadmin"),
+      secret_access_key: System.get_env("PULSO_S3_SECRET_ACCESS_KEY", "rustfsadmin"),
+      allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "true") in ["1", "true", "yes"]
+
+  :prod ->
+    require_env = fn name ->
+      case System.get_env(name) do
+        value when is_binary(value) and value != "" ->
+          value
+
+        _ ->
+          raise """
+          environment variable #{name} is missing or empty.
+          Pulso.Storage.S3 requires bucket/region/credentials in prod.
+          """
+      end
+    end
+
+    # Tenant tokens. Expected shape: a JSON object mapping tenant name to
+    # "sha256$<hex-of-sha256-of-token>". Deployments compute the hash offline
+    # and store only the digest in env, never the plaintext token.
+    tokens =
+      case System.get_env("PULSO_TENANT_TOKENS") do
+        blob when is_binary(blob) and blob != "" ->
+          case JSON.decode(blob) do
+            {:ok, map} when is_map(map) ->
+              map
+
+            {:ok, _} ->
+              raise "PULSO_TENANT_TOKENS must decode to a JSON object"
+
+            {:error, reason} ->
+              raise "PULSO_TENANT_TOKENS is not valid JSON: #{inspect(reason)}"
+          end
+
+        _ ->
+          raise """
+          environment variable PULSO_TENANT_TOKENS is missing or empty.
+          Pulso.Auth.SharedSecret requires at least one tenant token in prod.
+          """
+      end
+
+    config :pulso, Pulso.Auth,
+      module: SharedSecret,
+      tokens: tokens
+
+    config :pulso, Pulso.Storage, adapter: S3
+
+    config :pulso, S3,
+      bucket: require_env.("PULSO_S3_BUCKET"),
+      endpoint: System.get_env("PULSO_S3_ENDPOINT"),
+      region: require_env.("PULSO_S3_REGION"),
+      access_key_id: require_env.("PULSO_S3_ACCESS_KEY_ID"),
+      secret_access_key: require_env.("PULSO_S3_SECRET_ACCESS_KEY"),
+      allow_http: System.get_env("PULSO_S3_ALLOW_HTTP", "false") in ["1", "true", "yes"]
+
+  :test ->
+    :noop
+end
 
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.

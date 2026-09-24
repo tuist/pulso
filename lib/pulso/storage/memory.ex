@@ -2,10 +2,10 @@ defmodule Pulso.Storage.Memory do
   @moduledoc """
   In-memory log storage backed by a public ETS table.
 
-  Step 1 default adapter. Meant to prove the ingest → storage → query spine
-  end to end without dragging in Rust, Parquet, or S3. Step 2 will replace it
-  with a real S3-backed adapter; this module will move to `test/support/` and
-  keep serving the test suite.
+  Test-only adapter as of step 2. Meant to prove the ingest → storage → query
+  spine end to end without dragging in Rust, Parquet, or S3. Dev and prod use
+  `Pulso.Storage.S3`; this module stays wired as the default in `mix test`
+  because `config/test.exs` sets no adapter override.
 
   Records for each tenant are kept in a private list-per-tenant, appended to
   as batches arrive and scanned linearly on query. That is deliberately naive:
@@ -18,6 +18,7 @@ defmodule Pulso.Storage.Memory do
   use GenServer
 
   alias Pulso.Record.Log
+  alias Pulso.Storage.SortOrder
 
   @table __MODULE__
 
@@ -27,13 +28,13 @@ defmodule Pulso.Storage.Memory do
   end
 
   @impl Pulso.Storage
-  def append(tenant, records) when is_binary(tenant) and is_list(records) do
-    now = System.system_time(:nanosecond)
-
-    normalized =
-      for %Log{} = record <- records do
-        %{record | observed_timestamp_ns: record.observed_timestamp_ns || now}
-      end
+  def append(tenant, records, _opts \\ []) when is_binary(tenant) and is_list(records) do
+    # Memory ignores :idempotency_key — it's a test adapter. Storage does
+    # NOT backfill timestamps: injecting `now` would defeat the retry
+    # story that the S3 adapter relies on for idempotency (see
+    # `Pulso.Storage.S3` docstring). Callers that need a wall-clock
+    # timestamp set it themselves at ingest.
+    normalized = records
 
     existing =
       case :ets.lookup(@table, tenant) do
@@ -57,7 +58,7 @@ defmodule Pulso.Storage.Memory do
       records
       |> filter_by_time(Keyword.get(opts, :start_ts), Keyword.get(opts, :end_ts))
       |> filter_by_service(Keyword.get(opts, :service))
-      |> Enum.sort_by(& &1.timestamp_ns, :desc)
+      |> SortOrder.sort()
       |> take_limit(Keyword.get(opts, :limit))
 
     {:ok, filtered}
@@ -83,7 +84,13 @@ defmodule Pulso.Storage.Memory do
 
   defp filter_by_time(records, start_ts, end_ts) do
     Enum.filter(records, fn %Log{timestamp_ns: ts} ->
-      (start_ts == nil or ts >= start_ts) and (end_ts == nil or ts <= end_ts)
+      # A nil timestamp does not fit inside a time-bounded range. Elixir's
+      # term ordering puts atoms greater than numbers, so `nil >= 5` is
+      # true without an explicit guard — leaving nil-ts records leaking
+      # through every time filter.
+      is_integer(ts) and
+        (start_ts == nil or ts >= start_ts) and
+        (end_ts == nil or ts <= end_ts)
     end)
   end
 
