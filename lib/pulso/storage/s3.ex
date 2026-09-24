@@ -364,41 +364,52 @@ defmodule Pulso.Storage.S3 do
   # the condition, so they always get fetched — that is the price of not
   # knowing their bounds.
   defp scan_segments(config, segments, start_ts, end_ts, service, limit) do
-    initial = %{batches: [], count: 0}
+    ctx = %{
+      config: config,
+      segments: segments,
+      start_ts: start_ts,
+      end_ts: end_ts,
+      service: service,
+      limit: limit
+    }
 
     segments
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, initial}, fn {segment, index}, {:ok, state} ->
-      case ObjectStore.get(config, segment.key) do
-        {:ok, blob} ->
-          batch =
-            blob
-            |> decode()
-            |> filter_by_time(start_ts, end_ts)
-            |> filter_by_service(service)
-
-          new_state = %{
-            batches: [batch | state.batches],
-            count: state.count + length(batch)
-          }
-
-          if can_short_circuit?(new_state, limit, segments, index) do
-            {:halt, {:ok, new_state}}
-          else
-            {:cont, {:ok, new_state}}
-          end
-
-        {:error, :not_found} ->
-          {:cont, {:ok, state}}
-
-        {:error, _} = err ->
-          {:halt, err}
-      end
-    end)
+    |> Enum.reduce_while({:ok, %{batches: [], count: 0}}, &visit_segment(&1, &2, ctx))
     |> case do
       {:ok, %{batches: batches}} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
       {:error, _} = err -> err
     end
+  end
+
+  defp visit_segment({segment, index}, {:ok, state}, ctx) do
+    case ObjectStore.get(ctx.config, segment.key) do
+      {:ok, blob} ->
+        continue_or_halt(state, blob, index, ctx)
+
+      {:error, :not_found} ->
+        {:cont, {:ok, state}}
+
+      {:error, _} = err ->
+        {:halt, err}
+    end
+  end
+
+  defp continue_or_halt(state, blob, index, ctx) do
+    batch =
+      blob
+      |> decode()
+      |> filter_by_time(ctx.start_ts, ctx.end_ts)
+      |> filter_by_service(ctx.service)
+
+    new_state = %{
+      batches: [batch | state.batches],
+      count: state.count + length(batch)
+    }
+
+    if can_short_circuit?(new_state, ctx.limit, ctx.segments, index),
+      do: {:halt, {:ok, new_state}},
+      else: {:cont, {:ok, new_state}}
   end
 
   defp can_short_circuit?(_state, nil, _segments, _index), do: false
