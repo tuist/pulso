@@ -30,6 +30,11 @@ pulso-*.tar
 native/*/target/
 /priv/native/
 
+# RustlerPrecompiled emits a checksum sidecar in the project root when it
+# verifies a downloaded NIF artifact. It contains dev-machine transient
+# state; the authoritative checksums live in the GitHub Release.
+/checksum-*.exs
+
 # Per-worktree dev-instance suffix written by mise/utilities/dev_instance_env.sh.
 # Persisted inside .git/worktrees/*/pulso-dev-instance by design; the
 # top-level fallback is tracked here as a safety net for setups where the
