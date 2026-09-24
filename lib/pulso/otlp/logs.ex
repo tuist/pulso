@@ -13,52 +13,77 @@ defmodule Pulso.OTLP.Logs do
   alias Pulso.Record.Log
 
   @doc """
-  Decode a parsed JSON payload. Returns the flat list of log records; malformed
-  entries are skipped rather than aborting the whole batch.
+  Decode a parsed JSON payload.
+
+  Returns `{records, rejected}`:
+
+    * `records` — the flat list of `Pulso.Record.Log` that survived decoding.
+    * `rejected` — the count of `LogRecord` entries that could not be
+      decoded (missing or malformed `timeUnixNano`, wrong shape, etc.).
+      The OTLP receiver surfaces this to the sender via
+      `ExportLogsPartialSuccess.rejected_log_records` per the OTLP spec so
+      the sender knows some records did not make it into storage.
   """
-  @spec decode(map()) :: [Log.t()]
+  @spec decode(map()) :: {[Log.t()], non_neg_integer()}
   def decode(%{"resourceLogs" => resource_logs}) when is_list(resource_logs) do
-    Enum.flat_map(resource_logs, &decode_resource_logs/1)
+    resource_logs
+    |> Enum.reduce({[], 0}, fn rl, {records, rejected} ->
+      {rl_records, rl_rejected} = decode_resource_logs(rl)
+      {[rl_records | records], rejected + rl_rejected}
+    end)
+    |> then(fn {records, rejected} -> {records |> Enum.reverse() |> List.flatten(), rejected} end)
   end
 
-  def decode(_), do: []
+  # A top-level shape that is not an ExportLogsServiceRequest is not a valid
+  # OTLP body at all — treat every record as rejected (well, zero counted,
+  # since we can't count what we couldn't parse) and return empty.
+  def decode(_), do: {[], 0}
 
   defp decode_resource_logs(%{"scopeLogs" => scope_logs} = resource_logs) when is_list(scope_logs) do
     resource_attrs = attributes(resource_logs["resource"])
     service = resource_attrs["service.name"]
 
-    Enum.flat_map(scope_logs, fn scope_logs ->
-      records = scope_logs["logRecords"] || []
-      Enum.flat_map(records, &decode_log_record(&1, resource_attrs, service))
+    Enum.reduce(scope_logs, {[], 0}, fn sl, {records, rejected} ->
+      raw = sl["logRecords"] || []
+
+      {sl_records, sl_rejected} =
+        Enum.reduce(raw, {[], 0}, fn record, {rs, rj} ->
+          case decode_log_record(record, resource_attrs, service) do
+            {:ok, r} -> {[r | rs], rj}
+            :error -> {rs, rj + 1}
+          end
+        end)
+
+      {[Enum.reverse(sl_records) | records], rejected + sl_rejected}
     end)
+    |> then(fn {records, rejected} -> {records |> Enum.reverse() |> List.flatten(), rejected} end)
   end
 
-  defp decode_resource_logs(_), do: []
+  defp decode_resource_logs(_), do: {[], 0}
 
   defp decode_log_record(%{} = record, resource_attrs, service) do
     case timestamp(record["timeUnixNano"]) do
       {:ok, ts} ->
-        [
-          %Log{
-            timestamp_ns: ts,
-            observed_timestamp_ns: nano(record["observedTimeUnixNano"]),
-            severity_number: record["severityNumber"],
-            severity_text: record["severityText"],
-            service: service,
-            body: any_value(record["body"]),
-            trace_id: nil_if_empty(record["traceId"]),
-            span_id: nil_if_empty(record["spanId"]),
-            attributes: attributes(record),
-            resource: resource_attrs
-          }
-        ]
+        {:ok,
+         %Log{
+           timestamp_ns: ts,
+           observed_timestamp_ns: nano(record["observedTimeUnixNano"]),
+           severity_number: record["severityNumber"],
+           severity_text: record["severityText"],
+           service: service,
+           body: any_value(record["body"]),
+           trace_id: nil_if_empty(record["traceId"]),
+           span_id: nil_if_empty(record["spanId"]),
+           attributes: attributes(record),
+           resource: resource_attrs
+         }}
 
       _ ->
-        []
+        :error
     end
   end
 
-  defp decode_log_record(_, _, _), do: []
+  defp decode_log_record(_, _, _), do: :error
 
   defp timestamp(nil), do: :error
 

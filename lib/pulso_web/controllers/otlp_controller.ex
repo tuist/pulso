@@ -31,9 +31,13 @@ defmodule PulsoWeb.OTLPController do
 
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
-         records = Logs.decode(params),
+         {records, rejected} = Logs.decode(params),
          :ok <- Storage.append(tenant, records, opts) do
-      json(conn, %{})
+      # OTLP requires the receiver to signal partial success via a
+      # top-level `partialSuccess` block instead of a plain success. That
+      # lets the sender know some records did not make it into storage
+      # without turning the whole batch into a retry.
+      json(conn, partial_success_body(rejected, length(records)))
     else
       {:error, {:invalid_tenant, _}} ->
         conn
@@ -80,5 +84,17 @@ defmodule PulsoWeb.OTLPController do
       [key | _] when is_binary(key) and byte_size(key) > 0 -> [idempotency_key: key]
       _ -> []
     end
+  end
+
+  defp partial_success_body(0, _accepted), do: %{}
+
+  defp partial_success_body(rejected, accepted) do
+    %{
+      "partialSuccess" => %{
+        "rejectedLogRecords" => rejected,
+        "errorMessage" =>
+          "#{rejected} log record(s) rejected; #{accepted} accepted. Cause: missing or malformed timeUnixNano."
+      }
+    }
   end
 end

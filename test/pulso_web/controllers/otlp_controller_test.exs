@@ -80,6 +80,36 @@ defmodule PulsoWeb.OTLPControllerTest do
     assert json_response(conn, 400) == %{"error" => "invalid_tenant"}
   end
 
+  test "POST /v1/logs surfaces rejected records via partialSuccess per the OTLP spec",
+       %{conn: conn} do
+    # One valid record + one missing timeUnixNano. The receiver must
+    # signal the drop rather than acknowledging silently — otherwise the
+    # sender never retries the record that was never stored.
+    payload = %{
+      "resourceLogs" => [
+        %{
+          "scopeLogs" => [
+            %{
+              "logRecords" => [
+                %{"timeUnixNano" => "1700000000000000000", "body" => %{"stringValue" => "ok"}},
+                %{"body" => %{"stringValue" => "missing ts"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    conn =
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> post(~p"/v1/logs", payload)
+
+    body = json_response(conn, 200)
+    assert %{"partialSuccess" => %{"rejectedLogRecords" => 1}} = body
+    assert body["partialSuccess"]["errorMessage"] =~ "timeUnixNano"
+  end
+
   test "POST /v1/logs passes the Idempotency-Key header through", %{conn: conn} do
     # The Idempotency-Key header should end up in Storage.append opts. Two
     # POSTs with the same key + same payload are the same write to the store,
