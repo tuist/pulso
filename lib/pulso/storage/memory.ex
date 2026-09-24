@@ -29,20 +29,12 @@ defmodule Pulso.Storage.Memory do
 
   @impl Pulso.Storage
   def append(tenant, records, _opts \\ []) when is_binary(tenant) and is_list(records) do
-    # Memory ignores :idempotency_key — it's a test adapter, and repeat
-    # tests reset state between cases anyway.
-    now = System.system_time(:nanosecond)
-
-    normalized =
-      for %Log{} = record <- records do
-        observed = record.observed_timestamp_ns || now
-
-        %{
-          record
-          | timestamp_ns: record.timestamp_ns || observed,
-            observed_timestamp_ns: observed
-        }
-      end
+    # Memory ignores :idempotency_key — it's a test adapter. Storage does
+    # NOT backfill timestamps: injecting `now` would defeat the retry
+    # story that the S3 adapter relies on for idempotency (see
+    # `Pulso.Storage.S3` docstring). Callers that need a wall-clock
+    # timestamp set it themselves at ingest.
+    normalized = records
 
     existing =
       case :ets.lookup(@table, tenant) do
@@ -92,7 +84,13 @@ defmodule Pulso.Storage.Memory do
 
   defp filter_by_time(records, start_ts, end_ts) do
     Enum.filter(records, fn %Log{timestamp_ns: ts} ->
-      (start_ts == nil or ts >= start_ts) and (end_ts == nil or ts <= end_ts)
+      # A nil timestamp does not fit inside a time-bounded range. Elixir's
+      # term ordering puts atoms greater than numbers, so `nil >= 5` is
+      # true without an explicit guard — leaving nil-ts records leaking
+      # through every time filter.
+      is_integer(ts) and
+        (start_ts == nil or ts >= start_ts) and
+        (end_ts == nil or ts <= end_ts)
     end)
   end
 

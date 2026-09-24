@@ -120,27 +120,17 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp normalize(records) do
-    now = System.system_time(:nanosecond)
-
     Enum.reduce_while(records, {:ok, []}, fn
       %Log{} = record, {:ok, acc} ->
         with {:ok, attrs} <- sanitize_map(record.attributes || %{}),
              {:ok, resource} <- sanitize_map(record.resource || %{}) do
-          observed_ts = record.observed_timestamp_ns || now
-
-          # OTLP allows both timestamps to be absent (or explicitly zero,
-          # which the decoder folds to nil). We backfill: prefer the
-          # observed timestamp, then wall clock. This runs AFTER the
-          # caller_content_hash, so retries with identical raw records
-          # still hash to the same fingerprint.
-          normalized = %{
-            record
-            | timestamp_ns: record.timestamp_ns || observed_ts,
-              observed_timestamp_ns: observed_ts,
-              attributes: attrs,
-              resource: resource
-          }
-
+          # Deliberately no wall-clock backfill here. Injecting `now` for a
+          # nil timestamp would make retries under the same idempotency key
+          # overwrite the first stored record with a later timestamp, so an
+          # already-acknowledged log would disappear from its original time
+          # range and re-emerge in a later one. Step 3's conditional PUT
+          # (write-only-if-absent) will allow first-write-wins backfill.
+          normalized = %{record | attributes: attrs, resource: resource}
           {:cont, {:ok, [normalized | acc]}}
         else
           err -> {:halt, err}
@@ -391,7 +381,13 @@ defmodule Pulso.Storage.S3 do
 
   defp filter_by_time(records, start_ts, end_ts) do
     Enum.filter(records, fn %Log{timestamp_ns: ts} ->
-      (start_ts == nil or ts >= start_ts) and (end_ts == nil or ts <= end_ts)
+      # A record with a nil timestamp has no place inside a time-bounded
+      # range. Elixir's term ordering puts atoms greater than numbers, so
+      # `nil >= 5` is true — without the `is_integer` guard, nil-ts
+      # records would leak through every time filter.
+      is_integer(ts) and
+        (start_ts == nil or ts >= start_ts) and
+        (end_ts == nil or ts <= end_ts)
     end)
   end
 

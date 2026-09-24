@@ -98,13 +98,19 @@ defmodule Pulso.Storage.S3Test do
     assert Enum.map(records, & &1.timestamp_ns) == [4, 3]
   end
 
-  test "populates observed_timestamp_ns when the record does not carry one", %{tenant: tenant} do
-    before_append = System.system_time(:nanosecond)
-    assert :ok = S3.append(tenant, [record(1)])
-    after_append = System.system_time(:nanosecond)
+  test "stores records verbatim without injecting a wall-clock timestamp", %{tenant: tenant} do
+    # Wall-clock backfill would defeat retry idempotency (the second call
+    # under the same idempotency key would overwrite the first with a
+    # later observed_ts). Records that arrive without timestamps are
+    # stored as they came in; queries with time bounds naturally skip
+    # them, unbounded queries return them.
+    assert :ok =
+             S3.append(tenant, [
+               %Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}
+             ])
 
-    assert {:ok, [%Log{observed_timestamp_ns: observed}]} = S3.query(tenant, [])
-    assert observed >= before_append and observed <= after_append
+    assert {:ok, [%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}]} =
+             S3.query(tenant, [])
   end
 
   test "preserves NDJSON-hostile bodies through the round trip", %{tenant: tenant} do
