@@ -86,6 +86,8 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 - **Alerting** (when added): each rule is its own supervised process, cluster-wide singleton via Horde. Rules that require exactly-once firing route through `ra`.
 - **Ingestion** (when added): pull-based via Broadway/GenStage. No unbounded process mailboxes.
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
+- **Rust NIF distribution**: the `pulso_object_store` NIF ships via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for the target triples in `lib/pulso/object_store/nif.ex` and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.
+- **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT hands `object_store` a `Bytes` that reads straight from the Erlang binary heap via a documented `block_on`-bounded lifetime extension (zero copies). Do not spawn the S3 request onto a background task; the zero-copy invariant assumes the future completes before the NIF returns.
 
 ## Development workflow
 
