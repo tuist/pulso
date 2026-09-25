@@ -316,9 +316,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         # (network blip, S3 throttle). Callers will see `{:error, reason}`
         # on the first `register_segments`/`ensure_loaded` after this,
         # and retry.
-        Logger.warning(
-          "manifest load failed tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}"
-        )
+        Logger.warning("manifest load failed tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}")
 
         {:noreply, state, @idle_hibernate_ms}
     end
@@ -451,9 +449,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       {:error, reason} = err ->
         Enum.each(state.waiters, &GenServer.reply(&1, err))
 
-        Logger.warning(
-          "manifest CAS gave up tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}"
-        )
+        Logger.warning("manifest CAS gave up tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}")
 
         # Keep the process alive: the next register_segments will start
         # from a clean slate (and if the underlying failure was
