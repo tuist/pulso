@@ -6,6 +6,8 @@ defmodule Pulso.Application do
   use Application
 
   alias Pulso.Storage.Memory
+  alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.ManifestSupervision
 
   @impl true
   def start(_type, _args) do
@@ -33,6 +35,9 @@ defmodule Pulso.Application do
   # `Memory` only runs when it is the configured adapter — in `mix test` no
   # adapter is set, so `Pulso.Storage.adapter/0` falls back to it. In dev and
   # prod the S3 adapter is configured and Memory would just be dead weight.
+  #
+  # The manifest layer (registry + dynamic supervisor + ETS cache) is only
+  # started when the S3 adapter is active; other adapters have no manifest.
   defp storage_children do
     adapter =
       case Application.get_env(:pulso, Pulso.Storage) do
@@ -43,6 +48,7 @@ defmodule Pulso.Application do
     case adapter do
       nil -> [Memory]
       Memory -> [Memory]
+      S3 -> [ManifestSupervision]
       _ -> []
     end
   end

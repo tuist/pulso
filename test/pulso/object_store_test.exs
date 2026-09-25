@@ -30,7 +30,8 @@ defmodule Pulso.ObjectStoreTest do
   test "put then get returns the same bytes", %{config: config, key: key} do
     payload = :crypto.strong_rand_bytes(512)
 
-    assert :ok = ObjectStore.put(config, key, payload)
+    assert {:ok, etag} = ObjectStore.put(config, key, payload)
+    assert is_binary(etag) and etag != ""
     assert {:ok, ^payload} = ObjectStore.get(config, key)
   end
 
@@ -44,9 +45,9 @@ defmodule Pulso.ObjectStoreTest do
       ObjectStore.delete(config, key_b)
     end)
 
-    assert :ok = ObjectStore.put(config, key_a, "one")
-    assert :ok = ObjectStore.put(config, key_b, "two")
-    assert :ok = ObjectStore.put(config, key, "three")
+    assert {:ok, _} = ObjectStore.put(config, key_a, "one")
+    assert {:ok, _} = ObjectStore.put(config, key_b, "two")
+    assert {:ok, _} = ObjectStore.put(config, key, "three")
 
     assert {:ok, keys} = ObjectStore.list(config, prefix)
     assert Enum.sort(keys) == [key_a, key_b]
@@ -58,5 +59,39 @@ defmodule Pulso.ObjectStoreTest do
   test "get on a missing key returns an error", %{config: config} do
     missing = "pulso-object-store-test/missing-#{System.unique_integer([:positive])}"
     assert {:error, _reason} = ObjectStore.get(config, missing)
+  end
+
+  # Conditional-write coverage. These are what makes the manifest CAS work.
+  describe "conditional writes" do
+    test "put_if_none_match creates then rejects a duplicate create", %{config: config, key: key} do
+      assert {:ok, etag} = ObjectStore.put_if_none_match(config, key, "one")
+      assert is_binary(etag) and etag != ""
+      assert {:error, :already_exists} = ObjectStore.put_if_none_match(config, key, "two")
+      assert {:ok, "one"} = ObjectStore.get(config, key)
+    end
+
+    test "put_if_match updates on matching etag and rejects a stale one", %{
+      config: config,
+      key: key
+    } do
+      assert {:ok, etag1} = ObjectStore.put(config, key, "one")
+      assert {:ok, etag2} = ObjectStore.put_if_match(config, key, "two", etag1)
+      assert etag2 != etag1
+      assert {:ok, "two"} = ObjectStore.get(config, key)
+      assert {:error, :precondition_failed} = ObjectStore.put_if_match(config, key, "three", etag1)
+      assert {:ok, "two"} = ObjectStore.get(config, key)
+    end
+
+    test "get_if_none_match returns :not_modified for a matching etag", %{config: config, key: key} do
+      assert {:ok, etag} = ObjectStore.put(config, key, "one")
+      assert :not_modified = ObjectStore.get_if_none_match(config, key, etag)
+      assert {:ok, new_etag, "one"} = ObjectStore.get_if_none_match(config, key, nil)
+      assert new_etag == etag
+    end
+
+    test "get_if_none_match returns :not_found for a missing key", %{config: config} do
+      missing = "pulso-object-store-test/missing-cond-#{System.unique_integer([:positive])}"
+      assert {:error, :not_found} = ObjectStore.get_if_none_match(config, missing, nil)
+    end
   end
 end
