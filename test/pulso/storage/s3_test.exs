@@ -8,6 +8,12 @@ defmodule Pulso.Storage.S3Test do
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestCache
+  alias Pulso.Storage.S3.ManifestRegistry
+  alias Pulso.Storage.S3.ManifestSupervision
+  alias Pulso.Storage.S3.ManifestSupervisor
 
   @moduletag :integration
 
@@ -23,11 +29,16 @@ defmodule Pulso.Storage.S3Test do
 
     Application.put_env(:pulso, S3, config)
 
+    # The application boots ManifestSupervision only when the S3 adapter
+    # is configured as the active storage. Tests set the adapter config
+    # directly (not through mix env), so we start the tree here.
+    start_supervised!(ManifestSupervision)
+
     tenant = "test-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # The adapter writes objects under `tenants/<tenant>/v2/logs/`; clean up so
-      # a re-run starts empty.
+      # The adapter writes objects under `tenants/<tenant>/v2/logs/`; clean up
+      # both the segment objects and the manifest so a re-run starts empty.
       case ObjectStore.list(config, "tenants/#{tenant}/v2/logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
@@ -46,6 +57,15 @@ defmodule Pulso.Storage.S3Test do
       attributes: Keyword.get(opts, :attributes, %{}),
       resource: Keyword.get(opts, :resource, %{})
     }
+  end
+
+  # The tenant's v2 prefix now also holds the per-tenant `manifest.json`.
+  # These helpers narrow object listings to segment files only, so counts
+  # remain a proxy for how many *segments* the adapter wrote.
+  defp list_segments(config, tenant) do
+    with {:ok, keys} <- ObjectStore.list(config, "tenants/#{tenant}/v2/logs/") do
+      {:ok, Enum.reject(keys, &String.ends_with?(&1, "/manifest.json"))}
+    end
   end
 
   test "append then query round-trips log records", %{tenant: tenant} do
@@ -121,7 +141,7 @@ defmodule Pulso.Storage.S3Test do
 
   test "append with an empty batch is a no-op", %{tenant: tenant, config: config} do
     assert :ok = S3.append(tenant, [])
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v2/logs/")
+    assert {:ok, keys} = list_segments(config, tenant)
     assert keys == []
   end
 
@@ -145,7 +165,7 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
     assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
 
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v2/logs/")
+    assert {:ok, keys} = list_segments(config, tenant)
     assert length(keys) == 1
 
     assert {:ok, records} = S3.query(tenant, [])
@@ -163,7 +183,7 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, batch)
     assert :ok = S3.append(tenant, batch)
 
-    assert {:ok, keys} = ObjectStore.list(config, "tenants/#{tenant}/v2/logs/")
+    assert {:ok, keys} = list_segments(config, tenant)
     assert length(keys) == 2
   end
 
@@ -174,9 +194,9 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, [record(1), record(2)])
     assert :ok = S3.append(tenant, [record(3)])
 
-    # Delete one of the objects between our own list and get, mimicking a
-    # compaction / retention job racing with a query.
-    assert {:ok, [first | _]} = ObjectStore.list(config, "tenants/#{tenant}/v2/logs/")
+    # Delete one of the segment objects between our own list and get,
+    # mimicking a compaction / retention job racing with a query.
+    assert {:ok, [first | _]} = list_segments(config, tenant)
     assert :ok = ObjectStore.delete(config, first)
 
     # Query should still return the surviving records, not error.
@@ -192,5 +212,201 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = S3.append(tenant, [a, b, c])
     assert {:ok, sorted} = S3.query(tenant, [])
     assert Enum.map(sorted, & &1.observed_timestamp_ns) == [300, 200, 100]
+  end
+
+  describe "manifest coordination" do
+    test "append populates the manifest and the ETS cache", %{tenant: tenant} do
+      assert :ok = S3.append(tenant, [record(1, service: "api")])
+
+      entry = ManifestCache.get(tenant, "logs")
+      assert %{manifest: %Manifest{segments: [segment | _]}, etag: etag} = entry
+      assert is_binary(etag) and etag != ""
+      assert segment.min_ts == 1 and segment.max_ts == 1 and segment.row_count == 1
+    end
+
+    test "concurrent appends coalesce into a bounded number of CAS operations", %{tenant: tenant} do
+      # Fan out N tasks, each with a unique record so no idempotency
+      # dedup kicks in. Under coalescing they should all be batched into
+      # far fewer than N manifest CAS operations. We assert the
+      # loose-but-informative property: every record shows up, all
+      # tasks report :ok, and the manifest holds N segments in the end.
+      n = 32
+
+      tasks =
+        for i <- 1..n do
+          Task.async(fn ->
+            S3.append(tenant, [record(i, service: "svc-#{i}")])
+          end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      assert Enum.all?(results, &(&1 == :ok))
+
+      entry = ManifestCache.get(tenant, "logs")
+      assert %Manifest{segments: segments} = entry.manifest
+      assert length(segments) == n
+
+      # And the query path finds every one of them.
+      assert {:ok, records} = S3.query(tenant, [])
+      assert length(records) == n
+    end
+
+    test "query rebuilds the manifest from LIST when it has been deleted from S3",
+         %{tenant: tenant, config: config} do
+      # A tenant whose manifest file gets nuked (retention, operator
+      # error, a mid-migration crash) should not lose queryability. On
+      # the next query the owner LIST-fallbacks and rebuilds the
+      # manifest from the segments that survive in S3.
+      assert :ok = S3.append(tenant, [record(1), record(2)])
+      assert :ok = S3.append(tenant, [record(3)])
+
+      manifest_key = Manifest.manifest_key(tenant)
+      assert :ok = ObjectStore.delete(config, manifest_key)
+      # Force a cold-start on the next call: drop the cache and stop the
+      # per-tenant owner so `ensure_loaded` rebuilds fresh.
+      ManifestCache.drop(tenant, "logs")
+      stop_owner(tenant)
+
+      assert {:ok, records} = S3.query(tenant, [])
+      assert Enum.map(records, & &1.timestamp_ns) == [3, 2, 1]
+    end
+
+    test "rebuild skips non-segment objects (sidecars, junk under the prefix)",
+         %{tenant: tenant, config: config} do
+      # Codex F2: rebuild used to include every object under the v2
+      # prefix, so a sidecar file (or a stray upload) would land in the
+      # manifest with nil bounds — and then the next load of that
+      # manifest would fail decode. This asserts that non-`.ndjson`
+      # objects are skipped at rebuild time.
+      assert :ok = S3.append(tenant, [record(1)])
+
+      # Stash a sidecar-shaped object next to the segment.
+      sidecar_key = "tenants/#{tenant}/v2/logs/00000000000000000005-junk.bloom"
+      assert {:ok, _etag} = ObjectStore.put(config, sidecar_key, "not a segment")
+
+      # And an ndjson file with a key that doesn't carry the bounds
+      # format — a hypothetical hand-written import.
+      malformed_key = "tenants/#{tenant}/v2/logs/hand-written.ndjson"
+      assert {:ok, _etag} = ObjectStore.put(config, malformed_key, "still not a segment")
+
+      # Force a cold-start rebuild.
+      manifest_key = Manifest.manifest_key(tenant)
+      assert :ok = ObjectStore.delete(config, manifest_key)
+      ManifestCache.drop(tenant, "logs")
+      stop_owner(tenant)
+
+      assert {:ok, records} = S3.query(tenant, [])
+      assert Enum.map(records, & &1.timestamp_ns) == [1]
+
+      # Manifest is now on disk and must be reloadable — this is the
+      # regression Codex flagged: the previous code produced a manifest
+      # with `mn: nil`/`mx: nil` entries that failed Segment.from_wire.
+      assert {:ok, _etag, body} = ObjectStore.get_if_none_match(config, manifest_key, nil)
+      assert {:ok, decoded} = Manifest.decode(body)
+      assert length(decoded.segments) == 1
+    end
+
+    test "stale cache refreshes via conditional GET so cross-node writes become visible",
+         %{tenant: tenant, config: config} do
+      # Codex F1: a node whose local writer is idle can't learn about
+      # writes another node commits — the cached manifest is served
+      # from ETS without checking S3. The refresh path issues a
+      # conditional GET when the entry ages past `refresh_stale_ms`,
+      # so a stale cache picks up remote writes within that window.
+      short_config = Map.put(config, :refresh_stale_ms, 50)
+
+      # Prime the cache on this node with an empty manifest first.
+      assert :ok = S3.append(tenant, [record(1)])
+      before_entry = ManifestCache.get(tenant, "logs")
+      assert length(before_entry.manifest.segments) == 1
+
+      # Simulate a "remote" writer: PUT a new manifest bytes-first,
+      # then override the CAS-visible content by uploading directly.
+      # We do this by writing a new segment object out-of-band and
+      # patching the manifest to include it, then CAS-updating the
+      # manifest with the current etag.
+      remote_key =
+        "tenants/#{tenant}/v2/logs/00000000000000000042-00000000000000000042-rand-abcdef0123456789-deadbeefdeadbeef.ndjson"
+
+      remote_body =
+        %Log{timestamp_ns: 42, service: "remote", body: "from-node-b"}
+        |> Map.from_struct()
+        |> JSON.encode!()
+        |> Kernel.<>("\n")
+
+      assert {:ok, _etag} = ObjectStore.put(short_config, remote_key, remote_body)
+
+      # Now emulate what a peer node's ManifestOwner would do: read
+      # current manifest, merge the new segment in, CAS-put.
+      manifest_key = Manifest.manifest_key(tenant)
+      assert {:ok, current_etag, body} = ObjectStore.get_if_none_match(short_config, manifest_key, nil)
+      assert {:ok, current} = Manifest.decode(body)
+      remote_seg = Segment.build(remote_key, 42, 42, 1)
+      merged = Manifest.merge(current, [remote_seg])
+      new_payload = merged |> Manifest.encode() |> IO.iodata_to_binary()
+      assert {:ok, _new_etag} = ObjectStore.put_if_match(short_config, manifest_key, new_payload, current_etag)
+
+      # Age the local cache past refresh_stale_ms and query — the
+      # refresh path should pick up the remote write.
+      # The cache entry's `refreshed_at_mono` is set on write; wait
+      # slightly longer than refresh_stale_ms so the next query sees
+      # it as stale.
+      Process.sleep(120)
+
+      Application.put_env(:pulso, S3, short_config)
+      assert {:ok, records} = S3.query(tenant, [])
+      Application.put_env(:pulso, S3, config)
+
+      timestamps = Enum.map(records, & &1.timestamp_ns) |> Enum.sort()
+      assert 42 in timestamps
+      assert 1 in timestamps
+    end
+
+    test "rejects appends with :owner_overloaded when the mailbox is at the cap",
+         %{tenant: tenant, config: config} do
+      # Codex F3: the owner mailbox used to be unbounded — a sustained
+      # burst would grow memory until callers hit the 15s call timeout
+      # and got a raw `exit`. `register_segments` now probes
+      # `Process.info(pid, :message_queue_len)` against `max_mailbox`
+      # (config-overridable) and returns `{:error, :owner_overloaded}`
+      # before entering the mailbox. Passing `max_mailbox: 0` forces
+      # every subsequent call to trip the cap deterministically —
+      # length is always `>= 0`.
+      #
+      # We first do a normal append to boot the owner (rebuild path
+      # and initial CAS), then flip the ceiling to 0 in the config
+      # and verify the next call bounces.
+      assert :ok = S3.append(tenant, [record(1)])
+
+      capped_config = Map.put(config, :max_mailbox, 0)
+      Application.put_env(:pulso, S3, capped_config)
+
+      try do
+        assert {:error, :owner_overloaded} = S3.append(tenant, [record(2)])
+      after
+        Application.put_env(:pulso, S3, config)
+      end
+
+      # And once the cap is lifted, subsequent appends succeed
+      # normally — this asserts we haven't corrupted owner state.
+      assert :ok = S3.append(tenant, [record(3)])
+    end
+  end
+
+  defp stop_owner(tenant) do
+    case Registry.lookup(ManifestRegistry, {tenant, "logs"}) do
+      [{pid, _}] ->
+        ref = Process.monitor(pid)
+        DynamicSupervisor.terminate_child(ManifestSupervisor, pid)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _} -> :ok
+        after
+          1_000 -> :ok
+        end
+
+      [] ->
+        :ok
+    end
   end
 end

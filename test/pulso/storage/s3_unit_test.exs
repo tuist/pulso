@@ -121,58 +121,9 @@ defmodule Pulso.Storage.S3UnitTest do
     end
   end
 
-  describe "segment parsing and time pruning" do
-    test "parse_segment extracts min_ts and max_ts from a v2 key" do
-      key = S3.object_key("acme", 100, 500, "p", "req-1")
-      assert %{key: ^key, min_ts: 100, max_ts: 500} = S3.parse_segment(key)
-    end
-
-    test "parse_segment returns nil bounds for a v1 key (pre-min/max schema)" do
-      # A v1 key still parses to a segment record — bounds are nil, which
-      # the pruner treats as "always fetch", so an upgrade from v1 to v2
-      # never silently drops legitimate objects: they get scanned on
-      # every query until a compaction re-keys them into the current
-      # schema.
-      assert %{
-               key: "tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson",
-               min_ts: nil,
-               max_ts: nil
-             } =
-               S3.parse_segment("tenants/acme/v1/logs/00000000000000000042-idem-abc.ndjson")
-    end
-
-    test "prune_by_time drops segments strictly outside the requested range" do
-      segments = [
-        %{key: "s1", min_ts: 0, max_ts: 50},
-        %{key: "s2", min_ts: 100, max_ts: 200},
-        %{key: "s3", min_ts: 300, max_ts: 400}
-      ]
-
-      # Range [80, 250] overlaps only s2.
-      assert [%{key: "s2"}] = S3.prune_by_time(segments, 80, 250)
-    end
-
-    test "prune_by_time treats a segment as inside when start_ts hits its max_ts exactly" do
-      segments = [%{key: "s", min_ts: 100, max_ts: 200}]
-      assert [%{key: "s"}] = S3.prune_by_time(segments, 200, nil)
-    end
-
-    test "prune_by_time keeps unknown-bounds segments — they are always fetched" do
-      segments = [
-        %{key: "known", min_ts: 0, max_ts: 50},
-        %{key: "unknown", min_ts: nil, max_ts: nil}
-      ]
-
-      # Range [1000, 2000] excludes `known` but preserves `unknown` (we do
-      # not know whether it overlaps).
-      assert [%{key: "unknown"}] = S3.prune_by_time(segments, 1000, 2000)
-    end
-
-    test "prune_by_time returns everything when both bounds are nil" do
-      segments = [%{key: "s1", min_ts: 0, max_ts: 50}, %{key: "s2", min_ts: 100, max_ts: 200}]
-      assert ^segments = S3.prune_by_time(segments, nil, nil)
-    end
-  end
+  # Segment parsing and time pruning now live in
+  # `Pulso.Storage.S3.Manifest.Segment` / `Pulso.Storage.S3.Manifest` and
+  # are covered directly in `test/pulso/storage/s3/manifest_test.exs`.
 
   describe "caller_content_hash" do
     test "identical caller-provided records produce the same fingerprint" do

@@ -2,75 +2,63 @@ defmodule Pulso.Storage.S3 do
   @moduledoc """
   S3-backed log storage.
 
-  Each `append/3` writes one NDJSON object under a tenant-scoped, versioned
-  prefix: `tenants/<tenant>/v2/logs/<min_ts>-<max_ts>-<suffix>.ndjson`.
-  Tenant isolation is enforced by key construction: tenant names are
-  validated against a conservative charset so a batch cannot land outside
-  its own prefix. The `<min_ts>` and `<max_ts>` segments are zero-padded
-  20-decimal-digit representations of the smallest and largest
-  caller-supplied `timestamp_ns` in the batch (records with `nil` map to
-  `0`, which sorts first). Putting the segment's time bounds directly in
-  the key removes the need for a separate manifest and lets `query/2`
-  skip objects that fall outside the requested time range at LIST time.
+  Each `append/3` writes one NDJSON object under a tenant-scoped,
+  versioned prefix: `tenants/<tenant>/v2/logs/<min_ts>-<max_ts>-<suffix>.ndjson`.
+  Tenant isolation is enforced by key construction — tenant names are
+  validated against a conservative charset, so a batch cannot land
+  outside its own prefix. The `<min_ts>` and `<max_ts>` segments are
+  zero-padded 20-decimal-digit representations of the smallest and
+  largest caller-supplied `timestamp_ns` in the batch (records with
+  `nil` map to `0`, which sorts first).
 
   The trailing `<suffix>` depends on whether the caller supplied an
   `idempotency_key`:
 
     * **With `idempotency_key`** — the suffix is a deterministic hash of
       `tenant || idempotency_key || caller_content_hash`. Two `append`
-      calls with the same key AND the same caller-supplied content resolve
-      to the same object; a lost-response retry does not duplicate. Two
-      calls with the same key and different content produce different
-      objects, surfacing a client bug rather than silently overwriting an
-      earlier write.
+      calls with the same key AND the same caller-supplied content
+      resolve to the same object; a lost-response retry does not
+      duplicate. Two calls with the same key and different content
+      produce different objects, surfacing a client bug rather than
+      silently overwriting.
     * **Without `idempotency_key`** — the suffix mixes the content hash
-      with random bytes so distinct calls always produce distinct objects.
-      Retries in this mode duplicate — callers who need dedup must opt in.
+      with random bytes so distinct calls always produce distinct
+      objects. Retries in this mode duplicate — callers who need dedup
+      must opt in.
 
-  `query/2` lists the tenant prefix, parses `[min_ts, max_ts]` from each
-  key, prunes segments that cannot overlap the requested time range, and
-  fetches only the survivors. Results are ordered by
-  `Pulso.Storage.SortOrder` (shared with `Pulso.Storage.Memory`). Under
-  `limit`, segments are iterated newest-first (by `max_ts` desc) and the
-  scan short-circuits once the accumulator's k-th largest `timestamp_ns`
-  strictly exceeds the next segment's `max_ts`. A `NotFound` for a listed
-  key that has since been deleted is skipped rather than aborting.
+  ## Manifest coordination
 
-  Known limits, still deferred:
+  Every accepted append is registered in the per-`(tenant, signal)`
+  manifest via `Pulso.Storage.S3.ManifestOwner`. The owner batches
+  concurrent registrations into a single S3 CAS per flush window so
+  ingest throughput is decoupled from S3 CAS latency. `query/2` reads
+  the manifest from the ETS-backed cache
+  (`Pulso.Storage.S3.ManifestCache`), prunes by time bounds, and only
+  fetches segments that could contribute records — no per-query LIST.
 
-    * **No columnar layout.** Records go on the wire as NDJSON, not Parquet.
-      A columnar segment format lives in the Rust NIF's future.
-    * **No conditional writes (CAS).** Retry idempotency relies on
-      deterministic keys plus content-addressed suffixes rather than
-      compare-and-swap. Two concurrent PUTs on the same key are last-write-
-      wins; a caller who accidentally reuses an idempotency key with
-      different content gets a distinct object, so nothing is lost, but
-      neither request sees the other's write.
-    * **Key bounds are trusted for pruning.** `parse_segment/1` reads
-      `[min_ts, max_ts]` off the key and uses them without cross-checking
-      the object's contents. This holds because every writer goes through
-      `object_key/5`, which derives bounds from the records themselves.
-      A hand-crafted key with false bounds could hide records from
-      time-bounded queries; that requires write access to the tenant
-      prefix, which is enforced at the ingest and IAM layer.
+  Only after both the segment PUT and the manifest CAS succeed does
+  `append/3` return `:ok`. That is the load-bearing durability point.
 
   ## Key format stability
 
   Every object lives under a versioned prefix (`tenants/<tenant>/v2/…`).
-  Within one schema version, the exact suffix format is deliberately not
-  a public API. The idempotency suffix is derived from
-  `:erlang.term_to_binary(_, [:deterministic])`, which is stable within an
-  OTP release but is not guaranteed across a major OTP upgrade. Any change
-  to the fingerprint, the delimiter, the sort-key width, or the number of
-  bounds segments bumps the schema version — new writes go to `v3/`, old
-  objects stay at `v2/`, and a compaction job migrates at its own pace.
-  The reader can be taught to look at both during the migration window.
+  Within one schema version, the exact suffix format is deliberately
+  not a public API. The idempotency suffix is derived from
+  `:erlang.term_to_binary(_, [:deterministic])`, which is stable within
+  an OTP release but is not guaranteed across a major OTP upgrade. Any
+  change to the fingerprint, the delimiter, the sort-key width, or the
+  number of bounds segments bumps the schema version — new writes go
+  to `v3/`, old objects stay at `v2/`, and a compaction job migrates
+  at its own pace.
   """
 
   @behaviour Pulso.Storage
 
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
+  alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.SortOrder
 
   @tenant_regex ~r/\A[A-Za-z0-9_.\-]{1,128}\z/
@@ -80,6 +68,7 @@ defmodule Pulso.Storage.S3 do
   # 16 hex chars = 64 bits from SHA-256. Collision probability is negligible
   # for the volumes any single tenant will produce in a step-2 adapter.
   @content_hash_width 16
+  @signal "logs"
 
   @impl Pulso.Storage
   def append(tenant, records, opts \\ [])
@@ -93,6 +82,11 @@ defmodule Pulso.Storage.S3 do
   def append(tenant, records, opts) when is_binary(tenant) and is_list(records) do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
+    # Validation and pre-network encoding come first so a bad tenant name
+    # or an unencodable record is rejected before `config!/0` is even
+    # evaluated. That keeps the "reject adversarial tenant names before
+    # touching the object store" property from surviving as an accident
+    # of test setup.
     with :ok <- validate_tenant(tenant),
          # The fingerprint, the sort-key prefix, AND the max-ts key segment
          # are derived from the caller-supplied records BEFORE `normalize/1`
@@ -103,8 +97,13 @@ defmodule Pulso.Storage.S3 do
          {min_ts, max_ts} = caller_ts_bounds(records),
          {:ok, normalized} <- normalize(records),
          {:ok, payload} <- encode(normalized) do
+      config = config!()
       key = object_key(tenant, min_ts, max_ts, caller_hash, idempotency_key)
-      ObjectStore.put(config!(), key, payload)
+
+      with {:ok, _etag} <- ObjectStore.put(config, key, payload) do
+        segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
+        ManifestOwner.register_segments(tenant, @signal, [segment], config)
+      end
     end
   end
 
@@ -117,19 +116,12 @@ defmodule Pulso.Storage.S3 do
 
     with :ok <- validate_tenant(tenant),
          config = config!(),
-         {:ok, keys} <- list_readable_prefixes(config, tenant) do
-      # Parse [min_ts, max_ts] from every key. A key we cannot parse (a
-      # v1 key from before the schema bump, or a hypothetical future
-      # format) is kept with `nil` bounds so it is always fetched — the
-      # safe default. Then prune by time bounds and iterate newest max_ts
-      # first so a limited query can stop as soon as the k-th largest
-      # timestamp in the accumulator is guaranteed to beat every
-      # remaining segment.
-      segments =
-        keys
-        |> Enum.map(&parse_segment/1)
-        |> prune_by_time(start_ts, end_ts)
-        |> Enum.sort_by(&segment_max_ts_for_sort/1, :desc)
+         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, @signal, config) do
+      # Manifest segments are already sorted by max_ts desc (invariant
+      # maintained by `Manifest.merge/2` and `Manifest.decode/1`). Prune
+      # by time and hand the survivors to the scan loop as-is — no
+      # per-query sort.
+      segments = Manifest.prune_by_time(entry.manifest, start_ts, end_ts)
 
       case scan_segments(config, segments, start_ts, end_ts, service, limit) do
         {:ok, records} ->
@@ -140,32 +132,6 @@ defmodule Pulso.Storage.S3 do
           err
       end
     end
-  end
-
-  # Reads span every currently-readable schema version so an upgrade from
-  # v1 to v2 does not orphan already-written objects. New writes always go
-  # to the current @schema_version prefix; readable versions live at the
-  # legacy prefixes below and are treated as unknown-bounds segments (see
-  # `parse_segment/1`), so a query still finds their records — it just
-  # cannot skip them at LIST time.
-  defp list_readable_prefixes(config, tenant) do
-    readable_prefixes(tenant)
-    |> Enum.reduce_while({:ok, []}, fn prefix, {:ok, acc} ->
-      case ObjectStore.list(config, prefix) do
-        {:ok, keys} -> {:cont, {:ok, keys ++ acc}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-  end
-
-  # v1: the sort_ns-only key format from before the min/max bounds
-  # encoding. Any keys under this prefix still round-trip correctly — the
-  # unknown-bounds fallback in `parse_segment/1` means the pruner keeps
-  # them and the reader fetches them for every query.
-  @readable_legacy_prefixes ["v1"]
-
-  defp readable_prefixes(tenant) do
-    [prefix(tenant) | Enum.map(@readable_legacy_prefixes, &"tenants/#{tenant}/#{&1}/logs/")]
   end
 
   # -- helpers -----------------------------------------------------------------
@@ -187,8 +153,7 @@ defmodule Pulso.Storage.S3 do
           # nil timestamp would make retries under the same idempotency key
           # overwrite the first stored record with a later timestamp, so an
           # already-acknowledged log would disappear from its original time
-          # range and re-emerge in a later one. Step 3's conditional PUT
-          # (write-only-if-absent) will allow first-write-wins backfill.
+          # range and re-emerge in a later one.
           normalized = %{record | attributes: attrs, resource: resource}
           {:cont, {:ok, [normalized | acc]}}
         else
@@ -286,71 +251,6 @@ defmodule Pulso.Storage.S3 do
       {:ok, lines |> Enum.reverse() |> IO.iodata_to_binary()}
     end
   end
-
-  # A parsed segment listing. Bounds are nil when the key does not match
-  # the current schema's `<min_ts>-<max_ts>-` shape, which is the safe
-  # default: we still fetch the object, we just cannot prune it or use it
-  # for early-exit.
-  @doc false
-  @spec parse_segment(String.t()) :: %{
-          key: String.t(),
-          min_ts: non_neg_integer() | nil,
-          max_ts: non_neg_integer() | nil
-        }
-  def parse_segment(key) when is_binary(key), do: do_parse_segment(key)
-
-  defp do_parse_segment(key) do
-    prefix_stripped = String.split(key, "/logs/", parts: 2)
-
-    case prefix_stripped do
-      [_, rest] ->
-        parse_bounds(key, rest)
-
-      _ ->
-        %{key: key, min_ts: nil, max_ts: nil}
-    end
-  end
-
-  defp parse_bounds(key, rest) do
-    case rest do
-      <<min_str::binary-size(@sort_key_width), "-", max_str::binary-size(@sort_key_width), "-", _rest::binary>> ->
-        with {min_ts, ""} <- Integer.parse(min_str),
-             {max_ts, ""} <- Integer.parse(max_str) do
-          %{key: key, min_ts: min_ts, max_ts: max_ts}
-        else
-          _ -> %{key: key, min_ts: nil, max_ts: nil}
-        end
-
-      _ ->
-        %{key: key, min_ts: nil, max_ts: nil}
-    end
-  end
-
-  # A segment overlaps the requested time range iff its own [min, max]
-  # intersects [start_ts, end_ts]. Segments whose bounds are unknown are
-  # kept (safe default). Segments explicitly outside the range are
-  # dropped, which is where the time-bounded query pays back.
-  @doc false
-  @spec prune_by_time([map()], non_neg_integer() | nil, non_neg_integer() | nil) :: [map()]
-  def prune_by_time(segments, nil, nil), do: segments
-
-  def prune_by_time(segments, start_ts, end_ts) do
-    Enum.filter(segments, &segment_intersects?(&1, start_ts, end_ts))
-  end
-
-  defp segment_intersects?(%{min_ts: nil}, _start_ts, _end_ts), do: true
-  defp segment_intersects?(%{max_ts: nil}, _start_ts, _end_ts), do: true
-
-  defp segment_intersects?(%{min_ts: min_ts, max_ts: max_ts}, start_ts, end_ts) do
-    (start_ts == nil or max_ts >= start_ts) and (end_ts == nil or min_ts <= end_ts)
-  end
-
-  # `sort_by` sees `nil` as greater than every integer under Elixir's term
-  # order — unknown-bounds segments float to the top, which is exactly the
-  # safe default (always fetch first, never rely on their bounds for
-  # early-exit).
-  defp segment_max_ts_for_sort(%{max_ts: nil}), do: nil
-  defp segment_max_ts_for_sort(%{max_ts: max_ts}), do: max_ts
 
   # Scan segments newest-first, decode each, keep only records inside the
   # requested filter, and short-circuit once we know the running accumulator
@@ -469,8 +369,7 @@ defmodule Pulso.Storage.S3 do
 
   # Schema version segment. Baked into every object key so a future change
   # to the key format can coexist with older objects rather than orphan
-  # them. v1 used `<sort_ns>-<suffix>.ndjson`. v2 adds the segment's
-  # `max_ts` so `query/2` can prune by time bounds at LIST time.
+  # them.
   @schema_version "v2"
 
   defp prefix(tenant), do: "tenants/#{tenant}/#{@schema_version}/logs/"
@@ -518,11 +417,7 @@ defmodule Pulso.Storage.S3 do
   # `:erlang.term_to_binary/2` with `:deterministic` gives us the canonical
   # form for free within an OTP release: map keys are sorted, atoms and
   # integers are encoded canonically, and the same term always produces
-  # the same bytes. That is stronger than a JSON encoder (map keys emit
-  # in `Map.to_list/1` order, which is not canonical and can shift when a
-  # small map promotes to a hash map). It is NOT guaranteed across major
-  # OTP upgrades — see the module docstring's "Key format stability"
-  # section for how a version bump migrates old objects when that happens.
+  # the same bytes.
   @doc false
   @spec caller_content_hash([Log.t()]) :: {:ok, String.t()}
   def caller_content_hash(records) when is_list(records) do
