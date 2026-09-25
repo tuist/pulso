@@ -316,10 +316,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         # (network blip, S3 throttle). Callers will see `{:error, reason}`
         # on the first `register_segments`/`ensure_loaded` after this,
         # and retry.
-        Logger.warning("manifest load failed",
-          tenant: state.tenant,
-          signal: state.signal,
-          reason: inspect(reason)
+        Logger.warning(
+          "manifest load failed tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}"
         )
 
         {:noreply, state, @idle_hibernate_ms}
@@ -453,11 +451,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       {:error, reason} = err ->
         Enum.each(state.waiters, &GenServer.reply(&1, err))
 
-        Logger.warning("manifest CAS gave up",
-          tenant: state.tenant,
-          signal: state.signal,
-          reason: inspect(reason),
-          retries_left: 0
+        Logger.warning(
+          "manifest CAS gave up tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}"
         )
 
         # Keep the process alive: the next register_segments will start
@@ -468,55 +463,43 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   # One CAS attempt, with recovery via reload-and-retry on
-  # `:precondition_failed`. Every retry rebuilds the merged manifest
-  # against the freshest known ETag, so we never overwrite a concurrent
-  # writer's segments.
+  # `:precondition_failed` or `:already_exists` (a first-create race).
+  # Every retry rebuilds the merged manifest against the freshest known
+  # ETag, so we never overwrite a concurrent writer's segments.
   defp cas_with_retry(_state, _segments, 0), do: {:error, :cas_retries_exhausted}
 
   defp cas_with_retry(state, segments, retries_left) do
     merged = Manifest.merge(state.manifest, segments)
     payload = merged |> Manifest.encode() |> IO.iodata_to_binary()
+
+    case attempt_cas(state, payload) do
+      {:ok, new_etag} -> {:ok, merged, new_etag}
+      {:error, :precondition_failed} -> reload_and_retry(state, segments, retries_left)
+      {:error, :already_exists} -> reload_and_retry(state, segments, retries_left)
+      {:error, _} = err -> err
+    end
+  end
+
+  # `nil` etag means the owner has never seen this manifest; use
+  # `put_if_none_match` so a first create is atomic. Any subsequent
+  # update rides `put_if_match` against the ETag we remember.
+  defp attempt_cas(state, payload) do
     key = Manifest.manifest_key(state.tenant, state.signal)
 
-    result =
-      case state.etag do
-        nil -> ObjectStore.put_if_none_match(state.config, key, payload)
-        etag -> ObjectStore.put_if_match(state.config, key, payload, etag)
-      end
+    case state.etag do
+      nil -> ObjectStore.put_if_none_match(state.config, key, payload)
+      etag -> ObjectStore.put_if_match(state.config, key, payload, etag)
+    end
+  end
 
-    case result do
-      {:ok, new_etag} ->
-        {:ok, merged, new_etag}
-
-      {:error, :precondition_failed} ->
-        # Another node CAS-ed between our GET and PUT. Reload and rebuild
-        # on top of the fresher manifest.
-        case load_manifest(state) do
-          {:ok, reloaded_manifest, reloaded_etag} ->
-            cas_with_retry(
-              %{state | manifest: reloaded_manifest, etag: reloaded_etag},
-              segments,
-              retries_left - 1
-            )
-
-          {:error, _} = err ->
-            err
-        end
-
-      {:error, :already_exists} ->
-        # A create race — someone else created the manifest between our
-        # 404 and our PUT. Reload and retry as an update.
-        case load_manifest(state) do
-          {:ok, reloaded_manifest, reloaded_etag} ->
-            cas_with_retry(
-              %{state | manifest: reloaded_manifest, etag: reloaded_etag},
-              segments,
-              retries_left - 1
-            )
-
-          {:error, _} = err ->
-            err
-        end
+  defp reload_and_retry(state, segments, retries_left) do
+    case load_manifest(state) do
+      {:ok, reloaded_manifest, reloaded_etag} ->
+        cas_with_retry(
+          %{state | manifest: reloaded_manifest, etag: reloaded_etag},
+          segments,
+          retries_left - 1
+        )
 
       {:error, _} = err ->
         err
@@ -550,51 +533,43 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp rebuild_from_prefix(state) do
     prefix = "tenants/#{state.tenant}/v2/#{state.signal}/"
 
-    case ObjectStore.list(state.config, prefix) do
-      {:ok, keys} ->
-        # Only keys that parse cleanly to `<min_ts>-<max_ts>-…ndjson`
-        # get into the rebuilt manifest. Everything else — the
-        # manifest itself, future sidecar files (`.bloom`, `.postings`,
-        # `.stats`), stray uploads — is skipped. Codex flagged the
-        # earlier "keep with nil bounds" fallback: the rebuilt manifest
-        # would then fail to decode (Segment.from_wire/1 requires
-        # integer bounds), leaving the tenant unrecoverable.
-        segments =
-          keys
-          |> Enum.flat_map(fn key ->
-            case segment_from_key(key) do
-              {:ok, segment} -> [segment]
-              :skip -> []
-            end
-          end)
+    with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
+      publish_rebuilt_manifest(state, keys)
+    end
+  end
 
-        manifest = Manifest.merge(Manifest.new(), segments)
-        payload = manifest |> Manifest.encode() |> IO.iodata_to_binary()
-        manifest_key = Manifest.manifest_key(state.tenant, state.signal)
+  defp publish_rebuilt_manifest(state, keys) do
+    manifest = Manifest.merge(Manifest.new(), rebuild_segments(keys))
+    payload = manifest |> Manifest.encode() |> IO.iodata_to_binary()
+    manifest_key = Manifest.manifest_key(state.tenant, state.signal)
 
-        case ObjectStore.put_if_none_match(state.config, manifest_key, payload) do
-          {:ok, etag} ->
-            {:ok, manifest, etag}
+    case ObjectStore.put_if_none_match(state.config, manifest_key, payload) do
+      {:ok, etag} -> {:ok, manifest, etag}
+      {:error, :already_exists} -> reload_after_create_race(state, manifest_key)
+      {:error, _} = err -> err
+    end
+  end
 
-          {:error, :already_exists} ->
-            # Lost the create race — trust the winner's manifest.
-            case ObjectStore.get_if_none_match(state.config, manifest_key, nil) do
-              {:ok, etag, body} ->
-                case Manifest.decode(body) do
-                  {:ok, m} -> {:ok, m, etag}
-                  {:error, _} = err -> err
-                end
+  # Only keys that parse cleanly to `<min_ts>-<max_ts>-…ndjson` get into
+  # the rebuilt manifest. Everything else — the manifest itself, future
+  # sidecar files (`.bloom`, `.postings`, `.stats`), stray uploads —
+  # resolves to `:skip`. Codex flagged the earlier "keep with nil bounds"
+  # fallback: the rebuilt manifest would then fail to decode
+  # (`Segment.from_wire/1` requires integer bounds), leaving the tenant
+  # unrecoverable.
+  defp rebuild_segments(keys) do
+    Enum.flat_map(keys, fn key ->
+      case segment_from_key(key) do
+        {:ok, segment} -> [segment]
+        :skip -> []
+      end
+    end)
+  end
 
-              {:error, _} = err ->
-                err
-            end
-
-          {:error, _} = err ->
-            err
-        end
-
-      {:error, _} = err ->
-        err
+  defp reload_after_create_race(state, manifest_key) do
+    with {:ok, etag, body} <- ObjectStore.get_if_none_match(state.config, manifest_key, nil),
+         {:ok, manifest} <- Manifest.decode(body) do
+      {:ok, manifest, etag}
     end
   end
 
