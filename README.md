@@ -35,6 +35,7 @@ mix phx.server
 ```
 
 - OTLP/HTTP JSON logs land at `POST /v1/logs`. Tenant is picked up from `X-Scope-OrgID` (Loki/Cortex convention), defaulting to `default`.
+- Loki push JSON lands at `POST /loki/api/v1/push` (same tenant convention). Gzip-encoded bodies are decompressed transparently; Snappy-framed protobuf is not yet supported.
 - The MCP endpoint is exposed at `POST /mcp`. It speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`).
 
 ## 🐳 Local S3 (MinIO)

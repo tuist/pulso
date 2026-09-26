@@ -17,6 +17,9 @@ Early scaffolding. In place:
 - `Pulso.MCP` — JSON-RPC 2.0 dispatcher (`initialize`, `tools/list`, `tools/call`, `ping`)
 - `Pulso.MCP.Tools` — tool registry, currently one read-only tool (`query_logs`)
 - `PulsoWeb.MCPController` at `POST /mcp` (handles single and batched JSON-RPC)
+- `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
+- `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push JSON ingest (Snappy protobuf not yet supported)
+- `PulsoWeb.CompressedBodyReader` — gzip-aware Plug.Parsers body reader, so JSON receivers accept compressed bodies
 
 Not yet built: alerting, ingestion, Mimir/Tempo clients, storage engine, remediation surface, HITL wiring, distribution (Horde/libcluster/ra).
 
