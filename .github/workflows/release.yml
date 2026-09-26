@@ -1,7 +1,8 @@
 name: release
 
-# Cuts precompiled NIF artifacts for `Pulso.ObjectStore.NIF` and attaches
-# them to the matching GitHub Release. Once artifacts are up, downstream
+# Cuts precompiled NIF artifacts for every crate under native/
+# (`Pulso.ObjectStore.NIF`, `Pulso.Ingest.NIF`) and attaches them to the
+# matching GitHub Release. Once artifacts are up, downstream
 # consumers of Pulso install without a Cargo toolchain: `rustler_precompiled`
 # fetches the .tar.gz for their target from
 # `github.com/tuist/pulso/releases/download/v<version>/`.
@@ -25,11 +26,12 @@ permissions:
 
 jobs:
   build_release:
-    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    name: ${{ matrix.crate }} NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
+        crate: [pulso_object_store, pulso_ingest]
         nif: ["2.16"]
         job:
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, use-cross: false }
@@ -67,12 +69,12 @@ jobs:
         # tag). Bump this SHA when upgrading the action.
         uses: philss/rustler-precompiled-action@853ac56183f29a080304df3ff8a194b5bbdc24cc
         with:
-          project-name: pulso_object_store
+          project-name: ${{ matrix.crate }}
           project-version: ${{ steps.extract.outputs.version }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
           use-cross: ${{ matrix.job.use-cross }}
-          project-dir: "native/pulso_object_store"
+          project-dir: "native/${{ matrix.crate }}"
 
       - name: Upload artifact to the release
         # Pin to the commit SHA for `softprops/action-gh-release` at

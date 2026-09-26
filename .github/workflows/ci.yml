@@ -32,6 +32,13 @@ jobs:
             command: mix format --check-formatted
           - name: Credo
             command: mix credo
+          # The ingest decoder parses untrusted bytes in native code; its
+          # unit tests include a deterministic mutation-fuzzing loop.
+          - name: Rust
+            command: >-
+              cargo fmt --manifest-path native/pulso_ingest/Cargo.toml -- --check &&
+              cargo clippy --manifest-path native/pulso_ingest/Cargo.toml --all-targets -- -D warnings &&
+              cargo test --release --manifest-path native/pulso_ingest/Cargo.toml
     steps:
       - uses: actions/checkout@v4
 
@@ -44,11 +51,15 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/pulso_object_store -> target
+          workspaces: |
+            native/pulso_object_store -> target
+            native/pulso_ingest -> target
           key: ${{ matrix.check.name }}
 
       - name: Cache deps
@@ -64,7 +75,7 @@ jobs:
       # Mix's incremental compile does not track it. A restored _build makes
       # Mix think the modules are up to date and skip re-running Rustler,
       # even when the .so is absent. Rust compilation stays fast thanks to
-      # Swatinem/rust-cache keeping native/pulso_object_store/target warm.
+      # Swatinem/rust-cache keeping each crate's native/*/target warm.
 
       - name: Install dependencies
         run: mix deps.get
@@ -103,7 +114,9 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/pulso_object_store -> target
+          workspaces: |
+            native/pulso_object_store -> target
+            native/pulso_ingest -> target
           key: integration
 
       - name: Cache deps
