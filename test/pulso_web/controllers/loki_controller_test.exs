@@ -252,6 +252,34 @@ defmodule PulsoWeb.LokiControllerTest do
     assert {:ok, [%Log{body: "ok"}]} = Storage.query("default")
   end
 
+  test "POST /loki/api/v1/push keeps the batch when one line is not valid UTF-8",
+       %{conn: conn} do
+    # Alloy does not retry 4xx, so failing the request would silently drop
+    # every other line in the batch. The bad record is rejected on its own.
+    request = %PushProto.PushRequest{
+      streams: [
+        %PushProto.Stream{
+          labels: ~s({service_name="api"}),
+          entries: [
+            %PushProto.Entry{timestamp: %PushProto.Timestamp{seconds: 1}, line: "good"},
+            %PushProto.Entry{timestamp: %PushProto.Timestamp{seconds: 2}, line: "BAD!"}
+          ]
+        }
+      ]
+    }
+
+    body = request |> encode_proto() |> :binary.replace("BAD!", <<0xFF, 0xFE, 0xFD, 0xFC>>) |> encode_snappy()
+
+    conn =
+      conn
+      |> put_req_header("content-type", "application/x-protobuf")
+      |> post(~p"/loki/api/v1/push", body)
+
+    assert conn.status == 204
+    assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
+    assert {:ok, [%Log{body: "good"}]} = Storage.query("default")
+  end
+
   test "POST /loki/api/v1/push returns 400 for a body that is not valid Snappy",
        %{conn: conn} do
     conn =

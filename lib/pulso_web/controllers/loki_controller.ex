@@ -3,7 +3,6 @@ defmodule PulsoWeb.LokiController do
 
   alias Pulso.Auth
   alias Pulso.Loki.Push
-  alias Pulso.Loki.PushProto
   alias Pulso.Storage
 
   @default_tenant "default"
@@ -11,10 +10,10 @@ defmodule PulsoWeb.LokiController do
   # Cap on the decompressed protobuf body. Loki's default upstream limit
   # is a few MiB per push; 16 MiB is comfortably above that and small
   # enough that a single misconfigured or malicious sender cannot
-  # exhaust the request process's heap. Enforced twice: once against
-  # the length varint in the Snappy block header (before we allocate
-  # any output buffer), then once against the actual decompressed
-  # bytes as a belt-and-braces check.
+  # exhaust the request process's heap. The NIF checks it against the
+  # length varint in the Snappy block header before allocating any
+  # output buffer, and decompression fails if the payload does not
+  # produce exactly that many bytes.
   @max_decompressed_bytes 16 * 1024 * 1024
 
   # Hard cap on the compressed body read off the socket. Set well
@@ -126,11 +125,7 @@ defmodule PulsoWeb.LokiController do
       :protobuf ->
         with :ok <- validate_protobuf_encoding(conn),
              {:ok, body, conn} <- read_full_body(conn),
-             :ok <- guard_advertised_size(body),
-             {:ok, decoded} <- snappy_decode(body),
-             :ok <- guard_size(decoded),
-             {:ok, request} <- proto_decode(decoded) do
-          {records, rejected} = Push.decode_proto(request)
+             {:ok, records, rejected} <- Push.decode_protobuf(body, @max_decompressed_bytes) do
           {:ok, records, rejected, conn}
         else
           {:error, reason} -> {:error, reason, conn}
@@ -203,47 +198,6 @@ defmodule PulsoWeb.LokiController do
       {:error, _} = err ->
         err
     end
-  end
-
-  # Snappy's block format begins with a varint that carries the
-  # uncompressed size. Peeking at it before `decompress/1` lets us
-  # refuse a "snappy bomb" — a highly compressible payload whose
-  # decompressed output would blow through @max_decompressed_bytes —
-  # before we allocate an output buffer.
-  defp guard_advertised_size(body) do
-    case :snappyer.uncompressed_length(body) do
-      {:ok, size} when size <= @max_decompressed_bytes -> :ok
-      {:ok, _size} -> {:error, :payload_too_large}
-      {:error, _} -> {:error, :invalid_snappy}
-    end
-  rescue
-    _ -> {:error, :invalid_snappy}
-  end
-
-  defp snappy_decode(body) do
-    case :snappyer.decompress(body) do
-      {:ok, decoded} -> {:ok, decoded}
-      {:error, _} -> {:error, :invalid_snappy}
-    end
-  rescue
-    _ -> {:error, :invalid_snappy}
-  end
-
-  # Belt-and-braces check on the actual decompressed size. In practice
-  # `guard_advertised_size/1` already rejected anything above the cap,
-  # but the length header is untrusted input and this guarantees the
-  # buffer we hand to the protobuf decoder is bounded.
-  defp guard_size(body) when byte_size(body) > @max_decompressed_bytes, do: {:error, :payload_too_large}
-
-  defp guard_size(_), do: :ok
-
-  defp proto_decode(bytes) do
-    case PushProto.PushRequest.decode(bytes) do
-      {:ok, request} -> {:ok, request}
-      {:error, _} -> {:error, :invalid_protobuf}
-    end
-  rescue
-    _ -> {:error, :invalid_protobuf}
   end
 
   defp validate_tenant(tenant) do
