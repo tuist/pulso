@@ -2,6 +2,7 @@ defmodule Pulso.Loki.PushTest do
   use ExUnit.Case, async: true
 
   alias Pulso.Loki.Push
+  alias Pulso.Loki.PushProto
   alias Pulso.Record.Log
 
   test "returns {[], 0} for a payload without streams" do
@@ -214,5 +215,166 @@ defmodule Pulso.Loki.PushTest do
     }
 
     assert {[], 0} = Push.decode(payload)
+  end
+
+  describe "decode_proto/1" do
+    test "returns {[], 0} for anything that is not a PushRequest" do
+      assert Push.decode_proto(%{}) == {[], 0}
+      assert Push.decode_proto(nil) == {[], 0}
+    end
+
+    test "decodes a well-formed stream with structured metadata" do
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: ~s({service_name="api", level="info"}),
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 1_700_000_000, nanos: 42},
+                line: "hello",
+                structured_metadata: [
+                  %PushProto.LabelPair{name: "trace_id", value: "abc"},
+                  %PushProto.LabelPair{name: "span_id", value: "def"},
+                  %PushProto.LabelPair{name: "user_id", value: "u1"}
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {[
+                %Log{
+                  timestamp_ns: 1_700_000_000_000_000_042,
+                  observed_timestamp_ns: nil,
+                  severity_text: "info",
+                  service: "api",
+                  body: "hello",
+                  trace_id: "abc",
+                  span_id: "def",
+                  attributes: %{"user_id" => "u1"},
+                  resource: %{"service_name" => "api", "level" => "info"}
+                }
+              ], 0} = Push.decode_proto(request)
+    end
+
+    test "combines seconds and nanos into a single nanosecond timestamp" do
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: ~s({service_name="api"}),
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 5, nanos: 123_456_789},
+                line: "x",
+                structured_metadata: []
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {[%Log{timestamp_ns: 5_123_456_789}], 0} = Push.decode_proto(request)
+    end
+
+    test "counts a missing timestamp as one reject" do
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: ~s({service_name="api"}),
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 1, nanos: 0},
+                line: "ok",
+                structured_metadata: []
+              },
+              %PushProto.Entry{
+                timestamp: nil,
+                line: "no ts",
+                structured_metadata: []
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {[%Log{body: "ok"}], 1} = Push.decode_proto(request)
+    end
+
+    test "counts every entry as rejected when the labels string is malformed" do
+      # Without labels we cannot attribute records to a service or
+      # resource, so a whole-stream reject is honest. Counting entries
+      # gives the sender the same tally the JSON path would.
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: "not a valid label string",
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 1, nanos: 0},
+                line: "a",
+                structured_metadata: []
+              },
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 2, nanos: 0},
+                line: "b",
+                structured_metadata: []
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {[], 2} = Push.decode_proto(request)
+    end
+
+    test "flattens multiple streams" do
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: ~s({service_name="a"}),
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 1, nanos: 0},
+                line: "a1",
+                structured_metadata: []
+              },
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 2, nanos: 0},
+                line: "a2",
+                structured_metadata: []
+              }
+            ]
+          },
+          %PushProto.Stream{
+            labels: ~s({service_name="b"}),
+            entries: [
+              %PushProto.Entry{
+                timestamp: %PushProto.Timestamp{seconds: 3, nanos: 0},
+                line: "b1",
+                structured_metadata: []
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {records, 0} = Push.decode_proto(request)
+      assert Enum.map(records, & &1.service) == ["a", "a", "b"]
+      assert Enum.map(records, & &1.body) == ["a1", "a2", "b1"]
+    end
+
+    test "an empty entries list produces no records and no rejects" do
+      request = %PushProto.PushRequest{
+        streams: [
+          %PushProto.Stream{
+            labels: ~s({service_name="api"}),
+            entries: []
+          }
+        ]
+      }
+
+      assert {[], 0} = Push.decode_proto(request)
+    end
   end
 end
