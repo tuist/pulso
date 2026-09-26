@@ -1,0 +1,19 @@
+[package]
+name = "pulso_ingest"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+name = "pulso_ingest"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+snap = "1.1"
+simdutf8 = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1

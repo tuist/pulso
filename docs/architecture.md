@@ -188,6 +188,7 @@ The rule of thumb: **Elixir owns the write path's control flow; Rust owns anythi
 - Parquet decode and columnar scan at query time.
 - DataFusion query plan execution.
 - `object_store` crate for S3 GET/PUT/CAS.
+- Decompression and wire-format decoding for high-volume ingest protocols (Loki push protobuf today), returning terms whose strings are sub-binaries of the request buffer rather than copies.
 - SIMD-heavy predicate evaluation.
 
 ## What each node holds

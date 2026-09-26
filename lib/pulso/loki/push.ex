@@ -1,12 +1,15 @@
 defmodule Pulso.Loki.Push do
   @moduledoc """
-  Decode a Loki `POST /loki/api/v1/push` JSON body into a flat list of
+  Decode a Loki `POST /loki/api/v1/push` body into a flat list of
   `Pulso.Record.Log`.
 
-  Loki's push wire format is a list of streams. Each stream carries a
-  map of static labels and a list of `[timestamp_ns, line]` value tuples
-  (with an optional third element for structured metadata, added in
-  Loki 3.0):
+  Two wire formats land here: the JSON push, decoded in Elixir by
+  `decode/1`, and the Snappy-compressed protobuf push (Alloy's default),
+  decoded in Rust by `decode_protobuf/2`. Both apply the same mapping
+  into `Pulso.Record.Log`, described below, so a record looks identical
+  whichever path it arrived on.
+
+  ### JSON shape
 
       {
         "streams": [
@@ -19,6 +22,13 @@ defmodule Pulso.Loki.Push do
           }
         ]
       }
+
+  ### Protobuf shape
+
+  Loki's `PushRequest` → `Stream` → `Entry`. Labels arrive as a
+  Prometheus-style `{k="v",...}` string with Go-quoted values;
+  timestamps are `google.protobuf.Timestamp`-shaped (`{seconds, nanos}`);
+  structured metadata is a repeated name/value pair.
 
   ## Mapping to Pulso.Record.Log
 
@@ -40,10 +50,12 @@ defmodule Pulso.Loki.Push do
   `{records, rejected}`, mirroring `Pulso.OTLP.Logs.decode/1`. `rejected`
   counts value tuples the decoder could not interpret (missing timestamp,
   non-string line, malformed shape). A whole-stream drop (e.g. `stream`
-  is not a map) is counted as `length(values)` rejects for that stream
-  — the sender should still know that many records did not land.
+  is not a map, or a protobuf `labels` string is malformed) is counted
+  as one reject per entry in that stream — the sender should still know
+  that many records did not land.
   """
 
+  alias Pulso.Ingest.NIF
   alias Pulso.Record.Log
 
   @doc """
@@ -66,6 +78,33 @@ defmodule Pulso.Loki.Push do
   end
 
   def decode(_), do: {[], 0}
+
+  @doc """
+  Decode a Snappy-compressed (raw block format) protobuf `PushRequest`,
+  the body Grafana Alloy and Promtail send by default.
+
+  Decompression and decoding run in Rust (`Pulso.Ingest.NIF`). The
+  uncompressed size is read from the Snappy header and checked against
+  `max_decompressed_bytes` before any output buffer is allocated.
+
+  Returns `{:ok, records, rejected}` with the same record mapping and
+  reject semantics as `decode/1`, plus one addition: a record whose line
+  or structured metadata is not valid UTF-8 is rejected on its own
+  instead of failing the batch. Wire-level corruption fails the whole
+  request.
+
+  Every string in the returned records is a sub-binary of the
+  decompressed body. Records are expected to be request-scoped; anything
+  that retains them long-term should `:binary.copy/1` the fields it keeps,
+  or it will pin the whole buffer.
+  """
+  @spec decode_protobuf(binary(), pos_integer()) ::
+          {:ok, [Log.t()], non_neg_integer()}
+          | {:error, :invalid_snappy | :invalid_protobuf | :payload_too_large}
+  def decode_protobuf(compressed, max_decompressed_bytes)
+      when is_binary(compressed) and is_integer(max_decompressed_bytes) and max_decompressed_bytes > 0 do
+    NIF.decode_loki_push(compressed, max_decompressed_bytes)
+  end
 
   defp decode_stream(%{"stream" => labels, "values" => values}) when is_map(labels) and is_list(values) do
     {service, severity_text, resource} = split_labels(labels)

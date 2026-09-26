@@ -26,7 +26,7 @@ mix setup
 mix test
 ```
 
-The first build compiles the Rust NIF under [`native/pulso_object_store`](./native/pulso_object_store) and copies the shared object into `priv/native/`. Subsequent builds are incremental.
+The first build compiles the Rust NIFs under [`native/pulso_object_store`](./native/pulso_object_store) and [`native/pulso_ingest`](./native/pulso_ingest) and copies the shared objects into `priv/native/`. Subsequent builds are incremental.
 
 To boot the app locally:
 
@@ -35,7 +35,7 @@ mix phx.server
 ```
 
 - OTLP/HTTP JSON logs land at `POST /v1/logs`. Tenant is picked up from `X-Scope-OrgID` (Loki/Cortex convention), defaulting to `default`.
-- Loki push JSON lands at `POST /loki/api/v1/push` (same tenant convention). Gzip-encoded bodies are decompressed transparently; Snappy-framed protobuf is not yet supported.
+- Loki push lands at `POST /loki/api/v1/push` (same tenant convention), both as JSON (optionally gzip-encoded) and as Snappy-compressed protobuf, the default Grafana Alloy and Promtail send. The protobuf path is decoded in Rust.
 - The MCP endpoint is exposed at `POST /mcp`. It speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`).
 
 ## 🐳 Local S3 (MinIO)
