@@ -274,12 +274,12 @@ defmodule PulsoWeb.LokiControllerTest do
 
   test "POST /loki/api/v1/push refuses a snappy bomb before decompressing",
        %{conn: conn} do
-    # A ~48-byte snappy stream that advertises 128 MiB of output. The
-    # controller must check the length header and refuse before it
-    # allocates the output buffer, or a request can consume far more
-    # memory than the stated cap.
-    huge = 128 * 1024 * 1024
+    # Snappy tops out around 21x on zeros, so 64 MiB compresses to ~3 MiB:
+    # under the compressed-read cap, which means this reaches the length
+    # header check rather than being stopped by the read cap first.
+    huge = 64 * 1024 * 1024
     {:ok, bomb} = :snappyer.compress(:binary.copy(<<0>>, huge))
+    assert byte_size(bomb) < 4 * 1024 * 1024
     assert :snappyer.uncompressed_length(bomb) == {:ok, huge}
 
     conn =
