@@ -1,0 +1,241 @@
+name: Release App
+
+# Releases the Pulso Phoenix app image. On every push to `main`,
+# git-cliff decides whether the accumulated conventional commits earn a
+# version bump. If they do, the workflow builds and pushes the release
+# image to ghcr.io/tuist/pulso and creates a GitHub Release tagged
+# v<version>.
+#
+# The tag this workflow creates is dispatched to the NIF release
+# workflow (release.yml) explicitly, because GitHub does not fire the
+# tag-push trigger on tags created with the default GITHUB_TOKEN. The
+# NIF workflow then attaches its precompiled artifacts to the same
+# GitHub Release (softprops upserts by tag_name).
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  # `gh workflow run` needs actions:write to dispatch release.yml
+  # after the GitHub Release is cut.
+  actions: write
+
+concurrency:
+  # Serialize release publishing through one ref-independent group: it
+  # derives the next version from the v* tag set and creates a tag, so
+  # two runs must never overlap. Queue rather than cancel so an
+  # in-flight publish is never torn.
+  group: pulso-release
+  cancel-in-progress: false
+
+env:
+  MISE_VERSION: "2026.5.15"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check:
+    name: Check for releasable changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      next-version: ${{ steps.check.outputs.next-version }}
+      next-version-number: ${{ steps.check.outputs.next-version-number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4.0.1
+        with:
+          version: ${{ env.MISE_VERSION }}
+          # No `--locked` — this repo does not check in a mise.lock,
+          # so `mise install --locked` fails during tool setup.
+          install_args: "git-cliff"
+          cache: "false"
+          github_token: ${{ env.GITHUB_TOKEN }}
+      - id: check
+        # git-cliff --bumped-version is disabled from hitting GitHub
+        # (no [remote.github] in cliff.toml), so the two env vars below
+        # only need to be cleared as a precaution.
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: |
+          set -euo pipefail
+
+          latest=$(git tag -l | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n1 || true)
+          initial="v0.1.0"
+
+          if [ -n "$latest" ]; then
+            next=$(git cliff --config cliff.toml --bumped-version 2>/dev/null -- "${latest}..HEAD" || true)
+          else
+            next=$(git cliff --config cliff.toml --bumped-version 2>/dev/null || true)
+          fi
+
+          if [ -z "$next" ]; then
+            next="$initial"
+          fi
+
+          should=false
+          if [ -z "$latest" ]; then
+            should=true
+          else
+            greatest=$(printf '%s\n%s\n' "$latest" "$next" | sort -V | tail -n1)
+            if [ "$next" != "$latest" ] && [ "$greatest" = "$next" ]; then
+              should=true
+            else
+              next="$latest"
+            fi
+          fi
+
+          number="${next#v}"
+
+          echo "::group::Check pulso (release? ${should})"
+          printf 'latest tag: %s\nnext:       %s (number: %s)\nrelease?    %s\n' \
+            "${latest:-<none>}" "$next" "$number" "$should"
+          echo "::endgroup::"
+
+          {
+            echo "should-release=${should}"
+            echo "next-version=${next}"
+            echo "next-version-number=${number}"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release Pulso
+    needs: check
+    if: needs.check.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4.0.1
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: "git-cliff"
+          cache: "false"
+          github_token: ${{ env.GITHUB_TOKEN }}
+
+      - name: Get release notes
+        id: release-notes
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: |
+          set -euo pipefail
+          latest=$(git tag -l | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n1 || true)
+
+          {
+            echo "RELEASE_NOTES<<EOF"
+            if [ -n "$latest" ]; then
+              git cliff --config cliff.toml 2>/dev/null -- "${latest}..HEAD" \
+                | sed -n '/<!-- RELEASE NOTES START -->/,$p' | tail -n +2
+            else
+              git cliff --config cliff.toml 2>/dev/null \
+                | sed -n '/<!-- RELEASE NOTES START -->/,$p' | tail -n +2
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump mix.exs version and push to main
+        id: bump
+        # Both Pulso.Codec.NIF and Pulso.ObjectStore.NIF compute their
+        # rustler_precompiled base_url from Mix.Project.config()[:version]
+        # at consumer compile time (see AGENTS.md "Rust NIF distribution").
+        # If mix.exs stays at the initial version, a consumer that pulls
+        # a later Pulso tag would still request NIF artifacts from the
+        # first release's URL and fail. Bump mix.exs to match the next
+        # tag, commit it back to main, and use that commit as the tag
+        # target so the tagged tree has the right version.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ needs.check.outputs.next-version-number }}"
+
+          # Idempotent: skip when mix.exs already matches (manual dispatch,
+          # or the workflow rerun of a release that already landed).
+          current=$(sed -nE 's/^[[:space:]]*version:[[:space:]]*"([^"]+)".*/\1/p' mix.exs | head -n1)
+          if [ "$current" = "$number" ]; then
+            echo "mix.exs already at ${number}; skipping bump commit"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sed -i -E "s/^([[:space:]]*version:[[:space:]]*)\"[^\"]+\"/\1\"${number}\"/" mix.exs
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mix.exs
+          # `chore(release):` is skipped by cliff.toml, so this commit
+          # cannot itself become the driver of the next release bump.
+          # And GITHUB_TOKEN pushes do not re-trigger workflows, so this
+          # push does not fire release-app.yml a second time.
+          git commit -m "chore(release): bump to ${number}"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # linux/amd64 only for now. arm64 works locally on Apple
+          # Silicon via emulation but adds ~15 minutes to CI; opt into
+          # it once we have an arm64 runner or a real deployment need.
+          platforms: linux/amd64
+          build-args: |
+            MIX_ENV=prod
+          tags: |
+            ghcr.io/tuist/pulso:${{ needs.check.outputs.next-version-number }}
+            ghcr.io/tuist/pulso:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/tuist/pulso
+            org.opencontainers.image.revision=${{ steps.bump.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.check.outputs.next-version-number }}
+
+      - name: Create GitHub Release
+        # softprops creates the v* tag if it does not exist, and this
+        # is the tag the NIF release workflow will build against. Point
+        # the tag at the bump commit so the tagged tree has the mix.exs
+        # version that matches the NIF download URL.
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          target_commitish: ${{ steps.bump.outputs.sha }}
+          name: ${{ needs.check.outputs.next-version-number }}
+          tag_name: ${{ needs.check.outputs.next-version }}
+          body: |
+            Docker image: `ghcr.io/tuist/pulso:${{ needs.check.outputs.next-version-number }}`
+
+            ${{ steps.release-notes.outputs.RELEASE_NOTES }}
+
+      - name: Dispatch NIF release workflow
+        # The tag we just created was pushed with the default
+        # GITHUB_TOKEN, which does not fire tag-push workflows. Trigger
+        # release.yml explicitly against the new tag so it publishes
+        # the precompiled NIF artifacts onto the release above.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            --ref "${{ needs.check.outputs.next-version }}" \
+            -f "version=${{ needs.check.outputs.next-version }}"
