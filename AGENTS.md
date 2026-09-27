@@ -18,7 +18,7 @@ Early scaffolding. In place:
 - `Pulso.MCP.Tools` — tool registry, currently one read-only tool (`query_logs`)
 - `PulsoWeb.MCPController` at `POST /mcp` (handles single and batched JSON-RPC)
 - `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
-- `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push JSON ingest (Snappy protobuf not yet supported)
+- `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push ingest, JSON and Snappy-compressed protobuf (decoded in Rust by `Pulso.Codec.NIF`)
 - `PulsoWeb.CompressedBodyReader` — gzip-aware Plug.Parsers body reader, so JSON receivers accept compressed bodies
 
 Not yet built: alerting, ingestion, Mimir/Tempo clients, storage engine, remediation surface, HITL wiring, distribution (Horde/libcluster/ra).
@@ -83,14 +83,15 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 ## Conventions
 
 - **HTTP client**: use `Req`. Never `HTTPoison`, `Tesla`, `:httpc`, or `Finch` directly.
-- **JSON**: use Elixir's built-in `JSON` module (Elixir 1.18+), never `Jason`. Phoenix's `:json_library` is set to `JSON` in `config/config.exs`, and a Credo rule (`Credo.Check.Warning.ForbiddenModule`) fails CI on any direct `Jason.*` reference. Jason may still appear as a transitive dep of `phoenix` or a dev dep, but no code in `lib/`, `config/`, or `test/` may call it.
+- **JSON**: use `Pulso.JSON` (Rust fast path that defers to Elixir's built-in `JSON` for anything it cannot match exactly, so behavior and errors are `JSON`'s), or `JSON` itself where the native code is not loaded yet (`config/runtime.exs`); never `Jason`. Phoenix's `:json_library` is set to `Pulso.JSON` in `config/config.exs`, and a Credo rule (`Credo.Check.Warning.ForbiddenModule`) fails CI on any direct `Jason.*` reference. Jason may still appear as a transitive dep of `phoenix` or a dev dep, but no code in `lib/`, `config/`, or `test/` may call it.
+- **Rust fast paths** must be semantically identical to an Elixir reference implementation: when the Rust side cannot guarantee the same result it returns `:fallback` and the Elixir code runs. Tests compare the two on randomized input and assert the Rust path actually answered.
 - **New backends** go under `Pulso.<Backend>` (e.g. `Pulso.Mimir`, `Pulso.Tempo`), with the same read-only-first shape as `Pulso.Loki`. Every read function must accept a `:base_url` override in opts.
 - **MCP tools** live in `Pulso.MCP.Tools`. Each tool has an `inputSchema`, and its `call/2` clause returns `{:ok, [content_block]}` or `{:error, reason}`. Content blocks follow the MCP shape: `%{"type" => "text", "text" => "..."}`.
 - **Alerting** (when added): each rule is its own supervised process, cluster-wide singleton via Horde. Rules that require exactly-once firing route through `ra`.
 - **Ingestion** (when added): pull-based via Broadway/GenStage. No unbounded process mailboxes.
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
-- **Rust NIF distribution**: the `pulso_object_store` NIF ships via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for the target triples in `lib/pulso/object_store/nif.ex` and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.
-- **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT currently copies once into a `Bytes` via `Bytes::copy_from_slice` — the obvious zero-copy path (`Bytes::from_static` via a lifetime-extended slice) is unsound because reqwest's retry middleware can clone the payload past the NIF call. A proper zero-copy PUT needs `enif_keep_binary`, which Rustler 0.38 does not expose yet.
+- **Rust NIF distribution**: the NIF crates under `native/` (`pulso_object_store`, `pulso_codec`) ship via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for each crate and the target triples in its `lib/pulso/*/nif.ex` module and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.
+- **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT does not copy: the Erlang binary is saved into a process-independent `OwnedEnv` and wrapped with `Bytes::from_owner`, so every clone reqwest's retry layer makes shares an owner that keeps the binary alive (a lifetime-extended slice would be unsound for exactly that reason). S3 clients are cached per config so connections are reused. The codec (`pulso_codec`) writes encoder output straight into an Erlang binary and never copies it at the end. The Loki decoder decompresses once into a `NewBinary` and returns every string as a sub-binary of it, and the JSON and segment decoders return strings over 64 bytes as sub-binaries of their input, so retained decoded data pins its source buffer: `:binary.copy/1` anything kept past the request.
 
 ## Development workflow
 

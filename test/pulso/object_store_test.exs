@@ -35,6 +35,56 @@ defmodule Pulso.ObjectStoreTest do
     assert {:ok, ^payload} = ObjectStore.get(config, key)
   end
 
+  # PUT hands the Erlang binary to the S3 client without copying it; these
+  # cover each binary representation and binaries whose owner goes away.
+  describe "zero-copy put" do
+    test "round-trips heap, off-heap, and sub-binaries", %{config: config, key: key} do
+      large = :crypto.strong_rand_bytes(5 * 1024 * 1024)
+
+      for payload <- [<<>>, "small heap binary", large, binary_part(large, 1_000_001, 700_000)] do
+        assert {:ok, _etag} = ObjectStore.put(config, key, payload)
+        assert {:ok, ^payload} = ObjectStore.get(config, key)
+      end
+    end
+
+    test "survives the caller exiting right after the put", %{config: config, key: key} do
+      parent = self()
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          payload = :crypto.strong_rand_bytes(3 * 1024 * 1024)
+          send(parent, {:hash, :crypto.hash(:sha256, payload)})
+          {:ok, _} = ObjectStore.put(config, key, payload)
+        end)
+
+      assert_receive {:hash, hash}
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 30_000
+      :erlang.garbage_collect()
+      assert {:ok, body} = ObjectStore.get(config, key)
+      assert :crypto.hash(:sha256, body) == hash
+    end
+
+    test "concurrent puts through the shared client", %{config: config} do
+      keys = for i <- 1..16, do: "pulso-object-store-test/concurrent-#{System.unique_integer([:positive])}-#{i}.bin"
+      on_exit(fn -> Enum.each(keys, &ObjectStore.delete(config, &1)) end)
+
+      payloads =
+        keys
+        |> Task.async_stream(
+          fn k ->
+            payload = :crypto.strong_rand_bytes(256 * 1024)
+            {:ok, _} = ObjectStore.put(config, k, payload)
+            {k, payload}
+          end,
+          max_concurrency: 16,
+          timeout: :infinity
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      for {k, payload} <- payloads, do: assert({:ok, ^payload} = ObjectStore.get(config, k))
+    end
+  end
+
   test "list returns keys under a prefix and delete removes them", %{config: config, key: key} do
     prefix = "pulso-object-store-test/list-#{System.unique_integer([:positive])}"
     key_a = "#{prefix}/a.txt"

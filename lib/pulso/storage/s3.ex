@@ -21,9 +21,9 @@ defmodule Pulso.Storage.S3 do
       duplicate. Two calls with the same key and different content
       produce different objects, surfacing a client bug rather than
       silently overwriting.
-    * **Without `idempotency_key`** — the suffix mixes the content hash
-      with random bytes so distinct calls always produce distinct
-      objects. Retries in this mode duplicate — callers who need dedup
+    * **Without `idempotency_key`** — the suffix is random, so distinct
+      calls always produce distinct objects and no content hash is
+      computed. Retries in this mode duplicate — callers who need dedup
       must opt in.
 
   ## Manifest coordination
@@ -38,6 +38,16 @@ defmodule Pulso.Storage.S3 do
 
   Only after both the segment PUT and the manifest CAS succeed does
   `append/3` return `:ok`. That is the load-bearing durability point.
+
+  ## Encoding and decoding
+
+  Segments are encoded and decoded in Rust (`Pulso.Codec.NIF`): encoding
+  applies the same key normalization as `normalize/1` and returns the
+  timestamp bounds in one pass; decoding applies the query's time and
+  service filters before building records. Whenever the Rust path cannot
+  guarantee an identical result it defers, and the Elixir implementation
+  in this module runs instead, so both paths produce the same objects
+  and the same errors.
 
   ## Key format stability
 
@@ -54,6 +64,7 @@ defmodule Pulso.Storage.S3 do
 
   @behaviour Pulso.Storage
 
+  alias Pulso.Codec.NIF
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Storage.S3.Manifest
@@ -82,23 +93,18 @@ defmodule Pulso.Storage.S3 do
   def append(tenant, records, opts) when is_binary(tenant) and is_list(records) do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
-    # Validation and pre-network encoding come first so a bad tenant name
-    # or an unencodable record is rejected before `config!/0` is even
-    # evaluated. That keeps the "reject adversarial tenant names before
-    # touching the object store" property from surviving as an accident
-    # of test setup.
+    # Validation and encoding come first so a bad tenant name or an
+    # unencodable record is rejected before `config!/0` is even evaluated.
+    # That keeps the "reject adversarial tenant names before touching the
+    # object store" property from surviving as an accident of test setup.
+    #
+    # The key's `[min_ts, max_ts]` and fingerprint come from the
+    # caller-supplied records, so a legitimate retry produces the same key
+    # in full and the second PUT overwrites the first as intended.
     with :ok <- validate_tenant(tenant),
-         # The fingerprint, the sort-key prefix, AND the max-ts key segment
-         # are derived from the caller-supplied records BEFORE `normalize/1`
-         # fills any wall-clock timestamps. A legitimate retry produces the
-         # same key in full — every part is stable, so the second PUT
-         # overwrites the first as intended.
-         {:ok, caller_hash} = caller_content_hash(records),
-         {min_ts, max_ts} = caller_ts_bounds(records),
-         {:ok, normalized} <- normalize(records),
-         {:ok, payload} <- encode(normalized) do
+         {:ok, payload, min_ts, max_ts} <- encode_segment(records) do
       config = config!()
-      key = object_key(tenant, min_ts, max_ts, caller_hash, idempotency_key)
+      key = object_key(tenant, min_ts, max_ts, fingerprint(records, idempotency_key), idempotency_key)
 
       with {:ok, _etag} <- ObjectStore.put(config, key, payload) do
         segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
@@ -135,6 +141,40 @@ defmodule Pulso.Storage.S3 do
   end
 
   # -- helpers -----------------------------------------------------------------
+
+  # The content fingerprint only matters when an idempotency key makes the
+  # object key deterministic. Without one the key is random anyway, so
+  # skip hashing the batch (a full deterministic `term_to_binary` of every
+  # record).
+  defp fingerprint(records, idempotency_key) when is_binary(idempotency_key) and byte_size(idempotency_key) > 0 do
+    {:ok, hash} = caller_content_hash(records)
+    hash
+  end
+
+  defp fingerprint(_records, _idempotency_key), do: rand_hex()
+
+  # `impl` exists so tests can compare the Rust encoder against the Elixir
+  # reference implementation, which also runs whenever Rust defers.
+  @doc false
+  @spec encode_segment([Log.t()], :native | :elixir) ::
+          {:ok, binary(), integer(), integer()} | {:error, term()}
+  def encode_segment(records, impl \\ :native)
+
+  def encode_segment(records, :native) do
+    case NIF.encode_log_segment(records, :storage, :lines) do
+      {:ok, payload, min_ts, max_ts, _count} -> {:ok, payload, min_ts, max_ts}
+      :fallback -> encode_segment(records, :elixir)
+    end
+  end
+
+  def encode_segment(records, :elixir) do
+    {min_ts, max_ts} = caller_ts_bounds(records)
+
+    with {:ok, normalized} <- normalize(records),
+         {:ok, payload} <- encode(normalized) do
+      {:ok, payload, min_ts, max_ts}
+    end
+  end
 
   defp validate_tenant(tenant) do
     if Regex.match?(@tenant_regex, tenant) do
@@ -275,7 +315,7 @@ defmodule Pulso.Storage.S3 do
 
     segments
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, %{batches: [], count: 0}}, &visit_segment(&1, &2, ctx))
+    |> Enum.reduce_while({:ok, %{batches: [], count: 0, top: []}}, &visit_segment(&1, &2, ctx))
     |> case do
       {:ok, %{batches: batches}} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
       {:error, _} = err -> err
@@ -296,15 +336,12 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    batch =
-      blob
-      |> decode()
-      |> filter_by_time(ctx.start_ts, ctx.end_ts)
-      |> filter_by_service(ctx.service)
+    batch = decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service)
 
     new_state = %{
       batches: [batch | state.batches],
-      count: state.count + length(batch)
+      count: state.count + length(batch),
+      top: top_timestamps(state.top, batch, ctx.limit)
     }
 
     if can_short_circuit?(new_state, ctx.limit, ctx.segments, index),
@@ -328,20 +365,54 @@ defmodule Pulso.Storage.S3 do
         # Kth-largest timestamp in what we have so far. If it strictly
         # exceeds the next segment's max_ts, no record we have not yet
         # fetched can dominate it.
-        kth = kth_largest_ts(state.batches, limit)
+        kth = Enum.at(state.top, limit - 1)
         kth != nil and kth > next_max
     end
   end
 
   defp can_short_circuit?(_state, _limit, _segments, _index), do: false
 
-  defp kth_largest_ts(batches, k) do
-    batches
-    |> List.flatten()
-    |> Enum.map(& &1.timestamp_ns)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.sort(:desc)
-    |> Enum.at(k - 1)
+  # The `limit` largest non-nil timestamps seen so far, descending. Kept
+  # incrementally so the short-circuit check costs one batch sort and a
+  # bounded merge per segment instead of re-sorting everything fetched.
+  defp top_timestamps(top, _batch, nil), do: top
+
+  defp top_timestamps(top, batch, limit) do
+    batch_ts =
+      for %Log{timestamp_ns: ts} <- batch, ts != nil do
+        ts
+      end
+
+    merge_desc(top, Enum.sort(batch_ts, :desc), limit)
+  end
+
+  defp merge_desc(_a, _b, 0), do: []
+  defp merge_desc([], b, k), do: Enum.take(b, k)
+  defp merge_desc(a, [], k), do: Enum.take(a, k)
+  defp merge_desc([x | xs], [y | _] = b, k) when x >= y, do: [x | merge_desc(xs, b, k - 1)]
+  defp merge_desc(a, [y | ys], k), do: [y | merge_desc(a, ys, k - 1)]
+
+  # The Rust decoder takes integer bounds and a binary service; any other
+  # filter shape uses the Elixir reference implementation, which compares
+  # with Elixir's term semantics and also runs whenever Rust defers.
+  @doc false
+  @spec decode_segment(binary(), term(), term(), term(), :native | :elixir) :: [Log.t()]
+  def decode_segment(blob, start_ts, end_ts, service, impl \\ :native)
+
+  def decode_segment(blob, start_ts, end_ts, service, :native)
+      when (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+             (is_nil(service) or is_binary(service)) do
+    case NIF.decode_log_segment(blob, start_ts, end_ts, service) do
+      {:ok, records} -> records
+      :fallback -> decode_segment(blob, start_ts, end_ts, service, :elixir)
+    end
+  end
+
+  def decode_segment(blob, start_ts, end_ts, service, _impl) do
+    blob
+    |> decode()
+    |> filter_by_time(start_ts, end_ts)
+    |> filter_by_service(service)
   end
 
   defp decode(blob) do
@@ -394,8 +465,9 @@ defmodule Pulso.Storage.S3 do
           "idem-" <> stable_hash(tenant <> "\0" <> key <> "\0" <> caller_hash)
 
         _ ->
-          # No idempotency key: the caller accepts duplicates on retry. A
-          # random suffix guarantees distinct writes even when payload and
+          # No idempotency key: the caller accepts duplicates on retry, and
+          # `caller_hash` is random rather than a content hash. A random
+          # suffix guarantees distinct writes even when payload and
           # timestamp collide.
           "rand-" <> caller_hash <> "-" <> rand_hex()
       end

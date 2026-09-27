@@ -8,6 +8,7 @@ defmodule Pulso.MCP.Tools do
   """
 
   alias Pulso.Auth
+  alias Pulso.Codec.NIF
   alias Pulso.Record.Log
   alias Pulso.Storage
 
@@ -57,7 +58,7 @@ defmodule Pulso.MCP.Tools do
 
     with :ok <- verify(context, tenant),
          {:ok, records} <- Storage.query(tenant, opts) do
-      {:ok, [%{"type" => "text", "text" => JSON.encode!(Enum.map(records, &encode_record/1))}]}
+      {:ok, [%{"type" => "text", "text" => encode_records(records)}]}
     end
   end
 
@@ -84,6 +85,15 @@ defmodule Pulso.MCP.Tools do
 
   defp put_opt(opts, _key, nil), do: opts
   defp put_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  # Rust encodes the record list directly (no intermediate maps); it defers
+  # to the Elixir encoding below whenever it cannot produce the same JSON.
+  defp encode_records(records) do
+    case NIF.encode_log_segment(records, :plain, :array) do
+      {:ok, json, _min_ts, _max_ts, _count} -> json
+      :fallback -> JSON.encode!(Enum.map(records, &encode_record/1))
+    end
+  end
 
   defp encode_record(%Log{} = record) do
     %{

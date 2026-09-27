@@ -47,6 +47,9 @@ defmodule Pulso.MixProject do
       {:req, "~> 0.5"},
       {:rustler, "~> 0.38.0", optional: true},
       {:rustler_precompiled, "~> 0.8"},
+      # Test-only: an independent Snappy compressor for building Loki push
+      # fixtures. Production decoding is in Rust.
+      {:snappyer, "~> 1.2", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:quokka, "~> 2.13", only: [:dev, :test], runtime: false}
     ]
