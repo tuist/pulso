@@ -2,46 +2,56 @@ defmodule Pulso.Loki.PushProto do
   @moduledoc """
   Test-only encoder for Loki `POST /loki/api/v1/push` protobuf fixtures.
 
-  Production decoding lives in Rust (`native/pulso_codec`). Building
-  fixtures with an independent protobuf implementation means the tests
-  check the Rust decoder against a second reading of the schema rather
-  than against itself.
+  Production decoding lives in Rust (`native/pulso_codec`); this is a
+  separate, deliberately simple implementation so the tests check the
+  decoder against a second reading of the schema rather than against
+  itself. It is hand-written rather than generated because protobuf
+  code generators need the `protoc` compiler installed, and the fixtures
+  only ever need to encode these five messages.
 
-  Field numbers and wire types mirror the upstream Loki definition
-  (`pkg/push/push.proto` in grafana/loki); only field tags matter on the
-  wire, so the message names are our own. `Timestamp` is inlined because
-  its encoding is identical to `google.protobuf.Timestamp`.
+  Field numbers mirror the upstream Loki definition (`pkg/push/push.proto`
+  in grafana/loki). Proto3 defaults (empty strings, zero integers, empty
+  repeated fields, absent messages) are omitted, as any encoder would.
   """
 
-  use Protox,
-    schema: """
-    syntax = "proto3";
+  import Bitwise
 
-    message PushRequest {
-      repeated Stream streams = 1;
-    }
+  alias Pulso.Loki.PushProto.Entry
+  alias Pulso.Loki.PushProto.LabelPair
+  alias Pulso.Loki.PushProto.PushRequest
+  alias Pulso.Loki.PushProto.Stream
+  alias Pulso.Loki.PushProto.Timestamp
 
-    message Stream {
-      string labels = 1;
-      repeated Entry entries = 2;
-      string hash = 3;
-    }
+  @doc false
+  def encode(%PushRequest{streams: streams}), do: Enum.map(streams, &message(1, stream(&1)))
 
-    message Entry {
-      Timestamp timestamp = 1;
-      string line = 2;
-      repeated LabelPair structured_metadata = 3;
-    }
+  defp stream(%Stream{labels: labels, entries: entries, hash: hash}) do
+    [bytes(1, labels), Enum.map(entries, &message(2, entry(&1))), bytes(3, hash)]
+  end
 
-    message Timestamp {
-      int64 seconds = 1;
-      int32 nanos = 2;
-    }
+  defp entry(%Entry{timestamp: timestamp, line: line, structured_metadata: metadata}) do
+    [
+      if(timestamp, do: message(1, timestamp(timestamp)), else: []),
+      bytes(2, line),
+      Enum.map(metadata, &message(3, pair(&1)))
+    ]
+  end
 
-    message LabelPair {
-      string name = 1;
-      string value = 2;
-    }
-    """,
-    namespace: Pulso.Loki.PushProto
+  defp timestamp(%Timestamp{seconds: seconds, nanos: nanos}), do: [int(1, seconds), int(2, nanos)]
+
+  defp pair(%LabelPair{name: name, value: value}), do: [bytes(1, name), bytes(2, value)]
+
+  defp bytes(_field, ""), do: []
+  defp bytes(field, value), do: message(field, value)
+
+  defp message(field, iodata), do: [key(field, 2), varint(IO.iodata_length(iodata)), iodata]
+
+  # int64/int32: negatives are sign-extended to 64 bits (ten-byte varints).
+  defp int(_field, 0), do: []
+  defp int(field, value), do: [key(field, 0), varint(value &&& 0xFFFF_FFFF_FFFF_FFFF)]
+
+  defp key(field, wire_type), do: varint(field <<< 3 ||| wire_type)
+
+  defp varint(value) when value < 0x80, do: <<value>>
+  defp varint(value), do: [<<(value &&& 0x7F) ||| 0x80>>, varint(value >>> 7)]
 end
