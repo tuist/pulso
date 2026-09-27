@@ -1,7 +1,7 @@
 name: release
 
 # Cuts precompiled NIF artifacts for every crate under native/
-# (`Pulso.ObjectStore.NIF`, `Pulso.Ingest.NIF`) and attaches them to the
+# (`Pulso.ObjectStore.NIF`, `Pulso.Codec.NIF`) and attaches them to the
 # matching GitHub Release. Once artifacts are up, downstream
 # consumers of Pulso install without a Cargo toolchain: `rustler_precompiled`
 # fetches the .tar.gz for their target from
@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pulso_object_store, pulso_ingest]
+        crate: [pulso_object_store, pulso_codec]
         nif: ["2.16"]
         job:
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, use-cross: false }

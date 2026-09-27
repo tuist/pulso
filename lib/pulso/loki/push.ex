@@ -55,7 +55,7 @@ defmodule Pulso.Loki.Push do
   that many records did not land.
   """
 
-  alias Pulso.Ingest.NIF
+  alias Pulso.Codec.NIF
   alias Pulso.Record.Log
 
   @doc """
@@ -83,7 +83,7 @@ defmodule Pulso.Loki.Push do
   Decode a Snappy-compressed (raw block format) protobuf `PushRequest`,
   the body Grafana Alloy and Promtail send by default.
 
-  Decompression and decoding run in Rust (`Pulso.Ingest.NIF`). The
+  Decompression and decoding run in Rust (`Pulso.Codec.NIF`). The
   uncompressed size is read from the Snappy header and checked against
   `max_decompressed_bytes` before any output buffer is allocated.
 

@@ -66,7 +66,7 @@ defmodule Pulso.Storage.S3.Manifest do
   """
   @spec encode(t()) :: iodata()
   def encode(%__MODULE__{version: version, segments: segments}) do
-    JSON.encode_to_iodata!(%{
+    Pulso.JSON.encode_to_iodata!(%{
       "v" => version,
       "s" => Enum.map(segments, &Segment.to_wire/1)
     })
@@ -96,7 +96,7 @@ defmodule Pulso.Storage.S3.Manifest do
   end
 
   defp safe_decode(binary) do
-    {:ok, JSON.decode!(binary)}
+    {:ok, Pulso.JSON.decode!(binary)}
   rescue
     e -> {:error, {:decode_failed, e}}
   end

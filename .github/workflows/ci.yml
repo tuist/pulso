@@ -36,9 +36,9 @@ jobs:
           # unit tests include a deterministic mutation-fuzzing loop.
           - name: Rust
             command: >-
-              cargo fmt --manifest-path native/pulso_ingest/Cargo.toml -- --check &&
-              cargo clippy --manifest-path native/pulso_ingest/Cargo.toml --all-targets -- -D warnings &&
-              cargo test --release --manifest-path native/pulso_ingest/Cargo.toml
+              cargo fmt --manifest-path native/pulso_codec/Cargo.toml -- --check &&
+              cargo clippy --manifest-path native/pulso_codec/Cargo.toml --all-targets -- -D warnings &&
+              cargo test --release --manifest-path native/pulso_codec/Cargo.toml
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +59,7 @@ jobs:
         with:
           workspaces: |
             native/pulso_object_store -> target
-            native/pulso_ingest -> target
+            native/pulso_codec -> target
           key: ${{ matrix.check.name }}
 
       - name: Cache deps
@@ -116,7 +116,7 @@ jobs:
         with:
           workspaces: |
             native/pulso_object_store -> target
-            native/pulso_ingest -> target
+            native/pulso_codec -> target
           key: integration
 
       - name: Cache deps

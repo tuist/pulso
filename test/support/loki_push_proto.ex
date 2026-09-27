@@ -2,7 +2,7 @@ defmodule Pulso.Loki.PushProto do
   @moduledoc """
   Test-only encoder for Loki `POST /loki/api/v1/push` protobuf fixtures.
 
-  Production decoding lives in Rust (`native/pulso_ingest`). Building
+  Production decoding lives in Rust (`native/pulso_codec`). Building
   fixtures with an independent protobuf implementation means the tests
   check the Rust decoder against a second reading of the schema rather
   than against itself.

@@ -1,11 +1,11 @@
 [package]
-name = "pulso_ingest"
+name = "pulso_codec"
 version = "0.1.0"
 authors = []
 edition = "2021"
 
 [lib]
-name = "pulso_ingest"
+name = "pulso_codec"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 rustler = "0.38"
 snap = "1.1"
 simdutf8 = "0.1"
+memchr = "2"
+itoa = "1"
+ryu = "1"
 
 [profile.release]
 lto = true
