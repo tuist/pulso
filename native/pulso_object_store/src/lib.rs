@@ -17,8 +17,10 @@ use object_store::{
     UpdateVersion,
 };
 use once_cell::sync::Lazy;
-use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult};
-use std::sync::Arc;
+use rustler::env::SavedTerm;
+use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult, OwnedEnv};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
@@ -39,7 +41,7 @@ mod atoms {
     }
 }
 
-#[derive(rustler::NifMap)]
+#[derive(rustler::NifMap, Clone, PartialEq, Eq, Hash)]
 struct StoreConfig {
     bucket: String,
     endpoint: Option<String>,
@@ -69,7 +71,22 @@ fn map_object_store_error(err: ObjectStoreError) -> Error {
     }
 }
 
+// One client per distinct config, reused across calls. Building a store
+// per call created a fresh HTTP connection pool every time, so every PUT
+// and GET paid a new TCP (and TLS) handshake; a cached store keeps
+// connections alive. A config change (e.g. rotated credentials) is a new
+// key and gets its own client.
+static STORES: Lazy<Mutex<HashMap<StoreConfig, Arc<dyn ObjectStore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn build_store(config: &StoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
+    let mut stores = STORES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(store) = stores.get(config) {
+        return Ok(Arc::clone(store));
+    }
+
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(&config.bucket)
         .with_region(&config.region)
@@ -81,24 +98,55 @@ fn build_store(config: &StoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
         builder = builder.with_endpoint(endpoint);
     }
 
-    builder
+    let store = builder
         .build()
         .map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
-        .map_err(nif_error)
+        .map_err(nif_error)?;
+    stores.insert(config.clone(), Arc::clone(&store));
+    Ok(store)
 }
 
-// Copy the Erlang binary into a `Bytes` payload for the object store crate.
-// One memcpy from the Erlang binary heap into a `Bytes` we hand off to
-// `object_store`. The obvious zero-copy alternative (extend the Rustler
-// slice's lifetime to `'static` and use `Bytes::from_static`) is unsound
-// in general: reqwest's retry middleware can clone the body, and there is
-// no API guarantee that every hyper-side reference is dropped before
-// `store.put(...).await` returns. Any clone that outlives the NIF call
-// becomes a use-after-free against Erlang's binary heap. Removing this
-// copy properly needs `enif_keep_binary`, which Rustler 0.38 does not
-// expose — track upstream and revisit.
+// Hand the Erlang binary to `object_store` without copying it. The
+// binary is saved into a process-independent environment, which holds a
+// reference to it (a refcount, not a copy, for off-heap binaries), and
+// the resulting `Bytes` owns that environment. reqwest may clone the body
+// for retries and keep clones past the NIF call; every clone shares the
+// owner, so the Erlang binary stays alive until the last one is dropped.
+// That is what makes this sound where a lifetime-extended slice was not.
+struct ErlangBinary {
+    _saved: SavedTerm,
+    _env: OwnedEnv,
+    ptr: *const u8,
+    len: usize,
+}
+
+// The bytes are immutable and kept alive by `_env`, which is itself
+// `Send`; freeing a process-independent environment is allowed from any
+// thread.
+unsafe impl Send for ErlangBinary {}
+
+impl AsRef<[u8]> for ErlangBinary {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr`/`len` describe the binary saved in `_env`, which
+        // lives as long as `self` and never mutates or moves the data.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 fn payload_from_binary(data: Binary) -> PutPayload {
-    Bytes::copy_from_slice(data.as_slice()).into()
+    let env = OwnedEnv::new();
+    let saved = env.save(data);
+    let (ptr, len) = env.run(|e| {
+        let b: Binary = saved.load(e).decode().expect("saved term is a binary");
+        (b.as_slice().as_ptr(), b.len())
+    });
+    Bytes::from_owner(ErlangBinary {
+        _saved: saved,
+        _env: env,
+        ptr,
+        len,
+    })
+    .into()
 }
 
 // The `object_store` crate returns `PutResult { e_tag, version }`. S3
@@ -127,11 +175,7 @@ fn put(config: StoreConfig, key: String, data: Binary) -> NifResult<(Atom, Strin
 // written — races between two nodes trying to create the same manifest
 // resolve deterministically: exactly one wins, the loser reloads.
 #[rustler::nif(schedule = "DirtyIo")]
-fn put_if_none_match(
-    config: StoreConfig,
-    key: String,
-    data: Binary,
-) -> NifResult<(Atom, String)> {
+fn put_if_none_match(config: StoreConfig, key: String, data: Binary) -> NifResult<(Atom, String)> {
     let store = build_store(&config)?;
     let path = Path::from(key);
     let payload = payload_from_binary(data);
