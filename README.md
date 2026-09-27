@@ -26,7 +26,7 @@ mix setup
 mix test
 ```
 
-The first build compiles the Rust NIFs under [`native/pulso_object_store`](./native/pulso_object_store) and [`native/pulso_ingest`](./native/pulso_ingest) and copies the shared objects into `priv/native/`. Subsequent builds are incremental.
+The first build compiles the Rust NIFs under [`native/pulso_object_store`](./native/pulso_object_store) and [`native/pulso_codec`](./native/pulso_codec) and copies the shared objects into `priv/native/`. Subsequent builds are incremental.
 
 To boot the app locally:
 
