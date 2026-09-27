@@ -17,12 +17,13 @@
 ARG ELIXIR_VERSION=1.20.4
 ARG OTP_VERSION=29.1
 ARG DEBIAN_VERSION=trixie-20260918-slim
-# Kept in step with the transitive crate floor in the two Cargo.lock
-# files under native/. Some pulled-in crates (icu_collections and
-# friends via aws-sdk-s3) require Rust 1.88+; bump this when a fresh
-# Cargo.lock raises that floor. ci.yml uses dtolnay/rust-toolchain@stable
-# so the same "current stable" surface is exercised on PRs.
-ARG RUST_VERSION=1.90
+# Tracks the crate floor in the two Cargo.lock files under native/.
+# rustler 0.38 and its transitive deps have been pushing the required
+# rustc up regularly (1.88 for icu_collections, 1.91 for rustler
+# itself), and pinning to a specific minor keeps breaking. ci.yml uses
+# `dtolnay/rust-toolchain@stable`, so `stable` here builds against the
+# same rustc PRs are already exercising.
+ARG RUST_VERSION=stable
 
 ARG BUILDER_IMAGE="docker.io/hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_VERSION}"
 ARG RUNNER_IMAGE="docker.io/debian:${DEBIAN_VERSION}"
