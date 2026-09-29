@@ -21,6 +21,7 @@ mod labels;
 mod loki;
 mod out;
 mod segment;
+mod segment_parquet;
 mod term_json;
 mod wire;
 
@@ -309,6 +310,57 @@ fn decode_log_segment<'a>(
         service: service_bin.as_ref().map(|b| b.as_slice()),
     };
     match segment::decode(env, &blob, &filter) {
+        Ok(records) => (atoms::ok(), records).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// Encode `[%Pulso.Record.Log{}]` as an Apache Parquet segment for the
+/// S3 storage adapter. Returns `{:ok, binary, min_ts, max_ts, count}` on
+/// success or `:fallback` on any Rust-side failure — the Elixir side
+/// treats `:fallback` here as a hard error rather than falling back to
+/// pure Elixir, since there is no Elixir Parquet encoder.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_log_segment_parquet<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
+    match segment_parquet::encode(env, records) {
+        Ok((buf, b)) => (
+            atoms::ok(),
+            copy(env, &buf),
+            integer(env, b.min_ts),
+            integer(env, b.max_ts),
+            b.count,
+        )
+            .encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// Decode a Parquet segment into `[%Pulso.Record.Log{}]`, keeping only
+/// records inside `[start_ts, end_ts]` (either may be nil) and with the
+/// given service (nil for any). Row-group `timestamp_ns` stats prune
+/// whole row groups before any column pages are read. Returns
+/// `{:ok, records}` or `:fallback`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_log_segment_parquet<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    service: Term<'a>,
+) -> Term<'a> {
+    let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
+        return atoms::fallback().encode(env);
+    };
+    let service_bin: Option<Binary> = service.decode().ok();
+    if service_bin.is_none() && service.decode::<rustler::Atom>().ok() != Some(atoms::nil()) {
+        return atoms::fallback().encode(env);
+    }
+    let filter = segment_parquet::Filter {
+        start,
+        end,
+        service: service_bin.as_ref().map(|b| b.as_slice()),
+    };
+    match segment_parquet::decode(env, &blob, &filter) {
         Ok(records) => (atoms::ok(), records).encode(env),
         Err(_) => atoms::fallback().encode(env),
     }

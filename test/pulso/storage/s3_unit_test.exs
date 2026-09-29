@@ -93,14 +93,14 @@ defmodule Pulso.Storage.S3UnitTest do
       refute String.starts_with?(k2, "tenants/alpha/")
     end
 
-    test "the key path carries the v2 schema version segment" do
-      # v2 is the current write format. A future format change bumps to
-      # v3/ so old objects can be migrated at their own pace rather than
-      # orphaned. Guarding this at the key level catches an accidental
-      # removal of the versioning.
+    test "the key path carries the v3 schema version segment" do
+      # v3 is the current write format (Apache Parquet). A future format
+      # change bumps to v4/ so old objects can be migrated at their own
+      # pace rather than orphaned. Guarding this at the key level
+      # catches an accidental removal of the versioning.
       assert String.starts_with?(
                S3.object_key("acme", 100, 200, "p", "req-1"),
-               "tenants/acme/v2/logs/"
+               "tenants/acme/v3/logs/"
              )
     end
 
@@ -111,7 +111,7 @@ defmodule Pulso.Storage.S3UnitTest do
     end
 
     test "the key path includes both min_ts and max_ts so query can prune at LIST time" do
-      # The min_ts and max_ts segments are the whole point of the v2
+      # The min_ts and max_ts segments are the whole point of the v3
       # layout — they let `query/2` skip GETs on segments outside the
       # requested time range. Guard the shape so a refactor cannot
       # silently regress the query short-circuit.

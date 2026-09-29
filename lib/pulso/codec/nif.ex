@@ -29,4 +29,7 @@ defmodule Pulso.Codec.NIF do
   def json_encode_dirty(_term), do: :erlang.nif_error(:nif_not_loaded)
   def encode_log_segment(_records, _mode, _framing), do: :erlang.nif_error(:nif_not_loaded)
   def decode_log_segment(_blob, _start_ts, _end_ts, _service), do: :erlang.nif_error(:nif_not_loaded)
+  def encode_log_segment_parquet(_records), do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_log_segment_parquet(_blob, _start_ts, _end_ts, _service), do: :erlang.nif_error(:nif_not_loaded)
 end

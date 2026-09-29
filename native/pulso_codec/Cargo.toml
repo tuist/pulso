@@ -16,6 +16,9 @@ simdutf8 = "0.1"
 memchr = "2"
 itoa = "1"
 ryu = "1"
+arrow = { version = "54", default-features = false }
+parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+bytes = "1"
 
 [profile.release]
 lto = true
