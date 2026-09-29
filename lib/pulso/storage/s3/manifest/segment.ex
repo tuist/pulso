@@ -24,7 +24,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   @doc """
   Build a segment record for a segment the ingester just wrote.
 
-  `tail` is the object key with the leading `tenants/<tenant>/v2/<signal>/`
+  `tail` is the object key with the leading `tenants/<tenant>/v3/<signal>/`
   stripped. The struct holds the full key so the query path never has to
   re-glue the prefix.
   """

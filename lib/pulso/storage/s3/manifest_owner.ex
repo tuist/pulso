@@ -522,12 +522,12 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # First-write migration: no manifest exists yet, so LIST the v2 prefix
+  # First-write migration: no manifest exists yet, so LIST the v3 prefix
   # and reconstitute one from the segments that are already in S3. Then
   # PUT it with `put_if_none_match`. If another node beats us to the
   # create, we lose gracefully and reload their version.
   defp rebuild_from_prefix(state) do
-    prefix = "tenants/#{state.tenant}/v2/#{state.signal}/"
+    prefix = "tenants/#{state.tenant}/v3/#{state.signal}/"
 
     with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
       publish_rebuilt_manifest(state, keys)

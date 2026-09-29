@@ -110,7 +110,9 @@ pub fn encode<'a>(env: Env<'a>, records: Term<'a>) -> Enc<(Vec<u8>, Bounds)> {
     let mut scratch: Vec<u8> = Vec::with_capacity(256);
 
     for record in items {
-        let tag = record.map_get(struct_key).map_err(|_| EncodeError::Fallback)?;
+        let tag = record
+            .map_get(struct_key)
+            .map_err(|_| EncodeError::Fallback)?;
         if tag.as_c_arg() != log.as_c_arg() {
             return Err(EncodeError::Fallback);
         }
