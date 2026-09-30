@@ -522,12 +522,12 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # First-write migration: no manifest exists yet, so LIST the v2 prefix
+  # First-write migration: no manifest exists yet, so LIST the v3 prefix
   # and reconstitute one from the segments that are already in S3. Then
   # PUT it with `put_if_none_match`. If another node beats us to the
   # create, we lose gracefully and reload their version.
   defp rebuild_from_prefix(state) do
-    prefix = "tenants/#{state.tenant}/v2/#{state.signal}/"
+    prefix = "tenants/#{state.tenant}/v3/#{state.signal}/"
 
     with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
       publish_rebuilt_manifest(state, keys)
@@ -546,7 +546,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # Only keys that parse cleanly to `<min_ts>-<max_ts>-…ndjson` get into
+  # Only keys that parse cleanly to `<min_ts>-<max_ts>-….parquet` get into
   # the rebuilt manifest. Everything else — the manifest itself, future
   # sidecar files (`.bloom`, `.postings`, `.stats`), stray uploads —
   # resolves to `:skip`. Codex flagged the earlier "keep with nil bounds"
@@ -570,7 +570,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   # A rebuild-derived segment gets its bounds from the key format
-  # (`<min_ts>-<max_ts>-<suffix>.ndjson`). Anything the writer would
+  # (`<min_ts>-<max_ts>-<suffix>.parquet`). Anything the writer would
   # never produce — the manifest itself, sidecar indexes, a stray
   # upload — resolves to `:skip` and stays out of the manifest. Nothing
   # else has integer bounds, and the manifest requires them.
@@ -578,7 +578,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   @spec segment_from_key(String.t()) :: {:ok, Segment.t()} | :skip
   defp segment_from_key(key) do
-    with true <- String.ends_with?(key, ".ndjson"),
+    with true <- String.ends_with?(key, ".parquet"),
          [_, rest] <- String.split(key, "/logs/", parts: 2) do
       parse_bounds(key, rest)
     else

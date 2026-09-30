@@ -9,16 +9,16 @@ defmodule Pulso.Storage.S3.ManifestTest do
   end
 
   test "manifest_key/2 encodes tenant and signal into the S3 path" do
-    assert Manifest.manifest_key("acme", "logs") == "tenants/acme/v2/logs/manifest.json"
-    assert Manifest.manifest_key("acme") == "tenants/acme/v2/logs/manifest.json"
+    assert Manifest.manifest_key("acme", "logs") == "tenants/acme/v3/logs/manifest.json"
+    assert Manifest.manifest_key("acme") == "tenants/acme/v3/logs/manifest.json"
   end
 
   test "encode/decode round-trips with all fields" do
     manifest = %Manifest{
       version: 1,
       segments: [
-        seg("tenants/t/v2/logs/00-10-a.ndjson", 5, 10, 4),
-        seg("tenants/t/v2/logs/11-20-b.ndjson", 11, 20, 8)
+        seg("tenants/t/v3/logs/00-10-a.parquet", 5, 10, 4),
+        seg("tenants/t/v3/logs/11-20-b.parquet", 11, 20, 8)
       ]
     }
 

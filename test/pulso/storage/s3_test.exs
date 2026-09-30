@@ -37,9 +37,9 @@ defmodule Pulso.Storage.S3Test do
     tenant = "test-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # The adapter writes objects under `tenants/<tenant>/v2/logs/`; clean up
+      # The adapter writes objects under `tenants/<tenant>/v3/logs/`; clean up
       # both the segment objects and the manifest so a re-run starts empty.
-      case ObjectStore.list(config, "tenants/#{tenant}/v2/logs/") do
+      case ObjectStore.list(config, "tenants/#{tenant}/v3/logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
@@ -59,11 +59,11 @@ defmodule Pulso.Storage.S3Test do
     }
   end
 
-  # The tenant's v2 prefix now also holds the per-tenant `manifest.json`.
+  # The tenant's v3 prefix now also holds the per-tenant `manifest.json`.
   # These helpers narrow object listings to segment files only, so counts
   # remain a proxy for how many *segments* the adapter wrote.
   defp list_segments(config, tenant) do
-    with {:ok, keys} <- ObjectStore.list(config, "tenants/#{tenant}/v2/logs/") do
+    with {:ok, keys} <- ObjectStore.list(config, "tenants/#{tenant}/v3/logs/") do
       {:ok, Enum.reject(keys, &String.ends_with?(&1, "/manifest.json"))}
     end
   end
@@ -85,7 +85,7 @@ defmodule Pulso.Storage.S3Test do
     other = "test-other-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      case ObjectStore.list(config, "tenants/#{other}/v2/logs/") do
+      case ObjectStore.list(config, "tenants/#{other}/v3/logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
@@ -133,7 +133,7 @@ defmodule Pulso.Storage.S3Test do
              S3.query(tenant, [])
   end
 
-  test "preserves NDJSON-hostile bodies through the round trip", %{tenant: tenant} do
+  test "preserves control-character bodies through the round trip", %{tenant: tenant} do
     tricky = "line1\nline2\t\"quoted\"\r\nline3"
     assert :ok = S3.append(tenant, [record(1, body: tricky)])
     assert {:ok, [%Log{body: ^tricky}]} = S3.query(tenant, [])
@@ -273,20 +273,20 @@ defmodule Pulso.Storage.S3Test do
 
     test "rebuild skips non-segment objects (sidecars, junk under the prefix)",
          %{tenant: tenant, config: config} do
-      # Codex F2: rebuild used to include every object under the v2
+      # Codex F2: rebuild used to include every object under the v3
       # prefix, so a sidecar file (or a stray upload) would land in the
       # manifest with nil bounds — and then the next load of that
-      # manifest would fail decode. This asserts that non-`.ndjson`
+      # manifest would fail decode. This asserts that non-`.parquet`
       # objects are skipped at rebuild time.
       assert :ok = S3.append(tenant, [record(1)])
 
       # Stash a sidecar-shaped object next to the segment.
-      sidecar_key = "tenants/#{tenant}/v2/logs/00000000000000000005-junk.bloom"
+      sidecar_key = "tenants/#{tenant}/v3/logs/00000000000000000005-junk.bloom"
       assert {:ok, _etag} = ObjectStore.put(config, sidecar_key, "not a segment")
 
-      # And an ndjson file with a key that doesn't carry the bounds
-      # format — a hypothetical hand-written import.
-      malformed_key = "tenants/#{tenant}/v2/logs/hand-written.ndjson"
+      # And a Parquet-suffixed file with a key that doesn't carry the
+      # bounds format — a hypothetical hand-written import.
+      malformed_key = "tenants/#{tenant}/v3/logs/hand-written.parquet"
       assert {:ok, _etag} = ObjectStore.put(config, malformed_key, "still not a segment")
 
       # Force a cold-start rebuild.
@@ -326,13 +326,10 @@ defmodule Pulso.Storage.S3Test do
       # patching the manifest to include it, then CAS-updating the
       # manifest with the current etag.
       remote_key =
-        "tenants/#{tenant}/v2/logs/00000000000000000042-00000000000000000042-rand-abcdef0123456789-deadbeefdeadbeef.ndjson"
+        "tenants/#{tenant}/v3/logs/00000000000000000042-00000000000000000042-rand-abcdef0123456789-deadbeefdeadbeef.parquet"
 
-      remote_body =
-        %Log{timestamp_ns: 42, service: "remote", body: "from-node-b"}
-        |> Map.from_struct()
-        |> JSON.encode!()
-        |> Kernel.<>("\n")
+      {:ok, remote_body, 42, 42} =
+        S3.encode_segment([%Log{timestamp_ns: 42, service: "remote", body: "from-node-b"}])
 
       assert {:ok, _etag} = ObjectStore.put(short_config, remote_key, remote_body)
 

@@ -2,8 +2,8 @@ defmodule Pulso.Storage.S3 do
   @moduledoc """
   S3-backed log storage.
 
-  Each `append/3` writes one NDJSON object under a tenant-scoped,
-  versioned prefix: `tenants/<tenant>/v2/logs/<min_ts>-<max_ts>-<suffix>.ndjson`.
+  Each `append/3` writes one Parquet object under a tenant-scoped,
+  versioned prefix: `tenants/<tenant>/v3/logs/<min_ts>-<max_ts>-<suffix>.parquet`.
   Tenant isolation is enforced by key construction — tenant names are
   validated against a conservative charset, so a batch cannot land
   outside its own prefix. The `<min_ts>` and `<max_ts>` segments are
@@ -41,24 +41,31 @@ defmodule Pulso.Storage.S3 do
 
   ## Encoding and decoding
 
-  Segments are encoded and decoded in Rust (`Pulso.Codec.NIF`): encoding
-  applies the same key normalization as `normalize/1` and returns the
-  timestamp bounds in one pass; decoding applies the query's time and
-  service filters before building records. Whenever the Rust path cannot
-  guarantee an identical result it defers, and the Elixir implementation
-  in this module runs instead, so both paths produce the same objects
-  and the same errors.
+  Segments are Apache Parquet files, encoded and decoded in Rust
+  (`Pulso.Codec.NIF.encode_log_segment_parquet` / `decode_log_segment_parquet`).
+  Rows are sorted by `(service, timestamp_ns)` on write, so dictionary
+  encoding on `service` and delta encoding on `timestamp_ns` compress
+  tightly, and the row-group `timestamp_ns` min/max stats let a query
+  skip whole segments outside its time range without reading a single
+  column page. `attributes` and `resource` are stored as JSON strings
+  in dedicated Utf8 columns — real nested column projection lands with
+  sidecar indexes.
+
+  Every input map is first stringified through `sanitize_map/1` so a
+  caller passing atom or integer attribute keys sees the same result the
+  NDJSON path produced. There is no Elixir Parquet reference; when the
+  NIF returns `:fallback` the call errors out rather than falling back.
 
   ## Key format stability
 
-  Every object lives under a versioned prefix (`tenants/<tenant>/v2/…`).
+  Every object lives under a versioned prefix (`tenants/<tenant>/v3/…`).
   Within one schema version, the exact suffix format is deliberately
   not a public API. The idempotency suffix is derived from
   `:erlang.term_to_binary(_, [:deterministic])`, which is stable within
   an OTP release but is not guaranteed across a major OTP upgrade. Any
   change to the fingerprint, the delimiter, the sort-key width, or the
   number of bounds segments bumps the schema version — new writes go
-  to `v3/`, old objects stay at `v2/`, and a compaction job migrates
+  to `v4/`, old objects stay at `v3/`, and a compaction job migrates
   at its own pace.
   """
 
@@ -153,26 +160,17 @@ defmodule Pulso.Storage.S3 do
 
   defp fingerprint(_records, _idempotency_key), do: rand_hex()
 
-  # `impl` exists so tests can compare the Rust encoder against the Elixir
-  # reference implementation, which also runs whenever Rust defers.
   @doc false
-  @spec encode_segment([Log.t()], :native | :elixir) ::
-          {:ok, binary(), integer(), integer()} | {:error, term()}
-  def encode_segment(records, impl \\ :native)
+  @spec encode_segment([Log.t()]) :: {:ok, binary(), integer(), integer()} | {:error, term()}
+  def encode_segment(records) do
+    with {:ok, normalized} <- normalize(records) do
+      case NIF.encode_log_segment_parquet(normalized) do
+        {:ok, payload, min_ts, max_ts, _count} ->
+          {:ok, payload, min_ts, max_ts}
 
-  def encode_segment(records, :native) do
-    case NIF.encode_log_segment(records, :storage, :lines) do
-      {:ok, payload, min_ts, max_ts, _count} -> {:ok, payload, min_ts, max_ts}
-      :fallback -> encode_segment(records, :elixir)
-    end
-  end
-
-  def encode_segment(records, :elixir) do
-    {min_ts, max_ts} = caller_ts_bounds(records)
-
-    with {:ok, normalized} <- normalize(records),
-         {:ok, payload} <- encode(normalized) do
-      {:ok, payload, min_ts, max_ts}
+        :fallback ->
+          {:error, {:encode_failed, :parquet_encoder_rejected_input}}
+      end
     end
   end
 
@@ -260,38 +258,6 @@ defmodule Pulso.Storage.S3 do
   defp stringify_key(k) when is_integer(k), do: Integer.to_string(k)
   defp stringify_key(k), do: inspect(k)
 
-  # Caller-supplied `[min_ts, max_ts]` for the object key. Runs on records
-  # BEFORE normalization so a retry with identical caller input produces
-  # the same bounds. A record with `nil` timestamp contributes 0, which
-  # parks the segment at the head of the tenant listing and makes it
-  # always visible to a query with no time bounds — good enough for the
-  # fallback case and, importantly, deterministic across retries.
-  defp caller_ts_bounds(records) do
-    tss = Enum.map(records, fn %Log{timestamp_ns: ts} -> ts || 0 end)
-    {Enum.min(tss), Enum.max(tss)}
-  end
-
-  defp encode(records) do
-    encoded =
-      Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
-        # `JSON.encode_to_iodata!/1` skips the per-record binary allocation
-        # that `JSON.encode!/1` would produce; we keep the intermediate as
-        # iodata and only collapse to a single binary at the very end
-        # (right before the NIF boundary), which is the one copy we
-        # cannot avoid anyway.
-        try do
-          line = JSON.encode_to_iodata!(Map.from_struct(record))
-          {:cont, {:ok, [[line, "\n"] | acc]}}
-        rescue
-          e -> {:halt, {:error, {:encode_failed, e}}}
-        end
-      end)
-
-    with {:ok, lines} <- encoded do
-      {:ok, lines |> Enum.reverse() |> IO.iodata_to_binary()}
-    end
-  end
-
   # Scan segments newest-first, decode each, keep only records inside the
   # requested filter, and short-circuit once we know the running accumulator
   # already dominates every remaining segment. The safety condition:
@@ -336,17 +302,21 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    batch = decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service)
+    case decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service) do
+      {:ok, batch} ->
+        new_state = %{
+          batches: [batch | state.batches],
+          count: state.count + length(batch),
+          top: top_timestamps(state.top, batch, ctx.limit)
+        }
 
-    new_state = %{
-      batches: [batch | state.batches],
-      count: state.count + length(batch),
-      top: top_timestamps(state.top, batch, ctx.limit)
-    }
+        if can_short_circuit?(new_state, ctx.limit, ctx.segments, index),
+          do: {:halt, {:ok, new_state}},
+          else: {:cont, {:ok, new_state}}
 
-    if can_short_circuit?(new_state, ctx.limit, ctx.segments, index),
-      do: {:halt, {:ok, new_state}},
-      else: {:cont, {:ok, new_state}}
+      {:error, _} = err ->
+        {:halt, err}
+    end
   end
 
   defp can_short_circuit?(_state, nil, _segments, _index), do: false
@@ -392,56 +362,22 @@ defmodule Pulso.Storage.S3 do
   defp merge_desc([x | xs], [y | _] = b, k) when x >= y, do: [x | merge_desc(xs, b, k - 1)]
   defp merge_desc(a, [y | ys], k), do: [y | merge_desc(a, ys, k - 1)]
 
-  # The Rust decoder takes integer bounds and a binary service; any other
-  # filter shape uses the Elixir reference implementation, which compares
-  # with Elixir's term semantics and also runs whenever Rust defers.
   @doc false
-  @spec decode_segment(binary(), term(), term(), term(), :native | :elixir) :: [Log.t()]
-  def decode_segment(blob, start_ts, end_ts, service, impl \\ :native)
-
-  def decode_segment(blob, start_ts, end_ts, service, :native)
-      when (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+  @spec decode_segment(binary(), term(), term(), term()) ::
+          {:ok, [Log.t()]} | {:error, term()}
+  def decode_segment(blob, start_ts, end_ts, service)
+      when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
              (is_nil(service) or is_binary(service)) do
-    case NIF.decode_log_segment(blob, start_ts, end_ts, service) do
-      {:ok, records} -> records
-      :fallback -> decode_segment(blob, start_ts, end_ts, service, :elixir)
+    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service) do
+      {:ok, records} -> {:ok, records}
+      :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
-  end
-
-  def decode_segment(blob, start_ts, end_ts, service, _impl) do
-    blob
-    |> decode()
-    |> filter_by_time(start_ts, end_ts)
-    |> filter_by_service(service)
-  end
-
-  defp decode(blob) do
-    blob
-    |> String.split("\n", trim: true)
-    |> Enum.map(&decode_line/1)
-  end
-
-  defp decode_line(line) do
-    map = JSON.decode!(line)
-
-    %Log{
-      timestamp_ns: Map.fetch!(map, "timestamp_ns"),
-      observed_timestamp_ns: map["observed_timestamp_ns"],
-      severity_number: map["severity_number"],
-      severity_text: map["severity_text"],
-      service: map["service"],
-      body: map["body"],
-      trace_id: map["trace_id"],
-      span_id: map["span_id"],
-      attributes: map["attributes"] || %{},
-      resource: map["resource"] || %{}
-    }
   end
 
   # Schema version segment. Baked into every object key so a future change
   # to the key format can coexist with older objects rather than orphan
   # them.
-  @schema_version "v2"
+  @schema_version "v3"
 
   defp prefix(tenant), do: "tenants/#{tenant}/#{@schema_version}/logs/"
 
@@ -472,7 +408,7 @@ defmodule Pulso.Storage.S3 do
           "rand-" <> caller_hash <> "-" <> rand_hex()
       end
 
-    "#{prefix(tenant)}#{zero_pad(min_ts)}-#{zero_pad(max_ts)}-#{suffix}.ndjson"
+    "#{prefix(tenant)}#{zero_pad(min_ts)}-#{zero_pad(max_ts)}-#{suffix}.parquet"
   end
 
   # Fingerprint of the raw caller records. Two properties hold:
@@ -540,23 +476,6 @@ defmodule Pulso.Storage.S3 do
   defp rand_hex do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
-
-  defp filter_by_time(records, nil, nil), do: records
-
-  defp filter_by_time(records, start_ts, end_ts) do
-    Enum.filter(records, fn %Log{timestamp_ns: ts} ->
-      # A record with a nil timestamp has no place inside a time-bounded
-      # range. Elixir's term ordering puts atoms greater than numbers, so
-      # `nil >= 5` is true — without the `is_integer` guard, nil-ts
-      # records would leak through every time filter.
-      is_integer(ts) and
-        (start_ts == nil or ts >= start_ts) and
-        (end_ts == nil or ts <= end_ts)
-    end)
-  end
-
-  defp filter_by_service(records, nil), do: records
-  defp filter_by_service(records, service), do: Enum.filter(records, &(&1.service == service))
 
   defp take_limit(records, nil), do: records
   defp take_limit(records, limit) when is_integer(limit) and limit > 0, do: Enum.take(records, limit)

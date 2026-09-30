@@ -183,13 +183,13 @@ The rule of thumb: **Elixir owns the write path's control flow; Rust owns anythi
 
 ### Rust (via Rustler NIF)
 
-- Arrow → Parquet encode at flush time.
+- Arrow → Parquet log segment encode at flush time (arrow-rs and parquet-rs), with rows sorted by `(service, timestamp_ns)`, dictionary encoding on `service`/`severity_text`/`severity_number`, delta-binary-packed on `timestamp_ns`/`observed_timestamp_ns`, and zstd column compression.
 - Sidecar index computation (bloom filters, posting lists, stats).
-- Parquet decode and columnar scan at query time.
+- Parquet decode and columnar scan at query time: row-group `timestamp_ns` min/max stats prune whole row groups before any column page is read, then per-row time and service filters run in Rust and only surviving rows materialise as Erlang terms. One Erlang binary per string column per batch (the "arena") backs zero-copy sub-binary strings — a batch of N rows costs 7 fresh binaries per column, not 7 × N.
 - DataFusion query plan execution.
 - `object_store` crate for S3 GET/PUT/CAS.
 - Decompression and wire-format decoding for high-volume ingest protocols (Loki push protobuf today), returning terms whose strings are sub-binaries of the request buffer rather than copies.
-- JSON encode/decode for HTTP bodies and responses, and the interim NDJSON log segment encode/decode (with query filters applied before records are built), each deferring to an Elixir reference implementation whenever it cannot guarantee an identical result.
+- JSON encode/decode for HTTP bodies and responses. The `body`, `attributes`, and `resource` log fields are stored as JSON-encoded strings inside the Parquet segment's Utf8 columns and JSON-decoded on read; the shared `Pulso.JSON` fast path defers to Elixir's `JSON` on any case it cannot guarantee to encode identically.
 - SIMD-heavy predicate evaluation.
 
 ## What each node holds

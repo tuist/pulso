@@ -20,7 +20,7 @@ defmodule Pulso.Storage.S3.Manifest do
       Pre-sorting on load means each query pays O(n) filter, not
       O(n log n) sort.
     * A segment's `key` on the wire is the tail after the tenant/signal
-      prefix (e.g. `00000...20-00000...30-idem-<hash>.ndjson`), never
+      prefix (e.g. `00000...20-00000...30-idem-<hash>.parquet`), never
       the full path. Two reasons: it halves manifest bytes, and it makes
       it impossible for a hand-crafted manifest to reference an object
       outside its own tenant prefix.
@@ -50,7 +50,7 @@ defmodule Pulso.Storage.S3.Manifest do
   @doc "Path of the manifest object for one `(tenant, signal)`."
   @spec manifest_key(String.t(), String.t()) :: String.t()
   def manifest_key(tenant, signal \\ "logs") when is_binary(tenant) and is_binary(signal) do
-    "tenants/#{tenant}/v2/#{signal}/manifest.json"
+    "tenants/#{tenant}/v3/#{signal}/manifest.json"
   end
 
   @doc "An empty manifest — the shape a first-time `put_if_none_match` uploads."

@@ -3,7 +3,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   One row inside a manifest — the identity and summary metadata of a
   segment that has been PUT to S3.
 
-  `key` is the FULL S3 object key (`tenants/<tenant>/v2/logs/<tail>`),
+  `key` is the FULL S3 object key (`tenants/<tenant>/v3/logs/<tail>`),
   not the tail alone. The wire form uses only the tail, and
   `from_wire/1` requires the containing tenant + signal to reconstitute
   the full key. Keeping the full key in memory means the query path can
@@ -24,7 +24,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   @doc """
   Build a segment record for a segment the ingester just wrote.
 
-  `tail` is the object key with the leading `tenants/<tenant>/v2/<signal>/`
+  `tail` is the object key with the leading `tenants/<tenant>/v3/<signal>/`
   stripped. The struct holds the full key so the query path never has to
   re-glue the prefix.
   """
