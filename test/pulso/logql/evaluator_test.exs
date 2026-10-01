@@ -15,7 +15,7 @@ defmodule Pulso.LogQL.EvaluatorTest do
   # -- Test helpers ----------------------------------------------------------
 
   defp log(tenant, records) do
-    :ok = Storage.append(tenant, records)
+    :ok = Storage.append(:logs, tenant, records)
   end
 
   defp record(fields) do

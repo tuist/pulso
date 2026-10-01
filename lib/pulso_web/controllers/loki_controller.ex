@@ -60,7 +60,7 @@ defmodule PulsoWeb.LokiController do
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
          {:ok, records, rejected, conn} <- decode_body(conn, params),
-         :ok <- Storage.append(tenant, records, opts) do
+         :ok <- Storage.append(:logs, tenant, records, opts) do
       conn
       |> put_rejected_header(rejected)
       |> send_resp(:no_content, "")

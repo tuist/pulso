@@ -14,6 +14,7 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.Parser
   alias Pulso.Record.Log
+  alias Pulso.Record.MetricSample
   alias Pulso.Storage
 
   @tools [
@@ -38,6 +39,44 @@ defmodule Pulso.MCP.Tools do
           "end_ts_ns" => %{
             "type" => "integer",
             "description" => "Inclusive upper bound on log timestamp, Unix nanoseconds."
+          },
+          "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
+        },
+        "required" => ["tenant"]
+      }
+    },
+    %{
+      "name" => "query_metrics",
+      "description" =>
+        "Return metric samples for a tenant, optionally filtered by time range and PromQL-style label matchers.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "tenant" => %{
+            "type" => "string",
+            "description" => "Tenant identifier (matches the X-Scope-OrgID used at ingest)."
+          },
+          "matchers" => %{
+            "type" => "array",
+            "description" =>
+              "PromQL-style label matchers. Each element is `{name, op, value}` with op ∈ {=, !=, =~, !~}.",
+            "items" => %{
+              "type" => "object",
+              "properties" => %{
+                "name" => %{"type" => "string"},
+                "op" => %{"type" => "string", "enum" => ["=", "!=", "=~", "!~"]},
+                "value" => %{"type" => "string"}
+              },
+              "required" => ["name", "op", "value"]
+            }
+          },
+          "start_ts_ns" => %{
+            "type" => "integer",
+            "description" => "Inclusive lower bound on sample timestamp, Unix nanoseconds."
+          },
+          "end_ts_ns" => %{
+            "type" => "integer",
+            "description" => "Inclusive upper bound on sample timestamp, Unix nanoseconds."
           },
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
         },
@@ -83,12 +122,30 @@ defmodule Pulso.MCP.Tools do
       |> put_opt(:service, args["service"])
 
     with :ok <- verify(context, tenant),
-         {:ok, records} <- Storage.query(tenant, opts) do
+         {:ok, records} <- Storage.query(:logs, tenant, opts) do
       {:ok, [%{"type" => "text", "text" => encode_records(records)}]}
     end
   end
 
   def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
+
+  def call("query_metrics", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
+    with {:ok, matcher_tuples} <- parse_matchers(args["matchers"]) do
+      opts =
+        []
+        |> put_opt(:start_ts, args["start_ts_ns"])
+        |> put_opt(:end_ts, args["end_ts_ns"])
+        |> put_opt(:limit, args["limit"])
+        |> put_opt(:matchers, matcher_tuples)
+
+      with :ok <- verify(context, tenant),
+           {:ok, samples} <- Storage.query(:metrics, tenant, opts) do
+        {:ok, [%{"type" => "text", "text" => encode_samples(samples)}]}
+      end
+    end
+  end
+
+  def call("query_metrics", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
 
   def call("query_logql", %{"tenant" => tenant, "query" => query} = args, context)
       when is_binary(tenant) and is_binary(query) do
@@ -104,6 +161,40 @@ defmodule Pulso.MCP.Tools do
   def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
 
   def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
+
+  # -- query_metrics helpers -----------------------------------------------
+
+  # Translate the public PromQL-style operators (`=`, `!=`, `=~`, `!~`)
+  # into the atom shape the storage layer and the Rust decoder expect.
+  defp parse_matchers(nil), do: {:ok, nil}
+
+  defp parse_matchers(list) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn
+      %{"name" => n, "op" => op, "value" => v}, {:ok, acc}
+      when is_binary(n) and is_binary(v) ->
+        case translate_op(op) do
+          {:ok, atom_op} -> {:cont, {:ok, [{n, atom_op, v} | acc]}}
+          err -> {:halt, err}
+        end
+
+      _, _ ->
+        {:halt, {:error, {:invalid_arguments, "matchers must be [{name, op, value}]"}}}
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      err -> err
+    end
+  end
+
+  defp parse_matchers(_), do: {:error, {:invalid_arguments, "matchers must be a list"}}
+
+  defp translate_op("="), do: {:ok, :eq}
+  defp translate_op("!="), do: {:ok, :neq}
+  defp translate_op("=~"), do: {:ok, :re}
+  defp translate_op("!~"), do: {:ok, :nre}
+  defp translate_op(op), do: {:error, {:invalid_arguments, "unknown matcher op: #{inspect(op)}"}}
+
+  # -- query_logql helpers -------------------------------------------------
 
   defp parse_query(query) do
     case Parser.parse(query) do
@@ -190,6 +281,26 @@ defmodule Pulso.MCP.Tools do
       "span_id" => record.span_id,
       "attributes" => record.attributes,
       "resource" => record.resource
+    }
+  end
+
+  # Rust fast-path JSON encoder; falls back to Elixir on any shape the
+  # Rust side cannot guarantee to emit identically. Keeps the hot path
+  # (10k-sample MCP responses) off the general-purpose encoder, which
+  # has to build one intermediate string-keyed map per sample first.
+  defp encode_samples(samples) do
+    case NIF.encode_metric_samples(samples) do
+      {:ok, json} -> json
+      :fallback -> JSON.encode!(Enum.map(samples, &encode_sample/1))
+    end
+  end
+
+  defp encode_sample(%MetricSample{} = s) do
+    %{
+      "series_id" => s.series_id,
+      "timestamp_ns" => s.timestamp_ns,
+      "value" => s.value,
+      "labels" => s.labels
     }
   end
 end

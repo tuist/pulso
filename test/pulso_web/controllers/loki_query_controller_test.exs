@@ -13,7 +13,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   describe "GET /loki/api/v1/query_range with a log query" do
     setup do
       :ok =
-        Storage.append("acme", [
+        Storage.append(:logs, "acme", [
           %Log{timestamp_ns: 10, service: "api", body: "connection timeout"},
           %Log{timestamp_ns: 20, service: "api", body: "connection ok"},
           %Log{timestamp_ns: 30, service: "db", body: "insert failed"}
@@ -73,7 +73,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   describe "GET /loki/api/v1/query_range with a metric query" do
     test "returns a matrix envelope", %{conn: conn} do
       :ok =
-        Storage.append("acme", [
+        Storage.append(:logs, "acme", [
           %Log{timestamp_ns: 1_000_000_000, service: "api", body: "a"},
           %Log{timestamp_ns: 2_000_000_000, service: "api", body: "b"},
           %Log{timestamp_ns: 3_000_000_000, service: "api", body: "c"}
@@ -95,7 +95,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   describe "GET /loki/api/v1/labels" do
     test "returns unique label names for the tenant", %{conn: conn} do
       :ok =
-        Storage.append("acme", [
+        Storage.append(:logs, "acme", [
           %Log{
             timestamp_ns: 10,
             service: "api",
@@ -120,7 +120,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   describe "GET /loki/api/v1/label/:name/values" do
     test "returns unique values seen for the given label", %{conn: conn} do
       :ok =
-        Storage.append("acme", [
+        Storage.append(:logs, "acme", [
           %Log{timestamp_ns: 10, body: "x", resource: %{"env" => "prod"}},
           %Log{timestamp_ns: 20, body: "y", resource: %{"env" => "stg"}},
           %Log{timestamp_ns: 30, body: "z", resource: %{"env" => "prod"}}
@@ -148,7 +148,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
     end
 
     test "unparseable limit falls back to default, does not 500", %{conn: conn} do
-      :ok = Storage.append("acme", [%Log{timestamp_ns: 10, service: "api", body: "a"}])
+      :ok = Storage.append(:logs, "acme", [%Log{timestamp_ns: 10, service: "api", body: "a"}])
 
       conn =
         conn
@@ -160,7 +160,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
     end
 
     test "RFC3339 timestamps parse instead of scanning the whole tenant", %{conn: conn} do
-      :ok = Storage.append("acme", [%Log{timestamp_ns: 10, service: "api", body: "a"}])
+      :ok = Storage.append(:logs, "acme", [%Log{timestamp_ns: 10, service: "api", body: "a"}])
 
       conn =
         conn

@@ -56,7 +56,7 @@ defmodule Pulso.LogQL.Evaluator do
   def evaluate_log_raw(%AST.LogQuery{} = query, tenant, opts) when is_binary(tenant) do
     with :ok <- QueryValidation.validate(query),
          {storage_opts, remaining_stages} <- push_down(query, opts),
-         {:ok, records} <- Storage.query(tenant, storage_opts) do
+         {:ok, records} <- Storage.query(:logs, tenant, storage_opts) do
       compiled = Pipeline.compile(remaining_stages)
 
       entries =

@@ -92,7 +92,7 @@ defmodule PulsoWeb.LokiQueryController do
     tenant = tenant_from(conn)
 
     with :ok <- Auth.verify(conn, tenant),
-         {:ok, records} <- Storage.query(tenant, build_storage_time_opts(params)) do
+         {:ok, records} <- Storage.query(:logs, tenant, build_storage_time_opts(params)) do
       names =
         records
         |> Enum.flat_map(fn r ->
@@ -113,7 +113,7 @@ defmodule PulsoWeb.LokiQueryController do
     tenant = tenant_from(conn)
 
     with :ok <- Auth.verify(conn, tenant),
-         {:ok, records} <- Storage.query(tenant, build_storage_time_opts(params)) do
+         {:ok, records} <- Storage.query(:logs, tenant, build_storage_time_opts(params)) do
       values =
         records
         |> Enum.map(fn r ->

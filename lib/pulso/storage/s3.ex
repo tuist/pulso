@@ -1,15 +1,23 @@
 defmodule Pulso.Storage.S3 do
   @moduledoc """
-  S3-backed log storage.
+  S3-backed signal storage.
 
-  Each `append/3` writes one Parquet object under a tenant-scoped,
-  versioned prefix: `tenants/<tenant>/v3/logs/<min_ts>-<max_ts>-<suffix>.parquet`.
+  Each `append/4` writes one Parquet object under a tenant- and
+  signal-scoped, versioned, time-partitioned prefix:
+
+      tenants/<tenant>/v4/signal=<s>/date=<YYYY-MM-DD>/hour=<HH>/<min_ts>-<max_ts>-<suffix>.parquet
+
   Tenant isolation is enforced by key construction — tenant names are
   validated against a conservative charset, so a batch cannot land
-  outside its own prefix. The `<min_ts>` and `<max_ts>` segments are
-  zero-padded 20-decimal-digit representations of the smallest and
-  largest caller-supplied `timestamp_ns` in the batch (records with
-  `nil` map to `0`, which sorts first).
+  outside its own prefix. `<min_ts>` and `<max_ts>` are zero-padded
+  20-decimal-digit representations of the smallest and largest
+  caller-supplied `timestamp_ns` in the batch (records with `nil` map to
+  `0`, which sorts first). The `date=` and `hour=` partition components
+  are derived from `min_ts` as UTC, so a batch spanning an hour boundary
+  files under the hour of its earliest sample — segments are small
+  enough (`~1s` flush cadence, `~10 MiB` size cap) that cross-boundary
+  spill is negligible, and the chronological `[min_ts, max_ts]` tail
+  still gives the manifest a tight prunable range.
 
   The trailing `<suffix>` depends on whether the caller supplied an
   `idempotency_key`:
@@ -18,55 +26,40 @@ defmodule Pulso.Storage.S3 do
       `tenant || idempotency_key || caller_content_hash`. Two `append`
       calls with the same key AND the same caller-supplied content
       resolve to the same object; a lost-response retry does not
-      duplicate. Two calls with the same key and different content
-      produce different objects, surfacing a client bug rather than
-      silently overwriting.
+      duplicate.
     * **Without `idempotency_key`** — the suffix is random, so distinct
       calls always produce distinct objects and no content hash is
-      computed. Retries in this mode duplicate — callers who need dedup
-      must opt in.
+      computed.
+
+  ## Signal dispatch
+
+  Every call carries an explicit `signal` (`:logs` | `:metrics`). The
+  adapter translates to the corresponding Rust NIF entry point
+  (`encode_log_segment_parquet` / `encode_metric_segment_parquet`) and
+  back. Logs sort by `(service, timestamp_ns)`, metrics by
+  `(series_id, timestamp_ns)`. See `Pulso.Codec.NIF`.
 
   ## Manifest coordination
 
   Every accepted append is registered in the per-`(tenant, signal)`
   manifest via `Pulso.Storage.S3.ManifestOwner`. The owner batches
   concurrent registrations into a single S3 CAS per flush window so
-  ingest throughput is decoupled from S3 CAS latency. `query/2` reads
+  ingest throughput is decoupled from S3 CAS latency. `query/3` reads
   the manifest from the ETS-backed cache
   (`Pulso.Storage.S3.ManifestCache`), prunes by time bounds, and only
-  fetches segments that could contribute records — no per-query LIST.
+  fetches segments that could contribute records.
 
   Only after both the segment PUT and the manifest CAS succeed does
-  `append/3` return `:ok`. That is the load-bearing durability point.
-
-  ## Encoding and decoding
-
-  Segments are Apache Parquet files, encoded and decoded in Rust
-  (`Pulso.Codec.NIF.encode_log_segment_parquet` / `decode_log_segment_parquet`).
-  Rows are sorted by `(service, timestamp_ns)` on write, so dictionary
-  encoding on `service` and delta encoding on `timestamp_ns` compress
-  tightly, and the row-group `timestamp_ns` min/max stats let a query
-  skip whole segments outside its time range without reading a single
-  column page. `attributes` and `resource` are stored as JSON strings
-  in dedicated Utf8 columns — real nested column projection lands with
-  sidecar indexes.
-
-  Every input map is first stringified through `sanitize_map/1` so a
-  caller passing atom or integer attribute keys sees the same result the
-  NDJSON path produced. There is no Elixir Parquet reference; when the
-  NIF returns `:fallback` the call errors out rather than falling back.
+  `append/4` return `:ok`. That is the load-bearing durability point.
 
   ## Key format stability
 
-  Every object lives under a versioned prefix (`tenants/<tenant>/v3/…`).
+  Every object lives under a versioned prefix (`tenants/<t>/v4/…`).
   Within one schema version, the exact suffix format is deliberately
-  not a public API. The idempotency suffix is derived from
-  `:erlang.term_to_binary(_, [:deterministic])`, which is stable within
-  an OTP release but is not guaranteed across a major OTP upgrade. Any
-  change to the fingerprint, the delimiter, the sort-key width, or the
-  number of bounds segments bumps the schema version — new writes go
-  to `v4/`, old objects stay at `v3/`, and a compaction job migrates
-  at its own pace.
+  not a public API. Any change to the fingerprint, the delimiter, the
+  sort-key width, the number of bounds segments, or the partitioning
+  scheme bumps the schema version — new writes go to `v5/`, old objects
+  stay at `v4/`, and a compaction job migrates at its own pace.
   """
 
   @behaviour Pulso.Storage
@@ -74,6 +67,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.Codec.NIF
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
+  alias Pulso.Record.MetricSample
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
@@ -86,61 +80,57 @@ defmodule Pulso.Storage.S3 do
   # 16 hex chars = 64 bits from SHA-256. Collision probability is negligible
   # for the volumes any single tenant will produce in a step-2 adapter.
   @content_hash_width 16
-  @signal "logs"
+  # Schema version segment. Baked into every object key so a future change
+  # to the key format can coexist with older objects rather than orphan them.
+  @schema_version "v4"
 
   @impl Pulso.Storage
-  def append(tenant, records, opts \\ [])
+  def append(signal, tenant, records, opts \\ [])
 
-  def append(tenant, [], _opts) when is_binary(tenant) do
+  def append(signal, tenant, [], _opts) when is_atom(signal) and is_binary(tenant) do
     # Validate even on empty so an adversarial tenant name is rejected on the
-    # first attempt, not only once a real record survives OTLP decoding.
+    # first attempt, not only once a real record survives decoding.
     validate_tenant(tenant)
   end
 
-  def append(tenant, records, opts) when is_binary(tenant) and is_list(records) do
+  def append(signal, tenant, records, opts) when is_atom(signal) and is_binary(tenant) and is_list(records) do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
-    # Validation and encoding come first so a bad tenant name or an
-    # unencodable record is rejected before `config!/0` is even evaluated.
-    # That keeps the "reject adversarial tenant names before touching the
-    # object store" property from surviving as an accident of test setup.
-    #
-    # The key's `[min_ts, max_ts]` and fingerprint come from the
-    # caller-supplied records, so a legitimate retry produces the same key
-    # in full and the second PUT overwrites the first as intended.
     with :ok <- validate_tenant(tenant),
-         {:ok, payload, min_ts, max_ts} <- encode_segment(records) do
+         {:ok, payload, min_ts, max_ts} <- encode_segment(signal, records) do
       config = config!()
-      key = object_key(tenant, min_ts, max_ts, fingerprint(records, idempotency_key), idempotency_key)
+
+      key =
+        object_key(
+          tenant,
+          signal_string(signal),
+          min_ts,
+          max_ts,
+          fingerprint(signal, records, idempotency_key),
+          idempotency_key
+        )
 
       with {:ok, _etag} <- ObjectStore.put(config, key, payload) do
         segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
-        ManifestOwner.register_segments(tenant, @signal, [segment], config)
+        ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
       end
     end
   end
 
   @impl Pulso.Storage
-  def query(tenant, opts) when is_binary(tenant) and is_list(opts) do
+  def query(signal, tenant, opts) when is_atom(signal) and is_binary(tenant) and is_list(opts) do
     start_ts = Keyword.get(opts, :start_ts)
     end_ts = Keyword.get(opts, :end_ts)
-    service = Keyword.get(opts, :service)
     limit = Keyword.get(opts, :limit)
-    matchers = Keyword.get(opts, :matchers, [])
-    line_filters = Keyword.get(opts, :line_filters, [])
 
     with :ok <- validate_tenant(tenant),
          config = config!(),
-         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, @signal, config) do
-      # Manifest segments are already sorted by max_ts desc (invariant
-      # maintained by `Manifest.merge/2` and `Manifest.decode/1`). Prune
-      # by time and hand the survivors to the scan loop as-is — no
-      # per-query sort.
+         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config) do
       segments = Manifest.prune_by_time(entry.manifest, start_ts, end_ts)
 
-      case scan_segments(config, segments, start_ts, end_ts, service, matchers, line_filters, limit) do
+      case scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
         {:ok, records} ->
-          sorted = records |> SortOrder.sort() |> take_limit(limit)
+          sorted = records |> SortOrder.sort(signal) |> take_limit(limit)
           {:ok, sorted}
 
         {:error, _} = err ->
@@ -151,21 +141,25 @@ defmodule Pulso.Storage.S3 do
 
   # -- helpers -----------------------------------------------------------------
 
+  defp signal_string(:logs), do: "logs"
+  defp signal_string(:metrics), do: "metrics"
+
   # The content fingerprint only matters when an idempotency key makes the
   # object key deterministic. Without one the key is random anyway, so
-  # skip hashing the batch (a full deterministic `term_to_binary` of every
-  # record).
-  defp fingerprint(records, idempotency_key) when is_binary(idempotency_key) and byte_size(idempotency_key) > 0 do
-    {:ok, hash} = caller_content_hash(records)
+  # skip hashing the batch.
+  defp fingerprint(signal, records, idempotency_key)
+       when is_binary(idempotency_key) and byte_size(idempotency_key) > 0 do
+    {:ok, hash} = caller_content_hash(signal, records)
     hash
   end
 
-  defp fingerprint(_records, _idempotency_key), do: rand_hex()
+  defp fingerprint(_signal, _records, _idempotency_key), do: rand_hex()
 
   @doc false
-  @spec encode_segment([Log.t()]) :: {:ok, binary(), integer(), integer()} | {:error, term()}
-  def encode_segment(records) do
-    with {:ok, normalized} <- normalize(records) do
+  @spec encode_segment(Pulso.Storage.signal(), [Pulso.Storage.signal_record()]) ::
+          {:ok, binary(), integer(), integer()} | {:error, term()}
+  def encode_segment(:logs, records) do
+    with {:ok, normalized} <- normalize_logs(records) do
       case NIF.encode_log_segment_parquet(normalized) do
         {:ok, payload, min_ts, max_ts, _count} ->
           {:ok, payload, min_ts, max_ts}
@@ -173,6 +167,16 @@ defmodule Pulso.Storage.S3 do
         :fallback ->
           {:error, {:encode_failed, :parquet_encoder_rejected_input}}
       end
+    end
+  end
+
+  def encode_segment(:metrics, records) do
+    case NIF.encode_metric_segment_parquet(records) do
+      {:ok, payload, min_ts, max_ts, _count} ->
+        {:ok, payload, min_ts, max_ts}
+
+      :fallback ->
+        {:error, {:encode_failed, :parquet_encoder_rejected_input}}
     end
   end
 
@@ -184,16 +188,11 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp normalize(records) do
+  defp normalize_logs(records) do
     Enum.reduce_while(records, {:ok, []}, fn
       %Log{} = record, {:ok, acc} ->
         with {:ok, attrs} <- sanitize_map(record.attributes || %{}),
              {:ok, resource} <- sanitize_map(record.resource || %{}) do
-          # Deliberately no wall-clock backfill here. Injecting `now` for a
-          # nil timestamp would make retries under the same idempotency key
-          # overwrite the first stored record with a later timestamp, so an
-          # already-acknowledged log would disappear from its original time
-          # range and re-emerge in a later one.
           normalized = %{record | attributes: attrs, resource: resource}
           {:cont, {:ok, [normalized | acc]}}
         else
@@ -206,12 +205,7 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  # Coerce every attribute/resource map key to a string, recursively. OTLP
-  # decoding already produces string keys, but a caller building `%Log{}`
-  # directly (or a future backend surface) could hand us atoms or integers.
-  # If two logical keys coerce to the same string (`%{1 => a, "1" => b}`) we
-  # refuse — silently dropping either value would surprise a reader looking
-  # at either the original struct or the JSON-encoded record.
+  # Coerce every attribute/resource map key to a string, recursively.
   @doc false
   @spec sanitize_map(map()) :: {:ok, map()} | {:error, {:attribute_key_collision, [String.t()]}}
   def sanitize_map(map) when is_map(map) do
@@ -271,15 +265,19 @@ defmodule Pulso.Storage.S3 do
   # so it is safe to stop. Segments whose max_ts is unknown never satisfy
   # the condition, so they always get fetched — that is the price of not
   # knowing their bounds.
-  defp scan_segments(config, segments, start_ts, end_ts, service, matchers, line_filters, limit) do
+  #
+  # `opts` is passed through to the per-signal decoder so each signal's
+  # pushdowns (service + matchers + line_filters for logs, matchers for
+  # metrics) stay typed at the signal boundary rather than fanning into
+  # positional args here.
+  defp scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
     ctx = %{
+      signal: signal,
       config: config,
       segments: segments,
       start_ts: start_ts,
       end_ts: end_ts,
-      service: service,
-      matchers: matchers,
-      line_filters: line_filters,
+      opts: opts,
       limit: limit
     }
 
@@ -306,7 +304,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    case decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service, ctx.matchers, ctx.line_filters) do
+    case decode_segment(ctx.signal, blob, ctx.start_ts, ctx.end_ts, ctx.opts) do
       {:ok, batch} ->
         new_state = %{
           batches: [batch | state.batches],
@@ -327,18 +325,13 @@ defmodule Pulso.Storage.S3 do
 
   defp can_short_circuit?(state, limit, segments, index) when state.count >= limit do
     case Enum.at(segments, index + 1) do
-      # No more segments to scan.
       nil ->
         true
 
-      # An unknown-bounds segment could contain anything.
       %{max_ts: nil} ->
         false
 
       %{max_ts: next_max} ->
-        # Kth-largest timestamp in what we have so far. If it strictly
-        # exceeds the next segment's max_ts, no record we have not yet
-        # fetched can dominate it.
         kth = Enum.at(state.top, limit - 1)
         kth != nil and kth > next_max
     end
@@ -346,19 +339,15 @@ defmodule Pulso.Storage.S3 do
 
   defp can_short_circuit?(_state, _limit, _segments, _index), do: false
 
-  # The `limit` largest non-nil timestamps seen so far, descending. Kept
-  # incrementally so the short-circuit check costs one batch sort and a
-  # bounded merge per segment instead of re-sorting everything fetched.
   defp top_timestamps(top, _batch, nil), do: top
 
   defp top_timestamps(top, batch, limit) do
-    batch_ts =
-      for %Log{timestamp_ns: ts} <- batch, ts != nil do
-        ts
-      end
-
+    batch_ts = for r <- batch, (ts = record_ts(r)) != nil, do: ts
     merge_desc(top, Enum.sort(batch_ts, :desc), limit)
   end
+
+  defp record_ts(%Log{timestamp_ns: ts}), do: ts
+  defp record_ts(%MetricSample{timestamp_ns: ts}), do: ts
 
   defp merge_desc(_a, _b, 0), do: []
   defp merge_desc([], b, k), do: Enum.take(b, k)
@@ -367,12 +356,25 @@ defmodule Pulso.Storage.S3 do
   defp merge_desc(a, [y | ys], k), do: [y | merge_desc(a, ys, k - 1)]
 
   @doc false
-  @spec decode_segment(binary(), term(), term(), term(), [Pulso.Storage.matcher()], [Pulso.Storage.line_filter()]) ::
-          {:ok, [Log.t()]} | {:error, term()}
-  def decode_segment(blob, start_ts, end_ts, service, matchers \\ [], line_filters \\ []) do
+  @spec decode_segment(Pulso.Storage.signal(), binary(), term(), term(), keyword()) ::
+          {:ok, [Pulso.Storage.signal_record()]} | {:error, term()}
+  def decode_segment(:logs, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
+    service = Keyword.get(opts, :service)
+    matchers = Keyword.get(opts, :matchers, [])
+    line_filters = Keyword.get(opts, :line_filters, [])
+
     :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
 
     case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service, matchers, line_filters) do
+      {:ok, records} -> {:ok, records}
+      :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
+    end
+  end
+
+  def decode_segment(:metrics, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
+    matchers = Keyword.get(opts, :matchers, [])
+
+    case NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, matchers) do
       {:ok, records} -> {:ok, records}
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
@@ -384,61 +386,52 @@ defmodule Pulso.Storage.S3 do
     :ok
   end
 
-  # Schema version segment. Baked into every object key so a future change
-  # to the key format can coexist with older objects rather than orphan
-  # them.
-  @schema_version "v3"
+  defp prefix(tenant, signal) when is_binary(tenant) and is_binary(signal),
+    do: "tenants/#{tenant}/#{@schema_version}/signal=#{signal}/"
 
-  defp prefix(tenant), do: "tenants/#{tenant}/#{@schema_version}/logs/"
+  # Returns `date=<YYYY-MM-DD>/hour=<HH>/` for a nanosecond-epoch timestamp,
+  # UTC. Nil `min_ts` maps to `0`, which becomes `date=1970-01-01/hour=00/` —
+  # fine for correctness (segments with unknown bounds have always been a
+  # degenerate case) and still prunable by the manifest's own bounds.
+  defp time_partition(min_ns) when is_integer(min_ns) and min_ns >= 0 do
+    seconds = div(min_ns, 1_000_000_000)
+    dt = DateTime.from_unix!(seconds, :second)
+    date = Date.to_iso8601(dt)
+    hour = dt.hour |> Integer.to_string() |> String.pad_leading(2, "0")
+    "date=#{date}/hour=#{hour}/"
+  end
 
-  # `caller_hash` is a 16-hex fingerprint of the pre-normalization records
-  # from `caller_content_hash/1`. The pre-normalization form matters:
-  # `normalize/1` fills in a fresh wall-clock `observed_timestamp_ns` on
-  # every call, so hashing after normalization would make identical retries
-  # produce different keys even under an idempotency key.
+  defp time_partition(_), do: "date=1970-01-01/hour=00/"
+
+  # `caller_hash` is a 16-hex fingerprint of the pre-normalization records.
   @doc false
-  @spec object_key(String.t(), non_neg_integer(), non_neg_integer(), String.t(), String.t() | nil) ::
-          String.t()
-  def object_key(tenant, min_ts, max_ts, caller_hash, idempotency_key)
-      when is_binary(tenant) and is_binary(caller_hash) do
+  @spec object_key(
+          String.t(),
+          String.t(),
+          non_neg_integer(),
+          non_neg_integer(),
+          String.t(),
+          String.t() | nil
+        ) :: String.t()
+  def object_key(tenant, signal, min_ts, max_ts, caller_hash, idempotency_key)
+      when is_binary(tenant) and is_binary(signal) and is_binary(caller_hash) do
     suffix =
       case idempotency_key do
         <<key::binary>> when byte_size(key) > 0 ->
-          # Mixes tenant, key, and caller_hash. A client that accidentally
-          # reuses an idempotency key with different content produces a
-          # different object (no silent overwrite). Same content + same key
-          # collapses onto one object, which is the point of idempotency.
           "idem-" <> stable_hash(tenant <> "\0" <> key <> "\0" <> caller_hash)
 
         _ ->
-          # No idempotency key: the caller accepts duplicates on retry, and
-          # `caller_hash` is random rather than a content hash. A random
-          # suffix guarantees distinct writes even when payload and
-          # timestamp collide.
           "rand-" <> caller_hash <> "-" <> rand_hex()
       end
 
-    "#{prefix(tenant)}#{zero_pad(min_ts)}-#{zero_pad(max_ts)}-#{suffix}.parquet"
+    "#{prefix(tenant, signal)}#{time_partition(min_ts)}#{zero_pad(min_ts)}-#{zero_pad(max_ts)}-#{suffix}.parquet"
   end
 
-  # Fingerprint of the raw caller records. Two properties hold:
-  #
-  # 1. Every field the caller controls (including `observed_timestamp_ns`
-  #    when they set it) is included — a caller who legitimately changes
-  #    that field on a "retry" is signalling a distinct write, and gets a
-  #    distinct object.
-  # 2. The encoding is canonical across runtime, GC, and Jason versions.
-  #    Two identical records always hash to the same byte sequence, in
-  #    this process and in any future release. That is what makes cross-
-  #    version idempotency safe.
-  #
-  # `:erlang.term_to_binary/2` with `:deterministic` gives us the canonical
-  # form for free within an OTP release: map keys are sorted, atoms and
-  # integers are encoded canonically, and the same term always produces
-  # the same bytes.
+  # Fingerprint of the raw caller records.
   @doc false
-  @spec caller_content_hash([Log.t()]) :: {:ok, String.t()}
-  def caller_content_hash(records) when is_list(records) do
+  @spec caller_content_hash(Pulso.Storage.signal(), [Pulso.Storage.signal_record()]) ::
+          {:ok, String.t()}
+  def caller_content_hash(:logs, records) when is_list(records) do
     canonical =
       Enum.map(records, fn %Log{} = r ->
         %{
@@ -455,6 +448,23 @@ defmodule Pulso.Storage.S3 do
         }
       end)
 
+    digest_hex(canonical)
+  end
+
+  def caller_content_hash(:metrics, records) when is_list(records) do
+    canonical =
+      Enum.map(records, fn %MetricSample{} = s ->
+        %{
+          timestamp_ns: s.timestamp_ns,
+          value: s.value,
+          labels: s.labels
+        }
+      end)
+
+    digest_hex(canonical)
+  end
+
+  defp digest_hex(canonical) do
     digest =
       :sha256
       |> :crypto.hash(:erlang.term_to_binary(canonical, [:deterministic]))
@@ -464,10 +474,6 @@ defmodule Pulso.Storage.S3 do
     {:ok, digest}
   end
 
-  # `body` can arrive as a non-string term via OTLP AnyValue (int, bool,
-  # list). `:erlang.term_to_binary` handles all of these fine; nothing to
-  # normalize. This hook exists so a future callsite that wants a stable
-  # representation can add one without changing the fingerprint contract.
   defp normalize_hash_value(v), do: v
 
   defp zero_pad(ns) when is_integer(ns) and ns >= 0 do

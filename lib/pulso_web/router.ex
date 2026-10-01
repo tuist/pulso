@@ -11,6 +11,7 @@ defmodule PulsoWeb.Router do
     post "/mcp", MCPController, :rpc
     post "/v1/logs", OTLPController, :logs
     post "/loki/api/v1/push", LokiController, :push
+    post "/api/v1/write", RemoteWriteController, :write
 
     get "/loki/api/v1/query_range", LokiQueryController, :query_range
     post "/loki/api/v1/query_range", LokiQueryController, :query_range

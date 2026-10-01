@@ -37,9 +37,9 @@ defmodule Pulso.Storage.S3Test do
     tenant = "test-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # The adapter writes objects under `tenants/<tenant>/v3/logs/`; clean up
+      # The adapter writes objects under `tenants/<tenant>/v4/signal=logs/`; clean up
       # both the segment objects and the manifest so a re-run starts empty.
-      case ObjectStore.list(config, "tenants/#{tenant}/v3/logs/") do
+      case ObjectStore.list(config, "tenants/#{tenant}/v4/signal=logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
@@ -63,19 +63,19 @@ defmodule Pulso.Storage.S3Test do
   # These helpers narrow object listings to segment files only, so counts
   # remain a proxy for how many *segments* the adapter wrote.
   defp list_segments(config, tenant) do
-    with {:ok, keys} <- ObjectStore.list(config, "tenants/#{tenant}/v3/logs/") do
+    with {:ok, keys} <- ObjectStore.list(config, "tenants/#{tenant}/v4/signal=logs/") do
       {:ok, Enum.reject(keys, &String.ends_with?(&1, "/manifest.json"))}
     end
   end
 
   test "append then query round-trips log records", %{tenant: tenant} do
     assert :ok =
-             S3.append(tenant, [
+             S3.append(:logs, tenant, [
                record(10, service: "api", body: "hello"),
                record(20, service: "web", body: "world")
              ])
 
-    assert {:ok, records} = S3.query(tenant, [])
+    assert {:ok, records} = S3.query(:logs, tenant, [])
     assert Enum.map(records, & &1.timestamp_ns) == [20, 10]
     assert Enum.map(records, & &1.service) == ["web", "api"]
     assert Enum.map(records, & &1.body) == ["world", "hello"]
@@ -85,35 +85,35 @@ defmodule Pulso.Storage.S3Test do
     other = "test-other-#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      case ObjectStore.list(config, "tenants/#{other}/v3/logs/") do
+      case ObjectStore.list(config, "tenants/#{other}/v4/signal=logs/") do
         {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
         _ -> :ok
       end
     end)
 
-    assert :ok = S3.append(tenant, [record(1)])
-    assert :ok = S3.append(other, [record(2)])
+    assert :ok = S3.append(:logs, tenant, [record(1)])
+    assert :ok = S3.append(:logs, other, [record(2)])
 
-    assert {:ok, [%Log{timestamp_ns: 1}]} = S3.query(tenant, [])
-    assert {:ok, [%Log{timestamp_ns: 2}]} = S3.query(other, [])
+    assert {:ok, [%Log{timestamp_ns: 1}]} = S3.query(:logs, tenant, [])
+    assert {:ok, [%Log{timestamp_ns: 2}]} = S3.query(:logs, other, [])
   end
 
   test "filters by time range and service", %{tenant: tenant} do
     assert :ok =
-             S3.append(tenant, [
+             S3.append(:logs, tenant, [
                record(10, service: "api"),
                record(20, service: "web"),
                record(30, service: "api"),
                record(40, service: "api")
              ])
 
-    assert {:ok, records} = S3.query(tenant, start_ts: 15, end_ts: 35, service: "api")
+    assert {:ok, records} = S3.query(:logs, tenant, start_ts: 15, end_ts: 35, service: "api")
     assert Enum.map(records, & &1.timestamp_ns) == [30]
   end
 
   test "applies limit", %{tenant: tenant} do
-    assert :ok = S3.append(tenant, [record(1), record(2), record(3), record(4)])
-    assert {:ok, records} = S3.query(tenant, limit: 2)
+    assert :ok = S3.append(:logs, tenant, [record(1), record(2), record(3), record(4)])
+    assert {:ok, records} = S3.query(:logs, tenant, limit: 2)
     assert length(records) == 2
     assert Enum.map(records, & &1.timestamp_ns) == [4, 3]
   end
@@ -125,30 +125,30 @@ defmodule Pulso.Storage.S3Test do
     # stored as they came in; queries with time bounds naturally skip
     # them, unbounded queries return them.
     assert :ok =
-             S3.append(tenant, [
+             S3.append(:logs, tenant, [
                %Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}
              ])
 
     assert {:ok, [%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}]} =
-             S3.query(tenant, [])
+             S3.query(:logs, tenant, [])
   end
 
   test "preserves control-character bodies through the round trip", %{tenant: tenant} do
     tricky = "line1\nline2\t\"quoted\"\r\nline3"
-    assert :ok = S3.append(tenant, [record(1, body: tricky)])
-    assert {:ok, [%Log{body: ^tricky}]} = S3.query(tenant, [])
+    assert :ok = S3.append(:logs, tenant, [record(1, body: tricky)])
+    assert {:ok, [%Log{body: ^tricky}]} = S3.query(:logs, tenant, [])
   end
 
   test "append with an empty batch is a no-op", %{tenant: tenant, config: config} do
-    assert :ok = S3.append(tenant, [])
+    assert :ok = S3.append(:logs, tenant, [])
     assert {:ok, keys} = list_segments(config, tenant)
     assert keys == []
   end
 
   test "rejects tenant names that could escape the prefix" do
     for bad <- ["../evil", "foo/bar", "foo bar", "", String.duplicate("a", 200)] do
-      assert {:error, {:invalid_tenant, ^bad}} = S3.append(bad, [record(1)])
-      assert {:error, {:invalid_tenant, ^bad}} = S3.query(bad, [])
+      assert {:error, {:invalid_tenant, ^bad}} = S3.append(:logs, bad, [record(1)])
+      assert {:error, {:invalid_tenant, ^bad}} = S3.query(:logs, bad, [])
     end
   end
 
@@ -162,13 +162,13 @@ defmodule Pulso.Storage.S3Test do
     # duplicate appears at query time.
     batch = [record(1, body: "same", service: "api")]
 
-    assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
-    assert :ok = S3.append(tenant, batch, idempotency_key: "req-1")
+    assert :ok = S3.append(:logs, tenant, batch, idempotency_key: "req-1")
+    assert :ok = S3.append(:logs, tenant, batch, idempotency_key: "req-1")
 
     assert {:ok, keys} = list_segments(config, tenant)
     assert length(keys) == 1
 
-    assert {:ok, records} = S3.query(tenant, [])
+    assert {:ok, records} = S3.query(:logs, tenant, [])
     assert length(records) == 1
   end
 
@@ -180,8 +180,8 @@ defmodule Pulso.Storage.S3Test do
     # must not silently collapse — that would drop data.
     batch = [record(1, body: "same", service: "api")]
 
-    assert :ok = S3.append(tenant, batch)
-    assert :ok = S3.append(tenant, batch)
+    assert :ok = S3.append(:logs, tenant, batch)
+    assert :ok = S3.append(:logs, tenant, batch)
 
     assert {:ok, keys} = list_segments(config, tenant)
     assert length(keys) == 2
@@ -191,8 +191,8 @@ defmodule Pulso.Storage.S3Test do
     tenant: tenant,
     config: config
   } do
-    assert :ok = S3.append(tenant, [record(1), record(2)])
-    assert :ok = S3.append(tenant, [record(3)])
+    assert :ok = S3.append(:logs, tenant, [record(1), record(2)])
+    assert :ok = S3.append(:logs, tenant, [record(3)])
 
     # Delete one of the segment objects between our own list and get,
     # mimicking a compaction / retention job racing with a query.
@@ -200,7 +200,7 @@ defmodule Pulso.Storage.S3Test do
     assert :ok = ObjectStore.delete(config, first)
 
     # Query should still return the surviving records, not error.
-    assert {:ok, remaining} = S3.query(tenant, [])
+    assert {:ok, remaining} = S3.query(:logs, tenant, [])
     assert remaining != []
   end
 
@@ -209,14 +209,14 @@ defmodule Pulso.Storage.S3Test do
     b = %Log{timestamp_ns: 10, observed_timestamp_ns: 300, trace_id: "aaa"}
     c = %Log{timestamp_ns: 10, observed_timestamp_ns: 200, trace_id: "bbb"}
 
-    assert :ok = S3.append(tenant, [a, b, c])
-    assert {:ok, sorted} = S3.query(tenant, [])
+    assert :ok = S3.append(:logs, tenant, [a, b, c])
+    assert {:ok, sorted} = S3.query(:logs, tenant, [])
     assert Enum.map(sorted, & &1.observed_timestamp_ns) == [300, 200, 100]
   end
 
   describe "manifest coordination" do
     test "append populates the manifest and the ETS cache", %{tenant: tenant} do
-      assert :ok = S3.append(tenant, [record(1, service: "api")])
+      assert :ok = S3.append(:logs, tenant, [record(1, service: "api")])
 
       entry = ManifestCache.get(tenant, "logs")
       assert %{manifest: %Manifest{segments: [segment | _]}, etag: etag} = entry
@@ -235,7 +235,7 @@ defmodule Pulso.Storage.S3Test do
       tasks =
         for i <- 1..n do
           Task.async(fn ->
-            S3.append(tenant, [record(i, service: "svc-#{i}")])
+            S3.append(:logs, tenant, [record(i, service: "svc-#{i}")])
           end)
         end
 
@@ -247,7 +247,7 @@ defmodule Pulso.Storage.S3Test do
       assert length(segments) == n
 
       # And the query path finds every one of them.
-      assert {:ok, records} = S3.query(tenant, [])
+      assert {:ok, records} = S3.query(:logs, tenant, [])
       assert length(records) == n
     end
 
@@ -257,8 +257,8 @@ defmodule Pulso.Storage.S3Test do
       # error, a mid-migration crash) should not lose queryability. On
       # the next query the owner LIST-fallbacks and rebuilds the
       # manifest from the segments that survive in S3.
-      assert :ok = S3.append(tenant, [record(1), record(2)])
-      assert :ok = S3.append(tenant, [record(3)])
+      assert :ok = S3.append(:logs, tenant, [record(1), record(2)])
+      assert :ok = S3.append(:logs, tenant, [record(3)])
 
       manifest_key = Manifest.manifest_key(tenant)
       assert :ok = ObjectStore.delete(config, manifest_key)
@@ -267,7 +267,7 @@ defmodule Pulso.Storage.S3Test do
       ManifestCache.drop(tenant, "logs")
       stop_owner(tenant)
 
-      assert {:ok, records} = S3.query(tenant, [])
+      assert {:ok, records} = S3.query(:logs, tenant, [])
       assert Enum.map(records, & &1.timestamp_ns) == [3, 2, 1]
     end
 
@@ -278,15 +278,15 @@ defmodule Pulso.Storage.S3Test do
       # manifest with nil bounds — and then the next load of that
       # manifest would fail decode. This asserts that non-`.parquet`
       # objects are skipped at rebuild time.
-      assert :ok = S3.append(tenant, [record(1)])
+      assert :ok = S3.append(:logs, tenant, [record(1)])
 
       # Stash a sidecar-shaped object next to the segment.
-      sidecar_key = "tenants/#{tenant}/v3/logs/00000000000000000005-junk.bloom"
+      sidecar_key = "tenants/#{tenant}/v4/signal=logs/00000000000000000005-junk.bloom"
       assert {:ok, _etag} = ObjectStore.put(config, sidecar_key, "not a segment")
 
       # And a Parquet-suffixed file with a key that doesn't carry the
       # bounds format — a hypothetical hand-written import.
-      malformed_key = "tenants/#{tenant}/v3/logs/hand-written.parquet"
+      malformed_key = "tenants/#{tenant}/v4/signal=logs/hand-written.parquet"
       assert {:ok, _etag} = ObjectStore.put(config, malformed_key, "still not a segment")
 
       # Force a cold-start rebuild.
@@ -295,7 +295,7 @@ defmodule Pulso.Storage.S3Test do
       ManifestCache.drop(tenant, "logs")
       stop_owner(tenant)
 
-      assert {:ok, records} = S3.query(tenant, [])
+      assert {:ok, records} = S3.query(:logs, tenant, [])
       assert Enum.map(records, & &1.timestamp_ns) == [1]
 
       # Manifest is now on disk and must be reloadable — this is the
@@ -316,7 +316,7 @@ defmodule Pulso.Storage.S3Test do
       short_config = Map.put(config, :refresh_stale_ms, 50)
 
       # Prime the cache on this node with an empty manifest first.
-      assert :ok = S3.append(tenant, [record(1)])
+      assert :ok = S3.append(:logs, tenant, [record(1)])
       before_entry = ManifestCache.get(tenant, "logs")
       assert length(before_entry.manifest.segments) == 1
 
@@ -326,10 +326,10 @@ defmodule Pulso.Storage.S3Test do
       # patching the manifest to include it, then CAS-updating the
       # manifest with the current etag.
       remote_key =
-        "tenants/#{tenant}/v3/logs/00000000000000000042-00000000000000000042-rand-abcdef0123456789-deadbeefdeadbeef.parquet"
+        "tenants/#{tenant}/v4/signal=logs/00000000000000000042-00000000000000000042-rand-abcdef0123456789-deadbeefdeadbeef.parquet"
 
       {:ok, remote_body, 42, 42} =
-        S3.encode_segment([%Log{timestamp_ns: 42, service: "remote", body: "from-node-b"}])
+        S3.encode_segment(:logs, [%Log{timestamp_ns: 42, service: "remote", body: "from-node-b"}])
 
       assert {:ok, _etag} = ObjectStore.put(short_config, remote_key, remote_body)
 
@@ -351,7 +351,7 @@ defmodule Pulso.Storage.S3Test do
       Process.sleep(120)
 
       Application.put_env(:pulso, S3, short_config)
-      assert {:ok, records} = S3.query(tenant, [])
+      assert {:ok, records} = S3.query(:logs, tenant, [])
       Application.put_env(:pulso, S3, config)
 
       timestamps = Enum.map(records, & &1.timestamp_ns) |> Enum.sort()
@@ -373,20 +373,20 @@ defmodule Pulso.Storage.S3Test do
       # We first do a normal append to boot the owner (rebuild path
       # and initial CAS), then flip the ceiling to 0 in the config
       # and verify the next call bounces.
-      assert :ok = S3.append(tenant, [record(1)])
+      assert :ok = S3.append(:logs, tenant, [record(1)])
 
       capped_config = Map.put(config, :max_mailbox, 0)
       Application.put_env(:pulso, S3, capped_config)
 
       try do
-        assert {:error, :owner_overloaded} = S3.append(tenant, [record(2)])
+        assert {:error, :owner_overloaded} = S3.append(:logs, tenant, [record(2)])
       after
         Application.put_env(:pulso, S3, config)
       end
 
       # And once the cap is lifted, subsequent appends succeed
       # normally — this asserts we haven't corrupted owner state.
-      assert :ok = S3.append(tenant, [record(3)])
+      assert :ok = S3.append(:logs, tenant, [record(3)])
     end
   end
 

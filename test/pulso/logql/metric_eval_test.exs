@@ -12,7 +12,7 @@ defmodule Pulso.LogQL.MetricEvalTest do
     :ok
   end
 
-  defp log(tenant, records), do: :ok = Storage.append(tenant, records)
+  defp log(tenant, records), do: :ok = Storage.append(:logs, tenant, records)
   defp record(fields), do: struct!(Log, Map.new(fields))
 
   defp run(query, opts) do
