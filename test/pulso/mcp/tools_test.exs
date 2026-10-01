@@ -5,6 +5,7 @@ defmodule Pulso.MCP.ToolsTest do
   alias Pulso.Auth.SharedSecret
   alias Pulso.MCP.Tools
   alias Pulso.Record.Log
+  alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
 
@@ -13,10 +14,17 @@ defmodule Pulso.MCP.ToolsTest do
     :ok
   end
 
-  test "lists the query_logs tool" do
+  test "lists the query_logs and query_metrics tools" do
     tools = Tools.list()
-    assert [%{"name" => "query_logs", "inputSchema" => schema}] = tools
-    assert schema["required"] == ["tenant"]
+    names = Enum.map(tools, & &1["name"])
+    assert "query_logs" in names
+    assert "query_metrics" in names
+
+    logs_tool = Enum.find(tools, &(&1["name"] == "query_logs"))
+    assert logs_tool["inputSchema"]["required"] == ["tenant"]
+
+    metrics_tool = Enum.find(tools, &(&1["name"] == "query_metrics"))
+    assert metrics_tool["inputSchema"]["required"] == ["tenant"]
   end
 
   test "query_logs returns records for the tenant" do
@@ -46,6 +54,38 @@ defmodule Pulso.MCP.ToolsTest do
 
   test "query_logs errors when tenant is missing" do
     assert {:error, {:invalid_arguments, _}} = Tools.call("query_logs", %{})
+  end
+
+  describe "query_metrics" do
+    test "returns samples for the tenant filtered by label matchers" do
+      :ok =
+        Storage.append(:metrics, "acme", [
+          %MetricSample{timestamp_ns: 10, value: 1.0, labels: %{"__name__" => "up", "svc" => "api"}},
+          %MetricSample{timestamp_ns: 20, value: 2.0, labels: %{"__name__" => "up", "svc" => "web"}}
+        ])
+
+      assert {:ok, [%{"type" => "text", "text" => text}]} =
+               Tools.call("query_metrics", %{
+                 "tenant" => "acme",
+                 "matchers" => [%{"name" => "svc", "op" => "=", "value" => "api"}]
+               })
+
+      assert [sample] = JSON.decode!(text)
+      assert sample["labels"]["svc"] == "api"
+      assert sample["value"] == 1.0
+    end
+
+    test "errors on an unknown matcher op" do
+      assert {:error, {:invalid_arguments, _}} =
+               Tools.call("query_metrics", %{
+                 "tenant" => "acme",
+                 "matchers" => [%{"name" => "svc", "op" => "???", "value" => "api"}]
+               })
+    end
+
+    test "errors when tenant is missing" do
+      assert {:error, {:invalid_arguments, _}} = Tools.call("query_metrics", %{})
+    end
   end
 
   describe "auth on the read path" do
