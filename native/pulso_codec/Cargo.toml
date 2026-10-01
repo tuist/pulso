@@ -19,6 +19,13 @@ ryu = "1"
 arrow = { version = "54", default-features = false }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
 bytes = "1"
+# Byte-for-byte compatible with Prometheus's `github.com/cespare/xxhash/v2`,
+# which Prometheus's `labels.StableHash` uses — see src/stable_hash.rs.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Prometheus-compatible regex matchers (RE2 flavour; `regex` is RE2-equivalent
+# modulo anchors — Prometheus implicitly anchors remote-write matchers, which
+# we do explicitly in `metric_segment_parquet.rs`).
+regex = "1"
 
 [profile.release]
 lto = true

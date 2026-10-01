@@ -19,9 +19,12 @@ mod json_read;
 mod json_write;
 mod labels;
 mod loki;
+mod metric_segment_parquet;
 mod out;
+mod remote_write;
 mod segment;
 mod segment_parquet;
+mod stable_hash;
 mod term_json;
 mod wire;
 
@@ -29,7 +32,7 @@ use json_read::Parser;
 use out::BinSink;
 use term_json::{EncodeError, JsonEncoder, TermBuilder};
 
-use rustler::{Binary, Encoder, Env, NewBinary, NifResult, Term};
+use rustler::{Binary, Encoder, Env, ListIterator, NewBinary, NifResult, Term};
 use std::borrow::Cow;
 
 mod atoms {
@@ -56,6 +59,10 @@ mod atoms {
         span_id,
         attributes,
         resource,
+        eq,
+        neq,
+        re,
+        nre,
     }
 }
 
@@ -364,6 +371,140 @@ fn decode_log_segment_parquet<'a>(
         Ok(records) => (atoms::ok(), records).encode(env),
         Err(_) => atoms::fallback().encode(env),
     }
+}
+
+/// Encode `[%Pulso.Record.MetricSample{}]` as an Apache Parquet segment
+/// for the metrics S3 storage path. Returns
+/// `{:ok, binary, min_ts, max_ts, count}` on success or `:fallback`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_metric_segment_parquet<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
+    match metric_segment_parquet::encode(env, samples) {
+        Ok((buf, b)) => (
+            atoms::ok(),
+            copy(env, &buf),
+            integer(env, b.min_ts),
+            integer(env, b.max_ts),
+            b.count,
+        )
+            .encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// Decode a metric Parquet segment into
+/// `[%Pulso.Record.MetricSample{}]`, keeping only samples inside
+/// `[start_ts, end_ts]` and matching every supplied label matcher.
+/// Matchers are a list of `{name :: binary, op :: :eq | :neq | :re | :nre, value :: binary}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_metric_segment_parquet<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    matchers: Term<'a>,
+) -> Term<'a> {
+    let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
+        return atoms::fallback().encode(env);
+    };
+    let Ok(matcher_iter) = matchers.decode::<ListIterator>() else {
+        return atoms::fallback().encode(env);
+    };
+    // Borrow the raw bytes from the matcher value binaries through the
+    // owning `Binary` list we keep alive via `_owners`.
+    let mut owners: Vec<(Binary, Binary, metric_segment_parquet::MatcherOp)> = Vec::new();
+    for term in matcher_iter {
+        let Ok((name, op_atom, value)): Result<(Binary, rustler::Atom, Binary), _> = term.decode()
+        else {
+            return atoms::fallback().encode(env);
+        };
+        let op = if op_atom == atoms::eq() {
+            metric_segment_parquet::MatcherOp::Eq
+        } else if op_atom == atoms::neq() {
+            metric_segment_parquet::MatcherOp::Neq
+        } else if op_atom == atoms::re() {
+            metric_segment_parquet::MatcherOp::Re
+        } else if op_atom == atoms::nre() {
+            metric_segment_parquet::MatcherOp::Nre
+        } else {
+            return atoms::fallback().encode(env);
+        };
+        owners.push((name, value, op));
+    }
+    let matcher_views: Vec<metric_segment_parquet::Matcher> = owners
+        .iter()
+        .map(|(n, v, op)| metric_segment_parquet::Matcher {
+            name: n.as_slice(),
+            value: v.as_slice(),
+            op: *op,
+        })
+        .collect();
+    let filter = metric_segment_parquet::Filter {
+        start,
+        end,
+        matchers: matcher_views,
+    };
+    match metric_segment_parquet::decode(env, &blob, &filter) {
+        Ok(records) => (atoms::ok(), records).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// Decode a Snappy-compressed Prometheus remote_write v1
+/// `WriteRequest`. Returns `{:ok, series, rejected}` where each entry
+/// of `series` is `{labels_map, [{ts_ms, value}, …], series_id}`.
+///
+/// `labels_map` is `%{binary => binary}`, `ts_ms` is milliseconds (the
+/// Prometheus unit, not nanoseconds — the Elixir caller rescales),
+/// `series_id` is the Prometheus-compatible `labels.StableHash`
+/// digest (see `src/stable_hash.rs`).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_remote_write<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+) -> NifResult<Term<'a>> {
+    let input = compressed.as_slice();
+    let len = match snap::raw::decompress_len(input) {
+        Ok(len) => len,
+        Err(_) => return Ok(error(env, atoms::invalid_snappy())),
+    };
+    if len > max_decompressed {
+        return Ok(error(env, atoms::payload_too_large()));
+    }
+
+    let mut buffer = NewBinary::new(env, len);
+    match snap::raw::Decoder::new().decompress(input, buffer.as_mut_slice()) {
+        Ok(written) if written == len => {}
+        _ => return Ok(error(env, atoms::invalid_snappy())),
+    }
+    let buffer: Binary = buffer.into();
+
+    let decoded = match remote_write::decode(buffer.as_slice()) {
+        Some(d) => d,
+        None => return Ok(error(env, atoms::invalid_protobuf())),
+    };
+
+    let mut series_terms: Vec<Term<'a>> = Vec::with_capacity(decoded.series.len());
+    for series in &decoded.series {
+        let mut names: Vec<Term<'a>> = Vec::with_capacity(series.labels.len());
+        let mut values: Vec<Term<'a>> = Vec::with_capacity(series.labels.len());
+        for (name, value) in &series.labels {
+            names.push(slice(env, &buffer, name)?);
+            values.push(slice(env, &buffer, value)?);
+        }
+        let labels_map = Term::map_from_arrays(env, &names, &values)?;
+        let samples: Vec<Term<'a>> = series
+            .samples
+            .iter()
+            .map(|s| (s.timestamp_ms, s.value).encode(env))
+            .collect();
+        let sorted_pairs: Vec<(&[u8], &[u8])> =
+            series.labels.iter().map(|(n, v)| (*n, *v)).collect();
+        let series_id = stable_hash::stable_hash(sorted_pairs.into_iter()) as i64;
+        series_terms.push((labels_map, samples, series_id).encode(env));
+    }
+
+    Ok((atoms::ok(), series_terms, decoded.rejected).encode(env))
 }
 
 rustler::init!("Elixir.Pulso.Codec.NIF");
