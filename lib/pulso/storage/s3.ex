@@ -256,7 +256,20 @@ defmodule Pulso.Storage.S3 do
 
   # Scan segments newest-first, decode each, keep only records inside the
   # requested filter, and short-circuit once we know the running accumulator
-  # already dominates every remaining segment.
+  # already dominates every remaining segment. The safety condition:
+  #
+  #   have >= limit records AND
+  #   kth-largest.timestamp_ns > next_segment.max_ts
+  #
+  # means no future segment can produce a record higher than what we have,
+  # so it is safe to stop. Segments whose max_ts is unknown never satisfy
+  # the condition, so they always get fetched — that is the price of not
+  # knowing their bounds.
+  #
+  # `opts` is passed through to the per-signal decoder so each signal's
+  # pushdowns (service + matchers + line_filters for logs, matchers for
+  # metrics) stay typed at the signal boundary rather than fanning into
+  # positional args here.
   defp scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
     ctx = %{
       signal: signal,
@@ -345,22 +358,33 @@ defmodule Pulso.Storage.S3 do
   @doc false
   @spec decode_segment(Pulso.Storage.signal(), binary(), term(), term(), keyword()) ::
           {:ok, [Pulso.Storage.signal_record()]} | {:error, term()}
-  def decode_segment(:logs, blob, start_ts, end_ts, opts) when is_binary(blob) do
+  def decode_segment(:logs, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
     service = Keyword.get(opts, :service)
+    matchers = Keyword.get(opts, :matchers, [])
+    line_filters = Keyword.get(opts, :line_filters, [])
 
-    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service) do
+    :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+
+    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service, matchers, line_filters) do
       {:ok, records} -> {:ok, records}
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
   end
 
-  def decode_segment(:metrics, blob, start_ts, end_ts, opts) when is_binary(blob) do
+  def decode_segment(:metrics, blob, start_ts, end_ts, opts)
+      when is_binary(blob) and is_list(opts) do
     matchers = Keyword.get(opts, :matchers, [])
 
     case NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, matchers) do
       {:ok, records} -> {:ok, records}
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
+  end
+
+  defp validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+       when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+              (is_nil(service) or is_binary(service)) and is_list(matchers) and is_list(line_filters) do
+    :ok
   end
 
   defp prefix(tenant, signal) when is_binary(tenant) and is_binary(signal),

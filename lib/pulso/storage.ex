@@ -30,15 +30,27 @@ defmodule Pulso.Storage do
           {:idempotency_key, String.t()}
         ]
 
+  @type matcher_op :: :eq | :neq | :re | :nre
+  @type matcher :: {name :: String.t(), op :: matcher_op(), value :: String.t()}
+
+  @type line_filter_op :: :contains | :not_contains | :match_re | :not_match_re
+  @type line_filter :: {op :: line_filter_op(), value :: String.t()}
+
   @type query_opts :: [
           {:start_ts, non_neg_integer()}
           | {:end_ts, non_neg_integer()}
           | {:limit, pos_integer()}
           # Logs-only convenience filter.
           | {:service, String.t()}
-          # Metrics-only: `{name, op, value}` label matchers where `op` is
-          # `:eq | :neq | :re | :nre`. Logs adapters ignore it.
-          | {:matchers, [{String.t(), :eq | :neq | :re | :nre, String.t()}]}
+          # Label matchers. On logs these filter on the stream labels
+          # the Loki push path stores in `Log.resource`; on metrics they
+          # filter on the sample's label set. Pushed into the Rust
+          # Parquet decoder so rejected rows never materialise as
+          # Erlang terms.
+          | {:matchers, [matcher()]}
+          # Logs-only: substring or regex predicates on `Log.body`,
+          # pushed into the Rust decoder alongside the label matchers.
+          | {:line_filters, [line_filter()]}
         ]
 
   @callback append(signal, tenant, [signal_record], append_opts) :: :ok | {:error, term()}
