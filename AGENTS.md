@@ -26,7 +26,9 @@ Early scaffolding. In place:
 - `Pulso.PromQL` — initial [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/) parser and evaluator: float selectors, counter rates and increases, gauge deltas, over-time functions, grouped vector aggregations, and positive offsets. Exposed by `query_promql` and `/api/v1/query{,_range}`.
 - Metrics manifests carry complete, bounded metric-name sets for exact-name pruning. Unknown summaries are always scanned.
 
-Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), top-label manifest summaries, compactor, traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, distribution (membership discovery and rendezvous hashing).
+- `Pulso.Storage.S3.CompactionWorker` and `MetricsCompactor` provide opt-in metrics compaction, rendezvous ownership among live eligible workers, durable manifest-based tenant discovery, and restart-safe retirement cleanup. See the metrics compaction section in `docs/architecture.md`.
+
+Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), top-label manifest summaries, traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, ingest forwarding and ownership. Follow-up priority: label posting indexes, OpenTelemetry metrics ingestion, then alert evaluation.
 
 ## Design bet
 
