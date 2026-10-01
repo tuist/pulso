@@ -27,10 +27,10 @@ defmodule Pulso.Storage.S3CodecTest do
       # pass after that is a pure round-trip.
       for _ <- 1..200 do
         records = RandomTerms.logs(:rand.uniform(40))
-        {:ok, payload, min_ts, max_ts} = S3.encode_segment(records)
-        {:ok, decoded1} = S3.decode_segment(payload, nil, nil, nil)
-        {:ok, payload2, min_ts2, max_ts2} = S3.encode_segment(decoded1)
-        {:ok, decoded2} = S3.decode_segment(payload2, nil, nil, nil)
+        {:ok, payload, min_ts, max_ts} = S3.encode_segment(:logs, records)
+        {:ok, decoded1} = S3.decode_segment(:logs, payload, nil, nil, [])
+        {:ok, payload2, min_ts2, max_ts2} = S3.encode_segment(:logs, decoded1)
+        {:ok, decoded2} = S3.decode_segment(:logs, payload2, nil, nil, [])
 
         assert canonicalize(decoded1) == canonicalize(decoded2)
         assert min_ts == min_ts2
@@ -41,67 +41,67 @@ defmodule Pulso.Storage.S3CodecTest do
 
     test "preserves the caller's timestamp bounds" do
       records = for ts <- [50, 10, 30], do: %Log{timestamp_ns: ts}
-      assert {:ok, _payload, 10, 50} = S3.encode_segment(records)
+      assert {:ok, _payload, 10, 50} = S3.encode_segment(:logs, records)
     end
 
     test "an empty batch encodes to a valid segment with zero bounds" do
-      assert {:ok, payload, 0, 0} = S3.encode_segment([])
+      assert {:ok, payload, 0, 0} = S3.encode_segment(:logs, [])
       # An empty Parquet file with the schema round-trips to no records.
-      assert {:ok, []} = S3.decode_segment(payload, nil, nil, nil)
+      assert {:ok, []} = S3.decode_segment(:logs, payload, nil, nil, [])
     end
 
     test "nil or empty attributes and resource decode as empty maps" do
       records = [%Log{timestamp_ns: 1, attributes: nil, resource: %{}}]
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      assert {:ok, [decoded]} = S3.decode_segment(payload, nil, nil, nil)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      assert {:ok, [decoded]} = S3.decode_segment(:logs, payload, nil, nil, [])
       assert decoded.attributes == %{}
       assert decoded.resource == %{}
     end
 
     test "colliding stringified attribute keys surface as an attribute-key-collision error" do
       records = [%Log{timestamp_ns: 1, attributes: %{:a => 1, "a" => 2}}]
-      assert {:error, {:attribute_key_collision, _}} = S3.encode_segment(records)
+      assert {:error, {:attribute_key_collision, _}} = S3.encode_segment(:logs, records)
     end
 
     test "a non-UTF-8 body surfaces as a Parquet encoder error" do
       records = [%Log{timestamp_ns: 1, body: <<0xFF>>}]
-      assert {:error, {:encode_failed, _}} = S3.encode_segment(records)
+      assert {:error, {:encode_failed, _}} = S3.encode_segment(:logs, records)
     end
 
     test "a JSON-unencodable body value (reference) surfaces as a Parquet encoder error" do
       records = [%Log{timestamp_ns: 1, body: make_ref()}]
-      assert {:error, {:encode_failed, _}} = S3.encode_segment(records)
+      assert {:error, {:encode_failed, _}} = S3.encode_segment(:logs, records)
     end
 
     test "an out-of-range integer timestamp surfaces as a Parquet encoder error" do
       # Parquet's timestamp column is Int64; anything past 2^63 - 1 must
       # not be silently truncated.
       records = [%Log{timestamp_ns: 123_456_789_012_345_678_901_234_567_890}]
-      assert {:error, {:encode_failed, _}} = S3.encode_segment(records)
+      assert {:error, {:encode_failed, _}} = S3.encode_segment(:logs, records)
     end
   end
 
   describe "decode_segment/4" do
     test "reads back everything a segment holds when no filter is set" do
       records = for i <- 1..30, do: %Log{timestamp_ns: i * 1000, service: "svc#{rem(i, 3)}"}
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      assert {:ok, decoded} = S3.decode_segment(payload, nil, nil, nil)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      assert {:ok, decoded} = S3.decode_segment(:logs, payload, nil, nil, [])
       assert length(decoded) == 30
     end
 
     test "time-range filter drops records outside [start_ts, end_ts]" do
       records = for ts <- 1..10, do: %Log{timestamp_ns: ts, service: "svc"}
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      {:ok, kept} = S3.decode_segment(payload, 3, 7, nil)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      {:ok, kept} = S3.decode_segment(:logs, payload, 3, 7, [])
       assert Enum.sort(Enum.map(kept, & &1.timestamp_ns)) == [3, 4, 5, 6, 7]
     end
 
     test "half-open time filters work with only one bound set" do
       records = for ts <- 1..5, do: %Log{timestamp_ns: ts}
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      {:ok, from_3} = S3.decode_segment(payload, 3, nil, nil)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      {:ok, from_3} = S3.decode_segment(:logs, payload, 3, nil, [])
       assert Enum.sort(Enum.map(from_3, & &1.timestamp_ns)) == [3, 4, 5]
-      {:ok, upto_3} = S3.decode_segment(payload, nil, 3, nil)
+      {:ok, upto_3} = S3.decode_segment(:logs, payload, nil, 3, [])
       assert Enum.sort(Enum.map(upto_3, & &1.timestamp_ns)) == [1, 2, 3]
     end
 
@@ -112,34 +112,34 @@ defmodule Pulso.Storage.S3CodecTest do
         %Log{timestamp_ns: 3, service: "svc1"}
       ]
 
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      {:ok, kept} = S3.decode_segment(payload, nil, nil, "svc1")
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      {:ok, kept} = S3.decode_segment(:logs, payload, nil, nil, service: "svc1")
       assert Enum.sort(Enum.map(kept, & &1.timestamp_ns)) == [1, 3]
     end
 
     test "drops nil-timestamp records under any time filter" do
       records = [%Log{timestamp_ns: nil, body: "x"}, %Log{timestamp_ns: 5, body: "y"}]
-      {:ok, payload, _, _} = S3.encode_segment(records)
-      {:ok, all} = S3.decode_segment(payload, nil, nil, nil)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      {:ok, all} = S3.decode_segment(:logs, payload, nil, nil, [])
       assert length(all) == 2
-      {:ok, kept} = S3.decode_segment(payload, 0, nil, nil)
+      {:ok, kept} = S3.decode_segment(:logs, payload, 0, nil, [])
       assert match?([%Log{timestamp_ns: 5}], kept)
     end
 
     test "row-group time pruning skips a segment entirely outside the range" do
       records = for ts <- 100..200, do: %Log{timestamp_ns: ts, service: "svc"}
-      {:ok, payload, _, _} = S3.encode_segment(records)
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
       # Every timestamp in [100, 200]; asking for [500, 600] must decode
       # to nothing without materialising any Erlang record term.
-      assert {:ok, []} = S3.decode_segment(payload, 500, 600, nil)
+      assert {:ok, []} = S3.decode_segment(:logs, payload, 500, 600, [])
     end
 
     test "non-parquet input surfaces as a Parquet decoder error" do
-      assert {:error, {:decode_failed, _}} = S3.decode_segment("not-parquet", nil, nil, nil)
+      assert {:error, {:decode_failed, _}} = S3.decode_segment(:logs, "not-parquet", nil, nil, [])
     end
 
     test "an empty binary is not a valid Parquet file" do
-      assert {:error, {:decode_failed, _}} = S3.decode_segment("", nil, nil, nil)
+      assert {:error, {:decode_failed, _}} = S3.decode_segment(:logs, "", nil, nil, [])
     end
   end
 

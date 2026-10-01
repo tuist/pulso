@@ -50,7 +50,7 @@ defmodule Pulso.Storage.S3.Manifest do
   @doc "Path of the manifest object for one `(tenant, signal)`."
   @spec manifest_key(String.t(), String.t()) :: String.t()
   def manifest_key(tenant, signal \\ "logs") when is_binary(tenant) and is_binary(signal) do
-    "tenants/#{tenant}/v3/#{signal}/manifest.json"
+    "tenants/#{tenant}/v4/signal=#{signal}/manifest.json"
   end
 
   @doc "An empty manifest — the shape a first-time `put_if_none_match` uploads."

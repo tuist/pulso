@@ -70,8 +70,8 @@ defmodule PulsoWeb.LokiControllerTest do
 
     assert conn.status == 204
     assert conn.resp_body == ""
-    assert {:ok, [%Log{service: "api", body: "hello", severity_text: "info"}]} = Storage.query("acme")
-    assert {:ok, []} = Storage.query("other")
+    assert {:ok, [%Log{service: "api", body: "hello", severity_text: "info"}]} = Storage.query(:logs, "acme")
+    assert {:ok, []} = Storage.query(:logs, "other")
   end
 
   test "POST /loki/api/v1/push falls back to the default tenant when no header is set",
@@ -82,7 +82,7 @@ defmodule PulsoWeb.LokiControllerTest do
       |> post(~p"/loki/api/v1/push", payload())
 
     assert conn.status == 204
-    assert {:ok, [%Log{body: "hello"}]} = Storage.query("default")
+    assert {:ok, [%Log{body: "hello"}]} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push accepts an empty streams array", %{conn: conn} do
@@ -92,7 +92,7 @@ defmodule PulsoWeb.LokiControllerTest do
       |> post(~p"/loki/api/v1/push", %{"streams" => []})
 
     assert conn.status == 204
-    assert {:ok, []} = Storage.query("default")
+    assert {:ok, []} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push returns 400 for an unsafe tenant name", %{conn: conn} do
@@ -126,7 +126,7 @@ defmodule PulsoWeb.LokiControllerTest do
 
     assert conn.status == 204
     assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
-    assert {:ok, [%Log{body: "ok"}]} = Storage.query("default")
+    assert {:ok, [%Log{body: "ok"}]} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push omits the rejected header when all records land",
@@ -166,7 +166,7 @@ defmodule PulsoWeb.LokiControllerTest do
       |> post(~p"/loki/api/v1/push", gzipped)
 
     assert conn.status == 204
-    assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query("acme")
+    assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query(:logs, "acme")
   end
 
   test "POST /loki/api/v1/push accepts Snappy-compressed protobuf",
@@ -198,7 +198,7 @@ defmodule PulsoWeb.LokiControllerTest do
                 attributes: %{"user_id" => "u1"},
                 resource: %{"service_name" => "api", "level" => "info"}
               }
-            ]} = Storage.query("acme")
+            ]} = Storage.query(:logs, "acme")
   end
 
   test "POST /loki/api/v1/push treats an absent Content-Encoding on protobuf as snappy",
@@ -215,7 +215,7 @@ defmodule PulsoWeb.LokiControllerTest do
       |> post(~p"/loki/api/v1/push", body)
 
     assert conn.status == 204
-    assert {:ok, [%Log{body: "hello"}]} = Storage.query("acme")
+    assert {:ok, [%Log{body: "hello"}]} = Storage.query(:logs, "acme")
   end
 
   test "POST /loki/api/v1/push surfaces protobuf decode rejects in the header",
@@ -249,7 +249,7 @@ defmodule PulsoWeb.LokiControllerTest do
 
     assert conn.status == 204
     assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
-    assert {:ok, [%Log{body: "ok"}]} = Storage.query("default")
+    assert {:ok, [%Log{body: "ok"}]} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push keeps the batch when one line is not valid UTF-8",
@@ -277,7 +277,7 @@ defmodule PulsoWeb.LokiControllerTest do
 
     assert conn.status == 204
     assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
-    assert {:ok, [%Log{body: "good"}]} = Storage.query("default")
+    assert {:ok, [%Log{body: "good"}]} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push returns 400 for a body that is not valid Snappy",
@@ -316,7 +316,7 @@ defmodule PulsoWeb.LokiControllerTest do
       |> post(~p"/loki/api/v1/push", bomb)
 
     assert json_response(conn, 413) == %{"error" => "payload_too_large"}
-    assert {:ok, []} = Storage.query("default")
+    assert {:ok, []} = Storage.query(:logs, "default")
   end
 
   test "POST /loki/api/v1/push rejects protobuf with gzip Content-Encoding as 415",
@@ -360,7 +360,7 @@ defmodule PulsoWeb.LokiControllerTest do
         |> post(~p"/loki/api/v1/push", payload())
 
       assert conn.status == 204
-      assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query("acme")
+      assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query(:logs, "acme")
     end
 
     test "rejects a request with a bad token", %{conn: conn} do
@@ -372,7 +372,7 @@ defmodule PulsoWeb.LokiControllerTest do
         |> post(~p"/loki/api/v1/push", payload())
 
       assert json_response(conn, 401) == %{"error" => "invalid_token"}
-      assert {:ok, []} = Storage.query("acme")
+      assert {:ok, []} = Storage.query(:logs, "acme")
     end
 
     test "rejects a tenant with no configured token", %{conn: conn} do

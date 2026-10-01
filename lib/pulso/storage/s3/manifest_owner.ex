@@ -522,12 +522,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # First-write migration: no manifest exists yet, so LIST the v3 prefix
+  # First-write migration: no manifest exists yet, so LIST the v4 prefix
   # and reconstitute one from the segments that are already in S3. Then
   # PUT it with `put_if_none_match`. If another node beats us to the
-  # create, we lose gracefully and reload their version.
+  # create, we lose gracefully and reload their version. The LIST is
+  # recursive — the `date=/hour=` partitions are swept in one call.
   defp rebuild_from_prefix(state) do
-    prefix = "tenants/#{state.tenant}/v3/#{state.signal}/"
+    prefix = "tenants/#{state.tenant}/v4/signal=#{state.signal}/"
 
     with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
       publish_rebuilt_manifest(state, keys)
@@ -576,18 +577,26 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # else has integer bounds, and the manifest requires them.
   @sort_key_width 20
 
+  # v4 layout places the segment basename
+  # (`<min_ts>-<max_ts>-<suffix>.parquet`) under one or more partition
+  # prefixes (`date=.../hour=.../`), so parsing the key only needs the
+  # basename — not any assumption about how deep the partitioning goes.
+  # Anything the writer would never produce (the manifest itself, sidecar
+  # indexes, a stray upload) resolves to `:skip` and stays out of the
+  # manifest.
   @spec segment_from_key(String.t()) :: {:ok, Segment.t()} | :skip
   defp segment_from_key(key) do
-    with true <- String.ends_with?(key, ".parquet"),
-         [_, rest] <- String.split(key, "/logs/", parts: 2) do
-      parse_bounds(key, rest)
+    if String.ends_with?(key, ".parquet") do
+      key
+      |> Path.basename()
+      |> parse_bounds(key)
     else
-      _ -> :skip
+      :skip
     end
   end
 
-  defp parse_bounds(key, rest) do
-    case rest do
+  defp parse_bounds(basename, key) do
+    case basename do
       <<min_str::binary-size(@sort_key_width), "-", max_str::binary-size(@sort_key_width), "-", _::binary>> ->
         with {min_ts, ""} <- Integer.parse(min_str),
              {max_ts, ""} <- Integer.parse(max_str) do

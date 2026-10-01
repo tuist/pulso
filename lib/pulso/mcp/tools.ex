@@ -57,7 +57,7 @@ defmodule Pulso.MCP.Tools do
       |> put_opt(:service, args["service"])
 
     with :ok <- verify(context, tenant),
-         {:ok, records} <- Storage.query(tenant, opts) do
+         {:ok, records} <- Storage.query(:logs, tenant, opts) do
       {:ok, [%{"type" => "text", "text" => encode_records(records)}]}
     end
   end

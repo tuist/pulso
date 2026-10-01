@@ -45,8 +45,8 @@ defmodule PulsoWeb.OTLPControllerTest do
       |> post(~p"/v1/logs", payload())
 
     assert json_response(conn, 200) == %{}
-    assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query("acme")
-    assert {:ok, []} = Storage.query("other")
+    assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query(:logs, "acme")
+    assert {:ok, []} = Storage.query(:logs, "other")
   end
 
   test "POST /v1/logs falls back to the default tenant when no header is set", %{conn: conn} do
@@ -56,7 +56,7 @@ defmodule PulsoWeb.OTLPControllerTest do
       |> post(~p"/v1/logs", payload())
 
     assert json_response(conn, 200) == %{}
-    assert {:ok, [%Log{body: "hello"}]} = Storage.query("default")
+    assert {:ok, [%Log{body: "hello"}]} = Storage.query(:logs, "default")
   end
 
   test "POST /v1/logs accepts an empty batch without error", %{conn: conn} do
@@ -66,7 +66,7 @@ defmodule PulsoWeb.OTLPControllerTest do
       |> post(~p"/v1/logs", %{"resourceLogs" => []})
 
     assert json_response(conn, 200) == %{}
-    assert {:ok, []} = Storage.query("default")
+    assert {:ok, []} = Storage.query(:logs, "default")
   end
 
   test "POST /v1/logs returns 400 for a tenant name that would escape the prefix",
@@ -150,7 +150,7 @@ defmodule PulsoWeb.OTLPControllerTest do
         |> post(~p"/v1/logs", payload())
 
       assert json_response(conn, 200) == %{}
-      assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query("acme")
+      assert {:ok, [%Log{service: "api", body: "hello"}]} = Storage.query(:logs, "acme")
     end
 
     test "rejects a request with a bad token", %{conn: conn} do
@@ -162,7 +162,7 @@ defmodule PulsoWeb.OTLPControllerTest do
         |> post(~p"/v1/logs", payload())
 
       assert json_response(conn, 401) == %{"error" => "invalid_token"}
-      assert {:ok, []} = Storage.query("acme")
+      assert {:ok, []} = Storage.query(:logs, "acme")
     end
 
     test "rejects a tenant with no configured token", %{conn: conn} do

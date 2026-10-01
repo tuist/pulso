@@ -21,7 +21,7 @@ defmodule Pulso.MCP.ToolsTest do
 
   test "query_logs returns records for the tenant" do
     :ok =
-      Storage.append("acme", [
+      Storage.append(:logs, "acme", [
         %Log{timestamp_ns: 10, service: "api", body: "one"},
         %Log{timestamp_ns: 20, service: "web", body: "two"}
       ])
@@ -32,7 +32,7 @@ defmodule Pulso.MCP.ToolsTest do
 
   test "query_logs applies service and limit filters" do
     :ok =
-      Storage.append("acme", [
+      Storage.append(:logs, "acme", [
         %Log{timestamp_ns: 10, service: "api", body: "a"},
         %Log{timestamp_ns: 20, service: "web", body: "b"},
         %Log{timestamp_ns: 30, service: "api", body: "c"}
@@ -65,7 +65,7 @@ defmodule Pulso.MCP.ToolsTest do
     end
 
     test "rejects a query_logs call with no bearer token" do
-      Storage.append("acme", [%Log{timestamp_ns: 1}])
+      Storage.append(:logs, "acme", [%Log{timestamp_ns: 1}])
 
       assert {:error, {:unauthorized, :missing_token}} =
                Tools.call("query_logs", %{"tenant" => "acme"}, %{conn: %Plug.Conn{}})
@@ -77,14 +77,14 @@ defmodule Pulso.MCP.ToolsTest do
       # would silently read another tenant's data under shared-secret
       # auth. Now the fallback constructs an empty %Plug.Conn{}, which
       # SharedSecret.verify sees as :missing_token.
-      Storage.append("acme", [%Log{timestamp_ns: 1}])
+      Storage.append(:logs, "acme", [%Log{timestamp_ns: 1}])
 
       assert {:error, {:unauthorized, :missing_token}} =
                Tools.call("query_logs", %{"tenant" => "acme"}, %{})
     end
 
     test "rejects a query_logs call with a bad token" do
-      Storage.append("acme", [%Log{timestamp_ns: 1}])
+      Storage.append(:logs, "acme", [%Log{timestamp_ns: 1}])
 
       conn = %Plug.Conn{} |> Plug.Conn.put_req_header("authorization", "Bearer wrong")
 
@@ -93,7 +93,7 @@ defmodule Pulso.MCP.ToolsTest do
     end
 
     test "accepts a query_logs call with the correct token" do
-      Storage.append("acme", [%Log{timestamp_ns: 1, body: "ok"}])
+      Storage.append(:logs, "acme", [%Log{timestamp_ns: 1, body: "ok"}])
 
       conn = %Plug.Conn{} |> Plug.Conn.put_req_header("authorization", "Bearer the-token")
 
