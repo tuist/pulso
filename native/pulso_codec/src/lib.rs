@@ -458,7 +458,7 @@ fn decode_line_filters(term: Term<'_>) -> Result<Vec<LineFilter>, ()> {
                 let owned = value.as_slice().to_vec();
                 out.push(LineFilter::Substring {
                     op,
-                    finder: Finder::new(&owned).into_owned(),
+                    finder: Box::new(Finder::new(&owned).into_owned()),
                 });
             }
             LineFilterOp::MatchRe | LineFilterOp::NotMatchRe => {

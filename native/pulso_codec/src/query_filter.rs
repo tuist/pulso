@@ -139,8 +139,10 @@ pub enum LineFilterOp {
 pub enum LineFilter {
     Substring {
         op: LineFilterOp,
-        // Finder holds the pattern for `memmem` searches.
-        finder: Finder<'static>,
+        // Finder holds the pattern for `memmem` searches. Boxed so the
+        // enum stays close in size to its Regex variant (clippy's
+        // `large_enum_variant` lint).
+        finder: Box<Finder<'static>>,
     },
     Regex {
         op: LineFilterOp,
@@ -275,9 +277,11 @@ pub fn find_label<'a>(input: &'a [u8], key: &[u8]) -> Option<Cow<'a, [u8]>> {
         }
 
         // Match key?
-        let name_matches = has_escapes(&input[key_start..key_end])
-            .then(|| unescape_json_string(&input[key_start..key_end]) == key)
-            .unwrap_or_else(|| &input[key_start..key_end] == key);
+        let name_matches = if has_escapes(&input[key_start..key_end]) {
+            unescape_json_string(&input[key_start..key_end]) == key
+        } else {
+            &input[key_start..key_end] == key
+        };
 
         if input[i] == b'"' {
             i += 1;
@@ -600,7 +604,7 @@ mod tests {
     fn line_filter_substring() {
         let f = LineFilter::Substring {
             op: LineFilterOp::Contains,
-            finder: Finder::new("timeout").into_owned(),
+            finder: Box::new(Finder::new("timeout").into_owned()),
         };
         assert!(f.matches(b"connection timeout at server"));
         assert!(!f.matches(b"connection ok"));
