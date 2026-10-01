@@ -283,7 +283,7 @@ mod tests {
     fn parity_randomised_corpus() {
         // Deterministic PRNG (SplitMix64) over a seed so a regression
         // bisects to a specific input rather than a flake.
-        let mut state: u64 = 0xdeadbeefcafe_f00d;
+        let mut state: u64 = 0xdead_beef_cafe_f00d;
         let mut rand_byte = || {
             state = state
                 .wrapping_mul(6364136223846793005)
