@@ -50,6 +50,7 @@ mod atoms {
         payload_too_large,
         fallback,
         too_big,
+        query_sample_limit,
         storage,
         lines,
         eq,
@@ -442,6 +443,29 @@ fn decode_metric_segment_parquet<'a>(
     end_ts: Term<'a>,
     matchers: Term<'a>,
 ) -> Term<'a> {
+    decode_metrics(env, blob, start_ts, end_ts, matchers, None)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_metric_segment_parquet_bounded<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    matchers: Term<'a>,
+    max_samples: usize,
+) -> Term<'a> {
+    decode_metrics(env, blob, start_ts, end_ts, matchers, Some(max_samples))
+}
+
+fn decode_metrics<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    matchers: Term<'a>,
+    max_samples: Option<usize>,
+) -> Term<'a> {
     let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
         return atoms::fallback().encode(env);
     };
@@ -481,11 +505,31 @@ fn decode_metric_segment_parquet<'a>(
         start,
         end,
         matchers: matcher_views,
+        max_samples,
     };
     match metric_segment_parquet::decode(env, &blob, &filter) {
         Ok(records) => (atoms::ok(), records).encode(env),
+        Err(metric_segment_parquet::DecodeError::TooManySamples) => {
+            (atoms::error(), atoms::query_sample_limit()).encode(env)
+        }
         Err(_) => atoms::fallback().encode(env),
     }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn validate_metric_regex(pattern: &str) -> rustler::Atom {
+    if metric_segment_parquet::compile_metric_regex(pattern).is_ok() {
+        atoms::ok()
+    } else {
+        atoms::error()
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn match_metric_regex(pattern: &str, value: &str) -> NifResult<bool> {
+    let regex = metric_segment_parquet::compile_metric_regex(pattern)
+        .map_err(|_| rustler::Error::BadArg)?;
+    Ok(regex.is_match(value))
 }
 
 /// Decode a Snappy-compressed Prometheus remote_write v1

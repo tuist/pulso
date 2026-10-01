@@ -5,6 +5,8 @@ defmodule Pulso.Application do
 
   use Application
 
+  alias Pulso.PromQL.QuerySlots
+  alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Storage.Memory
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.CompactionWorker
@@ -15,6 +17,8 @@ defmodule Pulso.Application do
     children =
       [
         PulsoWeb.Telemetry,
+        {Task.Supervisor, name: TaskSupervisor, max_children: 4},
+        {Registry, keys: :unique, name: QuerySlots},
         {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Pulso.PubSub}
       ] ++ storage_children() ++ [PulsoWeb.Endpoint]

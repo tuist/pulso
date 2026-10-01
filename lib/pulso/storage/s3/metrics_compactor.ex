@@ -88,7 +88,12 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
       suffix = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
       original_key = S3.object_key(tenant, "metrics", min_ts, max_ts, suffix, nil)
       key = Path.join(Path.dirname(original_key), String.replace(Path.basename(original_key), "-rand-", "-compact-"))
-      replacement = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
+
+      replacement =
+        key
+        |> Segment.build(min_ts, max_ts, length(records), byte_size(payload))
+        |> Segment.summarize_metrics(records)
+
       source_keys = Enum.map(sources, & &1.key)
       grace = Keyword.get(opts, :grace_ms, 3_600_000)
 

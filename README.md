@@ -70,3 +70,32 @@ This runs `mix compile --warnings-as-errors`, `mix deps.unlock --unused`, `mix f
 ## 📄 License
 
 Pulso is released under the [MIT License](./LICENSE).
+
+## Metrics queries
+
+Prometheus `remote_write` samples ingested at `POST /api/v1/write` can be queried
+through the read-only `query_promql` [Model Context Protocol](https://modelcontextprotocol.io/) tool.
+Its `tenant` and `query` arguments are required. `end_ts_ns` selects the instant
+evaluation time (defaults to now); adding `start_ts_ns` and a positive `step_ms`
+selects a range query.
+
+The initial [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/)
+subset supports selectors, `rate`, `increase`, `irate`, `delta`, five over-time
+functions (`sum`, `avg`, `min`, `max`, `count`), and nested vector aggregations
+with `by`/`without` grouping. For example:
+
+```text
+sum by (job) (rate(http_requests_total{job="api"}[5m]))
+avg without (instance) (process_resident_memory_bytes)
+```
+
+Compatibility endpoints `GET|POST /api/v1/query` and `/api/v1/query_range` accept
+Prometheus parameters (`query`, `time`, or `start`/`end`/`step`) and the same
+`X-Scope-OrgID` tenant and authorization headers as ingestion. Timestamps accept
+Unix seconds or date-time strings with a timezone; steps accept seconds or
+unit durations such as `15s`. Client `timeout` values are accepted and capped at ten seconds. Results use Prometheus vector or matrix envelopes.
+
+Queries have sample, work, result, time, and heap budgets. Conflicting samples at the same timestamp resolve deterministically with a warning. Unsupported parameter overrides and expressions return an error. Binary operations, scalar expressions,
+subqueries, histograms, negative offsets, `@`, and stale-marker semantics are
+not included yet. See [the architecture](docs/architecture.md) for query limits
+and the remaining compatibility gaps.

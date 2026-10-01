@@ -2,6 +2,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   use ExUnit.Case, async: false
 
   alias Pulso.ObjectStore
+  alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage.S3
@@ -123,6 +124,90 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     # Deliberately serve a fresh-looking obsolete snapshot; missing files restart the scan.
     Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
     assert S3.query(:metrics, ctx.tenant, []) == hd(before)
+  end
+
+  test "compacted name summaries preserve selective query budgets and retirement metadata", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    matchers = [{"__name__", :eq, "requests"}]
+    before = S3.query(:metrics, ctx.tenant, matchers: matchers)
+    assert {:error, :query_scan_limit} = S3.query(:metrics, ctx.tenant, matchers: matchers, max_scan_segments: 1)
+    assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    other = %MetricSample{timestamp_ns: 5, value: 1.0, labels: %{"__name__" => "temperature"}}
+    assert :ok = S3.append(:metrics, ctx.tenant, [other])
+    manifest = load(ctx)
+    assert manifest.version == 2
+    assert map_size(manifest.retired) == 4
+    assert Enum.any?(manifest.segments, &(&1.metric_names == ["requests"]))
+    reads(ctx.agent)
+    assert S3.query(:metrics, ctx.tenant, matchers: matchers, max_scan_segments: 1, max_scan_rows: 4) == before
+    assert reads(ctx.agent) == 1
+    assert {:ok, 4} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    cleaned = load(ctx)
+    assert cleaned.cleanup_cursor != nil
+    assert Enum.all?(cleaned.retired, fn {_, retirement} -> retirement.deleted? end)
+    assert Enum.any?(cleaned.segments, &(&1.metric_names == ["requests"]))
+  end
+
+  test "a stale snapshot retry prunes unrelated metric names before checking scan budgets", ctx do
+    for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    snapshot = load(ctx)
+    expected = S3.query(:metrics, ctx.tenant, [])
+    assert {:ok, %{merged: 3}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    assert {:ok, 3} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+
+    for ts <- 4..7 do
+      other = %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => "temperature"}}
+      assert :ok = S3.append(:metrics, ctx.tenant, [other])
+    end
+
+    ManifestCache.put(ctx.tenant, "metrics", snapshot, "obsolete")
+    Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
+    reads(ctx.agent)
+    assert S3.query(:metrics, ctx.tenant, matchers: [{"__name__", :eq, "requests"}], max_scan_segments: 3) == expected
+    assert reads(ctx.agent) == 2
+  end
+
+  test "an in-flight compaction retry retains the rows already consumed from its scan budget", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    first_key = hd(load(ctx).segments).key
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", first_key} => owner}})
+    supervisor = start_supervised!(Task.Supervisor)
+    query = Task.Supervisor.async_nolink(supervisor, fn -> S3.query(:metrics, ctx.tenant, max_scan_rows: 4) end)
+    assert_receive {:storage_barrier, reader, "GET", ^first_key}, 5_000
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    assert {:ok, 4} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    send(reader, {:release_storage, first_key})
+    assert Task.await(query, 10_000) == {:error, :query_scan_limit}
+    assert {:ok, records} = S3.query(:metrics, ctx.tenant, max_scan_rows: 4)
+    assert length(records) == 4
+  end
+
+  test "public metric evaluation preserves counter resets and grouped range results after compaction", ctx do
+    previous = Application.get_env(:pulso, Pulso.Storage)
+    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
+    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+
+    for scrape <- 1..30 do
+      ts = scrape * 15_000_000_000
+      counter = if scrape < 10, do: scrape * 5.0, else: (scrape - 10) * 5.0
+      assert :ok = S3.append(:metrics, ctx.tenant, [sample(ts, counter), sample(ts, counter * 2, "b")])
+    end
+
+    queries = ["sum(rate(requests[60s]))", "max by(host) (requests)", "avg_over_time(requests[60s])"]
+    opts = %{start_ts_ns: 60_000_000_000, end_ts_ns: 450_000_000_000, step_ns: 15_000_000_000}
+    evaluate = fn query -> Evaluator.query(query, ctx.tenant, opts) end
+    before = Enum.map(queries, evaluate)
+    assert Enum.all?(before, &match?({:ok, %{"data" => %{"result" => [_ | _]}}}, &1))
+    reads(ctx.agent)
+    assert evaluate.(hd(queries)) == hd(before)
+    assert reads(ctx.agent) == 30
+    assert {:ok, %{merged: 30}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    assert {:ok, 30} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    reads(ctx.agent)
+    assert Enum.map(queries, evaluate) == before
+    assert reads(ctx.agent) == 3
   end
 
   test "concurrent append survives a conditional-write conflict", ctx do

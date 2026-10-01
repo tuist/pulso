@@ -19,6 +19,27 @@ defmodule Pulso.MCP.Tools do
 
   @tools [
     %{
+      "name" => "query_promql",
+      "description" =>
+        "Evaluate the supported Prometheus Query Language subset: selectors, rate/increase/irate/delta, over-time functions, and sum/avg/min/max/count with by/without grouping. Returns a Prometheus vector or matrix envelope.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "tenant" => %{"type" => "string"},
+          "query" => %{"type" => "string"},
+          "start_ts_ns" => %{"type" => "integer"},
+          "end_ts_ns" => %{"type" => "integer"},
+          "step_ms" => %{
+            "type" => "integer",
+            "minimum" => 1,
+            "description" =>
+              "Range-query step in milliseconds. Requires start_ts_ns and end_ts_ns; omit for an instant query."
+          }
+        },
+        "required" => ["tenant", "query"]
+      }
+    },
+    %{
       "name" => "query_logs",
       "description" => "Return log records for a tenant, optionally filtered by time range and service.",
       "inputSchema" => %{
@@ -160,7 +181,45 @@ defmodule Pulso.MCP.Tools do
 
   def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
 
+  def call("query_promql", %{"tenant" => tenant, "query" => query} = args, context)
+      when is_binary(tenant) and is_binary(query) do
+    opts =
+      %{}
+      |> maybe_put(:start_ts_ns, args["start_ts_ns"])
+      |> maybe_put(:end_ts_ns, args["end_ts_ns"])
+
+    opts =
+      case Map.fetch(args, "step_ms") do
+        :error -> opts
+        {:ok, ms} when is_integer(ms) and ms > 0 -> Map.put(opts, :step_ns, ms * 1_000_000)
+        _ -> Map.put(opts, :step_ns, :invalid)
+      end
+
+    with :ok <- verify(context, tenant) do
+      query |> Pulso.PromQL.Evaluator.query(tenant, opts) |> promql_result()
+    end
+  end
+
+  def call("query_promql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
+
   def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
+
+  defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
+  defp promql_result({:error, {:storage_error, _}}), do: {:error, :metric_storage_unavailable}
+  defp promql_result({:error, :query_execution_failed}), do: {:error, :metric_query_execution_failed}
+  defp promql_result({:error, :query_overloaded}), do: {:error, :query_overloaded}
+
+  defp promql_result({:error, reason})
+       when reason in [
+              :query_sample_limit,
+              :query_scan_limit,
+              :query_work_limit,
+              :query_result_limit,
+              :query_resource_limit,
+              :query_timeout
+            ], do: {:error, :query_execution_limit}
+
+  defp promql_result({:error, reason}), do: {:error, {:invalid_arguments, reason}}
 
   # -- query_metrics helpers -----------------------------------------------
 

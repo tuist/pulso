@@ -40,6 +40,11 @@ defmodule Pulso.Storage do
           {:start_ts, non_neg_integer()}
           | {:end_ts, non_neg_integer()}
           | {:limit, pos_integer()}
+          | {:max_records, non_neg_integer()}
+          | {:max_scan_segments, pos_integer()}
+          | {:max_scan_bytes, pos_integer()}
+          | {:max_scan_rows, pos_integer()}
+          | {:deadline_ms, integer()}
           # Logs-only convenience filter.
           | {:service, String.t()}
           # Label matchers. On logs these filter on the stream labels

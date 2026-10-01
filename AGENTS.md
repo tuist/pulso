@@ -15,7 +15,7 @@ Early scaffolding. In place:
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
 - `Pulso.Loki` — read-only Loki HTTP client wrapping `query_range`
 - `Pulso.MCP` — JSON-RPC 2.0 dispatcher (`initialize`, `tools/list`, `tools/call`, `ping`)
-- `Pulso.MCP.Tools` — tool registry; read-only tools `query_logs` and `query_metrics`
+- `Pulso.MCP.Tools` — tool registry; read-only tools `query_logs`, `query_metrics`, `query_logql`, and `query_promql`
 - `PulsoWeb.MCPController` at `POST /mcp` (handles single and batched JSON-RPC)
 - `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
 - `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push ingest, JSON and Snappy-compressed protobuf (decoded in Rust by `Pulso.Codec.NIF`)
@@ -23,8 +23,10 @@ Early scaffolding. In place:
 - `PulsoWeb.CompressedBodyReader` — gzip-aware Plug.Parsers body reader, so JSON receivers accept compressed bodies
 - `Pulso.Storage` — signal-generic behaviour (`append(signal, tenant, records, opts)` / `query(signal, tenant, opts)` with `signal :: :logs | :metrics`), with an in-memory adapter for tests and `Pulso.Storage.S3` for dev/prod. S3 objects are Apache Parquet segments (logs via `Pulso.Codec.NIF.{encode,decode}_log_segment_parquet`, metrics via `encode_metric_segment_parquet` / `decode_metric_segment_parquet`), keyed as `tenants/<t>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`, sorted by `(service, timestamp_ns)` for logs and `(series_id, timestamp_ns)` for metrics, coordinated per `(tenant, signal)` through an S3-CAS manifest (`Pulso.Storage.S3.Manifest`, `Pulso.Storage.S3.ManifestOwner`, `Pulso.Storage.S3.ManifestCache`).
 - `native/pulso_codec/src/stable_hash.rs` — Pulso's port of Prometheus's `labels.StableHash` (xxhash64 over `name<0xff>value<0xff>…` across labels sorted by name). Byte-exact with the Go reference; conformance-tested in-crate.
+- `Pulso.PromQL` — initial [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/) parser and evaluator: float selectors, counter rates and increases, gauge deltas, over-time functions, grouped vector aggregations, and positive offsets. Exposed by `query_promql` and `/api/v1/query{,_range}`.
+- Metrics manifests carry complete, bounded metric-name sets for exact-name pruning. Unknown summaries are always scanned.
 
-Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), manifest segment summary enrichment (metric names, top-label summaries), compactor, traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, distribution (Horde/libcluster/ra).
+Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), top-label manifest summaries, compactor, traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, distribution (membership discovery and rendezvous hashing).
 
 ## Design bet
 
@@ -32,7 +34,7 @@ Grafana's Loki/Mimir/Tempo (and the VictoriaMetrics stack) are already headless,
 
 Pulso's bet: build the ingest, storage-facade, alerting, and MCP-interface layer as one coherent system, on a runtime (BEAM/OTP) whose concurrency and supervision model fits this problem shape unusually well.
 
-**v1 shape**: MCP-native gateway + shared alerting over proven headless stores (Mimir/Loki/Tempo or VictoriaMetrics underneath). A unified storage engine is a longer-term option once the interface layer proves itself.
+**v1 shape**: headless nodes with object storage as the source of truth, immutable Parquet segments, and conditional manifest writes. Query tools, protocol-compatible ingestion, and future alerting share the same storage path. `docs/architecture.md` is authoritative for this design.
 
 ## Why Elixir/OTP
 
@@ -40,13 +42,13 @@ Pulso's bet: build the ingest, storage-facade, alerting, and MCP-interface layer
 - **Scheduler fairness** — preemptive, reduction-based scheduling; one expensive query cannot easily starve the rest.
 - **Backpressure-aware ingestion** — GenStage/Broadway for demand-driven pipelines. Process mailboxes are unbounded by default, so this must be designed for deliberately.
 - **Self-healing alerting** — each alert rule as a supervised process; "let it crash and restart" maps directly onto rule-evaluation correctness.
-- **Clustering without external coordinators** — distributed Erlang + Horde (CRDT distributed supervisor/registry) for cluster-wide singleton ownership. `libcluster` for discovery.
+- **Clustering without external coordinators** — membership discovery and rendezvous hashing assign expected owners; object-storage conditional writes enforce correctness during ownership changes.
 - **Phoenix PubSub** — distributed pub/sub for cross-signal correlation and alert fan-out.
 
 ## Known constraints to design around
 
 - Default distributed Erlang is a full mesh, doesn't scale cleanly past ~100–200 nodes without partitioned topologies.
-- Horde's CRDT sync is *eventually consistent* — fine for shard ownership, not strong enough alone for "exactly-once alert firing." Plan to use `ra` (RabbitMQ's Raft, in Erlang) for that specific guarantee.
+- Ownership is an optimization, not a correctness guarantee. Alert fires must use conditional object creation, as described in `docs/architecture.md`; do not add leader election or consensus services.
 - Binary sub-references can pin large buffers in memory — `:binary.copy/1` discipline is needed when parsing large payloads and keeping small slices.
 - Distributed Erlang's cookie auth is weak by default — cluster must stay inside a VPC, or use TLS distribution.
 
@@ -90,7 +92,7 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 - **Rust fast paths** must be semantically identical to an Elixir reference implementation: when the Rust side cannot guarantee the same result it returns `:fallback` and the Elixir code runs. Tests compare the two on randomized input and assert the Rust path actually answered. The one exception is the Parquet log-segment codec (`Pulso.Codec.NIF.{encode,decode}_log_segment_parquet`): Parquet is not a fast path for a pre-existing Elixir behaviour, so there is no reference implementation and no Elixir fallback — a `:fallback` there is a hard error (`{:error, {:encode_failed | :decode_failed, _}}`), mirroring `Pulso.ObjectStore.NIF`, which has no Elixir S3 client to fall back to. Round-trip tests fuzz `encode → decode → encode → decode` and assert idempotency from the first decode onwards.
 - **New backends** go under `Pulso.<Backend>` (e.g. `Pulso.Mimir`, `Pulso.Tempo`), with the same read-only-first shape as `Pulso.Loki`. Every read function must accept a `:base_url` override in opts.
 - **MCP tools** live in `Pulso.MCP.Tools`. Each tool has an `inputSchema`, and its `call/2` clause returns `{:ok, [content_block]}` or `{:error, reason}`. Content blocks follow the MCP shape: `%{"type" => "text", "text" => "..."}`.
-- **Alerting** (when added): each rule is its own supervised process, cluster-wide singleton via Horde. Rules that require exactly-once firing route through `ra`.
+- **Alerting** (when added): each rule is its own supervised process with a rendezvous-hashed evaluator. Rules and immutable fire records live in object storage; conditional creation arbitrates competing evaluators.
 - **Ingestion** (when added): pull-based via Broadway/GenStage. No unbounded process mailboxes.
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
 - **Rust NIF distribution**: the NIF crates under `native/` (`pulso_object_store`, `pulso_codec`) ship via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for each crate and the target triples in its `lib/pulso/*/nif.ex` module and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.

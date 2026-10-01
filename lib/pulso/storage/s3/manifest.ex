@@ -37,6 +37,7 @@ defmodule Pulso.Storage.S3.Manifest do
   alias Pulso.Storage.S3.Manifest.Segment
 
   @schema_version 1
+  @name_dictionary_bytes 65_536
 
   # `tenant` and `signal` are not serialized — they are derivable from
   # the manifest object's own key. Keeping them off the wire keeps the
@@ -69,12 +70,17 @@ defmodule Pulso.Storage.S3.Manifest do
   """
   @spec encode(t()) :: iodata()
   def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor}) do
-    Pulso.JSON.encode_to_iodata!(%{
+    {wire_segments, names} = encode_segments(segments)
+
+    wire = %{
       "v" => version,
-      "s" => Enum.map(segments, &Segment.to_wire/1),
+      "s" => wire_segments,
       "retired" => Map.new(retired, fn {key, retirement} -> {key, Retirement.to_wire(retirement)} end),
       "cleanup_cursor" => cursor
-    })
+    }
+
+    wire = if names == [], do: wire, else: Map.put(wire, "names", names)
+    Pulso.JSON.encode_to_iodata!(wire)
   end
 
   @doc """
@@ -90,7 +96,7 @@ defmodule Pulso.Storage.S3.Manifest do
     with {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(binary),
          :ok <- validate_version(version),
          :ok <- validate_fields(version, wire),
-         {:ok, parsed} <- decode_segments(segments),
+         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"])),
          {:ok, retired} <- decode_retired(Map.get(wire, "retired", %{})),
          {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")) do
       {:ok,
@@ -162,16 +168,63 @@ defmodule Pulso.Storage.S3.Manifest do
     e -> {:error, {:decode_failed, e}}
   end
 
-  defp decode_segments(list) when is_list(list) do
+  defp decode_segments(list, dictionary) when is_list(list) do
     Enum.reduce_while(list, {:ok, []}, fn wire, {:ok, acc} ->
-      case Segment.from_wire(wire) do
+      case Segment.from_wire(expand_names(wire, dictionary)) do
         {:ok, segment} -> {:cont, {:ok, [segment | acc]}}
         {:error, _} = err -> {:halt, err}
       end
     end)
   end
 
-  defp decode_segments(_), do: {:error, :invalid_manifest}
+  defp decode_segments(_, _), do: {:error, :invalid_manifest}
+
+  # Exact name sets repeat across ingest batches. One dictionary entry per set
+  # keeps that repetition off the hot manifest, with a hard byte budget for
+  # distinct sets. Omitted sets remain unknown, so budget exhaustion is safe.
+  defp encode_segments(segments) do
+    state = %{ids: %{}, names: [], bytes: 2, segments: []}
+    state = Enum.reduce(segments, state, &encode_segment/2)
+    {Enum.reverse(state.segments), Enum.reverse(state.names)}
+  end
+
+  defp encode_segment(segment, state) do
+    wire = Segment.to_wire(segment) |> Map.delete("n")
+
+    case dictionary_id(segment.metric_names, state) do
+      {nil, state} -> %{state | segments: [wire | state.segments]}
+      {id, state} -> %{state | segments: [Map.put(wire, "ni", id) | state.segments]}
+    end
+  end
+
+  defp dictionary_id(nil, state), do: {nil, state}
+
+  defp dictionary_id(names, state) do
+    case Map.fetch(state.ids, names) do
+      {:ok, id} -> {id, state}
+      :error -> add_name_set(names, state)
+    end
+  end
+
+  defp add_name_set(names, state) do
+    bytes = names |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_length()
+
+    if state.bytes + bytes + 1 <= @name_dictionary_bytes do
+      id = map_size(state.ids)
+      {id, %{state | ids: Map.put(state.ids, names, id), names: [names | state.names], bytes: state.bytes + bytes + 1}}
+    else
+      {nil, state}
+    end
+  end
+
+  defp name_dictionary(names) when is_list(names), do: List.to_tuple(names)
+  defp name_dictionary(_), do: {}
+
+  defp expand_names(%{"ni" => id} = wire, dictionary) when is_integer(id) and id >= 0 and id < tuple_size(dictionary),
+    do: Map.put(wire, "n", elem(dictionary, id))
+
+  defp expand_names(%{"ni" => _} = wire, _), do: Map.put(wire, "n", nil)
+  defp expand_names(wire, _), do: wire
 
   @doc """
   Merge a batch of newly-written segments into an existing manifest.
