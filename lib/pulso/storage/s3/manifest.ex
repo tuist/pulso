@@ -33,6 +33,7 @@ defmodule Pulso.Storage.S3.Manifest do
       producing a sorted output — O(n) rather than O(n log n).
   """
 
+  alias Pulso.Storage.S3.Manifest.Retirement
   alias Pulso.Storage.S3.Manifest.Segment
 
   @schema_version 1
@@ -41,11 +42,13 @@ defmodule Pulso.Storage.S3.Manifest do
   # `tenant` and `signal` are not serialized — they are derivable from
   # the manifest object's own key. Keeping them off the wire keeps the
   # payload smaller and forecloses a class of tenant-mixing bugs.
-  defstruct version: @schema_version, segments: []
+  defstruct version: @schema_version, segments: [], retired: %{}, cleanup_cursor: nil
 
   @type t :: %__MODULE__{
           version: non_neg_integer(),
-          segments: [Segment.t()]
+          segments: [Segment.t()],
+          retired: %{String.t() => Retirement.t()},
+          cleanup_cursor: String.t() | nil
         }
 
   @doc "Path of the manifest object for one `(tenant, signal)`."
@@ -66,9 +69,16 @@ defmodule Pulso.Storage.S3.Manifest do
   per-segment binary allocations.
   """
   @spec encode(t()) :: iodata()
-  def encode(%__MODULE__{version: version, segments: segments}) do
+  def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor}) do
     {wire_segments, names} = encode_segments(segments)
-    wire = %{"v" => version, "s" => wire_segments}
+
+    wire = %{
+      "v" => version,
+      "s" => wire_segments,
+      "retired" => Map.new(retired, fn {key, retirement} -> {key, Retirement.to_wire(retirement)} end),
+      "cleanup_cursor" => cursor
+    }
+
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
     Pulso.JSON.encode_to_iodata!(wire)
   end
@@ -84,15 +94,71 @@ defmodule Pulso.Storage.S3.Manifest do
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
   def decode(binary) when is_binary(binary) do
     with {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(binary),
-         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"])) do
+         :ok <- validate_version(version),
+         :ok <- validate_fields(version, wire),
+         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"])),
+         {:ok, retired} <- decode_retired(Map.get(wire, "retired", %{})),
+         {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")) do
       {:ok,
        %__MODULE__{
          version: version,
-         segments: sort_by_max_ts_desc(parsed)
+         segments: sort_by_max_ts_desc(parsed),
+         retired: retired,
+         cleanup_cursor: cursor
        }}
     else
       {:ok, _malformed} -> {:error, :invalid_manifest}
       {:error, _} = err -> err
+    end
+  end
+
+  # Tombstones remain after deletion: a delayed idempotent ingest retry must
+  # never reintroduce records that already live in a replacement segment.
+  defp validate_version(version) when version in [1, 2], do: :ok
+  defp validate_version(_), do: {:error, :unsupported_manifest_version}
+
+  defp validate_fields(1, _wire), do: :ok
+  defp validate_fields(2, %{"retired" => _}), do: :ok
+  defp validate_fields(_, _wire), do: {:error, :invalid_manifest}
+
+  defp decode_cursor(cursor) when is_nil(cursor) or is_binary(cursor), do: {:ok, cursor}
+  defp decode_cursor(_), do: {:error, :invalid_manifest}
+
+  defp decode_retired(retired) when is_map(retired) do
+    Enum.reduce_while(retired, {:ok, %{}}, fn {key, wire}, {:ok, acc} ->
+      case Retirement.from_wire(wire) do
+        {:ok, retirement} when is_binary(key) -> {:cont, {:ok, Map.put(acc, key, retirement)}}
+        _ -> {:halt, {:error, :invalid_manifest}}
+      end
+    end)
+  end
+
+  defp decode_retired(_), do: {:error, :invalid_manifest}
+
+  @doc "Mark successful deletions only if no ingest retry changed their revision."
+  def mark_deleted(manifest, deleted, cursor) do
+    retired =
+      Enum.reduce(deleted, manifest.retired, fn {key, observed}, acc ->
+        if Map.get(acc, key) == observed, do: Map.put(acc, key, %{observed | deleted?: true}), else: acc
+      end)
+
+    %{manifest | retired: retired, cleanup_cursor: cursor}
+  end
+
+  @doc "Replace active sources atomically, retaining durable deletion deadlines."
+  @spec replace(t(), [String.t()], Segment.t(), non_neg_integer()) :: {:ok, t()} | {:error, term()}
+  def replace(manifest, source_keys, replacement, delete_after) do
+    sources = MapSet.new(source_keys)
+    active = MapSet.new(manifest.segments, & &1.key)
+
+    if MapSet.size(sources) >= 2 and MapSet.subset?(sources, active) and
+         not MapSet.member?(active, replacement.key) and
+         not Map.has_key?(manifest.retired, replacement.key) do
+      retired = Enum.reduce(source_keys, manifest.retired, &Map.put(&2, &1, Retirement.new(delete_after)))
+      remaining = Enum.reject(manifest.segments, &MapSet.member?(sources, &1.key))
+      {:ok, merge(%{manifest | version: 2, segments: remaining, retired: retired}, [replacement])}
+    else
+      {:error, :compaction_conflict}
     end
   end
 
@@ -182,10 +248,18 @@ defmodule Pulso.Storage.S3.Manifest do
     # a later `query/2` would fetch that object twice and return each of
     # its records twice. `Enum.uniq_by/2` keeps the first occurrence,
     # which is fine here because the duplicates are byte-identical.
-    deduped = Enum.uniq_by(new_segments, & &1.key)
+    retired = Enum.reduce(Enum.uniq_by(new_segments, & &1.key), manifest.retired, &retry_retired/2)
+    deduped = new_segments |> Enum.reject(&Map.has_key?(manifest.retired, &1.key)) |> Enum.uniq_by(& &1.key)
     new_sorted = sort_by_max_ts_desc(deduped)
     merged = merge_sorted(new_sorted, existing, [], MapSet.new(Enum.map(new_sorted, & &1.key)))
-    %{manifest | segments: merged}
+    %{manifest | segments: merged, retired: retired}
+  end
+
+  defp retry_retired(segment, retired) do
+    case Map.fetch(retired, segment.key) do
+      {:ok, retirement} -> Map.put(retired, segment.key, Retirement.retried(retirement))
+      :error -> retired
+    end
   end
 
   # `new` overrides `existing` on key collision — MapSet holds the keys

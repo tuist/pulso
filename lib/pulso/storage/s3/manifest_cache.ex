@@ -69,6 +69,11 @@ defmodule Pulso.Storage.S3.ManifestCache do
     :ok
   end
 
+  @doc "Tenants observed locally through ingest or queries, without listing segment objects."
+  def tenants(signal) when is_binary(signal) do
+    :ets.select(@table, [{{{:"$1", signal}, :_}, [], [:"$1"]}]) |> Enum.sort()
+  end
+
   @doc "Drop a cached entry — used on tenant deletion or forced cache flush."
   @spec drop(String.t(), String.t()) :: :ok
   def drop(tenant, signal) when is_binary(tenant) and is_binary(signal) do

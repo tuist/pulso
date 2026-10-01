@@ -14,7 +14,8 @@ defmodule Pulso.Storage.SortOrder do
 
   Primary key: `timestamp_ns` descending (newest sample first).
   Tiebreakers, in order: `series_id` desc, then a canonical stringified
-  label-set. `nil` sorts last within its position. This matches what a
+  label-set and sample value. `nil` sorts last within its position. This matches
+  what a
   PromQL evaluator expects at the output boundary: samples bucketed by
   time, with a deterministic series order within each timestamp.
   """
@@ -47,9 +48,13 @@ defmodule Pulso.Storage.SortOrder do
     {
       s.timestamp_ns || 0,
       s.series_id || 0,
-      canonical_labels(s.labels)
+      canonical_labels(s.labels),
+      sample_value_key(s.value)
     }
   end
+
+  defp sample_value_key(nil), do: {0, 0}
+  defp sample_value_key(value), do: {1, value}
 
   # Deterministic string form of a label map, used only as a tiebreaker.
   # Sorting the keys makes it stable across the two Elixir map

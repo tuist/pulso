@@ -127,14 +127,7 @@ defmodule Pulso.Storage.S3 do
     with :ok <- validate_tenant(tenant),
          config = config!(),
          {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config) do
-      segments = Manifest.prune_by_time(entry.manifest, start_ts, end_ts)
-
-      segments =
-        if signal == :metrics do
-          Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, [])))
-        else
-          segments
-        end
+      segments = query_segments(entry.manifest, signal, start_ts, end_ts, opts)
 
       with :ok <- check_scan_budget(segments, opts) do
         scan_segments(signal, config, segments, start_ts, end_ts, opts, limit)
@@ -144,9 +137,47 @@ defmodule Pulso.Storage.S3 do
           sorted = records |> SortOrder.sort(signal) |> take_limit(limit)
           {:ok, sorted}
 
+        {:error, {:segment_missing, consumed}} ->
+          # Cleanup can overtake a cached snapshot or an in-flight query.
+          # Restart the whole scan against a fresh manifest, never mix generations.
+          retry_scan(signal, tenant, config, start_ts, end_ts, remaining_budget(opts, consumed), limit)
+
         {:error, _} = err ->
           err
       end
+    end
+  end
+
+  defp query_segments(manifest, signal, start_ts, end_ts, opts) do
+    segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
+
+    if signal == :metrics,
+      do: Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, []))),
+      else: segments
+  end
+
+  defp remaining_budget(opts, consumed) do
+    Enum.reduce(consumed, opts, fn {key, used}, acc ->
+      case Keyword.get(acc, key) do
+        nil -> acc
+        maximum -> Keyword.put(acc, key, maximum - used)
+      end
+    end)
+  end
+
+  defp retry_scan(signal, tenant, config, start_ts, end_ts, opts, limit) do
+    with :ok <- check_deadline(opts[:deadline_ms]),
+         {:ok, _etag, body} <-
+           ObjectStore.get_if_none_match(config, Manifest.manifest_key(tenant, signal_string(signal)), nil),
+         {:ok, manifest} <- Manifest.decode(body),
+         segments = query_segments(manifest, signal, start_ts, end_ts, opts),
+         :ok <- check_deadline(opts[:deadline_ms]),
+         :ok <- check_scan_budget(segments, opts),
+         {:ok, records} <- scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
+      {:ok, records |> SortOrder.sort(signal) |> take_limit(limit)}
+    else
+      {:error, {:segment_missing, _}} -> {:error, :not_found}
+      {:error, _} = error -> error
     end
   end
 
@@ -212,7 +243,8 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp validate_tenant(tenant) do
+  @doc false
+  def validate_tenant(tenant) do
     if Regex.match?(@tenant_regex, tenant) do
       :ok
     else
@@ -332,8 +364,20 @@ defmodule Pulso.Storage.S3 do
         do: {:halt, {:error, :query_scan_limit}},
         else: continue_or_halt(%{state | bytes: bytes}, blob, index, ctx)
     else
-      {:error, :not_found} -> {:cont, {:ok, state}}
-      {:error, _} = err -> {:halt, err}
+      {:error, :not_found} when ctx.signal == :logs ->
+        {:cont, {:ok, state}}
+
+      {:error, :not_found} ->
+        consumed = %{
+          max_scan_bytes: state.bytes,
+          max_scan_segments: index + 1,
+          max_scan_rows: ctx.segments |> Enum.take(index) |> Enum.map(&(&1.row_count || 0)) |> Enum.sum()
+        }
+
+        {:halt, {:error, {:segment_missing, consumed}}}
+
+      {:error, _} = err ->
+        {:halt, err}
     end
   end
 
@@ -434,8 +478,8 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
-       when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+  defp validate_decode_args(blob, start, finish, service, matchers, line_filters)
+       when is_binary(blob) and (is_nil(start) or is_integer(start)) and (is_nil(finish) or is_integer(finish)) and
               (is_nil(service) or is_binary(service)) and is_list(matchers) and is_list(line_filters) do
     :ok
   end

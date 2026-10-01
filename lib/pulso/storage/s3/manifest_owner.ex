@@ -324,31 +324,23 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   @impl GenServer
   def handle_call(:ensure_loaded, _from, state) do
-    if state.loaded? do
-      entry = %{
-        manifest: state.manifest,
-        etag: state.etag || "",
-        refreshed_at_mono: System.monotonic_time(:millisecond)
-      }
+    # A cache miss must not turn an old owner snapshot into a fresh query
+    # snapshot after another node has published compaction or new ingest.
+    case load_manifest(state) do
+      {:ok, manifest, etag} ->
+        ManifestCache.put(state.tenant, state.signal, manifest, etag)
+        state = %{state | manifest: manifest, etag: etag, loaded?: true}
 
-      {:reply, {:ok, entry}, state, @idle_hibernate_ms}
-    else
-      case load_manifest(state) do
-        {:ok, manifest, etag} ->
-          ManifestCache.put(state.tenant, state.signal, manifest, etag)
-          state = %{state | manifest: manifest, etag: etag, loaded?: true}
+        entry = %{
+          manifest: manifest,
+          etag: etag,
+          refreshed_at_mono: System.monotonic_time(:millisecond)
+        }
 
-          entry = %{
-            manifest: manifest,
-            etag: etag,
-            refreshed_at_mono: System.monotonic_time(:millisecond)
-          }
+        {:reply, {:ok, entry}, state, @idle_hibernate_ms}
 
-          {:reply, {:ok, entry}, state, @idle_hibernate_ms}
-
-        {:error, _} = err ->
-          {:reply, err, state, @idle_hibernate_ms}
-      end
+      {:error, _} = error ->
+        {:reply, error, state, @idle_hibernate_ms}
     end
   end
 
@@ -536,6 +528,16 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp publish_rebuilt_manifest(state, keys) do
+    if Enum.any?(keys, &String.contains?(Path.basename(&1), "-compact-")) do
+      # Once compacted, only the manifest can distinguish published replacements
+      # from orphan uploads and retired sources. Never guess by listing objects.
+      {:error, :compacted_manifest_missing}
+    else
+      publish_legacy_manifest(state, keys)
+    end
+  end
+
+  defp publish_legacy_manifest(state, keys) do
     manifest = Manifest.merge(Manifest.new(), rebuild_segments(keys))
     payload = manifest |> Manifest.encode() |> IO.iodata_to_binary()
     manifest_key = Manifest.manifest_key(state.tenant, state.signal)
@@ -586,7 +588,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # manifest.
   @spec segment_from_key(String.t()) :: {:ok, Segment.t()} | :skip
   defp segment_from_key(key) do
-    if String.ends_with?(key, ".parquet") do
+    if String.ends_with?(key, ".parquet") and not String.contains?(Path.basename(key), "-compact-") do
       key
       |> Path.basename()
       |> parse_bounds(key)

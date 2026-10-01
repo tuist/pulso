@@ -9,6 +9,7 @@ defmodule Pulso.Application do
   alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Storage.Memory
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.CompactionWorker
   alias Pulso.Storage.S3.ManifestSupervision
 
   @impl true
@@ -50,10 +51,18 @@ defmodule Pulso.Application do
       end
 
     case adapter do
-      nil -> [Memory]
-      Memory -> [Memory]
-      S3 -> [ManifestSupervision]
-      _ -> []
+      nil ->
+        [Memory]
+
+      Memory ->
+        [Memory]
+
+      S3 ->
+        config = :pulso |> Application.fetch_env!(S3) |> Map.new()
+        [ManifestSupervision | CompactionWorker.children(config)]
+
+      _ ->
+        []
     end
   end
 end
