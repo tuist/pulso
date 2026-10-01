@@ -19,6 +19,7 @@ mod json_read;
 mod json_write;
 mod labels;
 mod loki;
+mod metric_json;
 mod metric_segment_parquet;
 mod out;
 mod query_filter;
@@ -71,6 +72,10 @@ mod atoms {
         span_id,
         attributes,
         resource,
+        metric_sample = "Elixir.Pulso.Record.MetricSample",
+        series_id,
+        value,
+        labels,
     }
 }
 
@@ -627,6 +632,20 @@ fn decode_line_filter_op(atom: rustler::Atom) -> Result<LineFilterOp, ()> {
         Ok(LineFilterOp::NotMatchRe)
     } else {
         Err(())
+    }
+}
+
+/// JSON-encode `[%Pulso.Record.MetricSample{}]` for the MCP
+/// `query_metrics` response. Returns `{:ok, binary}` on success or
+/// `:fallback` on any input the Rust encoder cannot guarantee to emit
+/// identically — the Elixir caller downgrades to `JSON.encode!`.
+///
+/// Fast-path numbers (10 000 samples × 4 labels): see commit body.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
+    match metric_json::encode(env, samples) {
+        Ok(buf) => (atoms::ok(), copy(env, &buf)).encode(env),
+        Err(_) => atoms::fallback().encode(env),
     }
 }
 

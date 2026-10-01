@@ -45,4 +45,10 @@ defmodule Pulso.Codec.NIF do
   # `[{timestamp_ms, value}]`. Zero-copy over the decompressed buffer; the
   # Elixir caller converts to `%MetricSample{}` and ns units.
   def decode_remote_write(_compressed, _max_decompressed_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Rust fast-path JSON encoder for the MCP `query_metrics` response.
+  # Returns `{:ok, binary}` on success or `:fallback` when the input
+  # is not a well-shaped `[%Pulso.Record.MetricSample{}]`; the Elixir
+  # caller falls back to `JSON.encode!` in that case.
+  def encode_metric_samples(_samples), do: :erlang.nif_error(:nif_not_loaded)
 end

@@ -284,12 +284,15 @@ defmodule Pulso.MCP.Tools do
     }
   end
 
-  # Metrics have no Rust fast-path on the response-encoding boundary
-  # yet; keeping this in Elixir until there is one keeps the hot path
-  # tight for logs and lets the first metric response ship with the
-  # obvious shape.
+  # Rust fast-path JSON encoder; falls back to Elixir on any shape the
+  # Rust side cannot guarantee to emit identically. Keeps the hot path
+  # (10k-sample MCP responses) off the general-purpose encoder, which
+  # has to build one intermediate string-keyed map per sample first.
   defp encode_samples(samples) do
-    JSON.encode!(Enum.map(samples, &encode_sample/1))
+    case NIF.encode_metric_samples(samples) do
+      {:ok, json} -> json
+      :fallback -> JSON.encode!(Enum.map(samples, &encode_sample/1))
+    end
   end
 
   defp encode_sample(%MetricSample{} = s) do
