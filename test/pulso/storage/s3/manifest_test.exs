@@ -127,4 +127,29 @@ defmodule Pulso.Storage.S3.ManifestTest do
 
     assert Manifest.prune_by_time(manifest, nil, nil) == manifest.segments
   end
+
+  test "replacement retirement round-trips and prevents ingest retry resurrection" do
+    sources = [seg("a", 0, 5), seg("b", 6, 10)]
+    concurrent = seg("c", 11, 12)
+    manifest = Manifest.merge(Manifest.new(), sources ++ [concurrent])
+    replacement = seg("replacement", 0, 10, 2)
+    assert {:ok, updated} = Manifest.replace(manifest, ["a", "b"], replacement, 123)
+
+    assert Map.new(updated.retired, fn {key, retirement} -> {key, retirement.delete_after} end) == %{
+             "a" => 123,
+             "b" => 123
+           }
+
+    assert Enum.map(updated.segments, & &1.key) == ["c", "replacement"]
+    retried = Manifest.merge(updated, sources)
+    assert retried.segments == updated.segments
+    assert retried.retired["a"].revision == 1
+    assert retried.retired["b"].revision == 1
+    assert {:ok, ^updated} = updated |> Manifest.encode() |> IO.iodata_to_binary() |> Manifest.decode()
+    assert {:error, :compaction_conflict} = Manifest.replace(updated, ["a", "b"], replacement, 456)
+  end
+
+  test "invalid retirement deadlines fail closed" do
+    assert {:error, :invalid_manifest} = Manifest.decode(~s({"v":1,"s":[],"retired":{"a":"soon"}}))
+  end
 end

@@ -133,9 +133,32 @@ defmodule Pulso.Storage.S3 do
           sorted = records |> SortOrder.sort(signal) |> take_limit(limit)
           {:ok, sorted}
 
+        {:error, :not_found} ->
+          # Cleanup can overtake a cached snapshot or an in-flight query.
+          # Restart the whole scan against a fresh manifest, never mix generations.
+          retry_scan(signal, tenant, config, start_ts, end_ts, opts, limit)
+
         {:error, _} = err ->
           err
       end
+    end
+  end
+
+  defp retry_scan(signal, tenant, config, start_ts, end_ts, opts, limit) do
+    with {:ok, _etag, body} <-
+           ObjectStore.get_if_none_match(config, Manifest.manifest_key(tenant, signal_string(signal)), nil),
+         {:ok, manifest} <- Manifest.decode(body),
+         {:ok, records} <-
+           scan_segments(
+             signal,
+             config,
+             Manifest.prune_by_time(manifest, start_ts, end_ts),
+             start_ts,
+             end_ts,
+             opts,
+             limit
+           ) do
+      {:ok, records |> SortOrder.sort(signal) |> take_limit(limit)}
     end
   end
 
@@ -180,7 +203,8 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp validate_tenant(tenant) do
+  @doc false
+  def validate_tenant(tenant) do
     if Regex.match?(@tenant_regex, tenant) do
       :ok
     else
@@ -295,7 +319,7 @@ defmodule Pulso.Storage.S3 do
       {:ok, blob} ->
         continue_or_halt(state, blob, index, ctx)
 
-      {:error, :not_found} ->
+      {:error, :not_found} when ctx.signal == :logs ->
         {:cont, {:ok, state}}
 
       {:error, _} = err ->
@@ -380,8 +404,8 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
-       when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+  defp validate_decode_args(blob, start, finish, service, matchers, line_filters)
+       when is_binary(blob) and (is_nil(start) or is_integer(start)) and (is_nil(finish) or is_integer(finish)) and
               (is_nil(service) or is_binary(service)) and is_list(matchers) and is_list(line_filters) do
     :ok
   end

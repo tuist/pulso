@@ -266,3 +266,69 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 - Adding a dependency that maintains state (a database, a queue, a consensus service).
 
 If the change touches any of the above, update this document in the same PR. Otherwise no.
+
+## Metrics compaction implementation
+
+`Pulso.Storage.S3.CompactionWorker` runs independently from ingest and manifest
+owners. It is disabled by default. Upgrade every writer before enabling it with
+`PULSO_METRICS_COMPACTION_ENABLED=true` or `compaction_enabled: true` in storage
+configuration. Existing writers cannot preserve the new retirement metadata, so
+mixed-version writing is unsupported once compaction has begun.
+
+Every 60 seconds, with scheduling jitter, the worker performs one bounded merge
+and cleanup for each metrics tenant observed locally through ingest or queries.
+It discovers these tenants from the manifest cache rather than recursively
+listing every segment object. After restart, cold tenants become eligible when
+they next ingest or query; `MetricsCompactor.compact/3` and `cleanup/3` allow
+explicit maintenance of idle tenants. `compaction_interval_ms`,
+`compaction_options`, and `compaction_cleanup_options` tune cadence and limits.
+Each operation isolates tenant errors and exceptions, and a merge failure does
+not prevent cleanup or processing of other tenants.
+
+A merge selects at least two segments from the same hour partition, up to 32
+segments, 8 MiB of encoded input, and 100,000 samples. Each candidate must be at
+most 1 MiB and have known byte and row counts. Native metric codecs preserve every
+sample, including duplicates, without aggregation or resampling. Query results
+use sample value as the final tie breaker for identical labels and timestamps,
+keeping limited queries stable when conflicting values are compacted. This first
+implementation materializes bounded samples in Elixir between native decode and
+encode. Segments recovered by listing without summaries are skipped until
+summary enrichment is implemented.
+
+Replacements use the existing partitioned keys with a `compact` suffix. The
+compactor reloads the manifest and conditionally publishes the replacement with
+retirement metadata. Concurrent appends are preserved on retry. A competing
+compactor that definitively loses publication or exhausts conflicts deletes its
+unreferenced upload after a fresh manifest confirms it was never published;
+a lost publication response is recognized as success if the unique replacement
+key is active or already retired by subsequent compaction. Ambiguous storage
+errors retain uploads until a future orphan-reclamation policy can prove them
+safe to delete.
+
+Manifest version 2 records each retired key's deletion deadline, revision, and
+completion status, plus a cleanup cursor. Legacy version 1 manifests remain
+readable; unsupported future versions fail closed. The default grace period is
+one hour. Cleanup attempts at most 128 deletions per pass, continues past failed
+keys, and persists progress through conditional writes. The cursor rotates past
+permanent failures. Completed objects are not repeatedly deleted. A delayed
+ingest retry increments the retired key's revision and schedules its re-upload
+for deletion, preventing overlapping cleanup from incorrectly marking it done.
+Tombstones remain permanently to prevent duplicate ingest. Bounding their
+metadata requires an explicit ingest retry horizon in a later version. An ingest
+retry that crashes between re-upload and manifest registration can leave an
+unreferenced retired object; reclaiming abandoned uploads remains a follow-up.
+
+The manifest becomes indispensable after compaction. Prefix reconstruction
+cannot distinguish published replacements from orphan uploads or retired sources.
+If a manifest is missing and compacted objects exist, reads and ingest return
+`:compacted_manifest_missing` rather than reconstructing incomplete or duplicate
+data. Recovery requires restoring the manifest from object-store version history
+or a backup. Legacy prefixes without compaction retain their listing-based
+migration path.
+
+Queries that lose a segment to cleanup restart their entire scan once against a
+fresh manifest. A second missing object returns an error rather than silently
+omitting samples. The retry uses its own snapshot without overwriting the shared
+cache, so it cannot hide a later acknowledged append. This protects stale readers
+even after extended refresh failures; the grace period alone cannot bound every
+snapshot's lifetime.

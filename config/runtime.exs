@@ -23,6 +23,9 @@ if System.get_env("PHX_SERVER") do
   config :pulso, PulsoWeb.Endpoint, server: true
 end
 
+# Opt in only after all writers understand compaction retirement metadata.
+metrics_compaction_enabled = System.get_env("PULSO_METRICS_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
+
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
 # Log storage adapter. Tests keep the in-memory adapter (see config/test.exs);
@@ -34,6 +37,7 @@ case config_env() do
     config :pulso, Pulso.Storage, adapter: S3
 
     config :pulso, S3,
+      compaction_enabled: metrics_compaction_enabled,
       bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
       # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
       # The fallback matches the docker-compose default host port when mise
@@ -89,6 +93,7 @@ case config_env() do
     config :pulso, Pulso.Storage, adapter: S3
 
     config :pulso, S3,
+      compaction_enabled: metrics_compaction_enabled,
       bucket: require_env.("PULSO_S3_BUCKET"),
       endpoint: System.get_env("PULSO_S3_ENDPOINT"),
       region: require_env.("PULSO_S3_REGION"),
