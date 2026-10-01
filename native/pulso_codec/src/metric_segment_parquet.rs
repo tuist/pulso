@@ -125,7 +125,9 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     };
 
     for sample in items {
-        let tag = sample.map_get(struct_key).map_err(|_| EncodeError::BadInput)?;
+        let tag = sample
+            .map_get(struct_key)
+            .map_err(|_| EncodeError::BadInput)?;
         if tag.as_c_arg() != expected.as_c_arg() {
             return Err(EncodeError::BadInput);
         }
@@ -151,8 +153,8 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
     let mut buf: Vec<u8> = Vec::with_capacity(64 + rows.len() * 32);
     let props = writer_properties();
-    let mut writer =
-        ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).map_err(|_| EncodeError::Writer)?;
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
+        .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
     writer.close().map_err(|_| EncodeError::Writer)?;
 
@@ -186,8 +188,10 @@ fn extract_row<'a>(
     // Sorted-by-name byte pairs: identical to what Prometheus's
     // `Labels` iterator yields. StableHash and the on-disk canonical
     // byte sequence both depend on this ordering.
-    let mut pairs: Vec<(&[u8], &[u8])> =
-        labels_map.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    let mut pairs: Vec<(&[u8], &[u8])> = labels_map
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));
 
     let series_id_term = sample
@@ -222,7 +226,10 @@ fn extract_row<'a>(
             .map_err(|_| EncodeError::BadInput)?
     };
 
-    let metric_name = labels_map.get(b"__name__".as_ref()).cloned().unwrap_or_default();
+    let metric_name = labels_map
+        .get(b"__name__".as_ref())
+        .cloned()
+        .unwrap_or_default();
     let labels_canonical = canonical_bytes(&pairs);
     let labels_json = labels_as_json(&pairs);
 
@@ -401,7 +408,8 @@ pub fn decode<'a>(
 ) -> Result<Term<'a>, DecodeError> {
     let bytes = Bytes::copy_from_slice(blob.as_slice());
 
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| DecodeError::Reader)?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| DecodeError::Reader)?;
     let reader = builder.build().map_err(|_| DecodeError::Reader)?;
 
     let regex_cache: Vec<Option<regex::Regex>> = filter
@@ -463,7 +471,8 @@ pub fn decode<'a>(
                 names.push(copy(env, k));
                 values.push(copy(env, v));
             }
-            let labels_term = Term::map_from_arrays(env, &names, &values).map_err(|_| DecodeError::Reader)?;
+            let labels_term =
+                Term::map_from_arrays(env, &names, &values).map_err(|_| DecodeError::Reader)?;
 
             let fields = [
                 struct_name,
@@ -472,7 +481,8 @@ pub fn decode<'a>(
                 value.encode(env),
                 labels_term,
             ];
-            records.push(Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?);
+            records
+                .push(Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?);
         }
     }
 
@@ -508,11 +518,15 @@ fn labels_match(
             MatcherOp::Eq => got.map(|v| v == m.value).unwrap_or(m.value.is_empty()),
             MatcherOp::Neq => got.map(|v| v != m.value).unwrap_or(!m.value.is_empty()),
             MatcherOp::Re => match (got, re) {
-                (Some(v), Some(re)) => std::str::from_utf8(v).map(|s| re.is_match(s)).unwrap_or(false),
+                (Some(v), Some(re)) => std::str::from_utf8(v)
+                    .map(|s| re.is_match(s))
+                    .unwrap_or(false),
                 _ => false,
             },
             MatcherOp::Nre => match (got, re) {
-                (Some(v), Some(re)) => std::str::from_utf8(v).map(|s| !re.is_match(s)).unwrap_or(true),
+                (Some(v), Some(re)) => std::str::from_utf8(v)
+                    .map(|s| !re.is_match(s))
+                    .unwrap_or(true),
                 _ => true,
             },
         };

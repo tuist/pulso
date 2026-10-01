@@ -29,8 +29,7 @@ defmodule Pulso.Storage.Memory do
   end
 
   @impl Pulso.Storage
-  def append(signal, tenant, records, _opts \\ [])
-      when is_atom(signal) and is_binary(tenant) and is_list(records) do
+  def append(signal, tenant, records, _opts \\ []) when is_atom(signal) and is_binary(tenant) and is_list(records) do
     key = {tenant, signal}
 
     existing =
@@ -44,8 +43,7 @@ defmodule Pulso.Storage.Memory do
   end
 
   @impl Pulso.Storage
-  def query(signal, tenant, opts)
-      when is_atom(signal) and is_binary(tenant) and is_list(opts) do
+  def query(signal, tenant, opts) when is_atom(signal) and is_binary(tenant) and is_list(opts) do
     key = {tenant, signal}
 
     records =
@@ -147,11 +145,9 @@ defmodule Pulso.Storage.Memory do
 
   defp label_from_record(%MetricSample{labels: labels}, name), do: Map.get(labels, name)
 
-  defp promoted_field(%Log{} = record, name) when name in ["service", "service_name"],
-    do: record.service
+  defp promoted_field(%Log{} = record, name) when name in ["service", "service_name"], do: record.service
 
-  defp promoted_field(%Log{} = record, name) when name in ["level", "detected_level"],
-    do: record.severity_text
+  defp promoted_field(%Log{} = record, name) when name in ["level", "detected_level"], do: record.severity_text
 
   defp promoted_field(_record, _name), do: nil
 

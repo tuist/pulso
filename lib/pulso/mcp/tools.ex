@@ -158,8 +158,7 @@ defmodule Pulso.MCP.Tools do
     end
   end
 
-  def call("query_logql", _args, _context),
-    do: {:error, {:invalid_arguments, "tenant and query are required"}}
+  def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
 
   def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
 

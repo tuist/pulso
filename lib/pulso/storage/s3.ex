@@ -371,8 +371,7 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  def decode_segment(:metrics, blob, start_ts, end_ts, opts)
-      when is_binary(blob) and is_list(opts) do
+  def decode_segment(:metrics, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
     matchers = Keyword.get(opts, :matchers, [])
 
     case NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, matchers) do
