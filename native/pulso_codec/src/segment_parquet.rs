@@ -607,7 +607,9 @@ fn matchers_pass(
         let name = m.name();
         let kept = match name {
             b"service" | b"service_name" => promoted_or_resource(name, service, resource, i, m),
-            b"level" | b"detected_level" => promoted_or_resource(name, severity_text, resource, i, m),
+            b"level" | b"detected_level" => {
+                promoted_or_resource(name, severity_text, resource, i, m)
+            }
             _ => match resource_lookup(resource, name, i) {
                 Some(v) => m.evaluate_present(&v),
                 None => m.evaluate_absent(),
@@ -639,7 +641,11 @@ fn promoted_or_resource(
     }
 }
 
-fn resource_lookup<'b>(resource: &StringArena<'_, 'b>, name: &[u8], i: usize) -> Option<std::borrow::Cow<'b, [u8]>> {
+fn resource_lookup<'b>(
+    resource: &StringArena<'_, 'b>,
+    name: &[u8],
+    i: usize,
+) -> Option<std::borrow::Cow<'b, [u8]>> {
     if resource.is_null(i) || resource.is_empty(i) {
         return None;
     }

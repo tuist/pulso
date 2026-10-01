@@ -19,22 +19,24 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
 
   defp do_compile(rest, acc) do
     case :binary.match(rest, "<") do
-      :nomatch ->
-        Enum.reverse([{:literal, rest} | acc])
-
-      {lit_end, 1} ->
-        {literal, after_lt} = String.split_at(rest, lit_end)
-
-        case String.split(after_lt, ">", parts: 2) do
-          [_only] ->
-            do_compile("", [{:literal, rest} | acc])
-
-          [<<"<", inner::binary>>, tail] ->
-            acc = if literal == "", do: acc, else: [{:literal, literal} | acc]
-            token = if inner == "_", do: :skip, else: {:capture, inner}
-            do_compile(tail, [token | acc])
-        end
+      :nomatch -> Enum.reverse([{:literal, rest} | acc])
+      {lit_end, 1} -> compile_placeholder(rest, lit_end, acc)
     end
+  end
+
+  defp compile_placeholder(rest, lit_end, acc) do
+    {literal, after_lt} = String.split_at(rest, lit_end)
+
+    case String.split(after_lt, ">", parts: 2) do
+      [_only] -> do_compile("", [{:literal, rest} | acc])
+      [<<"<", inner::binary>>, tail] -> continue_placeholder(literal, inner, tail, acc)
+    end
+  end
+
+  defp continue_placeholder(literal, inner, tail, acc) do
+    acc = if literal == "", do: acc, else: [{:literal, literal} | acc]
+    token = if inner == "_", do: :skip, else: {:capture, inner}
+    do_compile(tail, [token | acc])
   end
 
   @spec match(template(), String.t()) :: {:ok, %{optional(String.t()) => String.t()}} | :nomatch

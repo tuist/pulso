@@ -83,11 +83,15 @@ impl Matcher {
             } => !regex.is_match(value),
             // Op-value combinations that shouldn't be constructed but
             // are cheap to close over.
-            Matcher::Literal { op: MatchOp::Re, .. }
+            Matcher::Literal {
+                op: MatchOp::Re, ..
+            }
             | Matcher::Literal {
                 op: MatchOp::Nre, ..
             }
-            | Matcher::Regex { op: MatchOp::Eq, .. }
+            | Matcher::Regex {
+                op: MatchOp::Eq, ..
+            }
             | Matcher::Regex {
                 op: MatchOp::Neq, ..
             } => false,

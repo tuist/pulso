@@ -46,61 +46,38 @@ defmodule PulsoWeb.LokiQueryController do
   # query_range
   # ---------------------------------------------------------------------------
 
-  def query_range(conn, params) do
-    tenant = tenant_from(conn)
-
-    with :ok <- Auth.verify(conn, tenant),
-         {:ok, query_str} <- require_query(params),
-         {:ok, ast} <- parse_query(query_str) do
-      opts = build_opts(params, :range)
-
-      case ast do
-        %AST.LogQuery{} ->
-          case Evaluator.evaluate_log(ast, tenant, opts) do
-            {:ok, streams} -> json(conn, Envelope.streams(streams))
-            {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
-          end
-
-        _ ->
-          case Evaluator.evaluate_metric(ast, tenant, opts) do
-            {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series))
-            {:ok, {:vector, series}} -> json(conn, Envelope.vector(series))
-            {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
-          end
-      end
-    else
-      err -> render_error(conn, err)
-    end
-  end
+  def query_range(conn, params), do: run_query(conn, params, :range)
 
   # ---------------------------------------------------------------------------
   # query (instant)
   # ---------------------------------------------------------------------------
 
-  def query(conn, params) do
+  def query(conn, params), do: run_query(conn, params, :instant)
+
+  defp run_query(conn, params, mode) do
     tenant = tenant_from(conn)
 
     with :ok <- Auth.verify(conn, tenant),
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- parse_query(query_str) do
-      opts = build_opts(params, :instant)
-
-      case ast do
-        %AST.LogQuery{} ->
-          case Evaluator.evaluate_log(ast, tenant, opts) do
-            {:ok, streams} -> json(conn, Envelope.streams(streams))
-            {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
-          end
-
-        _ ->
-          case Evaluator.evaluate_metric(ast, tenant, opts) do
-            {:ok, {:vector, series}} -> json(conn, Envelope.vector(series))
-            {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series))
-            {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
-          end
-      end
+      dispatch_eval(conn, ast, tenant, build_opts(params, mode))
     else
       err -> render_error(conn, err)
+    end
+  end
+
+  defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts) do
+    case Evaluator.evaluate_log(ast, tenant, opts) do
+      {:ok, streams} -> json(conn, Envelope.streams(streams))
+      {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
+    end
+  end
+
+  defp dispatch_eval(conn, ast, tenant, opts) do
+    case Evaluator.evaluate_metric(ast, tenant, opts) do
+      {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series))
+      {:ok, {:vector, series}} -> json(conn, Envelope.vector(series))
+      {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
     end
   end
 

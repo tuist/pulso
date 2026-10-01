@@ -29,25 +29,29 @@ defmodule Pulso.LogQL.Pipeline.Template do
         Enum.reverse([{:literal, rest} | acc])
 
       {pos, 2} ->
-        {literal, after_open} = String.split_at(rest, pos)
-        # Drop the leading `{{`.
-        after_open = binary_part(after_open, 2, byte_size(after_open) - 2)
+        compile_placeholder(rest, pos, acc)
+    end
+  end
 
-        case :binary.match(after_open, "}}") do
-          :nomatch ->
-            Enum.reverse([{:literal, rest} | acc])
+  defp compile_placeholder(rest, pos, acc) do
+    {literal, after_open} = String.split_at(rest, pos)
+    # Drop the leading `{{`.
+    after_open = binary_part(after_open, 2, byte_size(after_open) - 2)
 
-          {end_pos, 2} ->
-            inner = binary_part(after_open, 0, end_pos) |> String.trim()
-            tail = binary_part(after_open, end_pos + 2, byte_size(after_open) - end_pos - 2)
+    case :binary.match(after_open, "}}") do
+      :nomatch -> Enum.reverse([{:literal, rest} | acc])
+      {end_pos, 2} -> continue_placeholder(literal, after_open, end_pos, acc)
+    end
+  end
 
-            acc = if literal == "", do: acc, else: [{:literal, literal} | acc]
+  defp continue_placeholder(literal, after_open, end_pos, acc) do
+    inner = binary_part(after_open, 0, end_pos) |> String.trim()
+    tail = binary_part(after_open, end_pos + 2, byte_size(after_open) - end_pos - 2)
+    acc = if literal == "", do: acc, else: [{:literal, literal} | acc]
 
-            case parse_expr(inner) do
-              {:label, name} -> do_compile(tail, [{:label, name} | acc])
-              :ignored -> do_compile(tail, acc)
-            end
-        end
+    case parse_expr(inner) do
+      {:label, name} -> do_compile(tail, [{:label, name} | acc])
+      :ignored -> do_compile(tail, acc)
     end
   end
 

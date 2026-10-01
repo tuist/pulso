@@ -95,21 +95,25 @@ defmodule Pulso.LogQL.MetricEval do
   defp eval(%AST.BinaryOp{op: op, left: l, right: r, bool: bool, matching: matching}, tenant, opts) do
     with {:ok, lk, lser} <- eval(l, tenant, opts),
          {:ok, rk, rser} <- eval(r, tenant, opts) do
-      # If either side is a scalar (single %{} labeled series), broadcast.
-      cond do
-        scalar?(lser) and scalar?(rser) ->
-          combine_scalars(lk, rk, lser, rser, op, bool)
+      combine_binop(lk, lser, rk, rser, op, bool, matching)
+    end
+  end
 
-        scalar?(lser) ->
-          {:ok, rk, broadcast_scalar_op(rser, extract_scalar(lser), op, bool, :left)}
+  # If either side is a scalar (single series, empty label bag), broadcast.
+  defp combine_binop(lk, lser, rk, rser, op, bool, matching) do
+    cond do
+      scalar?(lser) and scalar?(rser) ->
+        combine_scalars(lk, rk, lser, rser, op, bool)
 
-        scalar?(rser) ->
-          {:ok, lk, broadcast_scalar_op(lser, extract_scalar(rser), op, bool, :right)}
+      scalar?(lser) ->
+        {:ok, rk, broadcast_scalar_op(rser, extract_scalar(lser), op, bool, :left)}
 
-        true ->
-          kind = if lk == :matrix or rk == :matrix, do: :matrix, else: :vector
-          {:ok, kind, combine_vectors(lser, rser, op, bool, matching, kind)}
-      end
+      scalar?(rser) ->
+        {:ok, lk, broadcast_scalar_op(lser, extract_scalar(rser), op, bool, :right)}
+
+      true ->
+        kind = if lk == :matrix or rk == :matrix, do: :matrix, else: :vector
+        {:ok, kind, combine_vectors(lser, rser, op, bool, matching, kind)}
     end
   end
 
@@ -123,43 +127,47 @@ defmodule Pulso.LogQL.MetricEval do
   # calls; now it issues one, at the cost of holding one range's worth of
   # entries in memory for the fold.
   defp run_range_matrix(%AST.RangeAgg{op: op, range_ns: r, offset_ns: off, param: p}, inner, unwrap, tenant, opts) do
-    offset = off || 0
     step_ts_list = steps(opts)
 
-    case step_ts_list do
-      [] ->
-        {:ok, :matrix, []}
-
-      _ ->
-        {min_step, max_step} = Enum.min_max(step_ts_list)
-        union_start = min_step - offset - r + 1
-        union_end = max_step - offset
-
-        query_opts =
-          opts
-          |> Map.put(:start_ts_ns, union_start)
-          |> Map.put(:end_ts_ns, union_end)
-          |> Map.drop([:limit, :direction, :step_ns])
-
-        with {:ok, entries} <- Evaluator.evaluate_log_raw(inner, tenant, query_opts) do
-          by_labels = Enum.group_by(entries, &entry_label_key/1)
-
-          series =
-            Enum.map(by_labels, fn {labels, es} ->
-              samples =
-                Enum.map(step_ts_list, fn t ->
-                  bucket_end = t - offset
-                  bucket_start = bucket_end - r + 1
-                  bucketed = filter_by_bucket(es, bucket_start, bucket_end)
-                  {t, compute_range_agg(op, bucketed, unwrap, bucket_start, bucket_end, p)}
-                end)
-
-              {labels, samples}
-            end)
-
-          {:ok, :matrix, series}
-        end
+    if step_ts_list == [] do
+      {:ok, :matrix, []}
+    else
+      spec = %{op: op, range: r, offset: off || 0, param: p, unwrap: unwrap, steps: step_ts_list}
+      fetch_and_bucket(spec, inner, tenant, opts)
     end
+  end
+
+  defp fetch_and_bucket(spec, inner, tenant, opts) do
+    {min_step, max_step} = Enum.min_max(spec.steps)
+    union_start = min_step - spec.offset - spec.range + 1
+    union_end = max_step - spec.offset
+
+    query_opts =
+      opts
+      |> Map.put(:start_ts_ns, union_start)
+      |> Map.put(:end_ts_ns, union_end)
+      |> Map.drop([:limit, :direction, :step_ns])
+
+    with {:ok, entries} <- Evaluator.evaluate_log_raw(inner, tenant, query_opts) do
+      series =
+        entries
+        |> Enum.group_by(&entry_label_key/1)
+        |> Enum.map(&bucket_series(&1, spec))
+
+      {:ok, :matrix, series}
+    end
+  end
+
+  defp bucket_series({labels, es}, spec) do
+    samples = Enum.map(spec.steps, &bucket_sample(&1, es, spec))
+    {labels, samples}
+  end
+
+  defp bucket_sample(t, es, spec) do
+    bucket_end = t - spec.offset
+    bucket_start = bucket_end - spec.range + 1
+    bucketed = filter_by_bucket(es, bucket_start, bucket_end)
+    {t, compute_range_agg(spec.op, bucketed, spec.unwrap, bucket_start, bucket_end, spec.param)}
   end
 
   defp run_range_vector(%AST.RangeAgg{op: op, range_ns: r, offset_ns: off, param: p}, inner, unwrap, tenant, opts) do
@@ -440,76 +448,82 @@ defmodule Pulso.LogQL.MetricEval do
   # which only handles numeric values.
   defp broadcast_scalar_op(series, scalar, op, bool, side) do
     series
-    |> Enum.map(fn
-      {labels, {ts, v}} ->
-        {a, b} = if side == :left, do: {scalar, v}, else: {v, scalar}
-
-        case apply_binop(op, a, b, bool) do
-          :drop -> nil
-          value -> {labels, {ts, value}}
-        end
-
-      {labels, samples} when is_list(samples) ->
-        new =
-          for {ts, v} <- samples,
-              {a, b} = if(side == :left, do: {scalar, v}, else: {v, scalar}),
-              value = apply_binop(op, a, b, bool),
-              value != :drop do
-            {ts, value}
-          end
-
-        if new != [], do: {labels, new}
-    end)
+    |> Enum.map(&broadcast_one(&1, scalar, op, bool, side))
     |> Enum.reject(&is_nil/1)
   end
+
+  defp broadcast_one({labels, {ts, v}}, scalar, op, bool, side) do
+    {a, b} = order_operands(scalar, v, side)
+
+    case apply_binop(op, a, b, bool) do
+      :drop -> nil
+      value -> {labels, {ts, value}}
+    end
+  end
+
+  defp broadcast_one({labels, samples}, scalar, op, bool, side) when is_list(samples) do
+    new = broadcast_samples(samples, scalar, op, bool, side)
+    if new != [], do: {labels, new}
+  end
+
+  defp broadcast_samples(samples, scalar, op, bool, side) do
+    for {ts, v} <- samples,
+        {a, b} = order_operands(scalar, v, side),
+        value = apply_binop(op, a, b, bool),
+        value != :drop do
+      {ts, value}
+    end
+  end
+
+  defp order_operands(scalar, v, :left), do: {scalar, v}
+  defp order_operands(scalar, v, :right), do: {v, scalar}
 
   defp combine_vectors(left, right, op, bool, matching, :vector) do
     right_index = index_by(right, matching)
 
     left
-    |> Enum.map(fn {labels, {ts, lv}} ->
-      key = match_key(labels, matching)
-
-      case Map.get(right_index, key) do
-        nil ->
-          nil
-
-        {rlabels, {_rts, rv}} ->
-          case apply_binop(op, lv, rv, bool) do
-            :drop -> nil
-            value -> {result_labels(labels, rlabels, matching), {ts, value}}
-          end
-      end
-    end)
+    |> Enum.map(&combine_vector_pair(&1, right_index, op, bool, matching))
     |> Enum.reject(&is_nil/1)
   end
 
   defp combine_vectors(left, right, op, bool, matching, :matrix) do
     right_index = index_by(right, matching)
+    Enum.flat_map(left, &combine_matrix_pair(&1, right_index, op, bool, matching))
+  end
 
-    left
-    |> Enum.flat_map(fn {labels, samples} ->
-      key = match_key(labels, matching)
+  defp combine_vector_pair({labels, {ts, lv}}, right_index, op, bool, matching) do
+    key = match_key(labels, matching)
 
-      case Map.get(right_index, key) do
-        nil ->
-          []
+    with {rlabels, {_rts, rv}} <- Map.get(right_index, key) || :no_match,
+         value when value != :drop <- apply_binop(op, lv, rv, bool) do
+      {result_labels(labels, rlabels, matching), {ts, value}}
+    else
+      _ -> nil
+    end
+  end
 
-        {rlabels, rsamples} ->
-          rmap = Map.new(rsamples)
+  defp combine_matrix_pair({labels, samples}, right_index, op, bool, matching) do
+    key = match_key(labels, matching)
 
-          combined =
-            for {ts, lv} <- samples,
-                rv = Map.get(rmap, ts),
-                rv != nil,
-                value = apply_binop(op, lv, rv, bool),
-                value != :drop do
-              {ts, value}
-            end
+    case Map.get(right_index, key) do
+      nil -> []
+      right_entry -> combine_matrix_samples(labels, samples, right_entry, op, bool, matching)
+    end
+  end
 
-          if combined == [], do: [], else: [{result_labels(labels, rlabels, matching), combined}]
+  defp combine_matrix_samples(labels, samples, {rlabels, rsamples}, op, bool, matching) do
+    rmap = Map.new(rsamples)
+
+    combined =
+      for {ts, lv} <- samples,
+          rv = Map.get(rmap, ts),
+          rv != nil,
+          value = apply_binop(op, lv, rv, bool),
+          value != :drop do
+        {ts, value}
       end
-    end)
+
+    if combined == [], do: [], else: [{result_labels(labels, rlabels, matching), combined}]
   end
 
   defp index_by(series, matching) do
