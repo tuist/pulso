@@ -45,6 +45,7 @@ defmodule Pulso.MixProject do
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
       {:req, "~> 0.5"},
+      {:nimble_parsec, "~> 1.4"},
       {:rustler, "~> 0.38.0", optional: true},
       {:rustler_precompiled, "~> 0.8"},
       # Test-only: an independent Snappy compressor for building Loki push
