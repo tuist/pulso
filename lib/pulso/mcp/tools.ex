@@ -9,6 +9,10 @@ defmodule Pulso.MCP.Tools do
 
   alias Pulso.Auth
   alias Pulso.Codec.NIF
+  alias Pulso.LogQL.AST
+  alias Pulso.LogQL.Envelope
+  alias Pulso.LogQL.Evaluator
+  alias Pulso.LogQL.Parser
   alias Pulso.Record.Log
   alias Pulso.Storage
 
@@ -39,6 +43,28 @@ defmodule Pulso.MCP.Tools do
         },
         "required" => ["tenant"]
       }
+    },
+    %{
+      "name" => "query_logql",
+      "description" =>
+        "Run a LogQL query and return the Loki-shaped JSON envelope. Supports log queries (streams result) and metric queries (matrix or vector result). The envelope is identical to /loki/api/v1/query_range so agent tooling that already understands Loki works unchanged.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "tenant" => %{"type" => "string"},
+          "query" => %{"type" => "string", "description" => "LogQL expression."},
+          "start_ts_ns" => %{"type" => "integer"},
+          "end_ts_ns" => %{"type" => "integer"},
+          "step_ms" => %{
+            "type" => "integer",
+            "description" =>
+              "Step interval in milliseconds for range metric queries. Required for matrix output; ignored for log queries."
+          },
+          "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000},
+          "direction" => %{"type" => "string", "enum" => ["forward", "backward"]}
+        },
+        "required" => ["tenant", "query"]
+      }
     }
   ]
 
@@ -63,7 +89,64 @@ defmodule Pulso.MCP.Tools do
   end
 
   def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
+
+  def call("query_logql", %{"tenant" => tenant, "query" => query} = args, context)
+      when is_binary(tenant) and is_binary(query) do
+    opts = build_logql_opts(args)
+
+    with :ok <- verify(context, tenant),
+         {:ok, ast} <- parse_query(query),
+         {:ok, envelope} <- run_logql(ast, tenant, opts) do
+      {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(envelope)}]}
+    end
+  end
+
+  def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
+
   def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
+
+  defp parse_query(query) do
+    case Parser.parse(query) do
+      {:ok, ast} -> {:ok, ast}
+      {:error, reason} -> {:error, {:invalid_arguments, {:logql_parse_error, reason}}}
+    end
+  end
+
+  defp build_logql_opts(args) do
+    %{}
+    |> maybe_put(:start_ts_ns, args["start_ts_ns"])
+    |> maybe_put(:end_ts_ns, args["end_ts_ns"])
+    |> maybe_put(:limit, args["limit"])
+    |> maybe_put(:step_ns, from_ms(args["step_ms"]))
+    |> maybe_put(:direction, from_direction(args["direction"]))
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp from_ms(nil), do: nil
+  defp from_ms(ms) when is_integer(ms) and ms > 0, do: ms * 1_000_000
+  # step_ms: 0 or negative is invalid; treat as absent rather than crash.
+  defp from_ms(_), do: nil
+
+  defp from_direction("forward"), do: :forward
+  defp from_direction("backward"), do: :backward
+  defp from_direction(_), do: nil
+
+  defp run_logql(%AST.LogQuery{} = ast, tenant, opts) do
+    case Evaluator.evaluate_log(ast, tenant, opts) do
+      {:ok, streams} -> {:ok, Envelope.streams(streams)}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp run_logql(metric_expr, tenant, opts) do
+    case Evaluator.evaluate_metric(metric_expr, tenant, opts) do
+      {:ok, {:matrix, series}} -> {:ok, Envelope.matrix(series)}
+      {:ok, {:vector, series}} -> {:ok, Envelope.vector(series)}
+      {:error, _} = err -> err
+    end
+  end
 
   # Every tool that names a tenant runs it through `Pulso.Auth.verify/2`.
   # MCP is the same JSON-RPC transport for read and write; without this hop
