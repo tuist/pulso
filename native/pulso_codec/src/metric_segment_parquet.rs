@@ -42,7 +42,9 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnPath;
 use rustler::{Binary, Encoder, Env, ListIterator, MapIterator, NewBinary, Term};
 use std::collections::HashMap;
@@ -389,7 +391,15 @@ fn writer_properties() -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_statistics_enabled(EnabledStatistics::Chunk);
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        // Smaller row groups than parquet-rs's default (1M rows): the
+        // metric read path prunes by row-group `timestamp_ns` stats
+        // before any column pages are read, so narrower groups let
+        // a tighter time filter skip proportionally more of the
+        // segment. 8192 rows is a decent compromise — large enough
+        // that zstd on each group still gets its context, small
+        // enough that a 10 000-sample segment splits into two groups.
+        .set_max_row_group_size(8192);
 
     // Delta-binary-packed on the sort key: back-to-back samples for the
     // same series differ by a scrape interval, which packs down to a few
@@ -478,8 +488,37 @@ pub fn decode<'a>(
     // order and must stay in sync with the mask.
     let projection =
         parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), [0usize, 1, 2, 4]);
+
+    // Row-group pruning: when a time filter is set, consult each row
+    // group's `timestamp_ns` min/max chunk stats and only read the
+    // groups that could contain surviving rows. The segment writer
+    // caps groups at 8192 rows, so a tight filter reads a strict
+    // fraction of the segment and skips the rest without opening any
+    // column pages.
+    let metadata = builder.metadata().clone();
+    let ts_col: Option<usize> = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.name() == "timestamp_ns");
+    let time_filter = filter.start.is_some() || filter.end.is_some();
+    let surviving: Vec<usize> = (0..metadata.num_row_groups())
+        .filter(|&i| {
+            if !time_filter {
+                return true;
+            }
+            row_group_matches_time(metadata.row_group(i), ts_col, filter)
+        })
+        .collect();
+
+    if surviving.is_empty() {
+        return Ok(Vec::<Term<'a>>::new().encode(env));
+    }
+
     let reader = builder
         .with_projection(projection)
+        .with_row_groups(surviving)
         .build()
         .map_err(|_| DecodeError::Reader)?;
 
@@ -622,6 +661,40 @@ fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> Result<&T, DecodeError> {
         .as_any()
         .downcast_ref::<T>()
         .ok_or(DecodeError::Reader)
+}
+
+/// True when the row group's `timestamp_ns` column stats overlap the
+/// filter range, so the group might contain matching records. Missing
+/// stats, or non-integer stats (shouldn't happen for an Int64 column
+/// written by our own writer), mean we don't know — err on the side
+/// of scanning. Mirrors `segment_parquet::row_group_matches_time`.
+fn row_group_matches_time(
+    rg: &RowGroupMetaData,
+    ts_col: Option<usize>,
+    filter: &Filter<'_>,
+) -> bool {
+    let Some(col) = ts_col else {
+        return true;
+    };
+    let Some(stats) = rg.column(col).statistics() else {
+        return true;
+    };
+    let Statistics::Int64(s) = stats else {
+        return true;
+    };
+    let min = s.min_opt().map(|v| i128::from(*v));
+    let max = s.max_opt().map(|v| i128::from(*v));
+    if let (Some(start), Some(max)) = (filter.start, max) {
+        if max < start {
+            return false;
+        }
+    }
+    if let (Some(end), Some(min)) = (filter.end, min) {
+        if min > end {
+            return false;
+        }
+    }
+    true
 }
 
 fn labels_match(

@@ -186,4 +186,58 @@ defmodule Pulso.Codec.MetricsBenchTest do
       length(samples)
     end)
   end
+
+  defp fixture_single_series_parquet(n_samples) do
+    labels = %{"__name__" => "pulso_bench_single", "instance" => "node-0"}
+    base = 1_790_000_000_000_000_000
+
+    samples =
+      for s <- 0..(n_samples - 1) do
+        %MetricSample{
+          series_id: 1,
+          timestamp_ns: base + s * 15_000_000_000,
+          value: s * 1.0,
+          labels: labels
+        }
+      end
+
+    {:ok, blob, _, _, _} = NIF.encode_metric_segment_parquet(samples)
+    {blob, base}
+  end
+
+  test "decode_metric_segment_parquet with filter that prunes all but one row group" do
+    # 20_000 samples > `max_row_group_size = 8192` row group cap, so
+    # the segment splits into 3 row groups. All samples belong to a
+    # single series, so each row group covers a distinct and contiguous
+    # timestamp window: group 0 ≈ ts 0..8191, group 1 ≈ 8192..16383,
+    # group 2 ≈ 16384..19999. Filtering to the middle group's window
+    # exercises the row-group min/max pruning in `decode`.
+    {blob, base} = fixture_single_series_parquet(20_000)
+    start_ts = base + 8_192 * 15_000_000_000
+    end_ts = base + 16_383 * 15_000_000_000
+
+    bench("decode_metric_segment_parquet (prune 2/3 row groups)", fn ->
+      {:ok, samples} = NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, [])
+      length(samples)
+    end)
+  end
+
+  test "decode_metric_segment_parquet with a narrow time filter (per-row short-circuit)" do
+    blob = fixture_metric_parquet()
+    # The fixture sorts by `(series_id, timestamp_ns)`, so every row
+    # group covers the full timestamp range. On this workload the
+    # time filter exercises the per-row short-circuit (continue
+    # before the labels arena slice is parsed), not row-group
+    # pruning — see the correctness test
+    # "a time filter that bisects a multi-row-group segment …" for a
+    # workload where row-group pruning actually fires.
+    base = 1_790_000_000_000_000_000
+    start_ts = base
+    end_ts = base + div(@samples_per_series, 5) * 15_000_000_000
+
+    bench("decode_metric_segment_parquet (filtered 20%)", fn ->
+      {:ok, samples} = NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, [])
+      length(samples)
+    end)
+  end
 end

@@ -78,6 +78,29 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert kept.labels["svc"] == "api-east"
   end
 
+  test "a time filter that misses the whole segment returns [] (row-group pruning)" do
+    labels = %{"__name__" => "x"}
+    samples = for ts <- 100..200, do: sample(ts, 1.0, labels)
+    {payload, _, _, _} = encode!(samples)
+
+    # Both sides of the range are outside the segment's bounds.
+    assert decode!(payload, start_ts: 500, end_ts: 1000) == []
+    assert decode!(payload, start_ts: 0, end_ts: 50) == []
+  end
+
+  test "a time filter that bisects a multi-row-group segment preserves correctness" do
+    # 20_000 samples > 8192 rows per row group → at least 3 row groups.
+    # Filtering to the middle third exercises row-group pruning on the
+    # bounding groups and a per-row scan on the middle one.
+    labels = %{"__name__" => "y"}
+    samples = for ts <- 1..20_000, do: sample(ts, 1.0, labels)
+    {payload, _, _, _} = encode!(samples)
+
+    kept = decode!(payload, start_ts: 7_000, end_ts: 13_000)
+    kept_ts = kept |> Enum.map(& &1.timestamp_ns) |> Enum.sort()
+    assert kept_ts == Enum.to_list(7_000..13_000)
+  end
+
   test "encode->decode->encode->decode is idempotent on bytes from the second decode on" do
     # Mirrors the Pulso.Codec.NIF contract documented in AGENTS.md:
     # Parquet is a hard-error codec with no Elixir fallback, so we at
