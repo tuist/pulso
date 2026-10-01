@@ -11,14 +11,15 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
-  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size]
+  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names]
 
   @type t :: %__MODULE__{
           key: String.t(),
           min_ts: non_neg_integer() | nil,
           max_ts: non_neg_integer() | nil,
           row_count: non_neg_integer() | nil,
-          byte_size: non_neg_integer() | nil
+          byte_size: non_neg_integer() | nil,
+          metric_names: [String.t()] | nil
         }
 
   @doc """
@@ -71,7 +72,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
       "r" => segment.row_count
     }
 
-    if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
+    base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
+    if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
   end
 
   @doc """
@@ -91,7 +93,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        min_ts: min_ts,
        max_ts: max_ts,
        row_count: row_count,
-       byte_size: byte_size
+       byte_size: byte_size,
+       metric_names: valid_names(wire["n"])
      }}
   end
 
@@ -109,6 +112,43 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   def intersects?(%__MODULE__{min_ts: min_ts, max_ts: max_ts}, start_ts, end_ts) do
     (start_ts == nil or max_ts >= start_ts) and (end_ts == nil or min_ts <= end_ts)
+  end
+
+  # Unknown or malformed summaries must never exclude a segment.
+  defp valid_names(names) when is_list(names) do
+    if length(names) <= 128 and Enum.all?(names, &(is_binary(&1) and byte_size(&1) <= 256)),
+      do: names
+  end
+
+  defp valid_names(_), do: nil
+
+  @doc "Attach a complete, bounded metric-name set; nil means unknown, never truncated."
+  def summarize_metrics(segment, records) do
+    names = Enum.reduce_while(records, MapSet.new(), &collect_metric_name/2)
+
+    names = if names, do: names |> Enum.map(&:binary.copy/1) |> Enum.sort()
+    %{segment | metric_names: names}
+  end
+
+  defp collect_metric_name(record, names) do
+    name = Map.get(record.labels, "__name__", "")
+
+    if is_binary(name) and byte_size(name) <= 256 do
+      names = MapSet.put(names, name)
+      if MapSet.size(names) <= 128, do: {:cont, names}, else: {:halt, nil}
+    else
+      {:halt, nil}
+    end
+  end
+
+  @doc "Keep unknown summaries and segments that could satisfy all exact name matchers."
+  def matches_metric_name?(%__MODULE__{metric_names: nil}, _matchers), do: true
+
+  def matches_metric_name?(%__MODULE__{metric_names: names}, matchers) do
+    Enum.all?(matchers, fn
+      {"__name__", :eq, value} -> value in names
+      _ -> true
+    end)
   end
 
   defp valid_non_neg(v) when is_integer(v) and v >= 0, do: v

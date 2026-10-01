@@ -112,6 +112,7 @@ defmodule Pulso.Storage.S3 do
 
       with {:ok, _etag} <- ObjectStore.put(config, key, payload) do
         segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
+        segment = summarize_segment(signal, segment, records)
         ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
       end
     end
@@ -128,7 +129,17 @@ defmodule Pulso.Storage.S3 do
          {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config) do
       segments = Manifest.prune_by_time(entry.manifest, start_ts, end_ts)
 
-      case scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
+      segments =
+        if signal == :metrics do
+          Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, [])))
+        else
+          segments
+        end
+
+      with :ok <- check_scan_budget(segments, opts) do
+        scan_segments(signal, config, segments, start_ts, end_ts, opts, limit)
+      end
+      |> case do
         {:ok, records} ->
           sorted = records |> SortOrder.sort(signal) |> take_limit(limit)
           {:ok, sorted}
@@ -138,6 +149,27 @@ defmodule Pulso.Storage.S3 do
       end
     end
   end
+
+  defp check_scan_budget(segments, opts) do
+    bytes = Enum.sum(Enum.map(segments, &(&1.byte_size || 0)))
+    rows = Enum.sum(Enum.map(segments, &(&1.row_count || 0)))
+
+    if exceeds_budget?(length(segments), opts[:max_scan_segments]) or
+         exceeds_budget?(bytes, opts[:max_scan_bytes]) or exceeds_budget?(rows, opts[:max_scan_rows]),
+       do: {:error, :query_scan_limit},
+       else: :ok
+  end
+
+  defp exceeds_budget?(_, nil), do: false
+  defp exceeds_budget?(value, max), do: value > max
+  defp check_deadline(nil), do: :ok
+
+  defp check_deadline(deadline) do
+    if System.monotonic_time(:millisecond) >= deadline, do: {:error, :query_timeout}, else: :ok
+  end
+
+  defp summarize_segment(:metrics, segment, records), do: Segment.summarize_metrics(segment, records)
+  defp summarize_segment(_signal, segment, _records), do: segment
 
   # -- helpers -----------------------------------------------------------------
 
@@ -283,7 +315,7 @@ defmodule Pulso.Storage.S3 do
 
     segments
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, %{batches: [], count: 0, top: []}}, &visit_segment(&1, &2, ctx))
+    |> Enum.reduce_while({:ok, %{batches: [], count: 0, top: [], bytes: 0}}, &visit_segment(&1, &2, ctx))
     |> case do
       {:ok, %{batches: batches}} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
       {:error, _} = err -> err
@@ -291,22 +323,31 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp visit_segment({segment, index}, {:ok, state}, ctx) do
-    case ObjectStore.get(ctx.config, segment.key) do
-      {:ok, blob} ->
-        continue_or_halt(state, blob, index, ctx)
+    with :ok <- check_deadline(ctx.opts[:deadline_ms]),
+         {:ok, blob} <- ObjectStore.get(ctx.config, segment.key),
+         :ok <- check_deadline(ctx.opts[:deadline_ms]) do
+      bytes = state.bytes + byte_size(blob)
 
-      {:error, :not_found} ->
-        {:cont, {:ok, state}}
-
-      {:error, _} = err ->
-        {:halt, err}
+      if exceeds_budget?(bytes, ctx.opts[:max_scan_bytes]),
+        do: {:halt, {:error, :query_scan_limit}},
+        else: continue_or_halt(%{state | bytes: bytes}, blob, index, ctx)
+    else
+      {:error, :not_found} -> {:cont, {:ok, state}}
+      {:error, _} = err -> {:halt, err}
     end
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    case decode_segment(ctx.signal, blob, ctx.start_ts, ctx.end_ts, ctx.opts) do
+    opts =
+      case Keyword.get(ctx.opts, :max_records) do
+        nil -> ctx.opts
+        max -> Keyword.put(ctx.opts, :max_records, max - state.count)
+      end
+
+    case decode_segment(ctx.signal, blob, ctx.start_ts, ctx.end_ts, opts) do
       {:ok, batch} ->
         new_state = %{
+          bytes: state.bytes,
           batches: [batch | state.batches],
           count: state.count + length(batch),
           top: top_timestamps(state.top, batch, ctx.limit)
@@ -374,8 +415,21 @@ defmodule Pulso.Storage.S3 do
   def decode_segment(:metrics, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
     matchers = Keyword.get(opts, :matchers, [])
 
-    case NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, matchers) do
+    decoded =
+      case Keyword.get(opts, :max_records) do
+        nil ->
+          NIF.decode_metric_segment_parquet(blob, start_ts, end_ts, matchers)
+
+        max when is_integer(max) and max >= 0 ->
+          NIF.decode_metric_segment_parquet_bounded(blob, start_ts, end_ts, matchers, max)
+
+        _ ->
+          {:error, :invalid_query_limit}
+      end
+
+    case decoded do
       {:ok, records} -> {:ok, records}
+      {:error, _} = error -> error
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
   end

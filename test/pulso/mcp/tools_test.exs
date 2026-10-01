@@ -20,6 +20,7 @@ defmodule Pulso.MCP.ToolsTest do
     assert "query_logs" in names
     assert "query_metrics" in names
     assert "query_logql" in names
+    assert "query_promql" in names
 
     query_logs = Enum.find(tools, &(&1["name"] == "query_logs"))
     assert query_logs["inputSchema"]["required"] == ["tenant"]
@@ -29,6 +30,38 @@ defmodule Pulso.MCP.ToolsTest do
 
     query_logql = Enum.find(tools, &(&1["name"] == "query_logql"))
     assert query_logql["inputSchema"]["required"] == ["tenant", "query"]
+  end
+
+  describe "query_promql" do
+    test "evaluates stored metrics and rejects invalid steps" do
+      :ok =
+        Storage.append(:metrics, "acme", [
+          %MetricSample{timestamp_ns: 1_000_000_000, value: 2.0, labels: %{"__name__" => "gauge"}}
+        ])
+
+      assert {:ok, [%{"text" => text}]} =
+               Tools.call("query_promql", %{
+                 "tenant" => "acme",
+                 "query" => "sum(gauge)",
+                 "end_ts_ns" => 1_000_000_000
+               })
+
+      assert JSON.decode!(text)["data"]["result"] == [%{"metric" => %{}, "value" => [1.0, "2"]}]
+
+      assert {:error, {:invalid_arguments, _}} =
+               Tools.call("query_promql", %{
+                 "tenant" => "acme",
+                 "query" => "gauge",
+                 "step_ms" => 0
+               })
+    end
+
+    test "requires tenant authorization before parsing or reading" do
+      original = Application.fetch_env!(:pulso, Pulso.Auth)
+      Application.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
+      on_exit(fn -> Application.put_env(:pulso, Pulso.Auth, original) end)
+      assert {:error, {:unauthorized, _}} = Tools.call("query_promql", %{"tenant" => "acme", "query" => "gauge"})
+    end
   end
 
   describe "query_logql" do
