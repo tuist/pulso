@@ -17,6 +17,7 @@ defmodule Pulso.Storage.Memory do
 
   use GenServer
 
+  alias Pulso.Codec.NIF
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage.SortOrder
@@ -61,7 +62,10 @@ defmodule Pulso.Storage.Memory do
       |> SortOrder.sort(signal)
       |> take_limit(Keyword.get(opts, :limit))
 
-    {:ok, filtered}
+    case Keyword.get(opts, :max_records) do
+      max when is_integer(max) and length(filtered) > max -> {:error, :query_sample_limit}
+      _ -> {:ok, filtered}
+    end
   end
 
   @doc false
@@ -125,7 +129,13 @@ defmodule Pulso.Storage.Memory do
   defp matcher_matches?({name, op, value}, record) do
     raw = label_from_record(record, name)
     label_value = if is_binary(raw), do: raw, else: ""
-    apply_matcher_op(op, label_value, value)
+
+    if match?(%MetricSample{}, record) and op in [:re, :nre] do
+      matched = NIF.match_metric_regex(value, label_value)
+      if op == :re, do: matched, else: not matched
+    else
+      apply_matcher_op(op, label_value, value)
+    end
   end
 
   # Logs: promoted typed fields first (service, service_name, level,

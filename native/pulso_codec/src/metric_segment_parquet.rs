@@ -91,6 +91,7 @@ pub struct Filter<'f> {
     pub start: Option<i128>,
     pub end: Option<i128>,
     pub matchers: Vec<Matcher<'f>>,
+    pub max_samples: Option<usize>,
 }
 
 struct Row {
@@ -111,6 +112,8 @@ pub enum EncodeError {
 #[derive(Debug)]
 pub enum DecodeError {
     Reader,
+    InvalidRegex,
+    TooManySamples,
 }
 
 pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), EncodeError> {
@@ -466,6 +469,7 @@ pub fn decode<'a>(
     blob: &Binary<'a>,
     filter: &Filter<'_>,
 ) -> Result<Term<'a>, DecodeError> {
+    let regex_cache = compile_regexes(&filter.matchers)?;
     let bytes = Bytes::copy_from_slice(blob.as_slice());
 
     let builder =
@@ -521,18 +525,6 @@ pub fn decode<'a>(
         .with_row_groups(surviving)
         .build()
         .map_err(|_| DecodeError::Reader)?;
-
-    let regex_cache: Vec<Option<regex::Regex>> = filter
-        .matchers
-        .iter()
-        .map(|m| match m.op {
-            MatcherOp::Re | MatcherOp::Nre => {
-                let s = std::str::from_utf8(m.value).ok()?;
-                regex::Regex::new(s).ok()
-            }
-            _ => None,
-        })
-        .collect();
 
     let mut records: Vec<Term<'a>> = Vec::new();
 
@@ -598,6 +590,9 @@ pub fn decode<'a>(
                 continue;
             }
 
+            if filter.max_samples.is_some_and(|max| records.len() >= max) {
+                return Err(DecodeError::TooManySamples);
+            }
             let series_id = series_id_arr.value(row);
             let value = value_arr.value(row);
 
@@ -697,6 +692,93 @@ fn row_group_matches_time(
     true
 }
 
+/// Prometheus uses ASCII Perl classes and word boundaries. Rust's defaults
+/// are Unicode, so translate these escapes before compiling for both adapters.
+pub fn compile_metric_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    reject_class_extensions(pattern)?;
+    let mut translated = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            translated.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('d') => translated.push_str("[0-9]"),
+            Some('D') => translated.push_str("[^0-9]"),
+            Some('w') => translated.push_str("[A-Za-z0-9_]"),
+            Some('W') => translated.push_str("[^A-Za-z0-9_]"),
+            Some('s') => translated.push_str(r"[\t\n\f\r ]"),
+            Some('S') => translated.push_str(r"[^\t\n\f\r ]"),
+            Some('b') => translated.push_str(r"(?-u:\b)"),
+            Some('B') => translated.push_str(r"(?-u:\B)"),
+            Some(next) => {
+                translated.push('\\');
+                translated.push(next);
+            }
+            None => translated.push('\\'),
+        }
+    }
+    regex::RegexBuilder::new(&translated)
+        .size_limit(1_048_576)
+        .dfa_size_limit(1_048_576)
+        .build()
+}
+
+// Rust class intersection/difference and nested classes have different
+// meanings from Prometheus classes. Reject them instead of returning wrong
+// matches. POSIX named classes remain supported.
+fn reject_class_extensions(pattern: &str) -> Result<(), regex::Error> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut previous = '\0';
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            previous = '\0';
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            previous = '\0';
+            continue;
+        }
+        if (depth > 0 && ch == previous && matches!(ch, '&' | '-' | '~'))
+            || (depth > 0 && ch == '[' && chars.peek() != Some(&':'))
+            || (depth > 0 && ch == ']' && matches!(previous, '[' | '^'))
+        {
+            return Err(regex::Error::Syntax(
+                "Unsupported character-class extension".into(),
+            ));
+        }
+        if ch == '[' {
+            depth += 1;
+        }
+        if ch == ']' {
+            depth = depth.saturating_sub(1);
+        }
+        previous = ch;
+    }
+    Ok(())
+}
+
+fn compile_regexes(matchers: &[Matcher<'_>]) -> Result<Vec<Option<regex::Regex>>, DecodeError> {
+    matchers
+        .iter()
+        .map(|m| match m.op {
+            MatcherOp::Re | MatcherOp::Nre => {
+                let pattern =
+                    std::str::from_utf8(m.value).map_err(|_| DecodeError::InvalidRegex)?;
+                compile_metric_regex(pattern)
+                    .map(Some)
+                    .map_err(|_| DecodeError::InvalidRegex)
+            }
+            _ => Ok(None),
+        })
+        .collect()
+}
+
 fn labels_match(
     labels: &[(&[u8], &[u8])],
     matchers: &[Matcher<'_>],
@@ -708,18 +790,18 @@ fn labels_match(
         let ok = match m.op {
             MatcherOp::Eq => got.map(|v| v == m.value).unwrap_or(m.value.is_empty()),
             MatcherOp::Neq => got.map(|v| v != m.value).unwrap_or(!m.value.is_empty()),
-            MatcherOp::Re => match (got, re) {
-                (Some(v), Some(re)) => std::str::from_utf8(v)
-                    .map(|s| re.is_match(s))
-                    .unwrap_or(false),
-                _ => false,
-            },
-            MatcherOp::Nre => match (got, re) {
-                (Some(v), Some(re)) => std::str::from_utf8(v)
-                    .map(|s| !re.is_match(s))
-                    .unwrap_or(true),
-                _ => true,
-            },
+            MatcherOp::Re | MatcherOp::Nre => {
+                let Some(re) = re else {
+                    return false;
+                };
+                let actual = std::str::from_utf8(got.unwrap_or(b""));
+                let matched = actual.map(|value| re.is_match(value)).unwrap_or(false);
+                if matches!(m.op, MatcherOp::Re) {
+                    matched
+                } else {
+                    !matched
+                }
+            }
         };
 
         if !ok {

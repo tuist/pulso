@@ -38,6 +38,12 @@ defmodule Pulso.Codec.NIF do
 
   def decode_metric_segment_parquet(_blob, _start_ts, _end_ts, _matchers), do: :erlang.nif_error(:nif_not_loaded)
 
+  def decode_metric_segment_parquet_bounded(_blob, _start_ts, _end_ts, _matchers, _max_samples),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def validate_metric_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)
+  def match_metric_regex(_pattern, _value), do: :erlang.nif_error(:nif_not_loaded)
+
   # Hand-rolled Prometheus remote_write v1 wire decoder: takes a
   # Snappy-compressed `prometheus.WriteRequest` protobuf and a cap on the
   # decompressed size, returns `{:ok, series}` where each series is
