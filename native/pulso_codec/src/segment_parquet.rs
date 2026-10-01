@@ -29,6 +29,7 @@
 //!     not by owned strings.
 
 use crate::json_read::{Fallback, Parser, Res, Stacks};
+use crate::query_filter::{find_label, line_bytes_for_match, LineFilter, Matcher};
 use crate::term_json::{Enc, EncodeError, JsonEncoder, TermBuilder};
 
 use arrow::array::{
@@ -75,6 +76,8 @@ pub struct Filter<'f> {
     pub start: Option<i128>,
     pub end: Option<i128>,
     pub service: Option<&'f [u8]>,
+    pub matchers: Vec<Matcher>,
+    pub line_filters: Vec<LineFilter>,
 }
 
 struct Row {
@@ -521,6 +524,8 @@ fn materialize<'a>(
     all_keys.extend_from_slice(&keys);
 
     let time_filter = filter.start.is_some() || filter.end.is_some();
+    let has_matchers = !filter.matchers.is_empty();
+    let has_line_filters = !filter.line_filters.is_empty();
     let mut stacks: Stacks<Term<'a>> = Stacks::new();
 
     for i in 0..batch.num_rows() {
@@ -542,6 +547,12 @@ fn materialize<'a>(
             if !matches {
                 continue;
             }
+        }
+        if has_matchers && !matchers_pass(&filter.matchers, &resource, &service, &sev_text, i) {
+            continue;
+        }
+        if has_line_filters && !line_filters_pass(&filter.line_filters, &body, i) {
+            continue;
         }
 
         let ts_term = int_term(env, ts_col, i, nil);
@@ -573,6 +584,81 @@ fn materialize<'a>(
         out.push(term);
     }
     Ok(())
+}
+
+// Evaluate every matcher against the row's `resource` JSON, plus the
+// promoted-field mirror for `service`/`service_name`/`level`/
+// `detected_level` (so an OTLP record that never populated `resource`
+// but has typed struct fields still matches). All matchers must pass
+// — stream selectors are conjunctive.
+//
+// The lookup is inlined here rather than extracted to a helper because
+// the two arenas (`service`, `severity_text`) have distinct lifetime
+// parameters that Rust's variance rules don't unify through a Cow
+// return without extra copies.
+fn matchers_pass(
+    matchers: &[Matcher],
+    resource: &StringArena,
+    service: &StringArena,
+    severity_text: &StringArena,
+    i: usize,
+) -> bool {
+    for m in matchers {
+        let name = m.name();
+        let kept = match name {
+            b"service" | b"service_name" => promoted_or_resource(name, service, resource, i, m),
+            b"level" | b"detected_level" => promoted_or_resource(name, severity_text, resource, i, m),
+            _ => match resource_lookup(resource, name, i) {
+                Some(v) => m.evaluate_present(&v),
+                None => m.evaluate_absent(),
+            },
+        };
+
+        if !kept {
+            return false;
+        }
+    }
+    true
+}
+
+// Prefer the promoted typed column when present; fall back to a
+// resource-JSON scan when it's null/empty.
+fn promoted_or_resource(
+    name: &[u8],
+    promoted: &StringArena,
+    resource: &StringArena,
+    i: usize,
+    matcher: &Matcher,
+) -> bool {
+    if !promoted.is_null(i) && !promoted.is_empty(i) {
+        return matcher.evaluate_present(promoted.value_bytes(i));
+    }
+    match resource_lookup(resource, name, i) {
+        Some(v) => matcher.evaluate_present(&v),
+        None => matcher.evaluate_absent(),
+    }
+}
+
+fn resource_lookup<'b>(resource: &StringArena<'_, 'b>, name: &[u8], i: usize) -> Option<std::borrow::Cow<'b, [u8]>> {
+    if resource.is_null(i) || resource.is_empty(i) {
+        return None;
+    }
+    find_label(resource.value_bytes(i), name)
+}
+
+// Every line filter must match. Conjunction, same as label matchers.
+// Body is stored as JSON-encoded — for a string body that is the source
+// text surrounded by `"`. We peel the quotes and unescape before
+// matching so `|~ "^hello"` behaves the way a user reading the log
+// line would expect, and so the Rust and Memory adapters produce
+// identical result sets for identical LogQL.
+fn line_filters_pass(line_filters: &[LineFilter], body: &StringArena, i: usize) -> bool {
+    if body.is_null(i) || body.is_empty(i) {
+        return line_filters.iter().all(|f| f.matches(b""));
+    }
+    let raw = body.value_bytes(i);
+    let matched = line_bytes_for_match(raw);
+    line_filters.iter().all(|f| f.matches(&matched))
 }
 
 // Same column order + atom order as `segment.rs` uses so the returned

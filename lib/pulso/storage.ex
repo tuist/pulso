@@ -23,11 +23,23 @@ defmodule Pulso.Storage do
           # omit the key.
           {:idempotency_key, String.t()}
         ]
+  @type matcher_op :: :eq | :neq | :re | :nre
+  @type matcher :: {name :: String.t(), op :: matcher_op(), value :: String.t()}
+
+  @type line_filter_op :: :contains | :not_contains | :match_re | :not_match_re
+  @type line_filter :: {op :: line_filter_op(), value :: String.t()}
+
   @type query_opts :: [
           {:start_ts, non_neg_integer()}
           | {:end_ts, non_neg_integer()}
           | {:limit, pos_integer()}
           | {:service, String.t()}
+          # Label matchers on stream labels (which the Loki push path stores
+          # in `Log.resource`). Pushed into the Rust Parquet decoder so
+          # rejected rows never materialise as Erlang terms.
+          | {:matchers, [matcher()]}
+          # Substring or regex predicates on `Log.body`. Same pushdown.
+          | {:line_filters, [line_filter()]}
         ]
 
   @callback append(tenant, [Log.t()], append_opts) :: :ok | {:error, term()}

@@ -714,6 +714,7 @@ dependencies = [
  "itoa",
  "memchr",
  "parquet",
+ "regex",
  "rustler",
  "ryu",
  "simdutf8",

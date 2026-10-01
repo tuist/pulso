@@ -58,6 +58,8 @@ defmodule Pulso.Storage.Memory do
       records
       |> filter_by_time(Keyword.get(opts, :start_ts), Keyword.get(opts, :end_ts))
       |> filter_by_service(Keyword.get(opts, :service))
+      |> filter_by_matchers(Keyword.get(opts, :matchers, []))
+      |> filter_by_line_filters(Keyword.get(opts, :line_filters, []))
       |> SortOrder.sort()
       |> take_limit(Keyword.get(opts, :limit))
 
@@ -96,6 +98,77 @@ defmodule Pulso.Storage.Memory do
 
   defp filter_by_service(records, nil), do: records
   defp filter_by_service(records, service), do: Enum.filter(records, &(&1.service == service))
+
+  # Selector-matcher parity with the S3 Rust pushdown. Every matcher must
+  # pass. Missing labels are treated as the empty string, matching Loki
+  # semantics: `foo=""` matches records with no `foo` label.
+  defp filter_by_matchers(records, []), do: records
+
+  defp filter_by_matchers(records, matchers) do
+    Enum.filter(records, fn record ->
+      Enum.all?(matchers, &matcher_matches?(&1, record))
+    end)
+  end
+
+  defp matcher_matches?({name, op, value}, record) do
+    raw = label_from_record(record, name)
+    label_value = if is_binary(raw), do: raw, else: ""
+    apply_matcher_op(op, label_value, value)
+  end
+
+  # Selector-matcher label lookup: promoted typed fields first
+  # (service, service_name, level, detected_level), then resource JSON.
+  # Attributes are NOT consulted — they are per-record structured
+  # metadata, not stream labels, and mixing them here would diverge from
+  # the S3 Rust decoder which only reads resource + promoted columns.
+  # Callers who want to filter on attributes use the post-parse label
+  # filter (`| foo = "bar"`) which runs over the full merged bag in the
+  # pipeline.
+  defp label_from_record(record, name) do
+    promoted_field(record, name) || Map.get(record.resource || %{}, name)
+  end
+
+  defp promoted_field(record, name) when name in ["service", "service_name"], do: record.service
+  defp promoted_field(record, name) when name in ["level", "detected_level"], do: record.severity_text
+  defp promoted_field(_record, _name), do: nil
+
+  defp apply_matcher_op(:eq, actual, wanted), do: actual == wanted
+  defp apply_matcher_op(:neq, actual, wanted), do: actual != wanted
+  defp apply_matcher_op(:re, actual, pattern), do: regex_match?(pattern, actual)
+  defp apply_matcher_op(:nre, actual, pattern), do: not regex_match?(pattern, actual)
+
+  # Invalid regexes are caught by `Pulso.LogQL.QueryValidation` before the
+  # storage layer runs. If we somehow get here with one, raise rather
+  # than silently invert to `true` for the `:nre` / `:not_match_re` op.
+  defp regex_match?(pattern, subject) do
+    case Regex.compile(pattern) do
+      {:ok, re} -> Regex.match?(re, subject)
+      {:error, reason} -> raise ArgumentError, "invalid regex #{inspect(pattern)}: #{inspect(reason)}"
+    end
+  end
+
+  # Line-filter parity with the S3 Rust decoder. Body normalization
+  # mirrors `Pulso.LogQL.Entry.from_record/1` and Rust's
+  # `line_bytes_for_match`: a string body is matched directly; a
+  # non-string body is JSON-encoded first so both paths agree on what
+  # "the log line" means.
+  defp filter_by_line_filters(records, []), do: records
+
+  defp filter_by_line_filters(records, filters) do
+    Enum.filter(records, fn record ->
+      body = line_from_record(record)
+      Enum.all?(filters, &line_filter_matches?(&1, body))
+    end)
+  end
+
+  defp line_from_record(%{body: nil}), do: ""
+  defp line_from_record(%{body: body}) when is_binary(body), do: body
+  defp line_from_record(%{body: body}), do: Pulso.JSON.encode!(body)
+
+  defp line_filter_matches?({:contains, needle}, body), do: String.contains?(body, needle)
+  defp line_filter_matches?({:not_contains, needle}, body), do: not String.contains?(body, needle)
+  defp line_filter_matches?({:match_re, pattern}, body), do: regex_match?(pattern, body)
+  defp line_filter_matches?({:not_match_re, pattern}, body), do: not regex_match?(pattern, body)
 
   defp take_limit(records, nil), do: records
   defp take_limit(records, limit) when is_integer(limit) and limit > 0, do: Enum.take(records, limit)

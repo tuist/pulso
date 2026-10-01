@@ -19,6 +19,7 @@ ryu = "1"
 arrow = { version = "54", default-features = false }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
 bytes = "1"
+regex = { version = "1", default-features = false, features = ["std", "perf-dfa", "unicode-perl"] }
 
 [profile.release]
 lto = true
