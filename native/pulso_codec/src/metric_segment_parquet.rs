@@ -34,8 +34,8 @@
 use crate::stable_hash;
 
 use arrow::array::{
-    Array, Float64Array, Float64Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
-    StringBuilder,
+    Array, BinaryArray, BinaryBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
+    RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -323,7 +323,15 @@ fn schema() -> SchemaRef {
         Field::new("timestamp_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("metric_name", DataType::Utf8, false),
-        Field::new("labels_canonical", DataType::Utf8, false),
+        // `labels_canonical` is `Binary`, not `Utf8`, specifically so
+        // the 0xff byte we use as the field separator — identical to
+        // Prometheus's `labels.StableHash` separator in
+        // `prometheus/prometheus/model/labels/labels_common.go` — can
+        // appear verbatim. Writing it to a Utf8 column would force an
+        // `invalid utf-8 → U+FFFD` lossy replacement on encode and
+        // break the exact-bytes contract that lets decode return
+        // sub-binaries of the arena without a second parse.
+        Field::new("labels_canonical", DataType::Binary, false),
         Field::new("labels_json", DataType::Utf8, false),
     ]))
 }
@@ -333,22 +341,19 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut ts = Int64Builder::with_capacity(rows.len());
     let mut value = Float64Builder::with_capacity(rows.len());
     let mut metric_name = StringBuilder::with_capacity(rows.len(), 0);
-    let mut labels_canonical = StringBuilder::with_capacity(rows.len(), 0);
+    let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), 0);
     let mut labels_json = StringBuilder::with_capacity(rows.len(), 0);
 
     for row in rows {
         series_id.append_value(row.series_id);
         ts.append_value(row.timestamp_ns);
         value.append_value(row.value);
-        // Documented contract on the Elixir side: label names and values
-        // are UTF-8. The JSON encoder sanitises them lossily so this
-        // string column is always valid UTF-8. The canonical column has
-        // the raw bytes with 0xFF separators, which is also valid UTF-8
-        // only if the names/values are UTF-8 — Prometheus rejects
-        // non-UTF-8 upstream, so we accept the risk and let a malformed
-        // segment fail decode loudly if it ever arrives.
+        // `metric_name` and `labels_json` are UTF-8 by construction
+        // (Prometheus restricts metric names, and our JSON encoder
+        // escapes any sub-0x20 bytes), so the StringBuilder path is
+        // the common case. `labels_canonical` is raw bytes.
         append_string(&mut metric_name, &row.metric_name);
-        append_string(&mut labels_canonical, &row.labels_canonical);
+        labels_canonical.append_value(&row.labels_canonical);
         append_string(&mut labels_json, &row.labels_json);
     }
 
@@ -401,6 +406,51 @@ fn writer_properties() -> WriterProperties {
     builder.build()
 }
 
+// Per-batch arena for a Binary column: one Erlang `NewBinary` holds
+// the entire column's underlying bytes, and `sub_binary` returns
+// zero-copy slices into it. For a batch of N rows we go from N
+// allocations per column to one — same contract as
+// `segment_parquet::StringArena`.
+struct BinaryArena<'a> {
+    arena: Option<Binary<'a>>,
+    offsets: Vec<i32>,
+}
+
+impl<'a> BinaryArena<'a> {
+    fn from(env: Env<'a>, col: &BinaryArray) -> Self {
+        let bytes = col.value_data();
+        let arena = if bytes.is_empty() {
+            None
+        } else {
+            let mut nb = NewBinary::new(env, bytes.len());
+            nb.as_mut_slice().copy_from_slice(bytes);
+            Some(Binary::from(nb))
+        };
+        BinaryArena {
+            arena,
+            offsets: col.value_offsets().to_vec(),
+        }
+    }
+
+    fn row_bounds(&self, row: usize) -> (usize, usize) {
+        (self.offsets[row] as usize, self.offsets[row + 1] as usize)
+    }
+
+    fn sub_binary(&self, start: usize, len: usize) -> Result<Binary<'a>, DecodeError> {
+        match &self.arena {
+            Some(a) => a
+                .make_subbinary(start, len)
+                .map_err(|_| DecodeError::Reader),
+            None if len == 0 => Err(DecodeError::Reader),
+            None => Err(DecodeError::Reader),
+        }
+    }
+
+    fn arena_bytes(&self) -> Option<&[u8]> {
+        self.arena.as_ref().map(|a| a.as_slice())
+    }
+}
+
 pub fn decode<'a>(
     env: Env<'a>,
     blob: &Binary<'a>,
@@ -440,7 +490,26 @@ pub fn decode<'a>(
         let series_id_arr = col::<Int64Array>(&batch, 0)?;
         let ts_arr = col::<Int64Array>(&batch, 1)?;
         let value_arr = col::<Float64Array>(&batch, 2)?;
-        let labels_json_arr = col::<StringArray>(&batch, 5)?;
+        // Column index 4 is `labels_canonical` (see `schema()` above).
+        // We ignore `labels_json` on decode: `labels_canonical` carries
+        // the raw `name<0xff>value<0xff>...` bytes we hashed into
+        // `series_id`, so every label slice can be returned as a sub-
+        // binary of the arena without a per-row JSON parse.
+        let labels_arr = col::<BinaryArray>(&batch, 4)?;
+        let labels_arena = BinaryArena::from(env, labels_arr);
+        // The whole-column byte view — the per-row canonical slices we
+        // scan during the row loop point into this slice.
+        let labels_bytes: &[u8] = labels_arena.arena_bytes().unwrap_or(&[]);
+        let base = labels_bytes.as_ptr() as usize;
+
+        // Scratch buffers reused across rows within the batch to avoid
+        // per-row Vec allocs. Scope is per-batch so the slice lifetimes
+        // in `label_pairs` do not escape `labels_bytes`'s borrow.
+        // Prometheus series rarely exceed a dozen labels, so 16 is a
+        // comfortable upper bound to avoid reallocation.
+        let mut name_terms: Vec<Term<'a>> = Vec::with_capacity(16);
+        let mut value_terms: Vec<Term<'a>> = Vec::with_capacity(16);
+        let mut label_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
 
         for row in 0..batch.num_rows() {
             let ts = ts_arr.value(row) as i128;
@@ -455,24 +524,37 @@ pub fn decode<'a>(
                 }
             }
 
-            let labels_json = labels_json_arr.value(row);
-            let labels_map = parse_label_json(labels_json.as_bytes()).ok_or(DecodeError::Reader)?;
+            let (row_start, row_end) = labels_arena.row_bounds(row);
 
-            if !labels_match(&labels_map, &filter.matchers, &regex_cache) {
+            label_pairs.clear();
+            if row_end > row_start {
+                let row_bytes = &labels_bytes[row_start..row_end];
+                if parse_canonical_pairs(row_bytes, &mut label_pairs).is_err() {
+                    return Err(DecodeError::Reader);
+                }
+            }
+
+            if !labels_match(&label_pairs, &filter.matchers, &regex_cache) {
                 continue;
             }
 
             let series_id = series_id_arr.value(row);
             let value = value_arr.value(row);
 
-            let mut names: Vec<Term<'a>> = Vec::with_capacity(labels_map.len());
-            let mut values: Vec<Term<'a>> = Vec::with_capacity(labels_map.len());
-            for (k, v) in &labels_map {
-                names.push(copy(env, k));
-                values.push(copy(env, v));
+            // Rebuild label terms as sub-binaries of the arena. The
+            // slice pointer arithmetic recovers each slice's absolute
+            // offset inside the arena so the sub-binary points at the
+            // right bytes — no second copy.
+            name_terms.clear();
+            value_terms.clear();
+            for (name, value) in &label_pairs {
+                let name_off = (name.as_ptr() as usize) - base;
+                let value_off = (value.as_ptr() as usize) - base;
+                name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
+                value_terms.push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
             }
-            let labels_term =
-                Term::map_from_arrays(env, &names, &values).map_err(|_| DecodeError::Reader)?;
+            let labels_term = Term::map_from_arrays(env, &name_terms, &value_terms)
+                .map_err(|_| DecodeError::Reader)?;
 
             let fields = [
                 struct_name,
@@ -489,6 +571,30 @@ pub fn decode<'a>(
     Ok(records.encode(env))
 }
 
+// Split a row's canonical bytes (`name<0xff>value<0xff>...`) into
+// borrowed `(name, value)` pairs. Returns `Err(())` on a stray trailing
+// byte or a missing separator — a well-formed segment never produces
+// either.
+fn parse_canonical_pairs<'r>(
+    bytes: &'r [u8],
+    out: &mut Vec<(&'r [u8], &'r [u8])>,
+) -> Result<(), ()> {
+    let mut i = 0;
+    while i < bytes.len() {
+        let name_start = i;
+        let name_end = memchr::memchr(crate::stable_hash::SEP, &bytes[i..]).ok_or(())? + i;
+        let value_start = name_end + 1;
+        if value_start > bytes.len() {
+            return Err(());
+        }
+        let value_end =
+            memchr::memchr(crate::stable_hash::SEP, &bytes[value_start..]).ok_or(())? + value_start;
+        out.push((&bytes[name_start..name_end], &bytes[value_start..value_end]));
+        i = value_end + 1;
+    }
+    Ok(())
+}
+
 fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> Result<&T, DecodeError> {
     batch
         .column(idx)
@@ -497,22 +603,13 @@ fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> Result<&T, DecodeError> {
         .ok_or(DecodeError::Reader)
 }
 
-fn copy<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
-    let mut out = NewBinary::new(env, bytes.len());
-    out.as_mut_slice().copy_from_slice(bytes);
-    Binary::from(out).encode(env)
-}
-
 fn labels_match(
-    labels: &[(Vec<u8>, Vec<u8>)],
+    labels: &[(&[u8], &[u8])],
     matchers: &[Matcher<'_>],
     regex_cache: &[Option<regex::Regex>],
 ) -> bool {
     for (m, re) in matchers.iter().zip(regex_cache.iter()) {
-        let got: Option<&[u8]> = labels
-            .iter()
-            .find(|(k, _)| k.as_slice() == m.name)
-            .map(|(_, v)| v.as_slice());
+        let got: Option<&[u8]> = labels.iter().find(|(k, _)| *k == m.name).map(|(_, v)| *v);
 
         let ok = match m.op {
             MatcherOp::Eq => got.map(|v| v == m.value).unwrap_or(m.value.is_empty()),
@@ -536,137 +633,4 @@ fn labels_match(
         }
     }
     true
-}
-
-// Minimal JSON object parser specialised to our writer's output
-// (`{"k":"v",...}` with simple backslash escapes, no numbers, no
-// nested objects). This stays in-crate so the metric read path does
-// not depend on `Pulso.JSON`'s term builder for a tiny, bounded shape.
-fn parse_label_json(input: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut i = 0;
-    skip_ws(input, &mut i);
-    if input.get(i) != Some(&b'{') {
-        return None;
-    }
-    i += 1;
-    let mut out = Vec::new();
-
-    skip_ws(input, &mut i);
-    if input.get(i) == Some(&b'}') {
-        return Some(out);
-    }
-
-    loop {
-        skip_ws(input, &mut i);
-        let k = parse_json_string(input, &mut i)?;
-        skip_ws(input, &mut i);
-        if input.get(i) != Some(&b':') {
-            return None;
-        }
-        i += 1;
-        skip_ws(input, &mut i);
-        let v = parse_json_string(input, &mut i)?;
-        out.push((k, v));
-        skip_ws(input, &mut i);
-        match input.get(i) {
-            Some(&b',') => {
-                i += 1;
-                continue;
-            }
-            Some(&b'}') => {
-                return Some(out);
-            }
-            _ => return None,
-        }
-    }
-}
-
-fn skip_ws(input: &[u8], i: &mut usize) {
-    while let Some(&b) = input.get(*i) {
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-            *i += 1;
-        } else {
-            break;
-        }
-    }
-}
-
-fn parse_json_string(input: &[u8], i: &mut usize) -> Option<Vec<u8>> {
-    if input.get(*i) != Some(&b'"') {
-        return None;
-    }
-    *i += 1;
-    let mut out = Vec::new();
-    while *i < input.len() {
-        let b = input[*i];
-        if b == b'"' {
-            *i += 1;
-            return Some(out);
-        }
-        if b == b'\\' {
-            *i += 1;
-            let esc = *input.get(*i)?;
-            *i += 1;
-            match esc {
-                b'"' => out.push(b'"'),
-                b'\\' => out.push(b'\\'),
-                b'/' => out.push(b'/'),
-                b'b' => out.push(0x08),
-                b't' => out.push(0x09),
-                b'n' => out.push(0x0a),
-                b'f' => out.push(0x0c),
-                b'r' => out.push(0x0d),
-                b'u' => {
-                    let hi = hex_u16(input, i)?;
-                    // Only accept a plain BMP code point; we never emit
-                    // surrogates on encode. If one shows up, bail — this
-                    // is a trusted-input path.
-                    if (0xd800..=0xdfff).contains(&hi) {
-                        return None;
-                    }
-                    push_utf8(&mut out, hi as u32);
-                }
-                _ => return None,
-            }
-            continue;
-        }
-        out.push(b);
-        *i += 1;
-    }
-    None
-}
-
-fn hex_u16(input: &[u8], i: &mut usize) -> Option<u16> {
-    if *i + 4 > input.len() {
-        return None;
-    }
-    let mut v: u16 = 0;
-    for off in 0..4 {
-        let digit = input[*i + off];
-        v = v.checked_mul(16)?.checked_add(hex_val(digit)? as u16)?;
-    }
-    *i += 4;
-    Some(v)
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
-}
-
-fn push_utf8(out: &mut Vec<u8>, cp: u32) {
-    if cp < 0x80 {
-        out.push(cp as u8);
-    } else if cp < 0x800 {
-        out.push(0xc0 | (cp >> 6) as u8);
-        out.push(0x80 | (cp & 0x3f) as u8);
-    } else {
-        out.push(0xe0 | (cp >> 12) as u8);
-        out.push(0x80 | ((cp >> 6) & 0x3f) as u8);
-        out.push(0x80 | (cp & 0x3f) as u8);
-    }
 }
