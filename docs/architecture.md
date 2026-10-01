@@ -29,9 +29,9 @@ All three signals are stored in **Apache Parquet** files in S3. Same substrate a
 
 For each signal Pulso stores:
 
-- **Segment files** (`s3://<bucket>/tenant=X/signal=logs/date=Y/hour=Z/segment-<node>-<seq>.parquet`): immutable Parquet objects containing the records themselves.
-- **Sidecar index files** (`.bloom`, `.postings`, `.stats`), written alongside the segment at flush time, immutable, live in S3.
-- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenant=X/signal=logs/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it.
+- **Segment files** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`): immutable Parquet objects containing the records themselves. The zero-padded 20-digit `[min_ts, max_ts]` tail is what the query path prunes against at LIST time; the `date=`/`hour=` partitions are derived from `min_ts` as UTC and let Athena-style callers prune without opening the manifest.
+- **Sidecar index files** (`.bloom`, `.postings`, `.stats`), written alongside the segment at flush time, immutable, live in S3. **Not yet implemented**; the first signal to need them is metrics (label→series posting list).
+- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it.
 
 The manifest is the only file for a tenant that ever gets rewritten. Segments and sidecar indexes are write-once.
 
@@ -229,9 +229,12 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 
 ### Metrics
 
-- PromQL subset. Range vector selection, `rate`, `increase`, aggregations, `histogram_quantile`.
-- Sort row groups by `(series_id, ts)`. `series_id` is a fingerprint of the label set.
-- Sidecar: label→series posting list (TSDB-style).
+- Ingest wire protocol: **Prometheus `remote_write` v1** (Snappy-compressed protobuf), at `POST /api/v1/write`. Full receiver contract: `Content-Type: application/x-protobuf`, `Content-Encoding: snappy` (strict — unlike Loki push, an absent header is rejected), `X-Prometheus-Remote-Write-Version: 0.*` (0.1.0 in practice), `X-Scope-OrgID` for tenant (defaults to `"default"`), `Idempotency-Key` propagated to storage. `204` on success, `400` for invalid snappy/protobuf, `415` on wrong content-type/encoding, `429` on `:owner_overloaded` backpressure, `5xx` on storage transients. OTLP/HTTP metrics (`/v1/metrics`) is a follow-up PR.
+- Sort row groups by `(series_id, timestamp_ns)`.
+- `series_id` is Pulso's port of Prometheus's `labels.StableHash` — xxhash64 over `name<0xff>value<0xff>…` across labels sorted by name. Byte-exact compatibility with the Go reference is pinned by `native/pulso_codec/src/stable_hash.rs` and its oracle test. Treat `series_id` as an accelerator only — the canonical labels are the identity, and readers must compare them, not the hash.
+- Parquet schema: `series_id Int64`, `timestamp_ns Int64`, `value Float64`, `metric_name Utf8` (dictionary-encoded), `labels_canonical Utf8` (the bytes `StableHash` consumes), `labels_json Utf8` (for materialisation on read). Delta-binary-packed on `timestamp_ns`, zstd column compression.
+- Sidecar: **not yet built.** The first metrics PR punted label postings; manifest segment summaries carry metric-name sets and top-label summaries so pruning has somewhere to live before the full sidecar lands. **Also not yet built — tracked follow-up.**
+- Native histograms and exemplars are deliberately out of v1. If OTLP metrics ships before they do, the receiver must reject unsupported histogram/summary types with partial success rather than silently coercing.
 - Caveat: very high active-series cardinality (100M+) may eventually justify a specialized TSDB block layout beside Parquet. Not v1.
 
 ### Traces

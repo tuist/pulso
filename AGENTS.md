@@ -15,14 +15,16 @@ Early scaffolding. In place:
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
 - `Pulso.Loki` — read-only Loki HTTP client wrapping `query_range`
 - `Pulso.MCP` — JSON-RPC 2.0 dispatcher (`initialize`, `tools/list`, `tools/call`, `ping`)
-- `Pulso.MCP.Tools` — tool registry, currently one read-only tool (`query_logs`)
+- `Pulso.MCP.Tools` — tool registry; read-only tools `query_logs` and `query_metrics`
 - `PulsoWeb.MCPController` at `POST /mcp` (handles single and batched JSON-RPC)
 - `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
 - `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push ingest, JSON and Snappy-compressed protobuf (decoded in Rust by `Pulso.Codec.NIF`)
+- `PulsoWeb.RemoteWriteController` at `POST /api/v1/write` — Prometheus remote_write v1 ingest (Snappy-compressed protobuf, hand-decoded in Rust). Full receiver contract per the Prometheus spec; see `lib/pulso_web/controllers/remote_write_controller.ex` for the header/status-code rules.
 - `PulsoWeb.CompressedBodyReader` — gzip-aware Plug.Parsers body reader, so JSON receivers accept compressed bodies
-- `Pulso.Storage` — behaviour with an in-memory adapter for tests and `Pulso.Storage.S3` for dev/prod. S3 objects are Apache Parquet log segments (written and read by `Pulso.Codec.NIF.{encode,decode}_log_segment_parquet` in Rust via arrow-rs / parquet-rs), keyed as `tenants/<t>/v3/logs/<min_ts>-<max_ts>-<suffix>.parquet`, sorted by `(service, timestamp_ns)` inside each segment, coordinated per `(tenant, signal)` through an S3-CAS manifest (`Pulso.Storage.S3.Manifest`, `Pulso.Storage.S3.ManifestOwner`, `Pulso.Storage.S3.ManifestCache`).
+- `Pulso.Storage` — signal-generic behaviour (`append(signal, tenant, records, opts)` / `query(signal, tenant, opts)` with `signal :: :logs | :metrics`), with an in-memory adapter for tests and `Pulso.Storage.S3` for dev/prod. S3 objects are Apache Parquet segments (logs via `Pulso.Codec.NIF.{encode,decode}_log_segment_parquet`, metrics via `encode_metric_segment_parquet` / `decode_metric_segment_parquet`), keyed as `tenants/<t>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`, sorted by `(service, timestamp_ns)` for logs and `(series_id, timestamp_ns)` for metrics, coordinated per `(tenant, signal)` through an S3-CAS manifest (`Pulso.Storage.S3.Manifest`, `Pulso.Storage.S3.ManifestOwner`, `Pulso.Storage.S3.ManifestCache`).
+- `native/pulso_codec/src/stable_hash.rs` — Pulso's port of Prometheus's `labels.StableHash` (xxhash64 over `name<0xff>value<0xff>…` across labels sorted by name). Byte-exact with the Go reference; conformance-tested in-crate.
 
-Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats), compactor, metrics and traces signals, remediation surface, HITL wiring, distribution (Horde/libcluster/ra).
+Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), manifest segment summary enrichment (metric names, top-label summaries), compactor, traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, distribution (Horde/libcluster/ra).
 
 ## Design bet
 
