@@ -347,4 +347,21 @@ fn list(config: StoreConfig, prefix: String) -> NifResult<(Atom, Vec<String>)> {
     Ok((atoms::ok(), keys))
 }
 
+// Delimiter listing discovers tenant directories without downloading every
+// segment key. The object_store client follows provider pagination internally.
+#[rustler::nif(schedule = "DirtyIo")]
+fn list_prefixes(config: StoreConfig, prefix: String) -> NifResult<(Atom, Vec<String>)> {
+    let store = build_store(&config)?;
+    let path = Path::from(prefix);
+    let result = RUNTIME
+        .block_on(store.list_with_delimiter(Some(&path)))
+        .map_err(map_object_store_error)?;
+    let prefixes = result
+        .common_prefixes
+        .into_iter()
+        .map(|path| path.to_string())
+        .collect();
+    Ok((atoms::ok(), prefixes))
+}
+
 rustler::init!("Elixir.Pulso.ObjectStore.NIF");

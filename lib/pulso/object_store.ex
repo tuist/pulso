@@ -90,6 +90,12 @@ defmodule Pulso.ObjectStore do
     end
   end
 
+  @doc "List immediate directory prefixes, following provider pagination without materializing descendant object keys."
+  @spec list_prefixes(config(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_prefixes(config, prefix) when is_map(config) and is_binary(prefix) do
+    normalize(NIF.list_prefixes(normalize_config(config), prefix))
+  end
+
   # 304 responses reach us as a NIF error carrying the `:not_modified`
   # atom (that is what `Error::Term(Box::new(atoms::not_modified()))`
   # translates to on the BEAM side). We map it to a plain return value

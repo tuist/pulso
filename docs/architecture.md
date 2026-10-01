@@ -65,6 +65,13 @@ Each `(tenant, signal)` has a rendezvous-hashed owner among the current live nod
 
 Ownership is an *optimization*, not a correctness property. It determines which node is expected to buffer records for a (tenant, signal) and thus have the warmest cache for it. Any node can serve any query; any node can accept any ingest and forward if it isn't the owner.
 
+Implemented ownership currently covers background metrics merge and cleanup.
+`ManifestOwner` is a node-local request coalescer, not a cluster-wide owner;
+conditional object-storage writes arbitrate concurrent ingest from multiple
+nodes. Ingest forwarding, buffered ingest ownership, and alert evaluation remain
+future features and must reuse `Pulso.Rendezvous` with their own eligible roles.
+Query caches and query admission limits deliberately remain local to each node.
+
 ### S3 CAS for manifest updates
 
 Manifest updates use S3 conditional PUT (`If-Match: <etag>` on writes; `If-None-Match: *` for first-time creation). All major S3-compatible providers support this as of 2024.
@@ -279,15 +286,48 @@ owners. It is disabled by default. Upgrade every writer before enabling it with
 configuration. Existing writers cannot preserve the new retirement metadata, so
 mixed-version writing is unsupported once compaction has begun.
 
-Every 60 seconds, with scheduling jitter, the worker performs one bounded merge
-and cleanup for each metrics tenant observed locally through ingest or queries.
-It discovers these tenants from the manifest cache rather than recursively
-listing every segment object. After restart, cold tenants become eligible when
-they next ingest or query; `MetricsCompactor.compact/3` and `cleanup/3` allow
-explicit maintenance of idle tenants. `compaction_interval_ms`,
-`compaction_options`, and `compaction_cleanup_options` tune cadence and limits.
-Each operation isolates tenant errors and exceptions, and a merge failure does
-not prevent cleanup or processing of other tenants.
+Every 60 seconds, with scheduling jitter, each worker discovers tenant directories
+with delimiter listing under `tenants/`. Provider pagination returns immediate
+tenant prefixes without materializing descendant segment keys. This durable
+discovery includes tenants first observed by other instances and idle tenants
+after all caches or nodes restart. Owners load only their metrics manifests;
+missing manifests never adopt orphan segments. Discovery memory grows with tenant
+count rather than the segment backlog. Discovery errors skip the pass and retry
+on the next interval without falling back to an incomplete local cache.
+
+Enabled workers join an [Erlang process group](https://www.erlang.org/doc/apps/kernel/pg.html)
+scoped by storage endpoint, region, and bucket. Existing domain name discovery
+connects nodes; process groups advertise only live compaction workers, excluding
+disabled nodes and removing failed workers even when their node stays connected.
+Deployments must use identical store identities and connect the eligible nodes
+in a full mesh. A standalone node owns every tenant. The process-group scope and
+worker share a supervision tree that restores registration after scope failure.
+
+The shared `Pulso.Rendezvous` algorithm accepts binary key fields for tenant work
+and future rule evaluation. For each `(tenant, signal)`, rendezvous hashing chooses the highest digest of
+length-prefixed purpose (`compaction`), tenant, signal, and node-name fields, with node name breaking
+score ties. Membership order and duplicate announcements do not affect ownership.
+Only the current local owner merges or cleans up; ownership is checked again
+before cleanup. Joins and departures change the next pass without transferring
+state. Views can disagree during propagation or partitions, and a merge already
+in progress can finish after ownership moves. Ownership reduces duplicate work;
+it is not a lock. Conditional publication, durable retirement revisions, and
+grace periods remain the correctness backstop for overlapping workers.
+
+`MetricsCompactor.compact/3` and `cleanup/3` remain explicit maintenance operations
+that bypass background ownership. `compaction_interval_ms`, `compaction_options`,
+and `compaction_cleanup_options` tune cadence and limits. Each operation runs under a dedicated supervised task with a 30-second deadline
+(`compaction_timeout_ms`). Errors and exceptions remain isolated; a merge failure
+does not prevent cleanup or other tenants. A timeout stops waiting and withdraws
+the worker from eligibility, allowing peers to take over. The task remains
+supervised until it finishes: killing a process inside a native call can report
+termination while native work is still running. The worker skips further passes
+until the task actually finishes, then rejoins on its next interval. A timed-out
+tenant is deferred locally for five minutes (`compaction_retry_ms`), allowing
+other tenants to progress instead of repeatedly rotating a slow tenant among
+nodes. Discovery has its own 60-second deadline (`compaction_discovery_timeout_ms`).
+These limits bound admitted work during a stall. A late task may still publish or clean up;
+conditional publication and durable retirement safeguards remain mandatory.
 
 A merge selects at least two segments from the same hour partition, up to 32
 segments, 8 MiB of encoded input, and 100,000 samples. Each candidate must be at
@@ -312,7 +352,9 @@ safe to delete.
 Manifest version 2 records each retired key's deletion deadline, revision, and
 completion status, plus a cleanup cursor. Legacy version 1 manifests remain
 readable; unsupported future versions fail closed. The default grace period is
-one hour. Cleanup attempts at most 128 deletions per pass, continues past failed
+one hour. Nodes must keep their wall clocks synchronized; grace must exceed
+expected cross-node clock skew and reader lifetime. Ownership changes do not
+reset durable deletion deadlines. Cleanup attempts at most 128 deletions per pass, continues past failed
 keys, and persists progress through conditional writes. The cursor rotates past
 permanent failures. Completed objects are not repeatedly deleted. A delayed
 ingest retry increments the retired key's revision and schedules its re-upload
@@ -336,3 +378,5 @@ omitting samples. The retry uses its own snapshot without overwriting the shared
 cache, so it cannot hide a later acknowledged append. This protects stale readers
 even after extended refresh failures; the grace period alone cannot bound every
 snapshot's lifetime.
+
+The next metrics work is label posting indexes, followed by OpenTelemetry metrics ingestion and then alert evaluation.

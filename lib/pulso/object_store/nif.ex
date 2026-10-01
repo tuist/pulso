@@ -29,5 +29,6 @@ defmodule Pulso.ObjectStore.NIF do
   def get(_config, _key), do: :erlang.nif_error(:nif_not_loaded)
   def get_if_none_match(_config, _key, _etag), do: :erlang.nif_error(:nif_not_loaded)
   def delete(_config, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def list_prefixes(_config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
   def list(_config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
 end

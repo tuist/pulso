@@ -6,13 +6,20 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.CompactionDiscovery
+  alias Pulso.Storage.S3.CompactionOwnership
+  alias Pulso.Storage.S3.CompactionSupervision
+  alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.CompactionWorker
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.MetricsCompactor
+  alias Pulso.Test.CompactionPeer
   alias Pulso.Test.CompactionStore
+
+  @moduletag timeout: 120_000
 
   setup do
     agent =
@@ -54,6 +61,12 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     end)
 
     start_supervised!(ManifestSupervision)
+    start_supervised!(%{id: CompactionOwnership, start: {:pg, :start_link, [CompactionOwnership.scope()]}})
+
+    start_supervised!(
+      Supervisor.child_spec({Task.Supervisor, name: CompactionTasks, max_children: 4}, id: CompactionTasks)
+    )
+
     tenant = "compact-#{System.unique_integer([:positive])}"
 
     {:ok, _} =
@@ -520,7 +533,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:error, :not_found} = ObjectStore.get(ctx.config, source.key)
   end
 
-  test "background maintenance handles a poison tenant without recursively listing objects", ctx do
+  test "background maintenance isolates a poison tenant discovered from durable manifests", ctx do
     for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
     poison = ctx.tenant <> "-poison"
     prefix = "tenants/#{poison}/v4/signal=metrics/date=2026-10-01/hour=00/"
@@ -548,7 +561,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     _ = :sys.get_state(worker)
     assert length(load(ctx).segments) == 1
     assert load(%{ctx | tenant: poison}).segments == manifest.segments
-    assert Agent.get(ctx.agent, & &1.lists) == lists
+    assert Agent.get(ctx.agent, & &1.lists) == lists + 1
   end
 
   test "a missing compacted manifest fails closed instead of rebuilding an incomplete snapshot", ctx do
@@ -566,7 +579,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert CompactionWorker.children(%{}) == []
     assert CompactionWorker.children(%{compaction_enabled: false}) == []
     config = %{compaction_enabled: true}
-    assert CompactionWorker.children(config) == [{CompactionWorker, config}]
+    assert CompactionWorker.children(config) == [{CompactionSupervision, config}]
     assert {:ok, %Manifest{version: 1, retired: %{}}} = Manifest.decode(~s({"v":1,"s":[]}))
     assert {:error, :unsupported_manifest_version} = Manifest.decode(~s({"v":99,"s":[]}))
     assert {:error, :invalid_manifest} = Manifest.decode(~s({"v":2,"s":[]}))
@@ -655,8 +668,9 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
         _ = :sys.get_state(worker)
       end)
 
-    assert log =~ "raised tenant="
+    assert log =~ "discovery raised tenant="
     :sys.replace_state(worker, fn _ -> ctx.config end)
+    :pg.join(CompactionOwnership.scope(), CompactionOwnership.group(ctx.config), worker)
     send(worker, :compact)
     _ = :sys.get_state(worker)
     assert length(load(ctx).segments) == 1
@@ -740,5 +754,386 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert length(MetricsCompactor.select(manifest, max_rows: 20)) == 2
     assert MetricsCompactor.select(manifest, max_input_bytes: 100) == []
     assert MetricsCompactor.select(manifest, small_segment_bytes: 99) == []
+  end
+
+  test "rendezvous agreement, signal separation, and minimal reassignment on joins and departures" do
+    members = [:a@host, :b@host, :c@host]
+    assert CompactionOwnership.owner("tenant", "metrics", []) == nil
+
+    owners =
+      for tenant <- 1..500 do
+        key = "tenant-#{tenant}"
+        owner = CompactionOwnership.owner(key, "metrics", members)
+        assert owner == CompactionOwnership.owner(key, "metrics", Enum.reverse(members, members))
+        {key, owner}
+      end
+
+    assert Enum.uniq(Enum.map(owners, &elem(&1, 1))) |> Enum.sort() == Enum.sort(members)
+
+    for {tenant, original} <- owners do
+      joined = CompactionOwnership.owner(tenant, "metrics", [:d@host | members])
+      assert joined in [original, :d@host]
+      departed = CompactionOwnership.owner(tenant, "metrics", members -- [:b@host])
+      if original != :b@host, do: assert(departed == original)
+    end
+
+    assert Enum.any?(owners, fn {tenant, metrics} ->
+             CompactionOwnership.owner(tenant, "logs", members) != metrics
+           end)
+  end
+
+  test "connected workers discover another instance's tenants and avoid duplicate source reads and uploads", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    connect_peers(first, second, first_node, second_node, ctx.config)
+
+    # Both remote caches are empty: ingest and the first query happened here.
+    for peer <- [first, second] do
+      assert CompactionPeer.call(peer, ManifestCache, :tenants, ["metrics"]) == []
+    end
+
+    reads(ctx.agent)
+    test_process = self()
+    Agent.update(ctx.agent, &%{&1 | requests: [], barriers: %{{"PUT", :replacement} => test_process}})
+    owner = CompactionOwnership.owner(ctx.tenant, "metrics", [first_node, second_node])
+    {owner_peer, non_owner} = if owner == first_node, do: {first, second}, else: {second, first}
+    supervisor = start_supervised!(Task.Supervisor)
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        CompactionPeer.call(owner_peer, CompactionPeer, :pass, [], 20_000)
+      end)
+
+    assert_receive {:storage_barrier, request, "PUT", replacement}, 10_000
+    # The sources are still active while the owner waits for its upload response.
+    assert CompactionPeer.call(non_owner, CompactionPeer, :pass, []) == :ok
+    assert reads(ctx.agent) == 4
+    assert replacement_uploads(ctx.agent) == 1
+    send(request, {:release_storage, replacement})
+    assert Task.await(task, 20_000) == :ok
+    assert replacement_uploads(ctx.agent) == 1
+    assert length(load(ctx).segments) == 1
+    assert S3.query(:metrics, ctx.tenant, []) == before
+  end
+
+  test "owner node departure transfers cleanup and idle tenant work without a cache handoff", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    owner = CompactionOwnership.owner(ctx.tenant, "metrics", [first_node, second_node])
+
+    {owner_peer, survivor, survivor_node} =
+      if owner == first_node, do: {first, second, second_node}, else: {second, first, first_node}
+
+    assert CompactionPeer.call(owner_peer, CompactionPeer, :pass, []) == :ok
+    assert load(ctx).retired |> Map.keys() |> length() == 4
+    assert Agent.get(ctx.agent, & &1.deletes) == []
+    stop_supervised!(Process.get({CompactionPeer, owner_peer}))
+    assert CompactionPeer.call(survivor, CompactionPeer, :await_members, [ctx.config, [survivor_node]]) == :ok
+
+    # Expire durable deadlines without warming the survivor's cache.
+    manifest = load(ctx)
+    retired = Map.new(manifest.retired, fn {key, retirement} -> {key, %{retirement | delete_after: 0}} end)
+
+    assert {:ok, _} =
+             ObjectStore.put(
+               ctx.config,
+               Manifest.manifest_key(ctx.tenant, "metrics"),
+               Manifest.encode(%{manifest | retired: retired}) |> IO.iodata_to_binary()
+             )
+
+    assert CompactionPeer.call(survivor, ManifestCache, :tenants, ["metrics"]) == []
+    assert CompactionPeer.call(survivor, CompactionPeer, :pass, []) == :ok
+    assert length(Agent.get(ctx.agent, & &1.deletes)) == 4
+    assert Enum.all?(load(ctx).retired, fn {_, retirement} -> retirement.deleted? end)
+    assert S3.query(:metrics, ctx.tenant, []) == before
+  end
+
+  test "inconsistent membership permits overlapping workers but only one safe publication", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    # Deliberately leave the nodes disconnected, as in a partition.
+    assert CompactionPeer.call(first, CompactionOwnership, :members, [ctx.config]) == [first_node]
+    assert CompactionPeer.call(second, CompactionOwnership, :members, [ctx.config]) == [second_node]
+    test_process = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", :replacement} => test_process}})
+    supervisor = start_supervised!(Task.Supervisor)
+
+    tasks =
+      for peer <- [first, second],
+          do:
+            Task.Supervisor.async_nolink(supervisor, fn ->
+              CompactionPeer.call(peer, CompactionPeer, :pass, [], 20_000)
+            end)
+
+    assert_receive {:storage_barrier, one, "PUT", one_key}, 10_000
+    assert_receive {:storage_barrier, two, "PUT", two_key}, 10_000
+    send(one, {:release_storage, one_key})
+    send(two, {:release_storage, two_key})
+    assert Enum.map(tasks, &Task.await(&1, 20_000)) == [:ok, :ok]
+    assert length(load(ctx).segments) == 1
+    assert map_size(load(ctx).retired) == 4
+    assert replacement_uploads(ctx.agent) == 2
+
+    assert Agent.get(ctx.agent, fn state ->
+             Enum.count(state.objects, fn {key, _} -> String.contains?(key, "-compact-") end)
+           end) == 1
+
+    assert S3.query(:metrics, ctx.tenant, []) == before
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    for peer <- [first, second], do: CompactionPeer.call(peer, CompactionPeer, :pass, [])
+    assert replacement_uploads(ctx.agent) == 2
+  end
+
+  test "failed worker loses eligibility even while its node remains connected", ctx do
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    assert CompactionPeer.call(first, Supervisor, :terminate_child, [CompactionSupervision, CompactionWorker]) == :ok
+    assert CompactionPeer.call(second, CompactionPeer, :await_members, [ctx.config, [second_node]]) == :ok
+    assert CompactionPeer.call(second, Node, :list, []) == [first_node]
+
+    assert CompactionPeer.call(first, Supervisor, :restart_child, [CompactionSupervision, CompactionWorker]) |> elem(0) ==
+             :ok
+
+    assert CompactionPeer.call(second, CompactionPeer, :await_members, [ctx.config, [first_node, second_node]]) == :ok
+  end
+
+  test "tenant prefix discovery survives a lost cache and missing metric manifests never adopt orphan segments", ctx do
+    for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
+    assert {:ok, _} = ObjectStore.put(ctx.config, "tenants/orphan/v4/signal=metrics/orphan.parquet", "unused")
+    assert {:ok, _} = ObjectStore.put(ctx.config, Manifest.manifest_key("logs-only", "logs"), "unused")
+    ManifestCache.reset()
+    assert CompactionDiscovery.tenants(ctx.config) == {:ok, Enum.sort([ctx.tenant, "logs-only", "orphan"])}
+    worker = start_supervised!({CompactionWorker, ctx.config})
+    send(worker, :compact)
+    _ = :sys.get_state(worker)
+    assert length(load(ctx).segments) == 1
+  end
+
+  test "owner failure after upload lets a survivor publish from the unchanged sources", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    owner = CompactionOwnership.owner(ctx.tenant, "metrics", [first_node, second_node])
+
+    {owner_peer, survivor, survivor_node} =
+      if owner == first_node, do: {first, second, second_node}, else: {second, first, first_node}
+
+    test_process = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", :replacement} => test_process}})
+    supervisor = start_supervised!(Task.Supervisor)
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        try do
+          CompactionPeer.call(owner_peer, CompactionPeer, :pass, [], 20_000)
+        catch
+          :exit, _ -> :owner_failed
+        end
+      end)
+
+    assert_receive {:storage_barrier, request, "PUT", abandoned_key}, 10_000
+    stop_supervised!(Process.get({CompactionPeer, owner_peer}))
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    send(request, {:release_storage, abandoned_key})
+    assert Task.await(task, 20_000) == :owner_failed
+    assert CompactionPeer.call(survivor, CompactionPeer, :await_members, [ctx.config, [survivor_node]]) == :ok
+    assert length(load(ctx).segments) == 4
+    assert CompactionPeer.call(survivor, CompactionPeer, :pass, []) == :ok
+    assert length(load(ctx).segments) == 1
+    refute Enum.any?(load(ctx).segments, &(&1.key == abandoned_key))
+    assert S3.query(:metrics, ctx.tenant, []) == before
+  end
+
+  test "membership scope restart restores the worker registration", ctx do
+    stop_supervised!(CompactionOwnership)
+    stop_supervised!(CompactionTasks)
+    supervisor = start_supervised!({CompactionSupervision, ctx.config})
+    old_worker = Process.whereis(CompactionWorker)
+    ref = Process.monitor(old_worker)
+    Process.exit(Process.whereis(CompactionOwnership.scope()), :kill)
+    assert_receive {:DOWN, ^ref, :process, ^old_worker, :shutdown}
+    _ = :sys.get_state(supervisor)
+    assert Process.whereis(CompactionWorker) != old_worker
+    assert CompactionOwnership.members(ctx.config) == [node()]
+  end
+
+  test "store identities isolate eligibility and discovery failures retry without touching sources", ctx do
+    for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
+    worker = start_supervised!({CompactionWorker, ctx.config})
+    assert CompactionOwnership.members(Map.put(ctx.config, :bucket, "other")) == []
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", "/pulso"} => {403, :before, 1}}, requests: []})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(worker, :compact)
+        _ = :sys.get_state(worker)
+      end)
+
+    assert log =~ "discovery failed"
+    assert replacement_uploads(ctx.agent) == 0
+    assert length(load(ctx).segments) == 3
+    send(worker, :compact)
+    _ = :sys.get_state(worker)
+    assert length(load(ctx).segments) == 1
+  end
+
+  test "a joining eligible node takes its new tenants without a cache transfer", ctx do
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+
+    tenant =
+      Enum.find_value(1..100, fn number ->
+        tenant = "joining-#{number}"
+        if CompactionOwnership.owner(tenant, "metrics", [first_node, second_node]) == second_node, do: tenant
+      end)
+
+    assert is_binary(tenant)
+
+    assert {:ok, _} =
+             ObjectStore.put(
+               ctx.config,
+               Manifest.manifest_key(tenant, "metrics"),
+               Manifest.encode(Manifest.new()) |> IO.iodata_to_binary()
+             )
+
+    for ts <- 1..3, do: assert(:ok = S3.append(:metrics, tenant, [sample(ts, ts / 1)]))
+    assert CompactionPeer.call(first, CompactionPeer, :pass, []) == :ok
+    assert length(load(%{ctx | tenant: tenant}).segments) == 1
+    for ts <- 4..6, do: assert(:ok = S3.append(:metrics, tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, tenant, [])
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    assert CompactionPeer.call(second, ManifestCache, :tenants, ["metrics"]) == []
+    reads(ctx.agent)
+    uploads = replacement_uploads(ctx.agent)
+    assert CompactionPeer.call(first, CompactionPeer, :pass, []) == :ok
+    assert reads(ctx.agent) == 0
+    assert replacement_uploads(ctx.agent) == uploads
+    assert CompactionPeer.call(second, CompactionPeer, :pass, []) == :ok
+    assert reads(ctx.agent) == 4
+    assert replacement_uploads(ctx.agent) == uploads + 1
+    assert S3.query(:metrics, tenant, []) == before
+  end
+
+  test "connected nodes with compaction disabled are not eligible", ctx do
+    {enabled, enabled_node} = compaction_peer(ctx.config)
+    {disabled, disabled_node} = compaction_peer(Map.put(ctx.config, :compaction_enabled, false))
+    assert CompactionPeer.call(enabled, Node, :connect, [disabled_node]) == true
+    assert CompactionPeer.call(disabled, Node, :list, []) == [enabled_node]
+    assert CompactionPeer.call(disabled, Process, :whereis, [CompactionWorker]) == nil
+    assert CompactionPeer.call(enabled, CompactionOwnership, :members, [ctx.config]) == [enabled_node]
+  end
+
+  test "delimiter discovery follows pages without returning the segment backlog", ctx do
+    for i <- 1..6 do
+      assert {:ok, _} = ObjectStore.put(ctx.config, Manifest.manifest_key("tenant-#{i}", "metrics"), "manifest")
+    end
+
+    for i <- 1..100 do
+      assert {:ok, _} =
+               ObjectStore.put(ctx.config, "tenants/#{ctx.tenant}/v4/signal=metrics/segment-#{i}.parquet", "segment")
+    end
+
+    lists = Agent.get(ctx.agent, & &1.lists)
+    assert {:ok, tenants} = CompactionDiscovery.tenants(ctx.config)
+    assert tenants == Enum.sort([ctx.tenant | Enum.map(1..6, &"tenant-#{&1}")])
+    assert Agent.get(ctx.agent, & &1.lists) == lists + 4
+  end
+
+  test "a stalled owner withdraws eligibility and lets another worker finish safely", ctx do
+    for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+    {first, first_node} = compaction_peer(ctx.config)
+    {second, second_node} = compaction_peer(ctx.config)
+    connect_peers(first, second, first_node, second_node, ctx.config)
+    owner = CompactionOwnership.owner(ctx.tenant, "metrics", [first_node, second_node])
+
+    {owner_peer, survivor, survivor_node} =
+      if owner == first_node, do: {first, second, second_node}, else: {second, first, first_node}
+
+    assert CompactionPeer.call(owner_peer, CompactionPeer, :timeout, [1_000]) == :ok
+    source = hd(load(ctx).segments).key
+    test_process = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", source} => test_process}})
+    supervisor = start_supervised!(Task.Supervisor)
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        CompactionPeer.call(owner_peer, CompactionPeer, :pass, [], 10_000)
+      end)
+
+    assert_receive {:storage_barrier, request, "GET", ^source}, 5_000
+    assert Task.await(task, 10_000) == :ok
+    assert CompactionPeer.call(survivor, CompactionPeer, :await_members, [ctx.config, [survivor_node]]) == :ok
+    # The old native call has not returned: another pass must neither rejoin
+    # nor admit another task while that call remains in flight.
+    assert CompactionPeer.call(owner_peer, CompactionPeer, :pass, []) == :ok
+    assert CompactionPeer.call(survivor, CompactionOwnership, :members, [ctx.config]) == [survivor_node]
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    assert CompactionPeer.call(survivor, CompactionPeer, :pass, []) == :ok
+    assert replacement_uploads(ctx.agent) == 1
+    send(request, {:release_storage, source})
+    assert length(load(ctx).segments) == 1
+    assert map_size(load(ctx).retired) == 4
+    assert S3.query(:metrics, ctx.tenant, []) == before
+    assert CompactionPeer.call(owner_peer, CompactionPeer, :await_tasks, []) == :ok
+    Agent.update(ctx.agent, &%{&1 | requests: []})
+    assert CompactionPeer.call(owner_peer, CompactionPeer, :pass, []) == :ok
+    manifest_key = Manifest.manifest_key(ctx.tenant, "metrics")
+    # The worker rejoins but defers the slow tenant during its retry backoff.
+    refute Agent.get(ctx.agent, &Enum.member?(&1.requests, {"GET", manifest_key}))
+    connect_peers(first, second, first_node, second_node, ctx.config)
+  end
+
+  test "a worker starting while earlier supervised work remains does not advertise eligibility", ctx do
+    {:ok, task} =
+      Task.Supervisor.start_child(CompactionTasks, fn ->
+        receive do
+          :finish -> :ok
+        end
+      end)
+
+    ref = Process.monitor(task)
+    worker = start_supervised!({CompactionWorker, ctx.config})
+    assert CompactionOwnership.members(ctx.config) == []
+    send(task, :finish)
+    assert_receive {:DOWN, ^ref, :process, ^task, :normal}
+    _ = :sys.get_state(CompactionTasks)
+    send(worker, :compact)
+    _ = :sys.get_state(worker)
+    assert CompactionOwnership.members(ctx.config) == [node()]
+  end
+
+  defp compaction_peer(config) do
+    config = config |> Map.put_new(:compaction_enabled, true) |> Map.put(:compaction_interval_ms, 3_600_000)
+    id = {CompactionPeer, make_ref()}
+    peer = start_supervised!(%{id: id, start: {CompactionPeer, :start_link, [{self(), config}]}, restart: :temporary})
+    assert_receive {:compaction_peer, ^peer, member}, 10_000
+    # Return an address usable by stop_supervised! as well as peer calls.
+    Process.put({CompactionPeer, peer}, id)
+    {peer, member}
+  end
+
+  defp connect_peers(first, second, first_node, second_node, config) do
+    assert CompactionPeer.call(first, Node, :connect, [second_node]) == true
+
+    for peer <- [first, second] do
+      assert CompactionPeer.call(peer, CompactionPeer, :await_members, [config, [first_node, second_node]]) == :ok
+    end
+  end
+
+  defp replacement_uploads(agent) do
+    Agent.get(agent, fn state ->
+      Enum.count(state.requests, fn {method, key} -> method == "PUT" and String.contains?(key, "-compact-") end)
+    end)
   end
 end

@@ -109,12 +109,35 @@ defmodule Pulso.Test.CompactionStore do
   defp list_response(state, conn) do
     prefix = Map.get(conn.query_params, "prefix", "")
 
-    entries =
-      state.objects
-      |> Enum.filter(fn {key, _} -> String.starts_with?(key, prefix) end)
-      |> Enum.map_join(&list_entry/1)
+    keys = state.objects |> Map.keys() |> Enum.filter(&String.starts_with?(&1, prefix)) |> Enum.sort()
 
-    "<ListBucketResult><Name>pulso</Name><IsTruncated>false</IsTruncated>#{entries}</ListBucketResult>"
+    {entries, truncated, token} =
+      if Map.get(conn.query_params, "delimiter") == "/" do
+        prefixes =
+          keys
+          |> Enum.flat_map(fn key ->
+            key
+            |> String.replace_prefix(prefix, "")
+            |> String.split("/", parts: 2)
+            |> case do
+              [tenant, _rest] -> [prefix <> tenant <> "/"]
+              _ -> []
+            end
+          end)
+          |> Enum.uniq()
+
+        # Deliberately small pages exercise the native provider continuation path.
+        offset = conn.query_params |> Map.get("continuation-token", "0") |> String.to_integer()
+        page = Enum.slice(prefixes, offset, 2)
+        truncated = offset + length(page) < length(prefixes)
+        entries = Enum.map_join(page, &"<CommonPrefixes><Prefix>#{&1}</Prefix></CommonPrefixes>")
+        token = if truncated, do: "<NextContinuationToken>#{offset + length(page)}</NextContinuationToken>", else: ""
+        {entries, truncated, token}
+      else
+        {Enum.map_join(keys, &list_entry({&1, Map.fetch!(state.objects, &1)})), false, ""}
+      end
+
+    "<ListBucketResult><Name>pulso</Name><IsTruncated>#{truncated}</IsTruncated>#{token}#{entries}</ListBucketResult>"
   end
 
   defp list_entry({key, {etag, body}}) do
