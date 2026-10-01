@@ -126,6 +126,8 @@ defmodule Pulso.Storage.S3 do
     end_ts = Keyword.get(opts, :end_ts)
     service = Keyword.get(opts, :service)
     limit = Keyword.get(opts, :limit)
+    matchers = Keyword.get(opts, :matchers, [])
+    line_filters = Keyword.get(opts, :line_filters, [])
 
     with :ok <- validate_tenant(tenant),
          config = config!(),
@@ -136,7 +138,7 @@ defmodule Pulso.Storage.S3 do
       # per-query sort.
       segments = Manifest.prune_by_time(entry.manifest, start_ts, end_ts)
 
-      case scan_segments(config, segments, start_ts, end_ts, service, limit) do
+      case scan_segments(config, segments, start_ts, end_ts, service, matchers, line_filters, limit) do
         {:ok, records} ->
           sorted = records |> SortOrder.sort() |> take_limit(limit)
           {:ok, sorted}
@@ -269,13 +271,15 @@ defmodule Pulso.Storage.S3 do
   # so it is safe to stop. Segments whose max_ts is unknown never satisfy
   # the condition, so they always get fetched — that is the price of not
   # knowing their bounds.
-  defp scan_segments(config, segments, start_ts, end_ts, service, limit) do
+  defp scan_segments(config, segments, start_ts, end_ts, service, matchers, line_filters, limit) do
     ctx = %{
       config: config,
       segments: segments,
       start_ts: start_ts,
       end_ts: end_ts,
       service: service,
+      matchers: matchers,
+      line_filters: line_filters,
       limit: limit
     }
 
@@ -302,7 +306,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    case decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service) do
+    case decode_segment(blob, ctx.start_ts, ctx.end_ts, ctx.service, ctx.matchers, ctx.line_filters) do
       {:ok, batch} ->
         new_state = %{
           batches: [batch | state.batches],
@@ -363,15 +367,21 @@ defmodule Pulso.Storage.S3 do
   defp merge_desc(a, [y | ys], k), do: [y | merge_desc(a, ys, k - 1)]
 
   @doc false
-  @spec decode_segment(binary(), term(), term(), term()) ::
+  @spec decode_segment(binary(), term(), term(), term(), [Pulso.Storage.matcher()], [Pulso.Storage.line_filter()]) ::
           {:ok, [Log.t()]} | {:error, term()}
-  def decode_segment(blob, start_ts, end_ts, service)
-      when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
-             (is_nil(service) or is_binary(service)) do
-    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service) do
+  def decode_segment(blob, start_ts, end_ts, service, matchers \\ [], line_filters \\ []) do
+    :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+
+    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service, matchers, line_filters) do
       {:ok, records} -> {:ok, records}
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
+  end
+
+  defp validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+       when is_binary(blob) and (is_nil(start_ts) or is_integer(start_ts)) and (is_nil(end_ts) or is_integer(end_ts)) and
+              (is_nil(service) or is_binary(service)) and is_list(matchers) and is_list(line_filters) do
+    :ok
   end
 
   # Schema version segment. Baked into every object key so a future change

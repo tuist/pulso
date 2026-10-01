@@ -20,13 +20,17 @@ mod json_write;
 mod labels;
 mod loki;
 mod out;
+mod query_filter;
 mod segment;
 mod segment_parquet;
 mod term_json;
 mod wire;
 
 use json_read::Parser;
+use memchr::memmem::Finder;
 use out::BinSink;
+use query_filter::{LineFilter, LineFilterOp, MatchOp, Matcher};
+use regex::bytes::Regex;
 use term_json::{EncodeError, JsonEncoder, TermBuilder};
 
 use rustler::{Binary, Encoder, Env, NewBinary, NifResult, Term};
@@ -44,6 +48,14 @@ mod atoms {
         too_big,
         storage,
         lines,
+        eq,
+        neq,
+        re,
+        nre,
+        contains,
+        not_contains,
+        match_re,
+        not_match_re,
         struct_key = "__struct__",
         log = "Elixir.Pulso.Record.Log",
         timestamp_ns,
@@ -335,11 +347,25 @@ fn encode_log_segment_parquet<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
     }
 }
 
-/// Decode a Parquet segment into `[%Pulso.Record.Log{}]`, keeping only
-/// records inside `[start_ts, end_ts]` (either may be nil) and with the
-/// given service (nil for any). Row-group `timestamp_ns` stats prune
-/// whole row groups before any column pages are read. Returns
-/// `{:ok, records}` or `:fallback`.
+/// Decode a Parquet segment into `[%Pulso.Record.Log{}]`, applying
+/// four categories of pushdown filter before any Erlang term is built:
+///
+///   * `start_ts` / `end_ts` — row-group `timestamp_ns` stats prune
+///     whole row groups; per-row check then rejects the rest.
+///   * `service` (a binary or `nil`) — kept on its own arg because
+///     `service` is a dictionary-encoded column and matching against it
+///     is faster than an equivalent matcher against `resource`.
+///   * `matchers` — a list of `{name, op, value}` tuples evaluated
+///     against the row's `resource` JSON. `op` is one of `:eq | :neq |
+///     :re | :nre`. Regex ops compile the pattern once here.
+///   * `line_filters` — a list of `{op, value}` tuples evaluated against
+///     the row's raw `body` bytes. `op` is one of `:contains |
+///     :not_contains | :match_re | :not_match_re`.
+///
+/// Any element the NIF cannot decode returns `:fallback`; the Elixir
+/// side treats that as a hard error and does not silently drop the
+/// pushdown — a Parquet segment lacks the Elixir reference
+/// implementation the JSON codecs have.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_log_segment_parquet<'a>(
     env: Env<'a>,
@@ -347,6 +373,8 @@ fn decode_log_segment_parquet<'a>(
     start_ts: Term<'a>,
     end_ts: Term<'a>,
     service: Term<'a>,
+    matchers: Term<'a>,
+    line_filters: Term<'a>,
 ) -> Term<'a> {
     let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
         return atoms::fallback().encode(env);
@@ -355,14 +383,105 @@ fn decode_log_segment_parquet<'a>(
     if service_bin.is_none() && service.decode::<rustler::Atom>().ok() != Some(atoms::nil()) {
         return atoms::fallback().encode(env);
     }
+    let matchers_vec = match decode_matchers(matchers) {
+        Ok(v) => v,
+        Err(_) => return atoms::fallback().encode(env),
+    };
+    let line_filters_vec = match decode_line_filters(line_filters) {
+        Ok(v) => v,
+        Err(_) => return atoms::fallback().encode(env),
+    };
     let filter = segment_parquet::Filter {
         start,
         end,
         service: service_bin.as_ref().map(|b| b.as_slice()),
+        matchers: matchers_vec,
+        line_filters: line_filters_vec,
     };
     match segment_parquet::decode(env, &blob, &filter) {
         Ok(records) => (atoms::ok(), records).encode(env),
         Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+fn decode_matchers(term: Term<'_>) -> Result<Vec<Matcher>, ()> {
+    let list: Vec<Term> = term.decode().map_err(|_| ())?;
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let (name, op_atom, value): (Binary, rustler::Atom, Binary) =
+            item.decode().map_err(|_| ())?;
+        let op = decode_match_op(op_atom)?;
+        let name_vec = name.as_slice().to_vec();
+        let value_vec = value.as_slice().to_vec();
+        match op {
+            MatchOp::Re | MatchOp::Nre => {
+                let pat = std::str::from_utf8(&value_vec).map_err(|_| ())?;
+                let re = Regex::new(pat).map_err(|_| ())?;
+                out.push(Matcher::Regex {
+                    name: name_vec,
+                    op,
+                    regex: re,
+                });
+            }
+            MatchOp::Eq | MatchOp::Neq => out.push(Matcher::Literal {
+                name: name_vec,
+                op,
+                value: value_vec,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+fn decode_match_op(atom: rustler::Atom) -> Result<MatchOp, ()> {
+    if atom == atoms::eq() {
+        Ok(MatchOp::Eq)
+    } else if atom == atoms::neq() {
+        Ok(MatchOp::Neq)
+    } else if atom == atoms::re() {
+        Ok(MatchOp::Re)
+    } else if atom == atoms::nre() {
+        Ok(MatchOp::Nre)
+    } else {
+        Err(())
+    }
+}
+
+fn decode_line_filters(term: Term<'_>) -> Result<Vec<LineFilter>, ()> {
+    let list: Vec<Term> = term.decode().map_err(|_| ())?;
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let (op_atom, value): (rustler::Atom, Binary) = item.decode().map_err(|_| ())?;
+        let op = decode_line_filter_op(op_atom)?;
+        match op {
+            LineFilterOp::Contains | LineFilterOp::NotContains => {
+                let owned = value.as_slice().to_vec();
+                out.push(LineFilter::Substring {
+                    op,
+                    finder: Box::new(Finder::new(&owned).into_owned()),
+                });
+            }
+            LineFilterOp::MatchRe | LineFilterOp::NotMatchRe => {
+                let pat = std::str::from_utf8(value.as_slice()).map_err(|_| ())?;
+                let re = Regex::new(pat).map_err(|_| ())?;
+                out.push(LineFilter::Regex { op, regex: re });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_line_filter_op(atom: rustler::Atom) -> Result<LineFilterOp, ()> {
+    if atom == atoms::contains() {
+        Ok(LineFilterOp::Contains)
+    } else if atom == atoms::not_contains() {
+        Ok(LineFilterOp::NotContains)
+    } else if atom == atoms::match_re() {
+        Ok(LineFilterOp::MatchRe)
+    } else if atom == atoms::not_match_re() {
+        Ok(LineFilterOp::NotMatchRe)
+    } else {
+        Err(())
     }
 }
 

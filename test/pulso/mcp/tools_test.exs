@@ -13,10 +13,71 @@ defmodule Pulso.MCP.ToolsTest do
     :ok
   end
 
-  test "lists the query_logs tool" do
+  test "lists query_logs and query_logql tools" do
     tools = Tools.list()
-    assert [%{"name" => "query_logs", "inputSchema" => schema}] = tools
-    assert schema["required"] == ["tenant"]
+    names = Enum.map(tools, & &1["name"])
+    assert "query_logs" in names
+    assert "query_logql" in names
+
+    query_logs = Enum.find(tools, &(&1["name"] == "query_logs"))
+    assert query_logs["inputSchema"]["required"] == ["tenant"]
+
+    query_logql = Enum.find(tools, &(&1["name"] == "query_logql"))
+    assert query_logql["inputSchema"]["required"] == ["tenant", "query"]
+  end
+
+  describe "query_logql" do
+    test "returns a Loki-shaped streams envelope for a log query" do
+      :ok =
+        Storage.append("acme", [
+          %Log{timestamp_ns: 10, service: "api", body: "timeout"},
+          %Log{timestamp_ns: 20, service: "api", body: "ok"}
+        ])
+
+      assert {:ok, [%{"type" => "text", "text" => text}]} =
+               Tools.call("query_logql", %{
+                 "tenant" => "acme",
+                 "query" => ~s({service="api"} |= "timeout")
+               })
+
+      envelope = JSON.decode!(text)
+      assert envelope["status"] == "success"
+      assert envelope["data"]["resultType"] == "streams"
+      streams = envelope["data"]["result"]
+      lines = for %{"values" => vs} <- streams, [_ts, line] <- vs, do: line
+      assert lines == ["timeout"]
+    end
+
+    test "returns a matrix envelope for a range metric query" do
+      :ok =
+        Storage.append("acme", [
+          %Log{timestamp_ns: 1_000_000_000, service: "api", body: "a"},
+          %Log{timestamp_ns: 2_000_000_000, service: "api", body: "b"},
+          %Log{timestamp_ns: 3_000_000_000, service: "api", body: "c"}
+        ])
+
+      assert {:ok, [%{"text" => text}]} =
+               Tools.call("query_logql", %{
+                 "tenant" => "acme",
+                 "query" => "count_over_time({service=\"api\"}[1s])",
+                 "start_ts_ns" => 1_000_000_000,
+                 "end_ts_ns" => 3_000_000_000,
+                 "step_ms" => 1000
+               })
+
+      envelope = JSON.decode!(text)
+      assert envelope["data"]["resultType"] == "matrix"
+    end
+
+    test "surfaces LogQL parse errors" do
+      assert {:error, {:invalid_arguments, {:logql_parse_error, _}}} =
+               Tools.call("query_logql", %{"tenant" => "acme", "query" => "not a query"})
+    end
+
+    test "errors on missing tenant or query" do
+      assert {:error, {:invalid_arguments, _}} = Tools.call("query_logql", %{})
+      assert {:error, {:invalid_arguments, _}} = Tools.call("query_logql", %{"tenant" => "acme"})
+    end
   end
 
   test "query_logs returns records for the tenant" do
