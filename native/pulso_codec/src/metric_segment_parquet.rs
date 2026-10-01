@@ -460,7 +460,28 @@ pub fn decode<'a>(
 
     let builder =
         ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| DecodeError::Reader)?;
-    let reader = builder.build().map_err(|_| DecodeError::Reader)?;
+
+    // Column projection: only the four columns the decoder actually
+    // reads. `metric_name` and `labels_json` stay in the file but are
+    // never materialised, decompressed, or allocated into Arrow
+    // buffers. After the mask is applied the returned batch has
+    // these four columns in projection order:
+    //
+    //     0 → series_id
+    //     1 → timestamp_ns
+    //     2 → value
+    //     3 → labels_canonical
+    //
+    // `metric_name` sits between `value` and `labels_canonical` in the
+    // on-disk schema (position 3), so dropping it renumbers the two
+    // columns after it; the indices below reflect the post-projection
+    // order and must stay in sync with the mask.
+    let projection =
+        parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), [0usize, 1, 2, 4]);
+    let reader = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|_| DecodeError::Reader)?;
 
     let regex_cache: Vec<Option<regex::Regex>> = filter
         .matchers
@@ -490,12 +511,12 @@ pub fn decode<'a>(
         let series_id_arr = col::<Int64Array>(&batch, 0)?;
         let ts_arr = col::<Int64Array>(&batch, 1)?;
         let value_arr = col::<Float64Array>(&batch, 2)?;
-        // Column index 4 is `labels_canonical` (see `schema()` above).
-        // We ignore `labels_json` on decode: `labels_canonical` carries
+        // Post-projection column 3 is `labels_canonical` (`metric_name`
+        // and `labels_json` were masked out). `labels_canonical` carries
         // the raw `name<0xff>value<0xff>...` bytes we hashed into
-        // `series_id`, so every label slice can be returned as a sub-
-        // binary of the arena without a per-row JSON parse.
-        let labels_arr = col::<BinaryArray>(&batch, 4)?;
+        // `series_id`, so every label slice is returned as a sub-binary
+        // of the arena without a per-row JSON parse.
+        let labels_arr = col::<BinaryArray>(&batch, 3)?;
         let labels_arena = BinaryArena::from(env, labels_arr);
         // The whole-column byte view — the per-row canonical slices we
         // scan during the row loop point into this slice.
