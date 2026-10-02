@@ -27,8 +27,8 @@ defmodule Pulso.Record.Log do
   ]
 
   @type t :: %__MODULE__{
-          timestamp_ns: non_neg_integer() | nil,
-          observed_timestamp_ns: non_neg_integer() | nil,
+          timestamp_ns: integer() | nil,
+          observed_timestamp_ns: integer() | nil,
           severity_number: non_neg_integer() | nil,
           severity_text: String.t() | nil,
           service: String.t() | nil,

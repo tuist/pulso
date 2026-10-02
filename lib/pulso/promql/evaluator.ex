@@ -17,7 +17,7 @@ defmodule Pulso.PromQL.Evaluator do
   alias Pulso.Storage
 
   @lookback_ns 300_000_000_000
-  @max_steps 11_000
+  @max_steps Pulso.QueryLimits.max_evaluation_steps()
 
   def query(query, tenant, opts \\ %{}) do
     with :ok <- check_slots(tenant),
@@ -109,7 +109,8 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp evaluation_steps(opts) do
     finish = Map.get(opts, :end_ts_ns, System.system_time(:nanosecond))
-    finish = if is_integer(finish) and abs(finish) <= 9_223_372_036_854_775_807, do: finish, else: :invalid
+
+    finish = if timestamp?(finish), do: finish, else: :invalid
 
     case Map.fetch(opts, :step_ns) do
       :error when is_integer(finish) and not is_map_key(opts, :start_ts_ns) ->
@@ -123,8 +124,14 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
+  defp timestamp?(value) when is_integer(value),
+    do: value >= -9_223_372_036_854_775_808 and value <= 9_223_372_036_854_775_807
+
+  defp timestamp?(_value), do: false
+
   defp range_steps(start, finish, step)
-       when is_integer(start) and is_integer(finish) and start <= finish and abs(start) <= 9_223_372_036_854_775_807 do
+       when is_integer(start) and is_integer(finish) and start <= finish and start >= -9_223_372_036_854_775_808 and
+              start <= 9_223_372_036_854_775_807 do
     count = div(finish - start, step)
 
     if count < @max_steps do
@@ -163,8 +170,8 @@ defmodule Pulso.PromQL.Evaluator do
     limits = limits()
 
     opts = [
-      start_ts: max(-9_223_372_036_854_775_807, hd(steps) - offset - window + 1),
-      end_ts: max(-9_223_372_036_854_775_807, List.last(steps) - offset),
+      start_ts: max(-9_223_372_036_854_775_808, hd(steps) - offset - window + 1),
+      end_ts: max(-9_223_372_036_854_775_808, List.last(steps) - offset),
       matchers: Enum.map(matchers, &anchored_matcher/1),
       max_records: limits.samples,
       max_scan_segments: limits.segments,

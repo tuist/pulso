@@ -160,6 +160,24 @@ A separate process subscribes to the per-tenant fires log (via S3 polling or eve
 
 ## MCP interface
 
+All four query tools advertise read-only, non-destructive, idempotent, closed-world
+annotations as defined by the [Model Context Protocol tool schema](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/2025-06-18/schema/2025-06-18/schema.ts).
+Calls validate the schema vocabulary used by the registry before evaluation:
+required fields, types, numeric bounds, string lengths, and enum values, including
+nested label matchers. Optional null fields retain the same defaults as omitted
+fields, and integer-valued decimal numbers are normalized to integers before
+validation. Unknown fields remain allowed. Time bounds must fit signed 64-bit
+nanoseconds and must not be reversed; Prometheus range queries require both
+bounds and a positive step. Both language tools cap millisecond steps so conversion
+fits signed nanoseconds. Log-based metric queries share the Prometheus evaluator's
+11,000-step ceiling and reject excessive ranges before constructing a timeline.
+Window scans clamp their lower bound to the earliest stored timestamp without
+changing the logical window. Raw metric matcher patterns are checked with the
+native regular-expression compiler, with a 1,024-byte pattern limit, before
+storage is read. A valid tenant is authorized before the remaining arguments,
+expressions, or patterns are validated. Annotations describe behavior and do not
+replace authorization.
+
 ### The read/write boundary is load-bearing
 
 | Tier | Where it lives | Blast radius |

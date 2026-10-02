@@ -3,18 +3,20 @@ defmodule Pulso.MCP.ToolsTest do
 
   alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
+  alias Pulso.Codec.NIF
   alias Pulso.MCP.Tools
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.NativeQueryStorage
 
   setup do
     Memory.reset()
     :ok
   end
 
-  test "lists query_logs, query_metrics, and query_logql tools" do
+  test "lists all four query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])
     assert "query_logs" in names
@@ -31,6 +33,313 @@ defmodule Pulso.MCP.ToolsTest do
     query_logql = Enum.find(tools, &(&1["name"] == "query_logql"))
     assert query_logql["inputSchema"]["required"] == ["tenant", "query"]
   end
+
+  describe "tool contracts" do
+    test "discovery declares every query read-only" do
+      {:reply, response} = Pulso.MCP.dispatch(%{"id" => 1, "method" => "tools/list"})
+      tools = response["result"]["tools"]
+      assert length(tools) == 4
+
+      for tool <- tools do
+        assert tool["annotations"] == %{
+                 "readOnlyHint" => true,
+                 "destructiveHint" => false,
+                 "idempotentHint" => true,
+                 "openWorldHint" => false
+               }
+      end
+    end
+
+    test "all tools reject malformed arguments and out-of-range timestamps" do
+      for tool <- Tools.list() do
+        name = tool["name"]
+        valid = %{"tenant" => "acme", "query" => expression(name)}
+
+        for args <- [nil, [], "invalid", 1, %{}, %{"tenant" => nil}, %{"tenant" => ""}] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, args)
+        end
+
+        for field <- ["start_ts_ns", "end_ts_ns"],
+            value <- ["10", 1.5, true, 9_223_372_036_854_775_808, -9_223_372_036_854_775_809] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(valid, field, value))
+        end
+
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call(name, Map.merge(valid, %{"start_ts_ns" => 20, "end_ts_ns" => 10}))
+      end
+    end
+
+    test "limit boundaries apply to every tool advertising a limit" do
+      for name <- ["query_logs", "query_metrics", "query_logql"] do
+        valid = %{"tenant" => "acme", "query" => expression(name)}
+
+        for value <- ["1", 1.5, 0, -1, 5001] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(valid, "limit", value))
+        end
+
+        for value <- [1, 5000] do
+          assert {:ok, _} = Tools.call(name, Map.put(valid, "limit", value))
+        end
+      end
+    end
+
+    test "query strings and steps have consistent types and bounds" do
+      for name <- ["query_logql", "query_promql"] do
+        valid = %{"tenant" => "acme", "query" => expression(name)}
+
+        for value <- [nil, 1, [], ""] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(valid, "query", value))
+        end
+
+        for value <- ["1", 1.5, 0, -1] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(valid, "step_ms", value))
+        end
+      end
+    end
+
+    test "rejects invalid service, direction, and nested matcher values" do
+      assert {:error, {:invalid_arguments, _}} =
+               Tools.call("query_logs", %{"tenant" => "acme", "service" => 1})
+
+      for value <- [1, "sideways"] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_logql", %{
+                   "tenant" => "acme",
+                   "query" => expression("query_logql"),
+                   "direction" => value
+                 })
+      end
+
+      for matchers <- [
+            %{},
+            [nil],
+            [%{}],
+            [%{"name" => 1, "op" => "=", "value" => "x"}],
+            [%{"name" => "a", "op" => "=", "value" => nil}],
+            [%{"name" => "a", "op" => "???", "value" => "x"}]
+          ] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_metrics", %{"tenant" => "acme", "matchers" => matchers})
+      end
+    end
+
+    test "Prometheus range queries require both times and a step" do
+      for fields <- [
+            %{"start_ts_ns" => 0},
+            %{"step_ms" => 1},
+            %{"start_ts_ns" => 0, "end_ts_ns" => 10},
+            %{"end_ts_ns" => 10, "step_ms" => 1}
+          ] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_promql", Map.merge(%{"tenant" => "acme", "query" => "up"}, fields))
+      end
+
+      assert {:ok, _} =
+               Tools.call("query_promql", %{
+                 "tenant" => "acme",
+                 "query" => "up",
+                 "start_ts_ns" => 0,
+                 "end_ts_ns" => 1_000_000,
+                 "step_ms" => 1
+               })
+    end
+
+    test "malformed calls return a tool error through the dispatcher" do
+      for arguments <- [nil, [], %{"tenant" => "acme", "limit" => "bad"}] do
+        {:reply, response} =
+          Pulso.MCP.dispatch(%{
+            "id" => 1,
+            "method" => "tools/call",
+            "params" => %{"name" => "query_logs", "arguments" => arguments}
+          })
+
+        assert response["result"]["isError"]
+        assert [%{"type" => "text", "text" => text}] = response["result"]["content"]
+        assert text =~ "invalid_arguments"
+      end
+    end
+
+    test "omitted optional fields and extra fields preserve existing calls" do
+      for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
+        assert {:ok, _} =
+                 Tools.call(name, %{
+                   "tenant" => "acme",
+                   "query" => expression(name),
+                   "future_option" => true
+                 })
+      end
+    end
+
+    test "optional nulls preserve defaults while required nulls are rejected" do
+      for tool <- Tools.list() do
+        args = %{"tenant" => "acme", "query" => expression(tool["name"])}
+        required = tool["inputSchema"]["required"]
+
+        for {field, _schema} <- tool["inputSchema"]["properties"], field not in required do
+          assert {:ok, _} = Tools.call(tool["name"], Map.put(args, field, nil))
+        end
+      end
+    end
+
+    test "integer-valued decimal numbers follow the published integer schema" do
+      for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
+        args = %{"tenant" => "acme", "query" => expression(name), "end_ts_ns" => 1_000_000.0}
+        assert {:ok, _} = Tools.call(name, args)
+      end
+
+      assert {:ok, _} = Tools.call("query_logs", %{"tenant" => "acme", "limit" => 1.0})
+
+      assert {:ok, _} =
+               Tools.call("query_promql", %{
+                 "tenant" => "acme",
+                 "query" => "up",
+                 "start_ts_ns" => 0.0,
+                 "end_ts_ns" => 1_000_000.0,
+                 "step_ms" => 1.0
+               })
+    end
+
+    test "tool schemas only use enforced validation keywords" do
+      for tool <- Tools.list(), do: assert_supported_schema(tool["inputSchema"])
+    end
+
+    test "step conversion stays inside signed nanoseconds" do
+      for name <- ["query_logql", "query_promql"] do
+        args = %{"tenant" => "acme", "query" => expression(name), "start_ts_ns" => 0, "end_ts_ns" => 0}
+        assert {:ok, _} = Tools.call(name, Map.put(args, "step_ms", 9_223_372_036_854))
+        assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "step_ms", 9_223_372_036_855))
+      end
+    end
+
+    test "metric regular expressions fail explicitly before storage, with or without samples" do
+      for samples <- [[], [%MetricSample{timestamp_ns: 1, value: 1.0, labels: %{"__name__" => "up"}}]] do
+        Memory.reset()
+        :ok = Storage.append(:metrics, "acme", samples)
+
+        for op <- ["=~", "!~"], pattern <- ["(", "[", String.duplicate("x", 1025)] do
+          assert {:error, {:invalid_arguments, _}} =
+                   Tools.call("query_metrics", %{
+                     "tenant" => "acme",
+                     "matchers" => [%{"name" => "__name__", "op" => op, "value" => pattern}]
+                   })
+        end
+      end
+
+      assert {:ok, _} =
+               Tools.call("query_metrics", %{
+                 "tenant" => "acme",
+                 "matchers" => [%{"name" => "__name__", "op" => "=~", "value" => "u.*"}]
+               })
+
+      for op <- ["=~", "!~"] do
+        assert {:ok, _} =
+                 Tools.call("query_metrics", %{
+                   "tenant" => "acme",
+                   "matchers" => [%{"name" => "__name__", "op" => op, "value" => String.duplicate("x", 1024)}]
+                 })
+      end
+    end
+
+    test "log metric ranges reject excessive steps before constructing the timeline" do
+      for finish <- [11_000_000_000, 9_000_000_000_000_000_000] do
+        assert {:error, _} =
+                 Tools.call("query_logql", %{
+                   "tenant" => "acme",
+                   "query" => ~s|rate({service="api"}[5m])|,
+                   "start_ts_ns" => 0,
+                   "end_ts_ns" => finish,
+                   "step_ms" => 1
+                 })
+      end
+    end
+
+    test "all tools handle signed timestamp boundaries, including native decoding" do
+      minimum = -9_223_372_036_854_775_808
+      maximum = 9_223_372_036_854_775_807
+      records = for ts <- [minimum, -1, maximum], do: %Log{timestamp_ns: ts, service: "api", body: "entry"}
+
+      samples =
+        for ts <- [minimum, -1, maximum], do: %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => "up"}}
+
+      :ok = Storage.append(:logs, "acme", records)
+      :ok = Storage.append(:metrics, "acme", samples)
+
+      {:ok, log_blob, _, _, _} = NIF.encode_log_segment_parquet(records)
+      {:ok, metric_blob, _, _, _} = NIF.encode_metric_segment_parquet(samples)
+      original = Application.get_env(:pulso, Storage)
+      Application.put_env(:pulso, Storage, adapter: NativeQueryStorage)
+
+      on_exit(fn ->
+        if original == nil,
+          do: Application.delete_env(:pulso, Storage),
+          else: Application.put_env(:pulso, Storage, original)
+      end)
+
+      for ts <- [minimum, -1, maximum] do
+        assert {:ok, [_]} = NIF.decode_log_segment_parquet(log_blob, max(ts - 1, minimum), ts, nil, [], [])
+        assert {:ok, [_]} = NIF.decode_metric_segment_parquet(metric_blob, max(ts - 1, minimum), ts, [])
+
+        for tool <- Tools.list() do
+          assert {:ok, _} =
+                   Tools.call(tool["name"], %{
+                     "tenant" => "acme",
+                     "query" => expression(tool["name"]),
+                     "end_ts_ns" => ts
+                   })
+        end
+
+        assert {:ok, [%{"text" => text}]} =
+                 Tools.call("query_promql", %{"tenant" => "acme", "query" => "up", "end_ts_ns" => ts})
+
+        assert length(JSON.decode!(text)["data"]["result"]) == 1
+
+        assert {:ok, _} =
+                 Tools.call("query_logql", %{
+                   "tenant" => "acme",
+                   "query" => ~s|count_over_time({service="api"}[1s])|,
+                   "end_ts_ns" => ts
+                 })
+      end
+
+      for fields <- [%{}, %{"start_ts_ns" => minimum, "step_ms" => 1}] do
+        args =
+          Map.merge(
+            %{
+              "tenant" => "acme",
+              "query" => ~s|count_over_time({service="api"}[1s] offset 1s)|,
+              "end_ts_ns" => minimum
+            },
+            fields
+          )
+
+        assert {:ok, [%{"text" => text}]} = Tools.call("query_logql", args)
+        assert JSON.decode!(text)["data"]["result"] == []
+      end
+
+      assert {:ok, [%{"text" => text}]} =
+               Tools.call("query_promql", %{
+                 "tenant" => "acme",
+                 "query" => "up offset 1s",
+                 "end_ts_ns" => minimum
+               })
+
+      assert JSON.decode!(text)["data"]["result"] == []
+    end
+
+    test "unknown tools keep their existing error" do
+      assert {:error, {:unknown_tool, "missing"}} = Tools.call("missing", %{})
+    end
+  end
+
+  defp assert_supported_schema(schema) do
+    supported = ~w(type properties required items enum minimum maximum minLength description)
+    assert Map.keys(schema) -- supported == []
+    for {_name, child} <- schema["properties"] || %{}, do: assert_supported_schema(child)
+    if schema["items"], do: assert_supported_schema(schema["items"])
+  end
+
+  defp expression("query_logql"), do: ~s({service="api"})
+  defp expression(_), do: "up"
 
   describe "argument validation" do
     @queries [
@@ -66,7 +375,7 @@ defmodule Pulso.MCP.ToolsTest do
     test "rejects malformed and reversed time bounds across all tools" do
       for {name, args} <- @queries do
         for key <- ["start_ts_ns", "end_ts_ns"],
-            invalid <- [nil, "10", 1.5, [], true, -9_223_372_036_854_775_809, 9_223_372_036_854_775_808] do
+            invalid <- ["10", 1.5, [], true, -9_223_372_036_854_775_809, 9_223_372_036_854_775_808] do
           assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, key, invalid))
         end
 
@@ -75,9 +384,9 @@ defmodule Pulso.MCP.ToolsTest do
       end
     end
 
-    test "enforces record limits including explicit null" do
+    test "enforces record limits for supplied values" do
       for {name, args} <- @queries, name != "query_promql" do
-        for invalid <- [nil, 0, -1, 5001, "1", 1.5, true] do
+        for invalid <- [0, -1, 5001, "1", 1.5, true] do
           assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "limit", invalid))
         end
 
@@ -93,17 +402,17 @@ defmodule Pulso.MCP.ToolsTest do
           assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "query", invalid))
         end
 
-        for invalid <- [nil, 0, -1, "1000", 1.5, true] do
+        for invalid <- [0, -1, "1000", 1.5, true] do
           assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "step_ms", invalid))
         end
       end
 
-      for invalid <- [nil, "sideways", 1, true] do
+      for invalid <- ["sideways", 1, true] do
         assert {:error, {:invalid_arguments, _}} =
                  Tools.call("query_logql", %{"tenant" => "acme", "query" => ~s({service="api"}), "direction" => invalid})
       end
 
-      for invalid <- [nil, 1, [], true] do
+      for invalid <- [1, [], true] do
         assert {:error, {:invalid_arguments, _}} =
                  Tools.call("query_logs", %{"tenant" => "acme", "service" => invalid})
       end
@@ -111,7 +420,6 @@ defmodule Pulso.MCP.ToolsTest do
 
     test "validates nested matchers without rejecting empty matcher values" do
       for invalid <- [
-            nil,
             %{},
             "up",
             [nil],

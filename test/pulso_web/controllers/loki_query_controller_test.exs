@@ -10,6 +10,23 @@ defmodule PulsoWeb.LokiQueryControllerTest do
     :ok
   end
 
+  test "excessive metric ranges return a client error without allocating a timeline", %{conn: conn} do
+    for {start, finish} <- [{"0", "11000000000"}, {"20", "10"}] do
+      response =
+        conn
+        |> get("/loki/api/v1/query_range", %{
+          "query" => ~s|rate({service="api"}[5m])|,
+          "start" => start,
+          "end" => finish,
+          "step" => "1ms"
+        })
+        |> json_response(400)
+
+      assert response["error"] == "evaluation_failed"
+      assert response["message"] =~ "invalid_range_or_too_many_steps"
+    end
+  end
+
   describe "GET /loki/api/v1/query_range with a log query" do
     setup do
       :ok =
