@@ -5,6 +5,11 @@ defmodule Pulso.MCP.Tools do
   Every tool in this module is read-only against `Pulso.Storage`. Write and
   remediation tools live in separate surfaces by design — see
   `docs/architecture.md`.
+
+  Calls validate the schema vocabulary used by this registry before execution.
+  Unknown properties remain allowed; explicit null does not omit a property.
+  Read-only annotations describe tool behavior and do not replace tenant
+  authorization, which every tool enforces before querying storage.
   """
 
   alias Pulso.Auth
@@ -17,18 +22,25 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
 
+  @timestamp_schema %{
+    "type" => "integer",
+    "minimum" => -9_223_372_036_854_775_808,
+    "maximum" => 9_223_372_036_854_775_807
+  }
+
   @tools [
     %{
       "name" => "query_promql",
       "description" =>
         "Evaluate the supported Prometheus Query Language subset: selectors, rate/increase/irate/delta, over-time functions, and sum/avg/min/max/count with by/without grouping. Returns a Prometheus vector or matrix envelope.",
+      "annotations" => %{"readOnlyHint" => true},
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "tenant" => %{"type" => "string"},
           "query" => %{"type" => "string"},
-          "start_ts_ns" => %{"type" => "integer"},
-          "end_ts_ns" => %{"type" => "integer"},
+          "start_ts_ns" => @timestamp_schema,
+          "end_ts_ns" => @timestamp_schema,
           "step_ms" => %{
             "type" => "integer",
             "minimum" => 1,
@@ -42,6 +54,7 @@ defmodule Pulso.MCP.Tools do
     %{
       "name" => "query_logs",
       "description" => "Return log records for a tenant, optionally filtered by time range and service.",
+      "annotations" => %{"readOnlyHint" => true},
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -53,14 +66,10 @@ defmodule Pulso.MCP.Tools do
             "type" => "string",
             "description" => "Optional service.name filter."
           },
-          "start_ts_ns" => %{
-            "type" => "integer",
-            "description" => "Inclusive lower bound on log timestamp, Unix nanoseconds."
-          },
-          "end_ts_ns" => %{
-            "type" => "integer",
-            "description" => "Inclusive upper bound on log timestamp, Unix nanoseconds."
-          },
+          "start_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive lower bound on log timestamp, Unix nanoseconds."),
+          "end_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive upper bound on log timestamp, Unix nanoseconds."),
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
         },
         "required" => ["tenant"]
@@ -70,6 +79,7 @@ defmodule Pulso.MCP.Tools do
       "name" => "query_metrics",
       "description" =>
         "Return metric samples for a tenant, optionally filtered by time range and PromQL-style label matchers.",
+      "annotations" => %{"readOnlyHint" => true},
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -91,14 +101,10 @@ defmodule Pulso.MCP.Tools do
               "required" => ["name", "op", "value"]
             }
           },
-          "start_ts_ns" => %{
-            "type" => "integer",
-            "description" => "Inclusive lower bound on sample timestamp, Unix nanoseconds."
-          },
-          "end_ts_ns" => %{
-            "type" => "integer",
-            "description" => "Inclusive upper bound on sample timestamp, Unix nanoseconds."
-          },
+          "start_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive lower bound on sample timestamp, Unix nanoseconds."),
+          "end_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive upper bound on sample timestamp, Unix nanoseconds."),
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
         },
         "required" => ["tenant"]
@@ -108,15 +114,17 @@ defmodule Pulso.MCP.Tools do
       "name" => "query_logql",
       "description" =>
         "Run a LogQL query and return the Loki-shaped JSON envelope. Supports log queries (streams result) and metric queries (matrix or vector result). The envelope is identical to /loki/api/v1/query_range so agent tooling that already understands Loki works unchanged.",
+      "annotations" => %{"readOnlyHint" => true},
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "tenant" => %{"type" => "string"},
           "query" => %{"type" => "string", "description" => "LogQL expression."},
-          "start_ts_ns" => %{"type" => "integer"},
-          "end_ts_ns" => %{"type" => "integer"},
+          "start_ts_ns" => @timestamp_schema,
+          "end_ts_ns" => @timestamp_schema,
           "step_ms" => %{
             "type" => "integer",
+            "minimum" => 1,
             "description" =>
               "Step interval in milliseconds for range metric queries. Required for matrix output; ignored for log queries."
           },
@@ -132,9 +140,112 @@ defmodule Pulso.MCP.Tools do
   def list, do: @tools
 
   @spec call(String.t(), map(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
-  def call(name, args, context \\ %{})
+  def call(name, args, context \\ %{}) do
+    case Enum.find(@tools, &(&1["name"] == name)) do
+      nil ->
+        {:error, {:unknown_tool, name}}
 
-  def call("query_logs", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
+      tool ->
+        args = normalize_integers(args, tool["inputSchema"])
+
+        with :ok <- validate_value(args, tool["inputSchema"], "arguments"),
+             :ok <- validate_range(args) do
+          execute(name, args, context)
+        end
+    end
+  end
+
+  # Schema integers include numbers written with a zero fractional part.
+  # Normalize those known fields before passing them to integer-only backends.
+  defp normalize_integers(args, schema) when is_map(args) do
+    Enum.reduce(Map.get(schema, "properties", %{}), args, fn
+      {key, %{"type" => "integer"}}, acc ->
+        case Map.fetch(acc, key) do
+          {:ok, value} -> Map.put(acc, key, normalize_integer(value))
+          :error -> acc
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp normalize_integers(args, _schema), do: args
+
+  defp normalize_integer(value) when is_float(value) do
+    integer = trunc(value)
+    if value == integer, do: integer, else: value
+  end
+
+  defp normalize_integer(value), do: value
+
+  # Validate the schema vocabulary used by this registry. Unknown properties
+  # remain allowed, as in the published schemas; explicit null is not omission.
+  defp validate_value(value, %{"type" => "object"} = schema, path) when is_map(value) do
+    required = Map.get(schema, "required", [])
+
+    case Enum.find(required, &(not Map.has_key?(value, &1))) do
+      nil ->
+        Enum.reduce_while(Map.get(schema, "properties", %{}), :ok, fn {key, child}, :ok ->
+          validation_result(validate_property(value, key, child, path))
+        end)
+
+      key ->
+        invalid("#{path}.#{key} is required")
+    end
+  end
+
+  defp validate_value(value, %{"type" => "array", "items" => item}, path) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {entry, index}, :ok ->
+      validation_result(validate_value(entry, item, "#{path}[#{index}]"))
+    end)
+  end
+
+  defp validate_value(value, %{"type" => "string"} = schema, path) when is_binary(value) do
+    if Map.has_key?(schema, "enum") and value not in schema["enum"] do
+      invalid("#{path} must be one of #{inspect(schema["enum"])}")
+    else
+      :ok
+    end
+  end
+
+  defp validate_value(value, %{"type" => "integer"} = schema, path) when is_integer(value) do
+    cond do
+      Map.has_key?(schema, "minimum") and value < schema["minimum"] ->
+        invalid("#{path} must be at least #{schema["minimum"]}")
+
+      Map.has_key?(schema, "maximum") and value > schema["maximum"] ->
+        invalid("#{path} must be at most #{schema["maximum"]}")
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_value(_value, %{"type" => type}, path), do: invalid("#{path} must be #{type}")
+
+  defp validate_value(_value, _schema, path), do: invalid("#{path} uses an unsupported schema")
+
+  defp validate_property(value, key, schema, path) do
+    case Map.fetch(value, key) do
+      :error -> :ok
+      {:ok, item} -> validate_value(item, schema, "#{path}.#{key}")
+    end
+  end
+
+  defp validation_result(:ok), do: {:cont, :ok}
+  defp validation_result(error), do: {:halt, error}
+
+  defp validate_range(%{"start_ts_ns" => start, "end_ts_ns" => finish}) when start > finish,
+    do: invalid("start_ts_ns must not exceed end_ts_ns")
+
+  defp validate_range(_args), do: :ok
+
+  defp invalid(message), do: {:error, {:invalid_arguments, message}}
+
+  defp execute("query_logs", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
     opts =
       []
       |> put_opt(:start_ts, args["start_ts_ns"])
@@ -148,9 +259,7 @@ defmodule Pulso.MCP.Tools do
     end
   end
 
-  def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
-
-  def call("query_metrics", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
+  defp execute("query_metrics", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
     with {:ok, matcher_tuples} <- parse_matchers(args["matchers"]) do
       opts =
         []
@@ -166,10 +275,8 @@ defmodule Pulso.MCP.Tools do
     end
   end
 
-  def call("query_metrics", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
-
-  def call("query_logql", %{"tenant" => tenant, "query" => query} = args, context)
-      when is_binary(tenant) and is_binary(query) do
+  defp execute("query_logql", %{"tenant" => tenant, "query" => query} = args, context)
+       when is_binary(tenant) and is_binary(query) do
     opts = build_logql_opts(args)
 
     with :ok <- verify(context, tenant),
@@ -179,30 +286,21 @@ defmodule Pulso.MCP.Tools do
     end
   end
 
-  def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
-
-  def call("query_promql", %{"tenant" => tenant, "query" => query} = args, context)
-      when is_binary(tenant) and is_binary(query) do
+  defp execute("query_promql", %{"tenant" => tenant, "query" => query} = args, context)
+       when is_binary(tenant) and is_binary(query) do
     opts =
       %{}
       |> maybe_put(:start_ts_ns, args["start_ts_ns"])
       |> maybe_put(:end_ts_ns, args["end_ts_ns"])
 
-    opts =
-      case Map.fetch(args, "step_ms") do
-        :error -> opts
-        {:ok, ms} when is_integer(ms) and ms > 0 -> Map.put(opts, :step_ns, ms * 1_000_000)
-        _ -> Map.put(opts, :step_ns, :invalid)
-      end
+    opts = maybe_put(opts, :step_ns, from_ms(args["step_ms"]))
 
     with :ok <- verify(context, tenant) do
       query |> Pulso.PromQL.Evaluator.query(tenant, opts) |> promql_result()
     end
   end
 
-  def call("query_promql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
-
-  def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
+  defp execute(name, _args, _context), do: {:error, {:unknown_tool, name}}
 
   defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
   defp promql_result({:error, {:storage_error, _}}), do: {:error, :metric_storage_unavailable}
@@ -274,14 +372,13 @@ defmodule Pulso.MCP.Tools do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
+  # These conversions only receive values accepted by the registry schema.
   defp from_ms(nil), do: nil
   defp from_ms(ms) when is_integer(ms) and ms > 0, do: ms * 1_000_000
-  # step_ms: 0 or negative is invalid; treat as absent rather than crash.
-  defp from_ms(_), do: nil
 
   defp from_direction("forward"), do: :forward
   defp from_direction("backward"), do: :backward
-  defp from_direction(_), do: nil
+  defp from_direction(nil), do: nil
 
   defp run_logql(%AST.LogQuery{} = ast, tenant, opts) do
     case Evaluator.evaluate_log(ast, tenant, opts) do

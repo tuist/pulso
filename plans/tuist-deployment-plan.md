@@ -60,7 +60,6 @@ Expose Pulso's existing read tools behind Atlas and deploy it privately with a d
 
 ### Pulso changes
 
-- Declare read-only annotations for the four existing query tools and validate arguments consistently.
 - Align the Model Context Protocol lifecycle and transport with a supported version: negotiate versions, handle initialized notifications, return the specified notification status, validate transport headers and request origin, and handle the optional streaming route explicitly.
 - Add liveness and readiness endpoints. Liveness should reflect process health; readiness should fail when the node cannot serve its configured role. Avoid a storage request on every probe by using a bounded periodic check.
 - Export self-monitoring for accepted and rejected records, queue depth, ingest latency, query failures, object operations, transferred bytes, and compaction. Keep it independent of Pulso during the initial rollout.
