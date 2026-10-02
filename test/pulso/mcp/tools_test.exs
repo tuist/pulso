@@ -32,6 +32,171 @@ defmodule Pulso.MCP.ToolsTest do
     assert query_logql["inputSchema"]["required"] == ["tenant", "query"]
   end
 
+  describe "argument validation" do
+    @queries [
+      {"query_logs", %{"tenant" => "acme"}},
+      {"query_metrics", %{"tenant" => "acme"}},
+      {"query_logql", %{"tenant" => "acme", "query" => ~s({service="api"})}},
+      {"query_promql", %{"tenant" => "acme", "query" => "up"}}
+    ]
+
+    test "all advertised tools declare read-only behavior" do
+      assert length(Tools.list()) == 4
+      assert Enum.all?(Tools.list(), &(&1["annotations"]["readOnlyHint"] == true))
+    end
+
+    test "rejects non-object arguments and invalid tenants across all tools" do
+      for {name, args} <- @queries do
+        assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.delete(args, "tenant"))
+
+        if Map.has_key?(args, "query") do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.delete(args, "query"))
+        end
+
+        for invalid <- [nil, [], "acme", 42] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, invalid)
+        end
+
+        for invalid <- [nil, [], 42, true] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "tenant", invalid))
+        end
+      end
+    end
+
+    test "rejects malformed and reversed time bounds across all tools" do
+      for {name, args} <- @queries do
+        for key <- ["start_ts_ns", "end_ts_ns"],
+            invalid <- [nil, "10", 1.5, [], true, -9_223_372_036_854_775_809, 9_223_372_036_854_775_808] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, key, invalid))
+        end
+
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call(name, Map.merge(args, %{"start_ts_ns" => 20, "end_ts_ns" => 10}))
+      end
+    end
+
+    test "enforces record limits including explicit null" do
+      for {name, args} <- @queries, name != "query_promql" do
+        for invalid <- [nil, 0, -1, 5001, "1", 1.5, true] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "limit", invalid))
+        end
+
+        for limit <- [1, 5000] do
+          assert {:ok, _} = Tools.call(name, Map.put(args, "limit", limit))
+        end
+      end
+    end
+
+    test "rejects invalid query strings, steps, directions, and services" do
+      for {name, args} <- @queries, name in ["query_logql", "query_promql"] do
+        for invalid <- [nil, [], 42, true] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "query", invalid))
+        end
+
+        for invalid <- [nil, 0, -1, "1000", 1.5, true] do
+          assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "step_ms", invalid))
+        end
+      end
+
+      for invalid <- [nil, "sideways", 1, true] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_logql", %{"tenant" => "acme", "query" => ~s({service="api"}), "direction" => invalid})
+      end
+
+      for invalid <- [nil, 1, [], true] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_logs", %{"tenant" => "acme", "service" => invalid})
+      end
+    end
+
+    test "validates nested matchers without rejecting empty matcher values" do
+      for invalid <- [
+            nil,
+            %{},
+            "up",
+            [nil],
+            [%{}],
+            [%{"name" => 1, "op" => "=", "value" => "api"}],
+            [%{"name" => "svc", "op" => "???", "value" => "api"}],
+            [%{"name" => "svc", "op" => "=", "value" => nil}]
+          ] do
+        assert {:error, {:invalid_arguments, _}} =
+                 Tools.call("query_metrics", %{"tenant" => "acme", "matchers" => invalid})
+      end
+
+      for op <- ["=", "!=", "=~", "!~"] do
+        assert {:ok, _} =
+                 Tools.call("query_metrics", %{
+                   "tenant" => "acme",
+                   "matchers" => [%{"name" => "svc", "op" => op, "value" => ""}]
+                 })
+      end
+    end
+
+    test "accepts equal time bounds, empty matchers, and additional properties" do
+      for {name, args} <- @queries do
+        args = Map.merge(args, %{"start_ts_ns" => 10, "end_ts_ns" => 10, "extension" => true})
+        args = if name == "query_promql", do: Map.put(args, "step_ms", 1), else: args
+        assert {:ok, _} = Tools.call(name, args)
+      end
+
+      assert {:ok, _} = Tools.call("query_metrics", %{"tenant" => "acme", "matchers" => []})
+    end
+
+    test "normalizes integral numbers before execution" do
+      for {name, args} <- @queries do
+        args = Map.merge(args, %{"start_ts_ns" => 10.0, "end_ts_ns" => 10.0})
+        args = if name == "query_promql", do: Map.put(args, "step_ms", 1.0), else: args
+        args = if name == "query_promql", do: args, else: Map.put(args, "limit", 1.0)
+        assert {:ok, _} = Tools.call(name, args)
+      end
+    end
+
+    test "reports the failing argument path" do
+      assert {:error, {:invalid_arguments, "arguments.limit must be at most 5000"}} =
+               Tools.call("query_logs", %{"tenant" => "acme", "limit" => 5001})
+
+      assert {:error, {:invalid_arguments, "arguments.matchers[0].value must be string"}} =
+               Tools.call("query_metrics", %{
+                 "tenant" => "acme",
+                 "matchers" => [%{"name" => "svc", "op" => "=", "value" => nil}]
+               })
+    end
+
+    test "valid arguments still require tenant authorization across all tools" do
+      original = Application.fetch_env!(:pulso, Pulso.Auth)
+      Application.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
+      on_exit(fn -> Application.put_env(:pulso, Pulso.Auth, original) end)
+
+      for {name, args} <- @queries do
+        assert {:error, {:unauthorized, :missing_token}} = Tools.call(name, args)
+        assert {:error, {:invalid_arguments, _}} = Tools.call(name, Map.put(args, "tenant", nil))
+      end
+    end
+
+    test "unknown tools retain their error even with malformed arguments" do
+      assert {:error, {:unknown_tool, "unknown"}} = Tools.call("unknown", nil)
+    end
+
+    test "the dispatcher exposes annotations and returns validation errors" do
+      assert {:reply, %{"result" => %{"tools" => tools}}} =
+               Pulso.MCP.dispatch(%{"id" => 1, "method" => "tools/list"})
+
+      assert Enum.all?(tools, &(&1["annotations"]["readOnlyHint"] == true))
+
+      for {name, args} <- @queries do
+        assert {:reply, %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}}} =
+                 Pulso.MCP.dispatch(%{
+                   "id" => 2,
+                   "method" => "tools/call",
+                   "params" => %{"name" => name, "arguments" => Map.put(args, "end_ts_ns", "bad")}
+                 })
+
+        assert text =~ "invalid_arguments"
+      end
+    end
+  end
+
   describe "query_promql" do
     test "evaluates stored metrics and rejects invalid steps" do
       :ok =
