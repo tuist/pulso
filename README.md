@@ -9,6 +9,8 @@ Pulso ships no UI. It exists to be talked to by humans through their own dashboa
 
 ## 🧭 Design
 
+The [Tuist deployment plan](plans/tuist-deployment-plan.md) describes the implementation milestones, cost measurements, and rollout gates for collecting logs, metrics, and traces and replacing Grafana Cloud services.
+
 The architecture is documented in **[`docs/architecture.md`](./docs/architecture.md)**. Read that first if you want to understand what Pulso is trying to be. The short version:
 
 - ☁️ **Object storage is the source of truth.** S3 (or R2, GCS, Azure Blob, MinIO) holds every acknowledged record. Local disk is a warm cache and nothing more.
