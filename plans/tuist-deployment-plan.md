@@ -1,12 +1,19 @@
 # Pulso deployment plan for Tuist
 
-Status: proposed implementation plan, based on the repositories inspected on October 2, 2026.
+Status: implementation started. Repository inventory completed on October 2, 2026; milestone 1 operational evidence and exit gate remain open.
 
 The goal is to collect and query Tuist's logs, metrics, and traces through Pulso, expose diagnosis tools through Atlas, and progressively replace Grafana Cloud's storage and alerting services. Pulso remains headless. Keeping Grafana for visualization or replacing that experience in Atlas is a separate product decision.
 
 Start with a staging deployment that receives a copy of selected logs and metrics. Production replacement requires traces, query compatibility, alerting, and predictable storage cost and recovery behavior. Each milestone below has an explicit exit gate; shipping endpoints alone does not satisfy those gates.
 
 [Architecture](../docs/architecture.md) remains the source of truth. This plan proposes work and does not change the implemented storage contract. Update the architecture alongside each implementation that changes formats, coordination, signal support, or tool capabilities.
+
+## Implementation progress
+
+- [x] Milestone 1 repository inventory: capture committed collection paths, dashboard requests, compatibility gaps, and downstream consumers in [the versioned workload inventory](tuist-workload-inventory.md) and its reproducible query snapshot.
+- [ ] Milestone 1 operational evidence: reconcile deployed paths, capture sanitized exporter payloads, export cloud-managed rules and workflows, measure seven representative days, and approve pilot tenant boundaries and acceptance targets. The milestone exit gate is not complete.
+- [x] Pulso query-tool argument validation and read-only annotations (commit `cfafc6e`).
+- [ ] Next reviewable implementation: align Pulso's protocol lifecycle and transport for Atlas. This can proceed alongside evidence gathering; it does not authorize deployment before the pilot entry checks pass.
 
 ## Constraints
 
@@ -69,7 +76,7 @@ Expose Pulso's existing read tools behind Atlas and deploy it privately with a d
 ### Atlas and Tuist changes
 
 - Allow stateless upstreams in Atlas. Its current proxy requires a session header that Pulso does not emit. Also respect the negotiated protocol version on subsequent requests.
-- Map `pulso` to Atlas's existing production-systems permission group, rather than the default group.
+- Map `pulso` to Atlas's existing `observability` permission group (“Production systems”), rather than the default group.
 - Register Pulso with a tenant-scoped bearer secret and an explicit query-tool allowlist. Preserve existing upstreams when configuring `MCP_PROXY_SERVERS`, which replaces the configured server list.
 - Keep shared access limited to internal Tuist telemetry. Before exposing customer-specific telemetry, implement subject-aware authorization and audit attribution through the trusted proxy boundary.
 - Add a second collector destination for selected logs and metrics. Change authentication from Grafana Cloud credentials to Pulso's bearer token and tenant header. Keep independent retries so Pulso failures do not block the existing destination.
@@ -131,7 +138,7 @@ Implement the query inventory in dependency order, rather than claiming full Pro
 - Add scalar and vector arithmetic, comparisons, set operators, and vector matching required by Tuist queries.
 - Add classic `histogram_quantile`, then the required functions such as `clamp_min`, `label_replace`, `vector`, `time`, `topk`, and `sort_desc`. Classify `quantile_over_time` by its query language, because Tuist also computes quantiles from logs, and verify that path independently. Native histograms and exemplars are separate capabilities, enabled only if the inventory requires them.
 - Support stale markers through decode, storage, compaction, and evaluation. Define non-finite sample behavior and out-of-order and duplicate semantics explicitly.
-- Add series, metric-name, and label discovery routes needed by Grafana variables and integrations, including Loki series discovery where required. Record these requests alongside expressions in the compatibility inventory.
+- Add series, metric-name, and label discovery routes needed by Grafana variables and integrations, including Loki series discovery and selector-filtered label discovery where required. Existing Loki label routes ignore query selectors; implement filtering before relying on dashboard variables. Record these requests alongside expressions in the compatibility inventory.
 - Add `/v1/metrics` for OpenTelemetry Protocol in text and Protocol Buffers formats, with compression and partial-success behavior. Map resource and scope attributes consistently; define cumulative and delta temporality and restart behavior before accepting delta sums. Reject unsupported types explicitly rather than silently changing their meaning.
 - Complete binary-format OpenTelemetry logs using the same decoding and rejection conventions.
 
