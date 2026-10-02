@@ -1,6 +1,7 @@
 defmodule Pulso.LogQL.MetricEvalTest do
   use ExUnit.Case, async: false
 
+  alias Pulso.LogQL.AST.NumberLit
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.Parser
   alias Pulso.Record.Log
@@ -18,6 +19,21 @@ defmodule Pulso.LogQL.MetricEvalTest do
   defp run(query, opts) do
     {:ok, ast} = Parser.parse(query)
     Evaluator.evaluate_metric(ast, "acme", opts)
+  end
+
+  test "matrix step limits apply before allocation, including scalar expressions" do
+    maximum = Pulso.QueryLimits.max_evaluation_steps()
+    expr = %NumberLit{value: 1}
+
+    assert {:ok, {:matrix, [{%{}, samples}]}} =
+             Evaluator.evaluate_metric(expr, "acme", %{start_ts_ns: 0, end_ts_ns: maximum - 1, step_ns: 1})
+
+    assert length(samples) == maximum
+
+    for finish <- [maximum, 9_000_000_000_000_000_000] do
+      assert {:error, :invalid_range_or_too_many_steps} =
+               Evaluator.evaluate_metric(expr, "acme", %{start_ts_ns: 0, end_ts_ns: finish, step_ns: 1})
+    end
   end
 
   describe "count_over_time (vector)" do

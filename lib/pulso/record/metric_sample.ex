@@ -23,7 +23,7 @@ defmodule Pulso.Record.MetricSample do
 
   @type t :: %__MODULE__{
           series_id: non_neg_integer() | nil,
-          timestamp_ns: non_neg_integer() | nil,
+          timestamp_ns: integer() | nil,
           value: float() | nil,
           labels: %{optional(String.t()) => String.t()}
         }

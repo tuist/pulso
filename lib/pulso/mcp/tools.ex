@@ -13,25 +13,41 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.LogQL.Envelope
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.Parser
+  alias Pulso.MCP.Arguments
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
 
+  @timestamp_schema %{
+    "type" => "integer",
+    "minimum" => -9_223_372_036_854_775_808,
+    "maximum" => 9_223_372_036_854_775_807
+  }
+
+  @read_only_annotations %{
+    "readOnlyHint" => true,
+    "destructiveHint" => false,
+    "idempotentHint" => true,
+    "openWorldHint" => false
+  }
+
   @tools [
     %{
       "name" => "query_promql",
+      "annotations" => @read_only_annotations,
       "description" =>
         "Evaluate the supported Prometheus Query Language subset: selectors, rate/increase/irate/delta, over-time functions, and sum/avg/min/max/count with by/without grouping. Returns a Prometheus vector or matrix envelope.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
-          "tenant" => %{"type" => "string"},
-          "query" => %{"type" => "string"},
-          "start_ts_ns" => %{"type" => "integer"},
-          "end_ts_ns" => %{"type" => "integer"},
+          "tenant" => %{"type" => "string", "minLength" => 1},
+          "query" => %{"type" => "string", "minLength" => 1},
+          "start_ts_ns" => @timestamp_schema,
+          "end_ts_ns" => @timestamp_schema,
           "step_ms" => %{
             "type" => "integer",
             "minimum" => 1,
+            "maximum" => 9_223_372_036_854,
             "description" =>
               "Range-query step in milliseconds. Requires start_ts_ns and end_ts_ns; omit for an instant query."
           }
@@ -41,12 +57,14 @@ defmodule Pulso.MCP.Tools do
     },
     %{
       "name" => "query_logs",
+      "annotations" => @read_only_annotations,
       "description" => "Return log records for a tenant, optionally filtered by time range and service.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "tenant" => %{
             "type" => "string",
+            "minLength" => 1,
             "description" => "Tenant identifier (matches the X-Scope-OrgID used at ingest)."
           },
           "service" => %{
@@ -55,10 +73,14 @@ defmodule Pulso.MCP.Tools do
           },
           "start_ts_ns" => %{
             "type" => "integer",
+            "minimum" => -9_223_372_036_854_775_808,
+            "maximum" => 9_223_372_036_854_775_807,
             "description" => "Inclusive lower bound on log timestamp, Unix nanoseconds."
           },
           "end_ts_ns" => %{
             "type" => "integer",
+            "minimum" => -9_223_372_036_854_775_808,
+            "maximum" => 9_223_372_036_854_775_807,
             "description" => "Inclusive upper bound on log timestamp, Unix nanoseconds."
           },
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
@@ -68,6 +90,7 @@ defmodule Pulso.MCP.Tools do
     },
     %{
       "name" => "query_metrics",
+      "annotations" => @read_only_annotations,
       "description" =>
         "Return metric samples for a tenant, optionally filtered by time range and PromQL-style label matchers.",
       "inputSchema" => %{
@@ -75,6 +98,7 @@ defmodule Pulso.MCP.Tools do
         "properties" => %{
           "tenant" => %{
             "type" => "string",
+            "minLength" => 1,
             "description" => "Tenant identifier (matches the X-Scope-OrgID used at ingest)."
           },
           "matchers" => %{
@@ -93,10 +117,14 @@ defmodule Pulso.MCP.Tools do
           },
           "start_ts_ns" => %{
             "type" => "integer",
+            "minimum" => -9_223_372_036_854_775_808,
+            "maximum" => 9_223_372_036_854_775_807,
             "description" => "Inclusive lower bound on sample timestamp, Unix nanoseconds."
           },
           "end_ts_ns" => %{
             "type" => "integer",
+            "minimum" => -9_223_372_036_854_775_808,
+            "maximum" => 9_223_372_036_854_775_807,
             "description" => "Inclusive upper bound on sample timestamp, Unix nanoseconds."
           },
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
@@ -106,17 +134,20 @@ defmodule Pulso.MCP.Tools do
     },
     %{
       "name" => "query_logql",
+      "annotations" => @read_only_annotations,
       "description" =>
         "Run a LogQL query and return the Loki-shaped JSON envelope. Supports log queries (streams result) and metric queries (matrix or vector result). The envelope is identical to /loki/api/v1/query_range so agent tooling that already understands Loki works unchanged.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
-          "tenant" => %{"type" => "string"},
-          "query" => %{"type" => "string", "description" => "LogQL expression."},
-          "start_ts_ns" => %{"type" => "integer"},
-          "end_ts_ns" => %{"type" => "integer"},
+          "tenant" => %{"type" => "string", "minLength" => 1},
+          "query" => %{"type" => "string", "minLength" => 1, "description" => "LogQL expression."},
+          "start_ts_ns" => @timestamp_schema,
+          "end_ts_ns" => @timestamp_schema,
           "step_ms" => %{
             "type" => "integer",
+            "minimum" => 1,
+            "maximum" => 9_223_372_036_854,
             "description" =>
               "Step interval in milliseconds for range metric queries. Required for matrix output; ignored for log queries."
           },
@@ -131,10 +162,53 @@ defmodule Pulso.MCP.Tools do
   @spec list() :: [map()]
   def list, do: @tools
 
-  @spec call(String.t(), map(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
+  @spec call(String.t(), term(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
   def call(name, args, context \\ %{})
 
-  def call("query_logs", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
+  def call(name, args, context) do
+    case Enum.find(@tools, &(&1["name"] == name)) do
+      nil ->
+        {:error, {:unknown_tool, name}}
+
+      tool ->
+        with :ok <- validate_tenant(args),
+             :ok <- verify(context, args["tenant"]),
+             args = Arguments.normalize(args, tool["inputSchema"]),
+             :ok <- Arguments.validate(args, tool["inputSchema"]),
+             :ok <- validate_range(name, args) do
+          execute(name, args)
+        end
+    end
+  end
+
+  defp validate_tenant(args) do
+    Arguments.validate(args, %{
+      "type" => "object",
+      "properties" => %{"tenant" => %{"type" => "string", "minLength" => 1}},
+      "required" => ["tenant"]
+    })
+  end
+
+  defp validate_range(name, args) do
+    with :ok <- validate_time_order(args), do: validate_range_fields(name, args)
+  end
+
+  defp validate_time_order(%{"start_ts_ns" => start, "end_ts_ns" => finish}) when start > finish,
+    do: {:error, {:invalid_arguments, "start_ts_ns must not exceed end_ts_ns"}}
+
+  defp validate_time_order(_args), do: :ok
+
+  defp validate_range_fields("query_promql", %{"start_ts_ns" => _, "end_ts_ns" => _, "step_ms" => _}), do: :ok
+
+  defp validate_range_fields("query_promql", args) do
+    if Map.has_key?(args, "step_ms") or Map.has_key?(args, "start_ts_ns"),
+      do: {:error, {:invalid_arguments, "range queries require start_ts_ns, end_ts_ns, and step_ms"}},
+      else: :ok
+  end
+
+  defp validate_range_fields(_name, _args), do: :ok
+
+  defp execute("query_logs", %{"tenant" => tenant} = args) when is_binary(tenant) do
     opts =
       []
       |> put_opt(:start_ts, args["start_ts_ns"])
@@ -142,15 +216,12 @@ defmodule Pulso.MCP.Tools do
       |> put_opt(:limit, args["limit"])
       |> put_opt(:service, args["service"])
 
-    with :ok <- verify(context, tenant),
-         {:ok, records} <- Storage.query(:logs, tenant, opts) do
+    with {:ok, records} <- Storage.query(:logs, tenant, opts) do
       {:ok, [%{"type" => "text", "text" => encode_records(records)}]}
     end
   end
 
-  def call("query_logs", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
-
-  def call("query_metrics", %{"tenant" => tenant} = args, context) when is_binary(tenant) do
+  defp execute("query_metrics", %{"tenant" => tenant} = args) when is_binary(tenant) do
     with {:ok, matcher_tuples} <- parse_matchers(args["matchers"]) do
       opts =
         []
@@ -159,30 +230,24 @@ defmodule Pulso.MCP.Tools do
         |> put_opt(:limit, args["limit"])
         |> put_opt(:matchers, matcher_tuples)
 
-      with :ok <- verify(context, tenant),
-           {:ok, samples} <- Storage.query(:metrics, tenant, opts) do
+      with {:ok, samples} <- Storage.query(:metrics, tenant, opts) do
         {:ok, [%{"type" => "text", "text" => encode_samples(samples)}]}
       end
     end
   end
 
-  def call("query_metrics", _args, _context), do: {:error, {:invalid_arguments, "tenant is required"}}
-
-  def call("query_logql", %{"tenant" => tenant, "query" => query} = args, context)
-      when is_binary(tenant) and is_binary(query) do
+  defp execute("query_logql", %{"tenant" => tenant, "query" => query} = args)
+       when is_binary(tenant) and is_binary(query) do
     opts = build_logql_opts(args)
 
-    with :ok <- verify(context, tenant),
-         {:ok, ast} <- parse_query(query),
+    with {:ok, ast} <- parse_query(query),
          {:ok, envelope} <- run_logql(ast, tenant, opts) do
       {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(envelope)}]}
     end
   end
 
-  def call("query_logql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
-
-  def call("query_promql", %{"tenant" => tenant, "query" => query} = args, context)
-      when is_binary(tenant) and is_binary(query) do
+  defp execute("query_promql", %{"tenant" => tenant, "query" => query} = args)
+       when is_binary(tenant) and is_binary(query) do
     opts =
       %{}
       |> maybe_put(:start_ts_ns, args["start_ts_ns"])
@@ -191,18 +256,11 @@ defmodule Pulso.MCP.Tools do
     opts =
       case Map.fetch(args, "step_ms") do
         :error -> opts
-        {:ok, ms} when is_integer(ms) and ms > 0 -> Map.put(opts, :step_ns, ms * 1_000_000)
-        _ -> Map.put(opts, :step_ns, :invalid)
+        {:ok, ms} -> Map.put(opts, :step_ns, ms * 1_000_000)
       end
 
-    with :ok <- verify(context, tenant) do
-      query |> Pulso.PromQL.Evaluator.query(tenant, opts) |> promql_result()
-    end
+    query |> Pulso.PromQL.Evaluator.query(tenant, opts) |> promql_result()
   end
-
-  def call("query_promql", _args, _context), do: {:error, {:invalid_arguments, "tenant and query are required"}}
-
-  def call(name, _args, _context), do: {:error, {:unknown_tool, name}}
 
   defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
   defp promql_result({:error, {:storage_error, _}}), do: {:error, :metric_storage_unavailable}
@@ -231,8 +289,10 @@ defmodule Pulso.MCP.Tools do
     Enum.reduce_while(list, {:ok, []}, fn
       %{"name" => n, "op" => op, "value" => v}, {:ok, acc}
       when is_binary(n) and is_binary(v) ->
-        case translate_op(op) do
-          {:ok, atom_op} -> {:cont, {:ok, [{n, atom_op, v} | acc]}}
+        with {:ok, atom_op} <- translate_op(op),
+             :ok <- validate_metric_pattern(atom_op, v) do
+          {:cont, {:ok, [{n, atom_op, v} | acc]}}
+        else
           err -> {:halt, err}
         end
 
@@ -246,6 +306,14 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp parse_matchers(_), do: {:error, {:invalid_arguments, "matchers must be a list"}}
+
+  defp validate_metric_pattern(op, pattern) when op in [:re, :nre] do
+    if byte_size(pattern) <= 1024 and NIF.validate_metric_regex(pattern) == :ok,
+      do: :ok,
+      else: {:error, {:invalid_arguments, "invalid or oversized metric regular expression"}}
+  end
+
+  defp validate_metric_pattern(_op, _value), do: :ok
 
   defp translate_op("="), do: {:ok, :eq}
   defp translate_op("!="), do: {:ok, :neq}
@@ -276,8 +344,6 @@ defmodule Pulso.MCP.Tools do
 
   defp from_ms(nil), do: nil
   defp from_ms(ms) when is_integer(ms) and ms > 0, do: ms * 1_000_000
-  # step_ms: 0 or negative is invalid; treat as absent rather than crash.
-  defp from_ms(_), do: nil
 
   defp from_direction("forward"), do: :forward
   defp from_direction("backward"), do: :backward

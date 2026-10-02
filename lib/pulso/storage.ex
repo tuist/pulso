@@ -37,8 +37,8 @@ defmodule Pulso.Storage do
   @type line_filter :: {op :: line_filter_op(), value :: String.t()}
 
   @type query_opts :: [
-          {:start_ts, non_neg_integer()}
-          | {:end_ts, non_neg_integer()}
+          {:start_ts, integer()}
+          | {:end_ts, integer()}
           | {:limit, pos_integer()}
           | {:max_records, non_neg_integer()}
           | {:max_scan_segments, pos_integer()}

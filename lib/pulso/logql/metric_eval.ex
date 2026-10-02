@@ -25,6 +25,8 @@ defmodule Pulso.LogQL.MetricEval do
   alias Pulso.LogQL.Evaluator
 
   @default_step_ns 60 * 1_000_000_000
+  @max_steps Pulso.QueryLimits.max_evaluation_steps()
+  @minimum_timestamp -9_223_372_036_854_775_808
 
   @over_time_ops [:sum_over_time, :avg_over_time, :max_over_time, :min_over_time, :stddev_over_time, :stdvar_over_time]
 
@@ -32,7 +34,8 @@ defmodule Pulso.LogQL.MetricEval do
 
   @spec evaluate(term(), Pulso.Storage.tenant(), Evaluator.opts()) :: {:ok, result()} | {:error, term()}
   def evaluate(expr, tenant, opts) when is_binary(tenant) and is_map(opts) do
-    with {:ok, kind, series} <- eval(expr, tenant, opts) do
+    with :ok <- validate_steps(opts),
+         {:ok, kind, series} <- eval(expr, tenant, opts) do
       {:ok, {kind, series}}
     end
   end
@@ -142,13 +145,7 @@ defmodule Pulso.LogQL.MetricEval do
     union_start = min_step - spec.offset - spec.range + 1
     union_end = max_step - spec.offset
 
-    query_opts =
-      opts
-      |> Map.put(:start_ts_ns, union_start)
-      |> Map.put(:end_ts_ns, union_end)
-      |> Map.drop([:limit, :direction, :step_ns])
-
-    with {:ok, entries} <- Evaluator.evaluate_log_raw(inner, tenant, query_opts) do
+    with {:ok, entries} <- query_window(inner, tenant, opts, union_start, union_end) do
       series =
         entries
         |> Enum.group_by(&entry_label_key/1)
@@ -176,13 +173,7 @@ defmodule Pulso.LogQL.MetricEval do
     end_ts = ts - offset
     start_ts = end_ts - r + 1
 
-    query_opts =
-      opts
-      |> Map.put(:start_ts_ns, start_ts)
-      |> Map.put(:end_ts_ns, end_ts)
-      |> Map.drop([:limit, :direction, :step_ns])
-
-    with {:ok, entries} <- Evaluator.evaluate_log_raw(inner, tenant, query_opts) do
+    with {:ok, entries} <- query_window(inner, tenant, opts, start_ts, end_ts) do
       series =
         entries
         |> Enum.group_by(&entry_label_key/1)
@@ -578,9 +569,42 @@ defmodule Pulso.LogQL.MetricEval do
   # Bucketing / opts helpers
   # ---------------------------------------------------------------------------
 
+  defp query_window(_inner, _tenant, _opts, _start, finish) when finish < @minimum_timestamp, do: {:ok, []}
+
+  defp query_window(inner, tenant, opts, start, finish) do
+    query_opts =
+      opts
+      |> Map.put(:start_ts_ns, max(start, @minimum_timestamp))
+      |> Map.put(:end_ts_ns, finish)
+      |> Map.drop([:limit, :direction, :step_ns])
+
+    Evaluator.evaluate_log_raw(inner, tenant, query_opts)
+  end
+
   defp result_kind(opts) do
     if Map.get(opts, :step_ns), do: :matrix, else: :vector
   end
+
+  defp validate_steps(opts) do
+    case Map.get(opts, :step_ns) do
+      nil ->
+        :ok
+
+      step ->
+        validate_step_count(
+          Map.get(opts, :start_ts_ns, 0),
+          Map.get(opts, :end_ts_ns, Map.get(opts, :start_ts_ns, 0)),
+          step
+        )
+    end
+  end
+
+  defp validate_step_count(start, stop, step)
+       when is_integer(start) and is_integer(stop) and is_integer(step) and step > 0 and start <= stop do
+    if div(stop - start, step) < @max_steps, do: :ok, else: {:error, :invalid_range_or_too_many_steps}
+  end
+
+  defp validate_step_count(_start, _stop, _step), do: {:error, :invalid_range_or_too_many_steps}
 
   defp steps(opts) do
     start = Map.get(opts, :start_ts_ns) || 0

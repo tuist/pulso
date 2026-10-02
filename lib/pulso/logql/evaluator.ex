@@ -20,8 +20,8 @@ defmodule Pulso.LogQL.Evaluator do
   alias Pulso.Storage
 
   @type opts :: %{
-          optional(:start_ts_ns) => non_neg_integer(),
-          optional(:end_ts_ns) => non_neg_integer(),
+          optional(:start_ts_ns) => integer(),
+          optional(:end_ts_ns) => integer(),
           optional(:limit) => pos_integer(),
           optional(:direction) => :forward | :backward,
           optional(:step_ns) => pos_integer()

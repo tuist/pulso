@@ -1,6 +1,14 @@
 # Pulso deployment plan for Tuist
 
-Status: proposed implementation plan, based on the repositories inspected on October 2, 2026.
+Status: implementation started. Deployment and replacement gates remain open. Based on the repositories inspected on October 2, 2026.
+
+## Execution progress
+
+- Completed the first Pulso tool-contract task in milestone 2: all four query tools advertise read-only annotations, and calls validate the published argument types, required fields, numeric bounds, and enums before querying. Empty tenants and expressions, reversed time ranges, and incomplete Prometheus range queries return explicit argument errors. Optional null fields preserve existing defaults; integer-valued decimal numbers are normalized to integers, and unknown fields remain allowed by the published schemas.
+- Adversarial review by Claude found unbounded log-metric step enumeration and raw metric pattern crashes. The implementation now shares the 11,000-step ceiling with Prometheus evaluation, rejects invalid or oversized metric patterns before storage reads, caps step conversion, authorizes the tenant before query validation, and handles earliest-timestamp windows safely. Regression tests cover native decoding at signed timestamp boundaries and schema vocabulary drift. Broader scan, row, heap, and admission limits remain milestone 3 work.
+- Validation: compilation with warnings treated as errors, formatting checks, and `mix credo` passed. The full suite passed 473 tests with seed 586804, with one skipped and 33 integration tests excluded. After adding the final regular-expression boundary and compatibility-endpoint checks, all 76 focused tool, request, and evaluator tests passed. Object-store integration and companion-repository rollout validation remain pending.
+- Claude's follow-up review found no remaining material defects in this change. It independently reproduced an intermittent admission-test cleanup race in the existing Prometheus evaluator tests, attributing it to unchanged slot lifecycle code. One full run hit that race before the same-seed replay passed. Keep cleanup synchronization and admission lifecycle hardening as separate follow-up work; this change does not claim to resolve that race.
+- This task is independent of the pilot tenant selection and does not establish deployment readiness. Milestone 1's workload inventory and measurements remain pending, as do the remaining milestone 2 transport, probes, monitoring, request bounds, chart, and companion-repository changes.
 
 The goal is to collect and query Tuist's logs, metrics, and traces through Pulso, expose diagnosis tools through Atlas, and progressively replace Grafana Cloud's storage and alerting services. Pulso remains headless. Keeping Grafana for visualization or replacing that experience in Atlas is a separate product decision.
 
@@ -60,7 +68,7 @@ Expose Pulso's existing read tools behind Atlas and deploy it privately with a d
 
 ### Pulso changes
 
-- Declare read-only annotations for the four existing query tools and validate arguments consistently.
+- [x] Declare read-only annotations for the four existing query tools and validate arguments consistently.
 - Align the Model Context Protocol lifecycle and transport with a supported version: negotiate versions, handle initialized notifications, return the specified notification status, validate transport headers and request origin, and handle the optional streaming route explicitly.
 - Add liveness and readiness endpoints. Liveness should reflect process health; readiness should fail when the node cannot serve its configured role. Avoid a storage request on every probe by using a bounded periodic check.
 - Export self-monitoring for accepted and rejected records, queue depth, ingest latency, query failures, object operations, transferred bytes, and compaction. Keep it independent of Pulso during the initial rollout.
