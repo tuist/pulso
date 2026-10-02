@@ -5,6 +5,10 @@ defmodule Pulso.MCP.Tools do
   Every tool in this module is read-only against `Pulso.Storage`. Write and
   remediation tools live in separate surfaces by design — see
   `docs/architecture.md`.
+  Calls validate the schema vocabulary used by this registry before execution.
+  Unknown properties remain allowed; optional null properties retain omitted-field defaults.
+  Read-only annotations describe tool behavior and do not replace tenant
+  authorization, which every tool enforces before querying storage.
   """
 
   alias Pulso.Auth
@@ -71,18 +75,10 @@ defmodule Pulso.MCP.Tools do
             "type" => "string",
             "description" => "Optional service.name filter."
           },
-          "start_ts_ns" => %{
-            "type" => "integer",
-            "minimum" => -9_223_372_036_854_775_808,
-            "maximum" => 9_223_372_036_854_775_807,
-            "description" => "Inclusive lower bound on log timestamp, Unix nanoseconds."
-          },
-          "end_ts_ns" => %{
-            "type" => "integer",
-            "minimum" => -9_223_372_036_854_775_808,
-            "maximum" => 9_223_372_036_854_775_807,
-            "description" => "Inclusive upper bound on log timestamp, Unix nanoseconds."
-          },
+          "start_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive lower bound on log timestamp, Unix nanoseconds."),
+          "end_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive upper bound on log timestamp, Unix nanoseconds."),
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
         },
         "required" => ["tenant"]
@@ -115,18 +111,10 @@ defmodule Pulso.MCP.Tools do
               "required" => ["name", "op", "value"]
             }
           },
-          "start_ts_ns" => %{
-            "type" => "integer",
-            "minimum" => -9_223_372_036_854_775_808,
-            "maximum" => 9_223_372_036_854_775_807,
-            "description" => "Inclusive lower bound on sample timestamp, Unix nanoseconds."
-          },
-          "end_ts_ns" => %{
-            "type" => "integer",
-            "minimum" => -9_223_372_036_854_775_808,
-            "maximum" => 9_223_372_036_854_775_807,
-            "description" => "Inclusive upper bound on sample timestamp, Unix nanoseconds."
-          },
+          "start_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive lower bound on sample timestamp, Unix nanoseconds."),
+          "end_ts_ns" =>
+            Map.put(@timestamp_schema, "description", "Inclusive upper bound on sample timestamp, Unix nanoseconds."),
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
         },
         "required" => ["tenant"]
