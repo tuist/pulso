@@ -105,6 +105,16 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   end
 
   defp run_operation(operation, tenant, name, config) do
+    Pulso.SelfMetrics.track(:compaction, metric_dimension(name), fn ->
+      do_run_operation(operation, tenant, name, config)
+    end)
+  end
+
+  defp metric_dimension("merge"), do: :worker_merge
+  defp metric_dimension("cleanup"), do: :worker_cleanup
+  defp metric_dimension("discovery"), do: :worker_discovery
+
+  defp do_run_operation(operation, tenant, name, config) do
     task = Task.Supervisor.async_nolink(CompactionTasks, fn -> execute_operation(operation, tenant, name) end)
 
     case Task.yield(task, operation_timeout(config, name)) do

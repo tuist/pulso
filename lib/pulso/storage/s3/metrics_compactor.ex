@@ -24,6 +24,10 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   alias Pulso.Storage.S3.Manifest.Segment
 
   def compact(tenant, config, opts \\ []) do
+    monitor(:compact, fn -> do_compact(tenant, config, opts) end)
+  end
+
+  defp do_compact(tenant, config, opts) do
     with :ok <- S3.validate_tenant(tenant),
          :ok <- validate_options(opts),
          {:ok, manifest, _etag} <- load(tenant, config) do
@@ -193,6 +197,18 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
 
   @doc "Delete up to max_deletions (128) expired objects; persist progress and retry failed keys on later passes."
   def cleanup(tenant, config, opts \\ []) do
+    monitor(:cleanup, fn -> do_cleanup(tenant, config, opts) end)
+  end
+
+  defp monitor(operation, fun) do
+    Pulso.SelfMetrics.track(:compaction, operation, fn ->
+      result = fun.()
+      Pulso.SelfMetrics.compaction(operation, result)
+      result
+    end)
+  end
+
+  defp do_cleanup(tenant, config, opts) do
     maximum = Keyword.get(opts, :max_deletions, 128)
 
     with :ok <- S3.validate_tenant(tenant),

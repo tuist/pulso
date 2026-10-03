@@ -280,6 +280,18 @@ All local state is disposable. Everything is reconstructible from S3 in bounded 
 
 If you feel the urge to add one of these, revisit "Core bets" first.
 
+## Operational monitoring
+
+`GET /metrics` exports bounded-cardinality Prometheus text metrics from disposable,
+node-local ETS counters and manifest-registry queue snapshots. It does not query
+or write signal storage. Scrape each node into an independent monitoring system
+so storage or query failures remain observable. Ingest records and request latency,
+query outcomes by layer, object operations and successful payload bytes, and
+metrics compaction progress are instrumented. No tenant, object-key, or expression
+labels are exported. The endpoint is unauthenticated and must stay on a restricted
+private network. See [self-monitoring](self-monitoring.md) for semantics, limitations,
+and example pilot queries.
+
 ## Dependencies with hard requirements
 
 - **S3 or S3-compatible storage with conditional PUT** (`If-Match`, `If-None-Match: *`). Supported by AWS S3 (since 2024), Cloudflare R2, GCS, Azure Blob, MinIO. This is non-negotiable.

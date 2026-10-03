@@ -63,12 +63,20 @@ defmodule Pulso.Storage do
 
   @spec append(signal, tenant, [signal_record], append_opts) :: :ok | {:error, term()}
   def append(signal, tenant, records, opts \\ []) when is_atom(signal) and is_binary(tenant) and is_list(records) do
-    adapter().append(signal, tenant, records, opts)
+    result = adapter().append(signal, tenant, records, opts)
+    outcome = if result == :ok, do: :accepted, else: :failed
+    Pulso.SelfMetrics.records(signal, outcome, length(records))
+    result
+  catch
+    kind, reason ->
+      Pulso.SelfMetrics.records(signal, :failed, length(records))
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   @spec query(signal, tenant, query_opts) :: {:ok, [signal_record]} | {:error, term()}
   def query(signal, tenant, opts \\ []) when is_atom(signal) and is_binary(tenant) and is_list(opts) do
-    adapter().query(signal, tenant, opts)
+    dimension = if signal == :logs, do: :storage_logs, else: :storage_metrics
+    Pulso.SelfMetrics.track(:query, dimension, fn -> adapter().query(signal, tenant, opts) end)
   end
 
   @spec adapter() :: module()
