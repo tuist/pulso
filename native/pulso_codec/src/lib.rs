@@ -647,7 +647,7 @@ fn decode_remote_write_inner<'a>(
             .collect();
         let sorted_pairs: Vec<(&[u8], &[u8])> =
             series.labels.iter().map(|(n, v)| (*n, *v)).collect();
-        let series_id = stable_hash::stable_hash(sorted_pairs.into_iter()) as i64;
+        let series_id = stable_hash::stable_hash(sorted_pairs) as i64;
         series_terms.push((labels_map, samples, series_id).encode(env));
     }
 
