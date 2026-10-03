@@ -14,9 +14,9 @@ Early scaffolding. In place:
 
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
 - `Pulso.Loki` — read-only Loki HTTP client wrapping `query_range`
-- `Pulso.MCP` — JSON-RPC 2.0 dispatcher (`initialize`, `tools/list`, `tools/call`, `ping`)
+- `Pulso.MCP` — stateless MCP `2026-07-28` dispatcher (`server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`); no `initialize` handshake, sessions, or `ping`
 - `Pulso.MCP.Tools` — tool registry; read-only tools `query_logs`, `query_metrics`, `query_logql`, and `query_promql`
-- `PulsoWeb.MCPController` at `POST /mcp` (handles single and batched JSON-RPC)
+- `PulsoWeb.MCPController` at `POST /mcp` — Streamable HTTP transport: one message per POST (no batches), `202` for notifications, mirrored-header validation (`PulsoWeb.MCPHeaders`), `405` for GET/DELETE; `PulsoWeb.MCPRequestGate` rejects disallowed `Origin` headers (`403`) and non-JSON POST bodies (`415`) before body parsing
 - `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
 - `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push ingest, JSON and Snappy-compressed protobuf (decoded in Rust by `Pulso.Codec.NIF`)
 - `PulsoWeb.RemoteWriteController` at `POST /api/v1/write` — Prometheus remote_write v1 ingest (Snappy-compressed protobuf, hand-decoded in Rust). Full receiver contract per the Prometheus spec; see `lib/pulso_web/controllers/remote_write_controller.ex` for the header/status-code rules.
@@ -112,7 +112,7 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 
 - Design brief covering Pulso's rationale, alerting model, and agent-integration tiers lives in the project notes (paste from the Claude Desktop session), not in-repo yet.
 - Grafana Loki HTTP API — the shape `Pulso.Loki` targets.
-- Model Context Protocol spec — `Pulso.MCP` targets the 2025-06-18 protocol version.
+- Model Context Protocol spec — `Pulso.MCP` targets the stateless 2026-07-28 protocol version only. Legacy initialize-based clients (2025-11-25 and earlier) receive a `400` naming the supported version.
 
 ---
 

@@ -36,13 +36,18 @@ defmodule PulsoWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  # Before Plug.Parsers so MCP requests with a disallowed origin or a
+  # non-JSON body are refused before the body is read.
+  plug PulsoWeb.MCPRequestGate
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
     json_decoder: Phoenix.json_library(),
     body_reader: {PulsoWeb.CompressedBodyReader, :read_body, []}
 
-  plug Plug.MethodOverride
+  # No Plug.MethodOverride: Pulso is headless, and a `_method` field in a
+  # JSON body (for example an MCP message) must not change the HTTP method.
   plug Plug.Head
   plug Plug.Session, @session_options
   plug PulsoWeb.Router

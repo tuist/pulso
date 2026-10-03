@@ -160,8 +160,29 @@ A separate process subscribes to the per-tenant fires log (via S3 polling or eve
 
 ## MCP interface
 
+Pulso implements only the stateless [MCP `2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28)
+revision over Streamable HTTP at `POST /mcp`. There is no `initialize` handshake and
+no protocol session, so any node can answer any request and nothing about a client
+lives in memory between requests, matching the rest of the system. Every request
+carries `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` in
+`params._meta`; missing metadata is invalid params (`-32602`), and unsupported
+versions return `-32022` listing the supported ones. Requests must mirror the version,
+method, and (for `tools/call`) tool name in `MCP-Protocol-Version`, `Mcp-Method`, and
+`Mcp-Name` headers; a missing, repeated, or mismatched header is `-32020`. Protocol
+errors use HTTP `400`, unknown methods `404`, and tool failures remain `200` results
+with `isError: true`. Each POST holds one message: batches are rejected, notifications
+are acknowledged with `202` and never executed, and GET or DELETE return `405`.
+`server/discover` and `tools/list` are cacheable for 60 seconds with private scope.
+Pulso emits no change notifications, so `subscriptions/listen` acknowledges an empty
+filter and closes the stream with a completion result. A present `Origin` header must
+match `PULSO_MCP_ALLOWED_ORIGINS` (`403` otherwise) and POST bodies must be
+`application/json` (`415` otherwise); both checks run before the body is parsed, on
+the percent-decoded path the router matches. Requests without an `Origin` header are
+accepted. Legacy initialize-based clients, including Atlas's proxy at
+the time of writing, need a client-side migration rather than a compatibility shim.
+
 All four query tools advertise read-only, non-destructive, idempotent, closed-world
-annotations as defined by the [Model Context Protocol tool schema](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/2025-06-18/schema/2025-06-18/schema.ts).
+annotations as defined by the [Model Context Protocol tool schema](https://modelcontextprotocol.io/specification/2026-07-28/schema#tool).
 Calls validate the schema vocabulary used by the registry before evaluation:
 required fields, types, numeric bounds, string lengths, and enum values, including
 nested label matchers. Optional null fields retain the same defaults as omitted
@@ -200,7 +221,7 @@ The rule of thumb: **Elixir owns the write path's control flow; Rust owns anythi
 
 ### Elixir
 
-- HTTP endpoints (Phoenix): OTLP receivers, remote_write receiver, Loki push receiver, MCP JSON-RPC.
+- HTTP endpoints (Phoenix): OTLP receivers, remote_write receiver, Loki push receiver, stateless MCP Streamable HTTP.
 - Per-tenant supervision, backpressure via Broadway/GenStage.
 - Arrow buffer accumulation.
 - Manifest read/write logic, ETag caching, conditional GET orchestration.

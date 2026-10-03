@@ -5,10 +5,16 @@ defmodule PulsoWeb.Router do
     plug :accepts, ["json"]
   end
 
+  # MCP clients advertise both application/json and text/event-stream, and
+  # the transport defines its own status codes, so `/mcp` skips `:accepts`.
+  scope "/", PulsoWeb do
+    post "/mcp", MCPController, :rpc
+    match :*, "/mcp", MCPController, :method_not_allowed
+  end
+
   scope "/", PulsoWeb do
     pipe_through :api
 
-    post "/mcp", MCPController, :rpc
     post "/v1/logs", OTLPController, :logs
     post "/loki/api/v1/push", LokiController, :push
     post "/api/v1/write", RemoteWriteController, :write

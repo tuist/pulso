@@ -38,7 +38,7 @@ mix phx.server
 
 - OTLP/HTTP JSON logs land at `POST /v1/logs`. Tenant is picked up from `X-Scope-OrgID` (Loki/Cortex convention), defaulting to `default`.
 - Loki push lands at `POST /loki/api/v1/push` (same tenant convention), both as JSON (optionally gzip-encoded) and as Snappy-compressed protobuf, the default Grafana Alloy and Promtail send. The protobuf path is decoded in Rust.
-- The MCP endpoint is exposed at `POST /mcp`. It speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`).
+- The MCP endpoint is exposed at `POST /mcp`. It implements the stateless [MCP `2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28) Streamable HTTP transport: no handshake or session, each request carries its version and capabilities in `params._meta` and mirrors them in `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`) `Mcp-Name` headers. Methods: `server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`. Browser origins must be allowlisted with `PULSO_MCP_ALLOWED_ORIGINS`.
 
 ## 🐳 Local S3 (MinIO)
 

@@ -6,6 +6,7 @@ defmodule PulsoWeb.MCPControllerTest do
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.MCPMessages
 
   test "tool discovery exposes read-only annotations", %{conn: conn} do
     response = request(conn, "tools/list", %{})
@@ -17,11 +18,20 @@ defmodule PulsoWeb.MCPControllerTest do
   end
 
   test "malformed arguments return an explicit error without failing the request", %{conn: conn} do
-    for arguments <- [nil, [], %{"tenant" => "acme", "limit" => "bad"}] do
-      response = request(conn, "tools/call", %{"name" => "query_logs", "arguments" => arguments})
-      assert response["id"] == 1
-      assert response["result"]["isError"] == true
-      assert hd(response["result"]["content"])["text"] =~ "invalid_arguments"
+    response =
+      request(conn, "tools/call", %{"name" => "query_logs", "arguments" => %{"tenant" => "acme", "limit" => "bad"}})
+
+    assert response["id"] == 1
+    assert response["result"]["isError"] == true
+    assert hd(response["result"]["content"])["text"] =~ "invalid_arguments"
+
+    for arguments <- [nil, []] do
+      response =
+        conn
+        |> post_mcp(MCPMessages.request(1, "tools/call", %{"name" => "query_logs", "arguments" => arguments}))
+        |> json_response(400)
+
+      assert response["error"]["code"] == -32_602
     end
   end
 
@@ -92,8 +102,20 @@ defmodule PulsoWeb.MCPControllerTest do
 
   defp request(conn, method, params) do
     conn
-    |> put_req_header("content-type", "application/json")
-    |> post("/mcp", JSON.encode!(%{"jsonrpc" => "2.0", "id" => 1, "method" => method, "params" => params}))
+    |> post_mcp(MCPMessages.request(1, method, params))
     |> json_response(200)
+  end
+
+  defp post_mcp(conn, message) do
+    method = message["method"]
+    name = get_in(message, ["params", "name"])
+
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("accept", "application/json, text/event-stream")
+    |> put_req_header("mcp-protocol-version", MCPMessages.version())
+    |> put_req_header("mcp-method", method)
+    |> then(&if is_binary(name), do: put_req_header(&1, "mcp-name", name), else: &1)
+    |> post("/mcp", JSON.encode!(message))
   end
 end
