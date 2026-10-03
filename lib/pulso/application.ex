@@ -17,6 +17,7 @@ defmodule Pulso.Application do
   def start(_type, _args) do
     children =
       [
+        Pulso.SelfMetrics,
         PulsoWeb.Telemetry,
         {Task.Supervisor, name: TaskSupervisor, max_children: 4},
         {Registry, keys: :unique, name: QuerySlots},

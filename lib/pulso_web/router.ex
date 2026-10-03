@@ -6,6 +6,7 @@ defmodule PulsoWeb.Router do
   end
 
   scope "/", PulsoWeb do
+    get "/metrics", MetricsController, :index
     get "/healthz", HealthController, :live
     get "/readyz", HealthController, :ready
   end

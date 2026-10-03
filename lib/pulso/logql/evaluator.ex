@@ -37,6 +37,10 @@ defmodule Pulso.LogQL.Evaluator do
   @spec evaluate_log(AST.LogQuery.t(), Storage.tenant(), opts()) ::
           {:ok, [stream()]} | {:error, term()}
   def evaluate_log(%AST.LogQuery{} = query, tenant, opts \\ %{}) when is_binary(tenant) do
+    Pulso.SelfMetrics.track(:query, :logql_log, fn -> do_evaluate_log(query, tenant, opts) end)
+  end
+
+  defp do_evaluate_log(query, tenant, opts) do
     with {:ok, entries} <- evaluate_log_raw(query, tenant, opts) do
       entries
       |> group_streams()
@@ -78,6 +82,10 @@ defmodule Pulso.LogQL.Evaluator do
   @spec evaluate_metric(term(), Storage.tenant(), opts()) ::
           {:ok, {:matrix, [series()]} | {:vector, [series()]}} | {:error, term()}
   def evaluate_metric(expr, tenant, opts \\ %{}) when is_binary(tenant) do
+    Pulso.SelfMetrics.track(:query, :logql_metric, fn -> do_evaluate_metric(expr, tenant, opts) end)
+  end
+
+  defp do_evaluate_metric(expr, tenant, opts) do
     with :ok <- QueryValidation.validate(expr) do
       MetricEval.evaluate(expr, tenant, opts)
     end

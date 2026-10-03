@@ -60,6 +60,7 @@ defmodule PulsoWeb.RemoteWriteController do
          :ok <- validate_version_header(conn),
          {:ok, body, conn} <- read_full_body(conn),
          {:ok, samples, rejected} <- Push.decode_protobuf(body, @max_decompressed_bytes),
+         :ok = Pulso.SelfMetrics.records(:metrics, :rejected, rejected),
          :ok <- Storage.append(:metrics, tenant, samples, opts) do
       conn
       |> put_rejected_header(rejected)

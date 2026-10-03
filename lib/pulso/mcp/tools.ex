@@ -160,6 +160,10 @@ defmodule Pulso.MCP.Tools do
   def call(name, args, context \\ %{})
 
   def call(name, args, context) do
+    Pulso.SelfMetrics.track(:query, :mcp, fn -> do_call(name, args, context) end)
+  end
+
+  defp do_call(name, args, context) do
     case Enum.find(@tools, &(&1["name"] == name)) do
       nil ->
         {:error, {:unknown_tool, name}}

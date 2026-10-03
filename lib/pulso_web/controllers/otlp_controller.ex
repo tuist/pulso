@@ -32,6 +32,7 @@ defmodule PulsoWeb.OTLPController do
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
          {records, rejected} = Logs.decode(params),
+         :ok = Pulso.SelfMetrics.records(:logs, :rejected, rejected),
          :ok <- Storage.append(:logs, tenant, records, opts) do
       # OTLP requires the receiver to signal partial success via a
       # top-level `partialSuccess` block instead of a plain success. That
