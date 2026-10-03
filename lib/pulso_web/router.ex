@@ -1,14 +1,27 @@
 defmodule PulsoWeb.Router do
   use PulsoWeb, :router
 
+  alias PulsoWeb.Plugs.MCPTransport
+
   pipeline :api do
     plug :accepts, ["json"]
+  end
+
+  pipeline :mcp do
+    plug MCPTransport
+  end
+
+  scope "/", PulsoWeb do
+    pipe_through :mcp
+
+    post "/mcp", MCPController, :rpc
+    get "/mcp", MCPController, :unsupported
+    delete "/mcp", MCPController, :unsupported
   end
 
   scope "/", PulsoWeb do
     pipe_through :api
 
-    post "/mcp", MCPController, :rpc
     post "/v1/logs", OTLPController, :logs
     post "/loki/api/v1/push", LokiController, :push
     post "/api/v1/write", RemoteWriteController, :write
