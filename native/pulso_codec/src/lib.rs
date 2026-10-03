@@ -15,6 +15,7 @@
 // Callers that keep decoded data past a request should `:binary.copy/1`
 // the fields they keep.
 
+mod ingest_limits;
 mod json_read;
 mod json_write;
 mod labels;
@@ -48,6 +49,8 @@ mod atoms {
         invalid_snappy,
         invalid_protobuf,
         payload_too_large,
+        too_many_records,
+        attributes_too_large,
         fallback,
         too_big,
         query_sample_limit,
@@ -92,6 +95,25 @@ fn decode_loki_push<'a>(
     compressed: Binary<'a>,
     max_decompressed: usize,
 ) -> NifResult<Term<'a>> {
+    decode_loki_inner(env, compressed, max_decompressed, None)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_loki_push_limited<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+    options: ingest_limits::Options,
+) -> NifResult<Term<'a>> {
+    decode_loki_inner(env, compressed, max_decompressed, Some(options.into()))
+}
+
+fn decode_loki_inner<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+    limits: Option<ingest_limits::Limits>,
+) -> NifResult<Term<'a>> {
     let input = compressed.as_slice();
     let len = match snap::raw::decompress_len(input) {
         Ok(len) => len,
@@ -108,10 +130,27 @@ fn decode_loki_push<'a>(
     }
     let buffer: Binary = buffer.into();
 
+    if let Some(limits) = limits {
+        if let Err(reason) = limits.loki(buffer.as_slice()) {
+            return Ok(ingest_error(env, reason));
+        }
+    }
+
     match loki::decode(buffer.as_slice()) {
         Some(decoded) => to_terms(env, &buffer, &decoded),
         None => Ok(error(env, atoms::invalid_protobuf())),
     }
+}
+
+fn ingest_error(env: Env<'_>, reason: ingest_limits::Error) -> Term<'_> {
+    error(
+        env,
+        match reason {
+            ingest_limits::Error::InvalidProtobuf => atoms::invalid_protobuf(),
+            ingest_limits::Error::TooManyRecords => atoms::too_many_records(),
+            ingest_limits::Error::AttributesTooLarge => atoms::attributes_too_large(),
+        },
+    )
 }
 
 fn error<'a>(env: Env<'a>, reason: rustler::Atom) -> Term<'a> {
@@ -546,6 +585,25 @@ fn decode_remote_write<'a>(
     compressed: Binary<'a>,
     max_decompressed: usize,
 ) -> NifResult<Term<'a>> {
+    decode_remote_write_inner(env, compressed, max_decompressed, None)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_remote_write_limited<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+    options: ingest_limits::Options,
+) -> NifResult<Term<'a>> {
+    decode_remote_write_inner(env, compressed, max_decompressed, Some(options.into()))
+}
+
+fn decode_remote_write_inner<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+    limits: Option<ingest_limits::Limits>,
+) -> NifResult<Term<'a>> {
     let input = compressed.as_slice();
     let len = match snap::raw::decompress_len(input) {
         Ok(len) => len,
@@ -561,6 +619,12 @@ fn decode_remote_write<'a>(
         _ => return Ok(error(env, atoms::invalid_snappy())),
     }
     let buffer: Binary = buffer.into();
+
+    if let Some(limits) = limits {
+        if let Err(reason) = limits.remote_write(buffer.as_slice()) {
+            return Ok(ingest_error(env, reason));
+        }
+    }
 
     let decoded = match remote_write::decode(buffer.as_slice()) {
         Some(d) => d,
@@ -583,7 +647,7 @@ fn decode_remote_write<'a>(
             .collect();
         let sorted_pairs: Vec<(&[u8], &[u8])> =
             series.labels.iter().map(|(n, v)| (*n, *v)).collect();
-        let series_id = stable_hash::stable_hash(sorted_pairs.into_iter()) as i64;
+        let series_id = stable_hash::stable_hash(sorted_pairs) as i64;
         series_terms.push((labels_map, samples, series_id).encode(env));
     }
 

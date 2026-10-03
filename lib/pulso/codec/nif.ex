@@ -23,6 +23,8 @@ defmodule Pulso.Codec.NIF do
     nif_versions: ~w(2.16)
 
   def decode_loki_push(_compressed, _max_decompressed_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_loki_push_limited(_compressed, _max_decompressed_bytes, _limits), do: :erlang.nif_error(:nif_not_loaded)
   def json_decode(_binary), do: :erlang.nif_error(:nif_not_loaded)
   def json_decode_dirty(_binary), do: :erlang.nif_error(:nif_not_loaded)
   def json_encode(_term, _budget), do: :erlang.nif_error(:nif_not_loaded)
@@ -51,6 +53,8 @@ defmodule Pulso.Codec.NIF do
   # `[{timestamp_ms, value}]`. Zero-copy over the decompressed buffer; the
   # Elixir caller converts to `%MetricSample{}` and ns units.
   def decode_remote_write(_compressed, _max_decompressed_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_remote_write_limited(_compressed, _max_decompressed_bytes, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
   # Rust fast-path JSON encoder for the MCP `query_metrics` response.
   # Returns `{:ok, binary}` on success or `:fallback` when the input

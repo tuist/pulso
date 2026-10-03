@@ -25,12 +25,13 @@ defmodule Pulso.RemoteWrite.Push do
   @doc """
   Decode a Snappy-compressed `WriteRequest` protobuf body into
   `{:ok, samples, rejected}` or `{:error, reason}` where `reason` is one
-  of `:invalid_snappy | :invalid_protobuf | :payload_too_large`.
+  of `:invalid_snappy | :invalid_protobuf | :payload_too_large |
+  :too_many_records | :attributes_too_large`.
   """
   @spec decode_protobuf(binary(), pos_integer()) ::
           {:ok, [MetricSample.t()], non_neg_integer()} | {:error, atom()}
   def decode_protobuf(body, max_decompressed) when is_binary(body) and is_integer(max_decompressed) do
-    case NIF.decode_remote_write(body, max_decompressed) do
+    case NIF.decode_remote_write_limited(body, max_decompressed, Pulso.IngestLimits.native_options()) do
       {:ok, series, rejected} ->
         samples = Enum.flat_map(series, &expand_series/1)
         {:ok, samples, rejected}

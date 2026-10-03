@@ -100,10 +100,11 @@ defmodule Pulso.Loki.Push do
   """
   @spec decode_protobuf(binary(), pos_integer()) ::
           {:ok, [Log.t()], non_neg_integer()}
-          | {:error, :invalid_snappy | :invalid_protobuf | :payload_too_large}
+          | {:error,
+             :invalid_snappy | :invalid_protobuf | :payload_too_large | :too_many_records | :attributes_too_large}
   def decode_protobuf(compressed, max_decompressed_bytes)
       when is_binary(compressed) and is_integer(max_decompressed_bytes) and max_decompressed_bytes > 0 do
-    NIF.decode_loki_push(compressed, max_decompressed_bytes)
+    NIF.decode_loki_push_limited(compressed, max_decompressed_bytes, Pulso.IngestLimits.native_options())
   end
 
   defp decode_stream(%{"stream" => labels, "values" => values}) when is_map(labels) and is_list(values) do
