@@ -1,57 +1,70 @@
 defmodule PulsoWeb.MCPController do
   @moduledoc """
-  Stateless MCP streamable HTTP endpoint.
+  Streamable HTTP transport for `Pulso.MCP` (MCP revision `2026-07-28`).
 
-  `POST /mcp` carries JSON-RPC messages. Requests are answered with a JSON
-  body; messages that need no reply (notifications and client responses) are
-  acknowledged with `202 Accepted` and no body. Pulso keeps no sessions and
-  never pushes server-initiated messages, so `GET` (the optional SSE stream)
-  and `DELETE` (session termination) answer `405 Method Not Allowed`, as the
-  specification prescribes for servers that do not offer them.
+  Each POST carries exactly one JSON-RPC request or notification; batches
+  are rejected. Notifications are acknowledged with `202 Accepted` and an
+  empty body. Requests must carry the mirrored metadata headers validated
+  by `PulsoWeb.MCPHeaders`. The transport is stateless: it never mints or
+  echoes `Mcp-Session-Id`, and ignores `Mcp-Session-Id` and `Last-Event-ID`.
+  GET and DELETE return `405 Method Not Allowed` because this revision
+  removed the standalone stream and session termination.
+
+  Origin and media-type checks run earlier, before body parsing, in
+  `PulsoWeb.MCPRequestGate`.
   """
 
   use PulsoWeb, :controller
 
-  def rpc(conn, %{"_json" => messages}) when is_list(messages) do
-    # JSON-RPC batching was removed in 2025-06-18; only older clients may use it.
-    if conn.assigns[:mcp_protocol_version] == "2025-06-18",
-      do: invalid_request(conn),
-      else: batch(conn, messages)
+  alias Pulso.MCP
+  alias PulsoWeb.MCPHeaders
+
+  @header_mismatch -32_020
+
+  def rpc(conn, _params) do
+    # Read the parsed body, not merged params, so query strings cannot
+    # supply protocol fields.
+    message = conn.body_params
+
+    case MCP.classify(message) do
+      {:notification, _method} ->
+        send_resp(conn, 202, "")
+
+      {:invalid, _id} ->
+        respond(conn, MCP.dispatch(message))
+
+      {:request, id, _method, _params} = request ->
+        case MCPHeaders.validate(conn, request) do
+          :ok -> respond(conn, MCP.dispatch(message, %{conn: conn}))
+          {:error, reason} -> respond(conn, {:reply, MCP.error_response(id, @header_mismatch, reason)})
+        end
+    end
   end
 
-  def rpc(conn, params) when is_map(params), do: respond(conn, Pulso.MCP.dispatch(params, %{conn: conn}))
-
-  def unsupported(conn, _params) do
+  def method_not_allowed(conn, _params) do
     conn
     |> put_resp_header("allow", "POST")
     |> send_resp(405, "")
   end
 
-  defp batch(conn, []), do: invalid_request(conn)
-
-  defp batch(conn, messages) do
-    context = %{conn: conn}
-
-    responses =
-      Enum.flat_map(messages, fn message ->
-        case Pulso.MCP.dispatch(message, context) do
-          {:reply, response} -> [response]
-          :noreply -> []
-        end
-      end)
-
-    case responses do
-      [] -> send_resp(conn, 202, "")
-      list -> json(conn, list)
-    end
-  end
-
-  defp invalid_request(conn) do
+  defp respond(conn, {:reply, response}) do
     conn
-    |> put_status(400)
-    |> json(%{"jsonrpc" => "2.0", "id" => nil, "error" => %{"code" => -32_600, "message" => "Invalid Request"}})
+    |> put_status(status(response))
+    |> json(response)
   end
 
-  defp respond(conn, {:reply, response}), do: json(conn, response)
-  defp respond(conn, :noreply), do: send_resp(conn, 202, "")
+  defp respond(conn, {:stream, messages}) do
+    body = Enum.map_join(messages, fn message -> "data: #{Pulso.JSON.encode!(message)}\n\n" end)
+
+    conn
+    |> put_resp_content_type("text/event-stream")
+    |> put_resp_header("cache-control", "no-cache")
+    |> put_resp_header("x-accel-buffering", "no")
+    |> send_resp(200, body)
+  end
+
+  defp status(%{"error" => %{"code" => -32_601}}), do: 404
+  defp status(%{"error" => %{"code" => -32_603}}), do: 500
+  defp status(%{"error" => _}), do: 400
+  defp status(_response), do: 200
 end

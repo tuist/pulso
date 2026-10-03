@@ -28,6 +28,16 @@ metrics_compaction_enabled = System.get_env("PULSO_METRICS_COMPACTION_ENABLED", 
 
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Browser origins allowed to call POST /mcp, comma-separated
+# (e.g. "https://atlas.example.com"). Requests without an Origin header are
+# always accepted; any other origin is rejected with 403.
+config :pulso, PulsoWeb.MCPController,
+  allowed_origins:
+    "PULSO_MCP_ALLOWED_ORIGINS"
+    |> System.get_env("")
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+
 # Log storage adapter. Tests keep the in-memory adapter (see config/test.exs);
 # dev and prod use the S3 adapter against any S3-compatible endpoint. RustFS
 # runs locally via docker-compose.yml — the dev defaults below match its

@@ -9,6 +9,7 @@ defmodule Pulso.MCP.ToolsTest do
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.MCPMessages
   alias Pulso.Test.NativeQueryStorage
 
   setup do
@@ -36,7 +37,7 @@ defmodule Pulso.MCP.ToolsTest do
 
   describe "tool contracts" do
     test "discovery declares every query read-only" do
-      {:reply, response} = Pulso.MCP.dispatch(%{"id" => 1, "method" => "tools/list"})
+      {:reply, response} = Pulso.MCP.dispatch(MCPMessages.request(1, "tools/list"))
       tools = response["result"]["tools"]
       assert length(tools) == 4
 
@@ -144,18 +145,26 @@ defmodule Pulso.MCP.ToolsTest do
                })
     end
 
-    test "malformed calls return a tool error through the dispatcher" do
-      for arguments <- [nil, [], %{"tenant" => "acme", "limit" => "bad"}] do
-        {:reply, response} =
-          Pulso.MCP.dispatch(%{
-            "id" => 1,
-            "method" => "tools/call",
-            "params" => %{"name" => "query_logs", "arguments" => arguments}
+    test "invalid argument values return a tool error through the dispatcher" do
+      {:reply, response} =
+        Pulso.MCP.dispatch(
+          MCPMessages.request(1, "tools/call", %{
+            "name" => "query_logs",
+            "arguments" => %{"tenant" => "acme", "limit" => "bad"}
           })
+        )
 
-        assert response["result"]["isError"]
-        assert [%{"type" => "text", "text" => text}] = response["result"]["content"]
-        assert text =~ "invalid_arguments"
+      assert response["result"]["isError"]
+      assert [%{"type" => "text", "text" => text}] = response["result"]["content"]
+      assert text =~ "invalid_arguments"
+    end
+
+    test "non-object arguments are invalid params, not tool errors" do
+      for arguments <- [nil, [], "invalid", 1] do
+        {:reply, response} =
+          Pulso.MCP.dispatch(MCPMessages.request(1, "tools/call", %{"name" => "query_logs", "arguments" => arguments}))
+
+        assert response["error"]["code"] == -32_602
       end
     end
 
@@ -488,17 +497,18 @@ defmodule Pulso.MCP.ToolsTest do
 
     test "the dispatcher exposes annotations and returns validation errors" do
       assert {:reply, %{"result" => %{"tools" => tools}}} =
-               Pulso.MCP.dispatch(%{"id" => 1, "method" => "tools/list"})
+               Pulso.MCP.dispatch(MCPMessages.request(1, "tools/list"))
 
       assert Enum.all?(tools, &(&1["annotations"]["readOnlyHint"] == true))
 
       for {name, args} <- @queries do
         assert {:reply, %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}}} =
-                 Pulso.MCP.dispatch(%{
-                   "id" => 2,
-                   "method" => "tools/call",
-                   "params" => %{"name" => name, "arguments" => Map.put(args, "end_ts_ns", "bad")}
-                 })
+                 Pulso.MCP.dispatch(
+                   MCPMessages.request(2, "tools/call", %{
+                     "name" => name,
+                     "arguments" => Map.put(args, "end_ts_ns", "bad")
+                   })
+                 )
 
         assert text =~ "invalid_arguments"
       end

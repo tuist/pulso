@@ -150,6 +150,12 @@ defmodule Pulso.MCP.Tools do
   @spec list() :: [map()]
   def list, do: @tools
 
+  @tool_names Enum.map(@tools, & &1["name"])
+
+  @doc "Whether `name` is a registered tool."
+  @spec known?(term()) :: boolean()
+  def known?(name), do: name in @tool_names
+
   @spec call(String.t(), term(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
   def call(name, args, context \\ %{})
 

@@ -5,12 +5,16 @@ defmodule PulsoWeb.ErrorJSON do
   See config/config.exs.
   """
 
-  # If you want to customize a particular status code,
-  # you may add your own clauses, such as:
-  #
-  # def render("500.json", _assigns) do
-  #   %{errors: %{detail: "Internal Server Error"}}
-  # end
+  alias Plug.Parsers.ParseError
+  alias PulsoWeb.MCPRequestGate
+
+  # MCP clients expect a JSON-RPC parse error for an undecodable body. Body
+  # parsing fails before routing, so match the path the way the router would.
+  def render("400.json", %{conn: %Plug.Conn{path_info: path_info}, reason: %ParseError{}} = assigns) do
+    if MCPRequestGate.mcp_path?(path_info),
+      do: Pulso.MCP.error_response(nil, -32_700, "Parse error"),
+      else: render("400.json", Map.delete(assigns, :reason))
+  end
 
   # By default, Phoenix returns the status message from
   # the template name. For example, "404.json" becomes

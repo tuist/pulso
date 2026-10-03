@@ -1,14 +1,8 @@
 defmodule PulsoWeb.Router do
   use PulsoWeb, :router
 
-  alias PulsoWeb.Plugs.MCPTransport
-
   pipeline :api do
     plug :accepts, ["json"]
-  end
-
-  pipeline :mcp do
-    plug MCPTransport
   end
 
   scope "/", PulsoWeb do
@@ -16,12 +10,12 @@ defmodule PulsoWeb.Router do
     get "/readyz", HealthController, :ready
   end
 
+  # MCP clients advertise both application/json and text/event-stream, and
+  # the transport defines its own status codes, so `/mcp` skips `:accepts`.
+  # Origin and media-type checks run in `PulsoWeb.MCPRequestGate`.
   scope "/", PulsoWeb do
-    pipe_through :mcp
-
     post "/mcp", MCPController, :rpc
-    get "/mcp", MCPController, :unsupported
-    delete "/mcp", MCPController, :unsupported
+    match :*, "/mcp", MCPController, :method_not_allowed
   end
 
   scope "/", PulsoWeb do
