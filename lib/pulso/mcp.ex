@@ -10,10 +10,15 @@ defmodule Pulso.MCP do
 
   alias Pulso.MCP.Tools
 
-  @protocol_version "2025-06-18"
+  @supported_protocol_versions ["2025-06-18", "2025-03-26"]
+  @latest_protocol_version hd(@supported_protocol_versions)
   @server_info %{"name" => "pulso", "version" => "0.1.0"}
 
   @type context :: %{optional(:conn) => Plug.Conn.t()}
+
+  @doc "Protocol versions Pulso can speak, newest first."
+  @spec supported_protocol_versions() :: [String.t()]
+  def supported_protocol_versions, do: @supported_protocol_versions
 
   @doc """
   Dispatch a single JSON-RPC message.
@@ -31,24 +36,29 @@ defmodule Pulso.MCP do
 
   def dispatch(%{"method" => method} = msg, context) when is_map(context) do
     id = Map.get(msg, "id")
-    params = Map.get(msg, "params", %{})
+    params = Map.get(msg, "params") || %{}
 
-    case {id, handle(method, params, context)} do
+    case {id, if(is_map(params), do: handle(method, params, context), else: invalid_params())} do
       {nil, _} -> :noreply
       {id, {:ok, result}} -> {:reply, ok(id, result)}
       {id, {:error, code, message}} -> {:reply, error(id, code, message)}
     end
   end
 
+  # Responses to server-initiated requests (and their errors) carry no method.
+  # Pulso never sends requests, so there is nothing to correlate; accept them.
+  def dispatch(%{"id" => _, "result" => _}, _), do: :noreply
+  def dispatch(%{"id" => _, "error" => _}, _), do: :noreply
   def dispatch(_, _), do: {:reply, error(nil, -32_600, "Invalid Request")}
 
-  defp handle("initialize", _params, _context) do
-    {:ok,
-     %{
-       "protocolVersion" => @protocol_version,
-       "serverInfo" => @server_info,
-       "capabilities" => %{"tools" => %{"listChanged" => false}}
-     }}
+  # Version negotiation: echo the client's version when supported, otherwise
+  # answer with the latest version and let the client decide whether to proceed.
+  defp handle("initialize", params, _context) do
+    case Map.get(params, "protocolVersion") do
+      version when version in @supported_protocol_versions -> {:ok, initialize_result(version)}
+      version when is_binary(version) -> {:ok, initialize_result(@latest_protocol_version)}
+      _ -> {:error, -32_602, "Invalid params: protocolVersion must be a string"}
+    end
   end
 
   defp handle("tools/list", _params, _context) do
@@ -73,6 +83,16 @@ defmodule Pulso.MCP do
 
   defp handle("ping", _params, _context), do: {:ok, %{}}
   defp handle(_unknown, _params, _context), do: {:error, -32_601, "Method not found"}
+
+  defp invalid_params, do: {:error, -32_602, "Invalid params: expected an object"}
+
+  defp initialize_result(version) do
+    %{
+      "protocolVersion" => version,
+      "serverInfo" => @server_info,
+      "capabilities" => %{"tools" => %{"listChanged" => false}}
+    }
+  end
 
   defp ok(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
 
