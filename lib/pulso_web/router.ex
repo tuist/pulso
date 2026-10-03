@@ -5,8 +5,14 @@ defmodule PulsoWeb.Router do
     plug :accepts, ["json"]
   end
 
+  scope "/", PulsoWeb do
+    get "/healthz", HealthController, :live
+    get "/readyz", HealthController, :ready
+  end
+
   # MCP clients advertise both application/json and text/event-stream, and
   # the transport defines its own status codes, so `/mcp` skips `:accepts`.
+  # Origin and media-type checks run in `PulsoWeb.MCPRequestGate`.
   scope "/", PulsoWeb do
     post "/mcp", MCPController, :rpc
     match :*, "/mcp", MCPController, :method_not_allowed

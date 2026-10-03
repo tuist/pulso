@@ -44,6 +44,9 @@ defmodule PulsoWeb.Endpoint do
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
     json_decoder: Phoenix.json_library(),
+    # Compressed (on-the-wire) body cap; decompressed size is capped in
+    # `PulsoWeb.CompressedBodyReader`. Matches the Snappy receivers' limit.
+    length: 4 * 1024 * 1024,
     body_reader: {PulsoWeb.CompressedBodyReader, :read_body, []}
 
   # No Plug.MethodOverride: Pulso is headless, and a `_method` field in a
