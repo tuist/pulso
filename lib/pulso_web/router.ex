@@ -12,6 +12,11 @@ defmodule PulsoWeb.Router do
   end
 
   scope "/", PulsoWeb do
+    get "/healthz", HealthController, :live
+    get "/readyz", HealthController, :ready
+  end
+
+  scope "/", PulsoWeb do
     pipe_through :mcp
 
     post "/mcp", MCPController, :rpc

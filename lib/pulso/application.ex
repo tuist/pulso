@@ -5,6 +5,7 @@ defmodule Pulso.Application do
 
   use Application
 
+  alias Pulso.Health.StorageMonitor
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Storage.Memory
@@ -59,7 +60,7 @@ defmodule Pulso.Application do
 
       S3 ->
         config = :pulso |> Application.fetch_env!(S3) |> Map.new()
-        [ManifestSupervision | CompactionWorker.children(config)]
+        [ManifestSupervision, {StorageMonitor, config: config} | CompactionWorker.children(config)]
 
       _ ->
         []
