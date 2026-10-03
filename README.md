@@ -40,6 +40,10 @@ mix phx.server
 - Loki push lands at `POST /loki/api/v1/push` (same tenant convention), both as JSON (optionally gzip-encoded) and as Snappy-compressed protobuf, the default Grafana Alloy and Promtail send. The protobuf path is decoded in Rust.
 - The MCP endpoint is exposed at `POST /mcp`. It implements the stateless [MCP `2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28) Streamable HTTP transport: no handshake or session, each request carries its version and capabilities in `params._meta` and mirrors them in `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`) `Mcp-Name` headers. Methods: `server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`. Browser origins must be allowlisted with `PULSO_MCP_ALLOWED_ORIGINS`.
 
+All ingest receivers enforce per-request record and attribute budgets and reject
+oversized batches in full with HTTP 413. See [ingest limits](docs/ingest-limits.md)
+for defaults, runtime configuration, counting rules, and authentication boundaries.
+
 ## 🐳 Local S3 (MinIO)
 
 The Rust NIF talks to any S3-compatible endpoint. [`docker-compose.yml`](./docker-compose.yml) brings up MinIO and preseeds a bucket:

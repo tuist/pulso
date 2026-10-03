@@ -40,7 +40,7 @@ defmodule PulsoWeb.RemoteWriteController do
     * `204 No Content` on success. Prometheus retries on anything else.
     * `400` on invalid snappy, invalid protobuf, or invalid tenant name.
     * `401` on auth failures.
-    * `413` if the body exceeds the compressed/decompressed caps.
+    * `413` if the body, record count, or attributes exceed ingest budgets.
     * `415` on wrong `Content-Type` or `Content-Encoding`.
     * `429` on storage backpressure (`:owner_overloaded`) — Prometheus
       interprets this as a retryable signal and backs off.
@@ -83,6 +83,9 @@ defmodule PulsoWeb.RemoteWriteController do
 
       {:error, :payload_too_large} ->
         conn |> put_status(:request_entity_too_large) |> json(%{error: "payload_too_large"})
+
+      {:error, reason} when reason in [:too_many_records, :attributes_too_large] ->
+        conn |> put_status(:request_entity_too_large) |> json(%{error: to_string(reason)})
 
       {:error, {:invalid_tenant, _}} ->
         conn |> put_status(:bad_request) |> json(%{error: "invalid_tenant"})

@@ -26,6 +26,32 @@ end
 # Opt in only after all writers understand compaction retirement metadata.
 metrics_compaction_enabled = System.get_env("PULSO_METRICS_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 
+# Optional per-request ingest budgets. Only supplied environment values
+# override config/config.exs; invalid values fail at startup, not on traffic.
+parse_ingest_limit = fn name, raw ->
+  case Integer.parse(raw) do
+    {value, ""} when value in 1..2_147_483_647 -> value
+    _ -> raise "#{name} must be an integer in 1..2147483647"
+  end
+end
+
+ingest_limits =
+  for key <- [
+        :max_records,
+        :max_attributes,
+        :max_key_bytes,
+        :max_value_bytes,
+        :max_attribute_bytes,
+        :max_depth,
+        :max_nodes
+      ],
+      name = "PULSO_INGEST_" <> String.upcase(Atom.to_string(key)),
+      raw = System.get_env(name),
+      raw != nil do
+    {key, parse_ingest_limit.(name, raw)}
+  end
+
+config :pulso, Pulso.IngestLimits, ingest_limits
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
 # Browser origins allowed to call POST /mcp, comma-separated

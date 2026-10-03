@@ -11,6 +11,22 @@ use std::borrow::Cow;
 pub type Labels<'a> = Vec<(&'a str, Cow<'a, [u8]>)>;
 
 pub fn parse(s: &[u8]) -> Option<Labels<'_>> {
+    parse_inner(s, usize::MAX, &mut false)
+}
+
+/// Distinguish a pair-budget failure from malformed label syntax. Checking
+/// before parsing the next pair also bounds the parser's output allocation.
+pub fn parse_limited(s: &[u8], max_pairs: usize) -> Result<Option<Labels<'_>>, ()> {
+    let mut too_many = false;
+    let labels = parse_inner(s, max_pairs, &mut too_many);
+    if too_many {
+        Err(())
+    } else {
+        Ok(labels)
+    }
+}
+
+fn parse_inner<'a>(s: &'a [u8], max_pairs: usize, too_many: &mut bool) -> Option<Labels<'a>> {
     let mut p = Parser { s, i: 0 };
     let mut out = Vec::new();
     p.expect(b'{')?;
@@ -20,6 +36,10 @@ pub fn parse(s: &[u8]) -> Option<Labels<'_>> {
         return p.at_end().then_some(out);
     }
     loop {
+        if out.len() >= max_pairs {
+            *too_many = true;
+            return None;
+        }
         let name = p.name()?;
         p.ws();
         p.expect(b'=')?;

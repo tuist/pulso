@@ -97,6 +97,23 @@ Pulso is designed to receive telemetry from **existing agents unchanged**. Prior
 3. **Loki push API** (`/loki/api/v1/push`, JSON and Snappy variants): the logs on-ramp the existing Alloy install base already uses.
 4. **OTLP/gRPC** (protobuf over HTTP/2): follow-up. Same signals as OTLP/HTTP, lower overhead.
 
+### Implemented receiver budgets
+
+The current OTLP JSON logs, Loki JSON/Snappy logs, and remote-write receivers
+validate per-request record counts and attribute budgets before appending.
+Defaults are 10,000 supplied records; 128 entries per attribute/label set;
+256-byte keys; 16 KiB values; and 64 KiB aggregate attribute bytes. JSON trees
+also have 16-level depth and 1,024-node budgets, including structured OTLP bodies.
+Separate container counts bound empty-stream/series/resource/scope floods.
+Over-budget requests return HTTP 413 and append nothing, rather than truncating
+or reporting partial success. Protobuf preflight runs after bounded decompression
+and before record/sample collection allocation and Erlang record expansion; JSON preflight
+runs before AnyValue conversion and record expansion. Authentication precedes
+semantic validation, but JSON parsing/gzip inflation remains pre-authentication
+under the existing 4 MiB wire and 16 MiB expanded-body caps. These are local
+request safety limits, not ingest admission control or rate limiting.
+See [ingest limits](ingest-limits.md) for exact counting and configuration.
+
 ### Per-record flow
 
 1. Request lands on any node.

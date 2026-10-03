@@ -86,6 +86,11 @@ defmodule PulsoWeb.LokiController do
         |> put_status(:request_entity_too_large)
         |> json(%{error: "payload_too_large"})
 
+      {:error, reason, conn} when reason in [:too_many_records, :attributes_too_large] ->
+        conn
+        |> put_status(:request_entity_too_large)
+        |> json(%{error: to_string(reason)})
+
       {:error, {:invalid_tenant, _}} ->
         conn
         |> put_status(:bad_request)
@@ -120,8 +125,14 @@ defmodule PulsoWeb.LokiController do
   defp decode_body(conn, params) do
     case content_type(conn) do
       :json ->
-        {records, rejected} = Push.decode(params)
-        {:ok, records, rejected, conn}
+        case Pulso.IngestLimits.validate(:loki, params) do
+          :ok ->
+            {records, rejected} = Push.decode(params)
+            {:ok, records, rejected, conn}
+
+          {:error, reason} ->
+            {:error, reason, conn}
+        end
 
       :protobuf ->
         with :ok <- validate_protobuf_encoding(conn),

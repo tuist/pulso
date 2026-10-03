@@ -50,9 +50,7 @@ defmodule Pulso.OTLP.Logs do
 
   defp decode_resource_logs(_), do: {[], 0}
 
-  defp decode_scope_logs(scope_logs, resource_attrs, service, {records, rejected}) do
-    raw = scope_logs["logRecords"] || []
-
+  defp decode_scope_logs(%{"logRecords" => raw}, resource_attrs, service, {records, rejected}) when is_list(raw) do
     {sl_records, sl_rejected} =
       Enum.reduce(raw, {[], 0}, fn record, acc ->
         decode_and_collect(record, resource_attrs, service, acc)
@@ -60,6 +58,8 @@ defmodule Pulso.OTLP.Logs do
 
     {[Enum.reverse(sl_records) | records], rejected + sl_rejected}
   end
+
+  defp decode_scope_logs(_, _, _, acc), do: acc
 
   defp decode_and_collect(record, resource_attrs, service, {rs, rj}) do
     case decode_log_record(record, resource_attrs, service) do

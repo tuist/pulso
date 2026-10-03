@@ -31,6 +31,7 @@ defmodule PulsoWeb.OTLPController do
 
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
+         :ok <- Pulso.IngestLimits.validate(:otlp, params),
          {records, rejected} = Logs.decode(params),
          :ok = Pulso.SelfMetrics.records(:logs, :rejected, rejected),
          :ok <- Storage.append(:logs, tenant, records, opts) do
@@ -48,6 +49,11 @@ defmodule PulsoWeb.OTLPController do
       {:error, reason} when reason in [:missing_token, :invalid_token, :unknown_tenant] ->
         conn
         |> put_status(:unauthorized)
+        |> json(%{error: to_string(reason)})
+
+      {:error, reason} when reason in [:too_many_records, :attributes_too_large] ->
+        conn
+        |> put_status(:request_entity_too_large)
         |> json(%{error: to_string(reason)})
 
       {:error, {:encode_failed, _}} ->
