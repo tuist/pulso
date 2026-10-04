@@ -44,6 +44,7 @@ defmodule Pulso.Codec.NIF do
     do: :erlang.nif_error(:nif_not_loaded)
 
   def validate_metric_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)
+  def validate_log_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)
   def match_metric_regex(_pattern, _value), do: :erlang.nif_error(:nif_not_loaded)
 
   # Hand-rolled Prometheus remote_write v1 wire decoder: takes a

@@ -20,7 +20,9 @@ defmodule Pulso.Application do
         Pulso.SelfMetrics,
         Pulso.Metrics,
         PulsoWeb.Telemetry,
-        {Task.Supervisor, name: TaskSupervisor, max_children: 4},
+        {Task.Supervisor,
+         name: TaskSupervisor,
+         max_children: Keyword.get(Application.get_env(:pulso, Pulso.QueryRunner, []), :max_global, 4)},
         {Registry, keys: :unique, name: QuerySlots},
         {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Pulso.PubSub}

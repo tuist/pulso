@@ -12,8 +12,7 @@ defmodule Pulso.PromQL.Evaluator do
   in Rust is a future optimization; unsupported expression types fail in parsing.
   """
   alias Pulso.PromQL.Parser
-  alias Pulso.PromQL.QuerySlots
-  alias Pulso.PromQL.TaskSupervisor
+  alias Pulso.QueryRunner
   alias Pulso.Storage
 
   @lookback_ns 300_000_000_000
@@ -24,69 +23,19 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp do_query(query, tenant, opts) do
-    with :ok <- check_slots(tenant),
-         {:ok, timeout} <- query_timeout(opts),
-         {:ok, task} <- start_query_task(query, tenant, opts, timeout) do
-      case Task.yield(task, timeout) do
-        {:ok, result} ->
-          result
+    QueryRunner.run(
+      tenant,
+      :promql,
+      fn deadline ->
+        Process.put(:promql_deadline_ms, deadline)
 
-        {:exit, :killed} ->
-          {:error, :query_resource_limit}
-
-        {:exit, _} ->
-          {:error, :query_execution_failed}
-
-        nil ->
-          Task.shutdown(task, :brutal_kill)
-          {:error, :query_timeout}
-      end
-    end
-  end
-
-  defp check_slots(tenant) do
-    full = Enum.all?(0..1, &(Registry.lookup(QuerySlots, {tenant, &1}) != []))
-    if full, do: {:error, :query_overloaded}, else: :ok
-  end
-
-  defp query_timeout(opts) do
-    case Map.get(opts, :timeout_ms, 10_000) do
-      ms when is_integer(ms) and ms > 0 -> {:ok, min(ms, 10_000)}
-      _ -> {:error, :invalid_timeout}
-    end
-  end
-
-  defp start_query_task(query, tenant, opts, timeout) do
-    task =
-      Task.Supervisor.async_nolink(TaskSupervisor, fn ->
-        Process.put(:promql_deadline_ms, System.monotonic_time(:millisecond) + timeout)
-
-        Process.flag(:max_heap_size, %{
-          size: Keyword.get(Application.get_env(:pulso, __MODULE__, []), :max_heap_words, 16_000_000),
-          kill: true,
-          error_logger: false
-        })
-
-        with :ok <- acquire_slot(tenant),
-             {:ok, expr} <- Parser.parse(query),
+        with {:ok, expr} <- Parser.parse(query),
              {:ok, kind, steps} <- evaluation_steps(opts) do
           run_query(expr, tenant, steps, kind)
         end
-      end)
-
-    {:ok, task}
-  rescue
-    RuntimeError -> {:error, :query_overloaded}
-  end
-
-  defp acquire_slot(tenant, slot \\ 0)
-  defp acquire_slot(_tenant, 2), do: {:error, :query_overloaded}
-
-  defp acquire_slot(tenant, slot) do
-    case Registry.register(QuerySlots, {tenant, slot}, nil) do
-      {:ok, _} -> :ok
-      {:error, {:already_registered, _}} -> acquire_slot(tenant, slot + 1)
-    end
+      end,
+      opts
+    )
   end
 
   defp run_query(expr, tenant, steps, kind) do

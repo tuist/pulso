@@ -10,6 +10,31 @@ defmodule PulsoWeb.LokiQueryControllerTest do
     :ok
   end
 
+  test "label discovery rejects an incomplete result", %{conn: conn} do
+    records =
+      for ts <- 1..5_001, do: %Log{timestamp_ns: ts, service: "api", body: "line", resource: %{"service.name" => "api"}}
+
+    :ok = Storage.append(:logs, "acme", records)
+
+    response =
+      conn
+      |> put_req_header("x-scope-orgid", "acme")
+      |> get("/loki/api/v1/labels")
+      |> json_response(422)
+
+    assert response["error"] == "query_limit"
+  end
+
+  test "a regular expression unsupported by the native decoder is a client error", %{conn: conn} do
+    response =
+      conn
+      |> get("/loki/api/v1/query_range", %{"query" => ~s[{service="api"} |~ "foo(?=bar)"]})
+      |> json_response(400)
+
+    assert response["error"] == "evaluation_failed"
+    assert response["message"] =~ "invalid_regex"
+  end
+
   test "excessive metric ranges return a client error without allocating a timeline", %{conn: conn} do
     for {start, finish} <- [{"0", "11000000000"}, {"20", "10"}] do
       response =

@@ -565,6 +565,15 @@ fn validate_metric_regex(pattern: &str) -> rustler::Atom {
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
+fn validate_log_regex(pattern: &str) -> rustler::Atom {
+    if Regex::new(pattern).is_ok() {
+        atoms::ok()
+    } else {
+        atoms::error()
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
 fn match_metric_regex(pattern: &str, value: &str) -> NifResult<bool> {
     let regex = metric_segment_parquet::compile_metric_regex(pattern)
         .map_err(|_| rustler::Error::BadArg)?;
