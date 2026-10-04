@@ -262,7 +262,7 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
-
+  defp promql_result({:error, :invalid_stored_sample}), do: {:error, :metric_data_invalid}
   defp promql_result({:error, {:storage_error, _}}), do: {:error, :metric_storage_unavailable}
   defp promql_result({:error, :query_execution_failed}), do: {:error, :metric_query_execution_failed}
   defp promql_result({:error, :query_overloaded}), do: {:error, :query_overloaded}

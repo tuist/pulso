@@ -79,6 +79,16 @@ failures keep their existing transport behavior (`payload_too_large` for
 protobuf, parser errors for JSON). Existing in-budget
 malformed-record rejection and partial-success behavior is unchanged.
 
+Prometheus remote write rejects individual non-finite samples and counts them
+in `X-Pulso-Rejected-Records`. This includes the Prometheus stale marker,
+other not-a-number values, and positive or negative infinity. Finite samples in the
+same series or request are stored, and the receiver returns **204**.
+An all-rejected series contributes its rejected sample count and produces no
+stored series. The segment encoder refuses absent values; a segment containing
+a non-finite value fails decoding instead of crashing a query. Full
+stale-series semantics remain future work, so pilot metric completeness and
+staleness must be evaluated against a reference destination.
+
 Tenant validation and authentication precede these semantic checks. Snappy
 protobuf preflight runs after one bounded decompression, before allocating
 record/sample collections, deduplicating labels, hashing series, or constructing

@@ -61,8 +61,11 @@ pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
         match reader.next_field()? {
             None => break,
             Some((1, Value::Bytes(bytes))) => match decode_series(bytes) {
-                Some(s) => decoded.series.push(s),
-                None => decoded.rejected = decoded.rejected.saturating_add(1),
+                Ok((s, rejected)) => {
+                    decoded.series.push(s);
+                    decoded.rejected = decoded.rejected.saturating_add(rejected);
+                }
+                Err(rejected) => decoded.rejected = decoded.rejected.saturating_add(rejected),
             },
             // Other fields (metadata, exemplars at the top level in
             // v2, etc.) are ignored.
@@ -73,21 +76,28 @@ pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
     Some(decoded)
 }
 
-fn decode_series(input: &[u8]) -> Option<Series<'_>> {
+fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
     let mut reader = Reader::new(input);
     let mut labels: Vec<(&[u8], &[u8])> = Vec::new();
     let mut samples: Vec<Sample> = Vec::new();
+    let mut rejected = 0u64;
+    let mut total_samples = 0u64;
 
     loop {
-        match reader.next_field()? {
+        match reader.next_field().ok_or(total_samples.max(1))? {
             None => break,
             Some((1, Value::Bytes(bytes))) => {
-                let label = decode_label(bytes)?;
+                let label = decode_label(bytes).ok_or(total_samples.max(1))?;
                 labels.push(label);
             }
             Some((2, Value::Bytes(bytes))) => {
-                let sample = decode_sample(bytes)?;
-                samples.push(sample);
+                total_samples = total_samples.saturating_add(1);
+                let sample = decode_sample(bytes).ok_or(total_samples)?;
+                if sample.value.is_finite() {
+                    samples.push(sample);
+                } else {
+                    rejected = rejected.saturating_add(1);
+                }
             }
             _ => {}
         }
@@ -97,11 +107,11 @@ fn decode_series(input: &[u8]) -> Option<Series<'_>> {
     // Treat a labels- or samples-empty series as rejected rather than
     // feeding a nameless point into storage.
     if labels.is_empty() || samples.is_empty() {
-        return None;
+        return Err(total_samples.max(1));
     }
 
     labels.sort_by(|a, b| a.0.cmp(b.0));
-    Some(Series { labels, samples })
+    Ok((Series { labels, samples }, rejected))
 }
 
 fn decode_label(input: &[u8]) -> Option<(&[u8], &[u8])> {

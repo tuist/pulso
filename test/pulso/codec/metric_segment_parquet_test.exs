@@ -7,6 +7,7 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.MetricSample
+  alias Pulso.Storage.S3
 
   defp sample(ts, value, labels) when is_integer(ts) and is_map(labels) do
     %MetricSample{timestamp_ns: ts, value: value, labels: labels}
@@ -39,6 +40,23 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert decoded.labels == s.labels
     # series_id is populated from StableHash on encode when the caller leaves it nil
     assert is_integer(decoded.series_id)
+  end
+
+  test "does not encode an unsupported value beside a finite sample" do
+    labels = %{"__name__" => "up"}
+    assert :fallback = NIF.encode_metric_segment_parquet([sample(1, 1.0, labels), sample(2, nil, labels)])
+  end
+
+  test "legacy stale values fail explicitly while filtered finite rows remain readable" do
+    blob = File.read!(Path.expand("../../fixtures/metrics/non_finite.parquet", __DIR__))
+
+    assert {:error, :non_finite_sample_value} = NIF.decode_metric_segment_parquet(blob, nil, nil, [])
+    assert {:error, :non_finite_sample_value} = NIF.decode_metric_segment_parquet_bounded(blob, nil, nil, [], 10)
+    assert {:error, :non_finite_sample_value} = S3.decode_segment(:metrics, blob, nil, nil, [])
+
+    assert {:ok, [finite]} = NIF.decode_metric_segment_parquet(blob, nil, nil, [{"__name__", :eq, "safe"}])
+    assert finite.value == 1.0
+    assert finite.labels == %{"__name__" => "safe"}
   end
 
   test "same label set hashes to the same series_id across samples" do

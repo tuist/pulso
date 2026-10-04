@@ -35,6 +35,10 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     length_delim(1, name) <> length_delim(2, value)
   end
 
+  defp encode_sample({:bits, bits}, ts_ms) do
+    fixed64_field(1, <<bits::little-unsigned-64>>) <> varint_field(2, ts_ms)
+  end
+
   defp encode_sample(value, ts_ms) do
     fixed64_field(1, <<value::little-float-64>>) <> varint_field(2, ts_ms)
   end
@@ -97,6 +101,33 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     # keeps them in nanoseconds so the controller rescales.
     assert Enum.map(samples, & &1.timestamp_ns) |> Enum.sort() ==
              [1_700_000_000_000_000_000, 1_700_000_015_000_000_000]
+  end
+
+  test "stale and non-finite samples are rejected without losing finite samples", %{conn: conn} do
+    unsupported = [
+      {:stale, 0x7FF0000000000002},
+      {:other_nan, 0x7FF8000000000001},
+      {:positive_infinity, 0x7FF0000000000000},
+      {:negative_infinity, 0xFFF0000000000000}
+    ]
+
+    for {_name, bits} <- unsupported do
+      Memory.reset()
+
+      request =
+        body([
+          %{labels: [{"__name__", "safe"}], samples: [{1.0, 1}, {{:bits, bits}, 2}, {2.0, 3}]},
+          %{labels: [{"__name__", "only_unsupported"}], samples: [{{:bits, bits}, 4}]}
+        ])
+
+      response = post_write(conn, request)
+      assert response.status == 204
+      assert get_resp_header(response, "x-pulso-rejected-records") == ["2"]
+      assert {:ok, stored} = Storage.query(:metrics, "default")
+
+      assert Enum.sort_by(stored, & &1.timestamp_ns) |> Enum.map(&{&1.timestamp_ns, &1.value}) ==
+               [{1_000_000, 1.0}, {3_000_000, 2.0}]
+    end
   end
 
   test "falls back to the default tenant when X-Scope-OrgID is absent", %{conn: conn} do
@@ -176,5 +207,19 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     assert conn.status == 204
     assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
     assert {:ok, [%MetricSample{}]} = Storage.query(:metrics, "default")
+  end
+
+  test "counts every sample in a structurally rejected series", %{conn: conn} do
+    request =
+      body([
+        %{labels: [], samples: [{1.0, 1}, {{:bits, 0x7FF0000000000002}, 2}, {2.0, 3}]},
+        %{labels: [{"__name__", "safe"}], samples: [{3.0, 4}]}
+      ])
+
+    response = post_write(conn, request)
+    assert response.status == 204
+    assert get_resp_header(response, "x-pulso-rejected-records") == ["3"]
+    assert {:ok, [stored]} = Storage.query(:metrics, "default")
+    assert stored.value == 3.0
   end
 end

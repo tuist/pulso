@@ -96,6 +96,50 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     end)
   end
 
+  test "an absent value is rejected while finite samples survive compaction and evaluation", ctx do
+    previous = Application.get_env(:pulso, Pulso.Storage)
+    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
+    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+
+    assert {:error, {:encode_failed, _}} =
+             S3.append(:metrics, ctx.tenant, [sample(1, 1.0), sample(2, nil)])
+
+    assert {:ok, []} = S3.query(:metrics, ctx.tenant, [])
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(1_000_000_000, 1.0)])
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(2_000_000_000, 2.0)])
+    assert {:ok, before} = S3.query(:metrics, ctx.tenant, [])
+    assert Enum.map(before, & &1.value) |> Enum.sort() == [1.0, 2.0]
+    assert {:ok, evaluated_before} = Evaluator.query("requests", ctx.tenant, %{end_ts_ns: 2_000_000_000})
+    assert Enum.map(evaluated_before["data"]["result"], & &1["value"]) == [[2.0, "2"]]
+
+    assert {:ok, %{merged: 2}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+    assert {:ok, after_compaction} = S3.query(:metrics, ctx.tenant, [])
+    assert Enum.sort_by(after_compaction, & &1.timestamp_ns) == Enum.sort_by(before, & &1.timestamp_ns)
+    assert {:ok, evaluated_after} = Evaluator.query("requests", ctx.tenant, %{end_ts_ns: 2_000_000_000})
+    assert evaluated_after == evaluated_before
+  end
+
+  test "a legacy non-finite segment reports a permanent data error", ctx do
+    previous = Application.get_env(:pulso, Pulso.Storage)
+    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
+    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+
+    records = [
+      %MetricSample{timestamp_ns: 1, value: 1.0, labels: %{"__name__" => "safe"}},
+      %MetricSample{timestamp_ns: 2, value: 2.0, labels: %{"__name__" => "unsafe"}}
+    ]
+
+    assert :ok = S3.append(:metrics, ctx.tenant, records)
+    key = hd(load(ctx).segments).key
+    fixture = File.read!(Path.expand("../../../fixtures/metrics/non_finite.parquet", __DIR__))
+    assert {:ok, _} = ObjectStore.put(ctx.config, key, fixture)
+
+    assert {:error, :non_finite_sample_value} = S3.query(:metrics, ctx.tenant, [])
+    assert {:error, :invalid_stored_sample} = Evaluator.query("unsafe", ctx.tenant, %{end_ts_ns: 2})
+    assert {:ok, [finite]} = S3.query(:metrics, ctx.tenant, matchers: [{"__name__", :eq, "safe"}])
+    assert finite.value == 1.0
+  end
+
   test "identical filtered results with 16 times fewer object reads, durable grace and ingest retry", ctx do
     for ts <- 1..16 do
       assert :ok =
