@@ -179,9 +179,15 @@ defmodule Pulso.SelfMetrics do
     ArgumentError -> 0
   end
 
+  # Read both legacy integer snapshots and the detailed owner snapshot. Count
+  # publication callers here, not segments, to preserve the canonical gauge.
+  defp pending_waiters(%{waiters: count}) when is_integer(count), do: count
+  defp pending_waiters(count) when is_integer(count), do: count
+  defp pending_waiters(_), do: 0
+
   defp owner_queue_depth({pid, pending}) do
     case Process.info(pid, :message_queue_len) do
-      {:message_queue_len, count} -> count + if(is_integer(pending), do: pending, else: 0)
+      {:message_queue_len, count} -> count + pending_waiters(pending)
       nil -> 0
     end
   end

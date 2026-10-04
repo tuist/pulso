@@ -201,11 +201,22 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   end
 
   defp monitor(operation, fun) do
-    Pulso.SelfMetrics.track(:compaction, operation, fn ->
-      result = fun.()
-      Pulso.SelfMetrics.compaction(operation, result)
-      result
-    end)
+    Pulso.Metrics.measure(
+      :compaction,
+      Atom.to_string(operation),
+      fn ->
+        Pulso.SelfMetrics.track(:compaction, operation, fn ->
+          result = fun.()
+          Pulso.SelfMetrics.compaction(operation, result)
+          result
+        end)
+      end,
+      fn
+        {:ok, %{merged: count}} -> %{segments: count}
+        {:ok, count} when is_integer(count) -> %{segments: count}
+        _ -> %{}
+      end
+    )
   end
 
   defp do_cleanup(tenant, config, opts) do

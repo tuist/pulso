@@ -29,7 +29,7 @@ defmodule Pulso.ObjectStore do
 
   @spec put(config(), String.t(), binary()) :: {:ok, etag()} | {:error, term()}
   def put(config, key, data) when is_map(config) and is_binary(key) and is_binary(data) do
-    request(:put, byte_size(data), fn -> normalize(NIF.put(normalize_config(config), key, data)) end)
+    observe("put", key, byte_size(data), fn -> normalize(NIF.put(normalize_config(config), key, data)) end)
   end
 
   # Creates the object only if no object exists at that key (`If-None-Match: *`).
@@ -39,7 +39,7 @@ defmodule Pulso.ObjectStore do
   @spec put_if_none_match(config(), String.t(), binary()) ::
           {:ok, etag()} | {:error, :already_exists | term()}
   def put_if_none_match(config, key, data) when is_map(config) and is_binary(key) and is_binary(data) do
-    request(:put_if_none_match, byte_size(data), fn ->
+    observe("put_if_none_match", key, byte_size(data), fn ->
       normalize(NIF.put_if_none_match(normalize_config(config), key, data))
     end)
   end
@@ -51,14 +51,14 @@ defmodule Pulso.ObjectStore do
           {:ok, etag()} | {:error, :precondition_failed | :not_found | term()}
   def put_if_match(config, key, data, etag)
       when is_map(config) and is_binary(key) and is_binary(data) and is_binary(etag) do
-    request(:put_if_match, byte_size(data), fn ->
+    observe("put_if_match", key, byte_size(data), fn ->
       normalize(NIF.put_if_match(normalize_config(config), key, data, etag))
     end)
   end
 
   @spec get(config(), String.t()) :: {:ok, binary()} | {:error, term()}
   def get(config, key) when is_map(config) and is_binary(key) do
-    request(:get, 0, fn ->
+    observe("get", key, 0, fn ->
       case NIF.get(normalize_config(config), key) do
         {:ok, data} -> {:ok, data}
         other -> normalize(other)
@@ -77,7 +77,7 @@ defmodule Pulso.ObjectStore do
   def get_if_none_match(config, key, etag) when is_map(config) and is_binary(key) do
     etag_string = etag || ""
 
-    request(:get_if_none_match, 0, fn ->
+    observe("get_if_none_match", key, 0, fn ->
       case NIF.get_if_none_match(normalize_config(config), key, etag_string) do
         {:ok, new_etag, data} -> {:ok, new_etag, data}
         other -> normalize(other)
@@ -87,12 +87,12 @@ defmodule Pulso.ObjectStore do
 
   @spec delete(config(), String.t()) :: :ok | {:error, term()}
   def delete(config, key) when is_map(config) and is_binary(key) do
-    request(:delete, 0, fn -> normalize(NIF.delete(normalize_config(config), key)) end)
+    observe("delete", key, 0, fn -> normalize(NIF.delete(normalize_config(config), key)) end)
   end
 
   @spec list(config(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
   def list(config, prefix \\ "") when is_map(config) and is_binary(prefix) do
-    request(:list, 0, fn ->
+    observe("list", prefix, 0, fn ->
       case NIF.list(normalize_config(config), prefix) do
         {:ok, keys} -> {:ok, keys}
         other -> normalize(other)
@@ -103,9 +103,33 @@ defmodule Pulso.ObjectStore do
   @doc "List immediate directory prefixes, following provider pagination without materializing descendant object keys."
   @spec list_prefixes(config(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
   def list_prefixes(config, prefix) when is_map(config) and is_binary(prefix) do
-    request(:list_prefixes, 0, fn -> normalize(NIF.list_prefixes(normalize_config(config), prefix)) end)
+    observe("list_prefixes", prefix, 0, fn -> normalize(NIF.list_prefixes(normalize_config(config), prefix)) end)
   end
 
+  defp observe(operation, key, write_bytes, fun) do
+    purpose =
+      cond do
+        String.ends_with?(key, "/manifest.json") -> "manifest"
+        String.ends_with?(key, ".parquet") -> "segment"
+        true -> "other"
+      end
+
+    Pulso.Metrics.measure(
+      :object,
+      operation,
+      fn -> request(String.to_existing_atom(operation), write_bytes, fun) end,
+      fn
+        {:ok, _etag, body} when is_binary(body) -> %{read: byte_size(body)}
+        {:ok, body} when operation == "get" and is_binary(body) -> %{read: byte_size(body)}
+        {:ok, _} when operation in ["put", "put_if_match", "put_if_none_match"] -> %{write: write_bytes}
+        _ -> %{}
+      end,
+      purpose
+    )
+  end
+
+  # Keep the canonical operation/payload counters alongside the detailed view;
+  # the supplied native operation still runs exactly once.
   defp request(operation, write_bytes, fun) do
     Pulso.SelfMetrics.track(:object, operation, fn ->
       result = fun.()

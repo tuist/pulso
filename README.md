@@ -40,6 +40,8 @@ mix phx.server
 - Loki push lands at `POST /loki/api/v1/push` (same tenant convention), both as JSON (optionally gzip-encoded) and as Snappy-compressed protobuf, the default Grafana Alloy and Promtail send. The protobuf path is decoded in Rust.
 - The MCP endpoint is exposed at `POST /mcp`. It implements the stateless [MCP `2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28) Streamable HTTP transport: no handshake or session, each request carries its version and capabilities in `params._meta` and mirrors them in `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`) `Mcp-Name` headers. Methods: `server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`. Browser origins must be allowlisted with `PULSO_MCP_ALLOWED_ORIGINS`.
 
+- Self-monitoring is exposed at `GET /metrics` in Prometheus text format. Scrape each node into an independent monitoring system, not Pulso itself. Keep the listener private; any public ingest/MCP proxy must deny or separately authenticate the metrics path, since port-level network policy cannot separate it from ingest. See [self-monitoring](docs/self-monitoring.md) for metrics, counting boundaries, and example queries.
+
 All ingest receivers enforce per-request record and attribute budgets and reject
 oversized batches in full with HTTP 413. See [ingest limits](docs/ingest-limits.md)
 for defaults, runtime configuration, counting rules, and authentication boundaries.

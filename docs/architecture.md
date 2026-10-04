@@ -155,6 +155,41 @@ Expressions are limited to 16,384 bytes, 64 matchers per selector, and 1,024 byt
 
 Each node maintains an LRU cache of recent Parquet segments and sidecar indexes on local NVMe. Cache eviction is best-effort; a miss just triggers a range GET to S3. Cache warming happens organically via queries; there is no proactive prefetch.
 
+## Operational self-monitoring
+
+`GET /metrics` exports Prometheus-text self-monitoring from supervised,
+node-local ETS counters and live registry/VM gauges. It never reads or writes
+Pulso storage, and reporting has no mailbox. Labels have a finite vocabulary;
+tenants, expressions, object keys, and raw errors are not retained. Counters
+reset when the metrics process or node restarts. Manifest owners publish batch
+queue depths in their existing registry entries, so scrapes do not wait for
+owners blocked in native I/O; registry cleanup removes terminated owners.
+
+Canonical `Pulso.SelfMetrics` families retain their published `layer` labels,
+latency summaries, distinct decoder-rejected/publication-failed record counts,
+and aggregate payload/progress metrics. Query instrumentation covers HTTP, MCP,
+evaluators, and storage as separate layers. The `Pulso.Metrics` detailed view adds
+route/tool distinctions, purpose-aware object bytes, histograms, and separate
+queue/runtime gauges. Overlapping operation, duration, and compaction family
+names use `pulso_detailed_` prefixes; receiver-only delivery counts use
+`pulso_ingest_delivery_records_total`. The two views describe overlapping work
+and must not be summed. Native operations and record publication run once.
+
+Record counts describe acknowledged attempts, not unique stored rows. Canonical
+publication failures remain separate from decoder drops; the delivery view
+combines them as rejected deliveries. Pre-decode failures count requests without
+inventing record counts. Tool errors remain observable even over HTTP 200.
+Object metrics describe logical calls and successful body bytes, not all billed
+retries or network transfers. Compaction and cleanup
+report completed attempts and confirmed segment counts. A separate background
+worker deadline counter exposes timeouts even before stalled native work finishes. See
+[self-monitoring](self-monitoring.md) for the full contract and limitations.
+Scrape every node into an independent monitor during rollout. The endpoint is
+not tenant-authenticated and shares the ingest listener. Keep the whole listener
+private, or deny/separately authenticate router-equivalent metrics paths at every
+public ingress proxy; port-level network policy cannot isolate this path from
+ingest. It adds no cluster state or admission policy.
+
 ## Alerting
 
 ### Rule storage
@@ -279,18 +314,6 @@ All local state is disposable. Everything is reconstructible from S3 in bounded 
 - No cluster-visible mutable state outside S3.
 
 If you feel the urge to add one of these, revisit "Core bets" first.
-
-## Operational monitoring
-
-`GET /metrics` exports bounded-cardinality Prometheus text metrics from disposable,
-node-local ETS counters and manifest-registry queue snapshots. It does not query
-or write signal storage. Scrape each node into an independent monitoring system
-so storage or query failures remain observable. Ingest records and request latency,
-query outcomes by layer, object operations and successful payload bytes, and
-metrics compaction progress are instrumented. No tenant, object-key, or expression
-labels are exported. The endpoint is unauthenticated and must stay on a restricted
-private network. See [self-monitoring](self-monitoring.md) for semantics, limitations,
-and example pilot queries.
 
 ## Dependencies with hard requirements
 

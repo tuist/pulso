@@ -160,7 +160,11 @@ defmodule Pulso.MCP.Tools do
   def call(name, args, context \\ %{})
 
   def call(name, args, context) do
-    Pulso.SelfMetrics.track(:query, :mcp, fn -> do_call(name, args, context) end)
+    operation = if known?(name), do: name, else: "unknown_tool"
+
+    Pulso.Metrics.measure(:query, operation, fn ->
+      Pulso.SelfMetrics.track(:query, :mcp, fn -> do_call(name, args, context) end)
+    end)
   end
 
   defp do_call(name, args, context) do

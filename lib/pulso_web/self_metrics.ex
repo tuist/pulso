@@ -4,13 +4,16 @@ defmodule PulsoWeb.SelfMetrics do
   alias Pulso.SelfMetrics
 
   @request_key {__MODULE__, :request}
-  @ingest_paths %{"/v1/logs" => :otlp, "/loki/api/v1/push" => :loki, "/api/v1/write" => :remote_write}
+  @ingest_paths %{
+    ["v1", "logs"] => :otlp,
+    ["loki", "api", "v1", "push"] => :loki,
+    ["api", "v1", "write"] => :remote_write
+  }
   @query_paths [
-    "/api/v1/query",
-    "/api/v1/query_range",
-    "/loki/api/v1/query",
-    "/loki/api/v1/query_range",
-    "/loki/api/v1/labels"
+    ["api", "v1", "query"],
+    ["api", "v1", "query_range"],
+    ["loki", "api", "v1", "query"],
+    ["loki", "api", "v1", "query_range"]
   ]
 
   def handle_event([:phoenix, :endpoint, :start], _measurements, %{conn: conn}, _config) do
@@ -47,23 +50,17 @@ defmodule PulsoWeb.SelfMetrics do
   end
 
   defp operation(conn) do
-    path = decode_path(conn.request_path)
+    path = Enum.map(conn.path_info, &URI.decode/1)
+    method = if conn.method == "HEAD", do: "GET", else: conn.method
 
-    case {conn.method, Map.get(@ingest_paths, path)} do
+    case {method, Map.get(@ingest_paths, path)} do
       {"POST", dimension} when not is_nil(dimension) -> {:ingest, dimension}
-      _ -> query_operation(path)
+      _ -> query_operation(method, path)
     end
   end
 
-  defp query_operation(path) when path in @query_paths, do: {:query, :http}
-
-  defp query_operation(path) do
-    if String.starts_with?(path, "/loki/api/v1/label/"), do: {:query, :http}
-  end
-
-  defp decode_path(path) do
-    URI.decode(path)
-  rescue
-    ArgumentError -> path
-  end
+  defp query_operation(method, path) when method in ["GET", "POST"] and path in @query_paths, do: {:query, :http}
+  defp query_operation("GET", ["loki", "api", "v1", "labels"]), do: {:query, :http}
+  defp query_operation("GET", ["loki", "api", "v1", "label", _name, "values"]), do: {:query, :http}
+  defp query_operation(_method, _path), do: nil
 end

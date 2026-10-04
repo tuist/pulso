@@ -18,6 +18,7 @@ defmodule Pulso.Application do
     children =
       [
         Pulso.SelfMetrics,
+        Pulso.Metrics,
         PulsoWeb.Telemetry,
         {Task.Supervisor, name: TaskSupervisor, max_children: 4},
         {Registry, keys: :unique, name: QuerySlots},

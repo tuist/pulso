@@ -3,7 +3,6 @@ defmodule PulsoWeb.LokiController do
 
   alias Pulso.Auth
   alias Pulso.Loki.Push
-  alias Pulso.Storage
 
   @default_tenant "default"
 
@@ -60,8 +59,7 @@ defmodule PulsoWeb.LokiController do
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
          {:ok, records, rejected, conn} <- decode_body(conn, params),
-         :ok = Pulso.SelfMetrics.records(:logs, :rejected, rejected),
-         :ok <- Storage.append(:logs, tenant, records, opts) do
+         :ok <- Pulso.Metrics.append(:logs, tenant, records, rejected, opts) do
       conn
       |> put_rejected_header(rejected)
       |> send_resp(:no_content, "")

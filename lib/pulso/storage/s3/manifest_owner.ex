@@ -380,7 +380,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # timer. Under bursty load this bounds tail latency.
   defp enqueue_and_maybe_flush(state, from, segments) do
     state = %{state | pending: state.pending ++ segments, waiters: [from | state.waiters]}
-    publish_queue_depth(state, length(state.waiters))
+    publish_queue_depth(state)
 
     cond do
       length(state.pending) >= state.flush_batch_max ->
@@ -395,10 +395,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # The registry value is a disposable scrape snapshot, never coordination
-  # state. Registry removes it automatically when this owner exits.
-  defp publish_queue_depth(state, count) do
-    Registry.update_value(@registry, {state.tenant, state.signal}, fn _ -> count end)
+  defp publish_queue_depth(state) do
+    Registry.update_value(@registry, {state.tenant, state.signal}, fn _ ->
+      %{pending: length(state.pending), waiters: length(state.waiters)}
+    end)
   end
 
   defp cancel_timer(%{timer_ref: nil} = state), do: state
@@ -431,7 +431,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     state = %{state | timer_ref: nil}
 
     result = cas_with_retry(state, state.pending, @cas_max_retries)
-    publish_queue_depth(state, 0)
+    publish_queue_depth(%{state | pending: [], waiters: []})
 
     case result do
       {:ok, manifest, etag} ->
