@@ -17,6 +17,7 @@ defmodule Pulso.LogQL.Evaluator do
   alias Pulso.LogQL.MetricEval
   alias Pulso.LogQL.Pipeline
   alias Pulso.LogQL.QueryValidation
+  alias Pulso.QueryRunner
   alias Pulso.Storage
 
   @type opts :: %{
@@ -37,7 +38,17 @@ defmodule Pulso.LogQL.Evaluator do
   @spec evaluate_log(AST.LogQuery.t(), Storage.tenant(), opts()) ::
           {:ok, [stream()]} | {:error, term()}
   def evaluate_log(%AST.LogQuery{} = query, tenant, opts \\ %{}) when is_binary(tenant) do
-    Pulso.SelfMetrics.track(:query, :logql_log, fn -> do_evaluate_log(query, tenant, opts) end)
+    Pulso.SelfMetrics.track(:query, :logql_log, fn ->
+      QueryRunner.run(
+        tenant,
+        :logql,
+        fn deadline ->
+          Process.put(:query_deadline_ms, deadline)
+          do_evaluate_log(query, tenant, opts)
+        end,
+        opts
+      )
+    end)
   end
 
   defp do_evaluate_log(query, tenant, opts) do
@@ -60,7 +71,7 @@ defmodule Pulso.LogQL.Evaluator do
   def evaluate_log_raw(%AST.LogQuery{} = query, tenant, opts) when is_binary(tenant) do
     with :ok <- QueryValidation.validate(query),
          {storage_opts, remaining_stages} <- push_down(query, opts),
-         {:ok, records} <- Storage.query(:logs, tenant, storage_opts) do
+         {:ok, records} <- query_storage(tenant, storage_opts) do
       compiled = Pipeline.compile(remaining_stages)
 
       entries =
@@ -73,6 +84,14 @@ defmodule Pulso.LogQL.Evaluator do
     end
   end
 
+  defp query_storage(tenant, opts) do
+    case Storage.query(:logs, tenant, opts) do
+      {:error, reason} when reason in [:query_scan_limit, :query_sample_limit, :query_timeout] -> {:error, reason}
+      {:error, reason} -> {:error, {:storage_error, reason}}
+      result -> result
+    end
+  end
+
   defp ok(value), do: {:ok, value}
 
   # ---------------------------------------------------------------------------
@@ -82,7 +101,17 @@ defmodule Pulso.LogQL.Evaluator do
   @spec evaluate_metric(term(), Storage.tenant(), opts()) ::
           {:ok, {:matrix, [series()]} | {:vector, [series()]}} | {:error, term()}
   def evaluate_metric(expr, tenant, opts \\ %{}) when is_binary(tenant) do
-    Pulso.SelfMetrics.track(:query, :logql_metric, fn -> do_evaluate_metric(expr, tenant, opts) end)
+    Pulso.SelfMetrics.track(:query, :logql_metric, fn ->
+      QueryRunner.run(
+        tenant,
+        :logql,
+        fn deadline ->
+          Process.put(:query_deadline_ms, deadline)
+          do_evaluate_metric(expr, tenant, opts)
+        end,
+        opts
+      )
+    end)
   end
 
   defp do_evaluate_metric(expr, tenant, opts) do
@@ -112,6 +141,8 @@ defmodule Pulso.LogQL.Evaluator do
       |> maybe_put_list(:matchers, matchers_wo_service)
       |> maybe_put_list(:line_filters, pushdown_line_filters)
 
+    deadline = Process.get(:query_deadline_ms)
+    storage_opts = storage_opts ++ Keyword.delete(QueryRunner.storage_opts(deadline), :max_records)
     {storage_opts, remaining}
   end
 

@@ -329,7 +329,7 @@ defmodule Pulso.Metrics do
       gauge("pulso_manifest_mailbox_messages", mailbox),
       gauge("pulso_manifest_pending_segments", pending),
       gauge("pulso_manifest_waiting_requests", waiters),
-      gauge("pulso_query_occupied_slots", registry_count(QuerySlots)),
+      gauge("pulso_query_occupied_slots", occupied_queries()),
       gauge("pulso_vm_memory_bytes", :erlang.memory(:total)),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue))
     ]
@@ -360,8 +360,15 @@ defmodule Pulso.Metrics do
     {mailbox + len, pending + Map.get(info, :pending, 0), waiters + Map.get(info, :waiters, 0)}
   end
 
-  defp registry_count(registry) do
-    if Process.whereis(registry), do: Registry.count(registry), else: 0
+  defp occupied_queries do
+    if Process.whereis(QuerySlots) do
+      QuerySlots
+      |> Registry.select([{{:_, :"$1", :_}, [], [:"$1"]}])
+      |> Enum.uniq()
+      |> length()
+    else
+      0
+    end
   rescue
     ArgumentError -> 0
   end

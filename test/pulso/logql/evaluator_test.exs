@@ -283,6 +283,13 @@ defmodule Pulso.LogQL.EvaluatorTest do
                run(~s({env=~"("}))
     end
 
+    test "regex accepted by Elixir but unsupported by the native decoder is rejected before storage" do
+      assert {:error, {:invalid_regex, :line_filter, "foo(?=bar)", _}} =
+               run(~s[{service="api"} |~ "foo(?=bar)"])
+
+      assert {:ok, _} = run(~s[{service="api"} | json |~ "foo(?=bar)"])
+    end
+
     test "invalid regex in line filter returns :invalid_regex" do
       assert {:error, {:invalid_regex, :line_filter, _, _}} =
                run(~s({service="api"} |~ "("))

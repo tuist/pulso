@@ -17,6 +17,18 @@ defmodule Pulso.MCP.ToolsTest do
     :ok
   end
 
+  test "raw metric queries reject unbounded responses but honor an explicit result limit" do
+    samples =
+      for ts <- 1..5_001 do
+        %MetricSample{timestamp_ns: ts, value: ts * 1.0, labels: %{"__name__" => "busy"}}
+      end
+
+    :ok = Storage.append(:metrics, "acme", samples)
+    assert {:error, :query_sample_limit} = Tools.call("query_metrics", %{"tenant" => "acme"})
+    assert {:ok, [%{"text" => text}]} = Tools.call("query_metrics", %{"tenant" => "acme", "limit" => 10})
+    assert length(Pulso.JSON.decode!(text)) == 10
+  end
+
   test "lists all four query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])

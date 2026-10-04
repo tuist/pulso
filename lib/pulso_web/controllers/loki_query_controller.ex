@@ -28,6 +28,7 @@ defmodule PulsoWeb.LokiQueryController do
   alias Pulso.LogQL.Envelope
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.Parser
+  alias Pulso.QueryRunner
   alias Pulso.Storage
 
   @default_tenant "default"
@@ -69,7 +70,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts) do
     case Evaluator.evaluate_log(ast, tenant, opts) do
       {:ok, streams} -> json(conn, Envelope.streams(streams))
-      {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
+      {:error, reason} -> render_query_error(conn, reason)
     end
   end
 
@@ -77,7 +78,7 @@ defmodule PulsoWeb.LokiQueryController do
     case Evaluator.evaluate_metric(ast, tenant, opts) do
       {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series))
       {:ok, {:vector, series}} -> json(conn, Envelope.vector(series))
-      {:error, reason} -> error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
+      {:error, reason} -> render_query_error(conn, reason)
     end
   end
 
@@ -92,17 +93,10 @@ defmodule PulsoWeb.LokiQueryController do
     tenant = tenant_from(conn)
 
     with :ok <- Auth.verify(conn, tenant),
-         {:ok, records} <- Storage.query(:logs, tenant, build_storage_time_opts(params)) do
-      names =
-        records
-        |> Enum.flat_map(fn r ->
-          resource = Map.keys(r.resource || %{})
-          attributes = Map.keys(r.attributes || %{})
-          resource ++ attributes
-        end)
-        |> Enum.uniq()
-        |> Enum.sort()
-
+         {:ok, names} <-
+           discover(tenant, params, fn records ->
+             Enum.flat_map(records, fn r -> Map.keys(r.resource || %{}) ++ Map.keys(r.attributes || %{}) end)
+           end) do
       json(conn, %{"status" => "success", "data" => names})
     else
       err -> render_error(conn, err)
@@ -113,30 +107,39 @@ defmodule PulsoWeb.LokiQueryController do
     tenant = tenant_from(conn)
 
     with :ok <- Auth.verify(conn, tenant),
-         {:ok, records} <- Storage.query(:logs, tenant, build_storage_time_opts(params)) do
-      values =
-        records
-        |> Enum.map(fn r ->
-          Map.get(r.resource || %{}, name) || Map.get(r.attributes || %{}, name)
-        end)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.uniq()
-        |> Enum.sort()
-
+         {:ok, values} <- discover(tenant, params, &label_values_for(&1, name)) do
       json(conn, %{"status" => "success", "data" => values})
     else
       err -> render_error(conn, err)
     end
   end
 
+  defp label_values_for(records, name) do
+    Enum.map(records, fn r -> Map.get(r.resource || %{}, name) || Map.get(r.attributes || %{}, name) end)
+  end
+
+  defp discover(tenant, params, project) do
+    QueryRunner.run(tenant, :discovery, fn deadline ->
+      opts = build_storage_time_opts(params) ++ QueryRunner.storage_opts(deadline, @label_scan_cap + 1)
+
+      with {:ok, records} <- Storage.query(:logs, tenant, opts),
+           :ok <- check_label_scan(length(records)) do
+        {:ok, records |> project.() |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.sort()}
+      end
+    end)
+  end
+
   defp build_storage_time_opts(params) do
-    [limit: @label_scan_cap]
+    [limit: @label_scan_cap + 1]
     |> maybe_kw(:start_ts, parse_ts(params["start"]))
     |> maybe_kw(:end_ts, parse_ts(params["end"]))
   end
 
   defp maybe_kw(kw, _key, nil), do: kw
   defp maybe_kw(kw, key, value), do: Keyword.put(kw, key, value)
+
+  defp check_label_scan(count) when count > @label_scan_cap, do: {:error, :query_sample_limit}
+  defp check_label_scan(_count), do: :ok
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -249,9 +252,38 @@ defmodule PulsoWeb.LokiQueryController do
     conn |> put_status(:unauthorized) |> json(%{"status" => "error", "error" => to_string(reason)})
   end
 
-  defp render_error(conn, err) do
-    error_json(conn, :internal_server_error, "unexpected", inspect(err))
-  end
+  defp render_error(conn, {:error, reason})
+       when reason in [
+              :query_overloaded,
+              :query_timeout,
+              :query_sample_limit,
+              :query_scan_limit,
+              :query_resource_limit,
+              :query_execution_failed
+            ], do: render_query_error(conn, reason)
+
+  defp render_error(conn, {:error, reason}),
+    do: error_json(conn, :service_unavailable, "storage_unavailable", inspect(reason))
+
+  defp render_query_error(conn, :query_overloaded),
+    do: error_json(conn, :too_many_requests, "query_overloaded", "Query capacity is busy.")
+
+  defp render_query_error(conn, :query_timeout),
+    do: error_json(conn, :gateway_timeout, "query_timeout", "Query timed out.")
+
+  defp render_query_error(conn, reason) when reason in [:query_execution_failed, :query_resource_limit],
+    do: error_json(conn, :internal_server_error, "query_failed", "Query execution failed.")
+
+  defp render_query_error(conn, reason) when reason in [:query_scan_limit, :query_sample_limit, :query_result_limit],
+    do: error_json(conn, :unprocessable_entity, "query_limit", "Query exceeded its resource budget.")
+
+  defp render_query_error(conn, {:storage_error, _}),
+    do: error_json(conn, :service_unavailable, "storage_unavailable", "Storage is unavailable.")
+
+  defp render_query_error(conn, reason) when reason in [:object_store_unavailable, :storage_unavailable],
+    do: error_json(conn, :service_unavailable, "storage_unavailable", "Storage is unavailable.")
+
+  defp render_query_error(conn, reason), do: error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
 
   defp error_json(conn, status, code, message) do
     conn

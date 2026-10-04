@@ -18,6 +18,7 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.Parser
   alias Pulso.MCP.Arguments
+  alias Pulso.QueryRunner
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
@@ -218,9 +219,7 @@ defmodule Pulso.MCP.Tools do
       |> put_opt(:limit, args["limit"])
       |> put_opt(:service, args["service"])
 
-    with {:ok, records} <- Storage.query(:logs, tenant, opts) do
-      {:ok, [%{"type" => "text", "text" => encode_records(records)}]}
-    end
+    query_raw(:logs, tenant, opts, &encode_records/1)
   end
 
   defp execute("query_metrics", %{"tenant" => tenant} = args) when is_binary(tenant) do
@@ -232,9 +231,7 @@ defmodule Pulso.MCP.Tools do
         |> put_opt(:limit, args["limit"])
         |> put_opt(:matchers, matcher_tuples)
 
-      with {:ok, samples} <- Storage.query(:metrics, tenant, opts) do
-        {:ok, [%{"type" => "text", "text" => encode_samples(samples)}]}
-      end
+      query_raw(:metrics, tenant, opts, &encode_samples/1)
     end
   end
 
@@ -265,6 +262,7 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
+
   defp promql_result({:error, {:storage_error, _}}), do: {:error, :metric_storage_unavailable}
   defp promql_result({:error, :query_execution_failed}), do: {:error, :metric_query_execution_failed}
   defp promql_result({:error, :query_overloaded}), do: {:error, :query_overloaded}
@@ -280,6 +278,28 @@ defmodule Pulso.MCP.Tools do
             ], do: {:error, :query_execution_limit}
 
   defp promql_result({:error, reason}), do: {:error, {:invalid_arguments, reason}}
+
+  defp raw_opts(opts, deadline) do
+    opts = if Keyword.has_key?(opts, :limit), do: opts, else: Keyword.put(opts, :limit, 5_001)
+    budgets = QueryRunner.storage_opts(deadline, 5_001)
+    budgets = if Keyword.get(opts, :limit) == 5_001, do: budgets, else: Keyword.delete(budgets, :max_records)
+    opts ++ budgets
+  end
+
+  defp query_raw(signal, tenant, opts, encode) do
+    QueryRunner.run(tenant, :raw, fn deadline ->
+      with {:ok, records} <- Storage.query(signal, tenant, raw_opts(opts, deadline)),
+           :ok <- check_raw_count(records, opts) do
+        {:ok, [%{"type" => "text", "text" => encode.(records)}]}
+      end
+    end)
+  end
+
+  defp check_raw_count(records, opts) do
+    if not Keyword.has_key?(opts, :limit) and length(records) > 5_000,
+      do: {:error, :query_sample_limit},
+      else: :ok
+  end
 
   # -- query_metrics helpers -----------------------------------------------
 
