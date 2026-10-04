@@ -106,6 +106,9 @@ defmodule Pulso.Metrics do
 
   @doc "Append a decoded receiver batch; count accepted records only after durable success."
   def append(signal, tenant, records, rejected, opts) do
+    # Storage owns accepted/failed canonical counts; decoder rejections are
+    # known here, before append. The detailed delivery view has its own family.
+    :ok = Pulso.SelfMetrics.records(signal, :rejected, rejected)
     result = Pulso.Storage.append(signal, tenant, records, opts)
 
     record_counts(
@@ -297,9 +300,26 @@ defmodule Pulso.Metrics do
 
   defp counter_order({{name, labels}, _}), do: {name, labels, 0}
 
+  defp exported_name("pulso_operations_total"), do: "pulso_detailed_operations_total"
+
+  defp exported_name("pulso_operation_duration_seconds" <> suffix),
+    do: "pulso_detailed_operation_duration_seconds" <> suffix
+
+  defp exported_name("pulso_ingest_records_total"), do: "pulso_ingest_delivery_records_total"
+  defp exported_name("pulso_compaction_segments_total"), do: "pulso_detailed_compaction_segments_total"
+  defp exported_name(name), do: name
+
   defp render_counter({{name, labels}, value}) do
     value = if name == "pulso_operation_duration_seconds_sum", do: seconds(value), else: Integer.to_string(value)
-    [name, "{", Enum.map_join(labels, ",", fn {key, value} -> "#{key}=\"#{value}\"" end), "} ", value, "\n"]
+
+    [
+      exported_name(name),
+      "{",
+      Enum.map_join(labels, ",", fn {key, value} -> "#{key}=\"#{value}\"" end),
+      "} ",
+      value,
+      "\n"
+    ]
   end
 
   defp render_gauges do
@@ -349,6 +369,10 @@ defmodule Pulso.Metrics do
   defp gauge(name, value),
     do: [metric_header(name, "gauge", Map.fetch!(@gauge_help, name)), name, " ", Integer.to_string(value), "\n"]
 
-  defp metric_header(name, type, help), do: ["# HELP ", name, " ", help, "\n# TYPE ", name, " ", type, "\n"]
+  defp metric_header(name, type, help) do
+    name = exported_name(name)
+    ["# HELP ", name, " ", help, "\n# TYPE ", name, " ", type, "\n"]
+  end
+
   defp seconds(value), do: Float.to_string(value / 1_000_000)
 end

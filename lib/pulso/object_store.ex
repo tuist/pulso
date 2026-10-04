@@ -117,7 +117,7 @@ defmodule Pulso.ObjectStore do
     Pulso.Metrics.measure(
       :object,
       operation,
-      fun,
+      fn -> request(String.to_existing_atom(operation), write_bytes, fun) end,
       fn
         {:ok, _etag, body} when is_binary(body) -> %{read: byte_size(body)}
         {:ok, body} when operation == "get" and is_binary(body) -> %{read: byte_size(body)}
@@ -126,6 +126,30 @@ defmodule Pulso.ObjectStore do
       end,
       purpose
     )
+  end
+
+  # Keep the canonical operation/payload counters alongside the detailed view;
+  # the supplied native operation still runs exactly once.
+  defp request(operation, write_bytes, fun) do
+    Pulso.SelfMetrics.track(:object, operation, fn ->
+      result = fun.()
+
+      case {operation, result} do
+        {:get, {:ok, data}} ->
+          Pulso.SelfMetrics.object_bytes(:read, byte_size(data))
+
+        {:get_if_none_match, {:ok, _etag, data}} ->
+          Pulso.SelfMetrics.object_bytes(:read, byte_size(data))
+
+        {op, {:ok, _etag}} when op in [:put, :put_if_none_match, :put_if_match] ->
+          Pulso.SelfMetrics.object_bytes(:write, write_bytes)
+
+        _ ->
+          :ok
+      end
+
+      result
+    end)
   end
 
   # 304 responses reach us as a NIF error carrying the `:not_modified`

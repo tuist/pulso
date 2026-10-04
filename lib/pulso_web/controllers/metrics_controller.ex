@@ -6,6 +6,6 @@ defmodule PulsoWeb.MetricsController do
     |> put_resp_content_type("text/plain", "utf-8")
     |> put_resp_header("content-type", "text/plain; version=0.0.4; charset=utf-8")
     |> put_resp_header("cache-control", "no-store")
-    |> send_resp(200, Pulso.Metrics.render())
+    |> send_resp(200, Pulso.SelfMetrics.render() <> Pulso.Metrics.render())
   end
 end

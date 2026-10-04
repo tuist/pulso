@@ -20,6 +20,10 @@ defmodule Pulso.PromQL.Evaluator do
   @max_steps Pulso.QueryLimits.max_evaluation_steps()
 
   def query(query, tenant, opts \\ %{}) do
+    Pulso.SelfMetrics.track(:query, :promql, fn -> do_query(query, tenant, opts) end)
+  end
+
+  defp do_query(query, tenant, opts) do
     with :ok <- check_slots(tenant),
          {:ok, timeout} <- query_timeout(opts),
          {:ok, task} <- start_query_task(query, tenant, opts, timeout) do

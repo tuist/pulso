@@ -31,6 +31,12 @@ defmodule Pulso.MetricsTest do
     value("pulso_ingest_records_total", [{"signal", signal}, {"outcome", outcome}])
   end
 
+  defp canonical_requests(layer, operation, outcome) do
+    labels = ~s(layer="#{layer}",operation="#{operation}",outcome="#{outcome}")
+    [{_, count}] = :ets.lookup(Pulso.SelfMetrics, {"pulso_operations_total", labels})
+    count
+  end
+
   defp otlp(records) do
     %{"resourceLogs" => [%{"scopeLogs" => [%{"logRecords" => records}]}]}
   end
@@ -42,6 +48,9 @@ defmodule Pulso.MetricsTest do
     assert get_resp_header(conn, "content-type") == ["text/plain; version=0.0.4; charset=utf-8"]
     assert get_resp_header(conn, "cache-control") == ["no-store"]
     assert conn.resp_body =~ "# TYPE pulso_operations_total counter\n"
+    assert conn.resp_body =~ "# TYPE pulso_detailed_operations_total counter\n"
+    assert conn.resp_body =~ "# TYPE pulso_operation_duration_seconds summary\n"
+    assert conn.resp_body =~ "# TYPE pulso_detailed_operation_duration_seconds histogram\n"
     assert conn.resp_body =~ "pulso_manifest_pending_segments 0\n"
     assert conn.resp_body =~ "pulso_query_occupied_slots 0\n"
     assert :ets.tab2list(Metrics) |> Enum.sort() == before
@@ -72,18 +81,33 @@ defmodule Pulso.MetricsTest do
     end)
   end
 
+  test "merged exposition has unique families and sample identities" do
+    conn = build_conn() |> get("/metrics")
+    lines = String.split(conn.resp_body, "\n", trim: true)
+    types = Enum.filter(lines, &String.starts_with?(&1, "# TYPE "))
+    assert Enum.uniq(types) == types
+    families = Enum.map(types, fn line -> Enum.at(String.split(line, " "), 2) end)
+    assert Enum.uniq(families) == families
+    samples = lines |> Enum.reject(&String.starts_with?(&1, "#")) |> Enum.map(&hd(String.split(&1, " ")))
+    assert Enum.uniq(samples) == samples
+  end
+
   test "router-equivalent paths count requests and pre-router parser errors" do
     for path <- ["/v1/logs/", "/v1//logs", "/v1/%6cogs/"] do
       before = requests("ingest", "otlp", "ok")
+      canonical_before = canonical_requests("ingest", "otlp", "success")
       assert (build_conn() |> put_req_header("content-type", "application/json") |> post(path, otlp([]))).status == 200
       assert requests("ingest", "otlp", "ok") == before + 1
+      assert canonical_requests("ingest", "otlp", "success") == canonical_before + 1
       rejected = requests("ingest", "otlp", "rejected")
+      canonical_rejected = canonical_requests("ingest", "otlp", "error")
 
       assert_raise ParseError, fn ->
         build_conn() |> put_req_header("content-type", "application/json") |> post(path, "{")
       end
 
       assert requests("ingest", "otlp", "rejected") == rejected + 1
+      assert canonical_requests("ingest", "otlp", "error") == canonical_rejected + 1
     end
 
     before = requests("query", "http_promql", "rejected")
@@ -93,6 +117,7 @@ defmodule Pulso.MetricsTest do
 
   test "encoded separators and nonexistent label routes do not become query or ingest attempts" do
     before = :ets.tab2list(Metrics) |> Enum.sort()
+    canonical_before = canonical_requests("query", "http", "error")
     assert (build_conn() |> get("/loki/api/v1/label/a/b/c/d")).status == 404
     assert (build_conn() |> get("/loki/api/v1/label/a%2Fb/c/values")).status == 404
 
@@ -100,6 +125,7 @@ defmodule Pulso.MetricsTest do
              404
 
     assert :ets.tab2list(Metrics) |> Enum.sort() == before
+    assert canonical_requests("query", "http", "error") == canonical_before
     before_labels = requests("query", "http_labels", "ok")
     assert (build_conn() |> get("/loki/api/v1/label/service_name/values/")).status == 200
     assert requests("query", "http_labels", "ok") == before_labels + 1
@@ -323,7 +349,7 @@ defmodule Pulso.MetricsTest do
       |> Enum.filter(
         &String.starts_with?(
           &1,
-          ~s(pulso_operation_duration_seconds_bucket{kind="compaction",operation="compact",purpose="none",outcome="ok",)
+          ~s(pulso_detailed_operation_duration_seconds_bucket{kind="compaction",operation="compact",purpose="none",outcome="ok",)
         )
       )
       |> Enum.map(fn line ->
@@ -334,7 +360,7 @@ defmodule Pulso.MetricsTest do
     assert bounds == ["0.005", "0.01", "0.05", "0.1", "0.5", "1.0", "5.0", "10.0", "+Inf"]
 
     assert Metrics.render() =~
-             ~s(pulso_operation_duration_seconds_bucket{kind="compaction",operation="compact",purpose="none",outcome="ok",le="0.005"})
+             ~s(pulso_detailed_operation_duration_seconds_bucket{kind="compaction",operation="compact",purpose="none",outcome="ok",le="0.005"})
   end
 
   test "measurement preserves successes, errors, throws and exceptions" do

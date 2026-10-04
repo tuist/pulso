@@ -165,12 +165,22 @@ reset when the metrics process or node restarts. Manifest owners publish batch
 queue depths in their existing registry entries, so scrapes do not wait for
 owners blocked in native I/O; registry cleanup removes terminated owners.
 
-Receiver records count acknowledged deliveries after successful append and
-known decoder/append rejections, not unique stored rows. Pre-decode failures
-count rejected requests without inventing record counts. Public HTTP queries
-and MCP tool results expose failures, including tool errors transported as
-HTTP 200. Object operations report logical calls, CAS outcomes, and successful
-body bytes, not all provider-billed retries or transfer. Compaction and cleanup
+Canonical `Pulso.SelfMetrics` families retain their published `layer` labels,
+latency summaries, distinct decoder-rejected/publication-failed record counts,
+and aggregate payload/progress metrics. Query instrumentation covers HTTP, MCP,
+evaluators, and storage as separate layers. The `Pulso.Metrics` detailed view adds
+route/tool distinctions, purpose-aware object bytes, histograms, and separate
+queue/runtime gauges. Overlapping operation, duration, and compaction family
+names use `pulso_detailed_` prefixes; receiver-only delivery counts use
+`pulso_ingest_delivery_records_total`. The two views describe overlapping work
+and must not be summed. Native operations and record publication run once.
+
+Record counts describe acknowledged attempts, not unique stored rows. Canonical
+publication failures remain separate from decoder drops; the delivery view
+combines them as rejected deliveries. Pre-decode failures count requests without
+inventing record counts. Tool errors remain observable even over HTTP 200.
+Object metrics describe logical calls and successful body bytes, not all billed
+retries or network transfers. Compaction and cleanup
 report completed attempts and confirmed segment counts. A separate background
 worker deadline counter exposes timeouts even before stalled native work finishes. See
 [self-monitoring](self-monitoring.md) for the full contract and limitations.

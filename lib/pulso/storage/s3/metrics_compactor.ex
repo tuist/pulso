@@ -24,10 +24,7 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   alias Pulso.Storage.S3.Manifest.Segment
 
   def compact(tenant, config, opts \\ []) do
-    Pulso.Metrics.measure(:compaction, "compact", fn -> do_compact(tenant, config, opts) end, fn
-      {:ok, %{merged: count}} -> %{segments: count}
-      _ -> %{}
-    end)
+    monitor(:compact, fn -> do_compact(tenant, config, opts) end)
   end
 
   defp do_compact(tenant, config, opts) do
@@ -200,10 +197,26 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
 
   @doc "Delete up to max_deletions (128) expired objects; persist progress and retry failed keys on later passes."
   def cleanup(tenant, config, opts \\ []) do
-    Pulso.Metrics.measure(:compaction, "cleanup", fn -> do_cleanup(tenant, config, opts) end, fn
-      {:ok, count} -> %{segments: count}
-      _ -> %{}
-    end)
+    monitor(:cleanup, fn -> do_cleanup(tenant, config, opts) end)
+  end
+
+  defp monitor(operation, fun) do
+    Pulso.Metrics.measure(
+      :compaction,
+      Atom.to_string(operation),
+      fn ->
+        Pulso.SelfMetrics.track(:compaction, operation, fn ->
+          result = fun.()
+          Pulso.SelfMetrics.compaction(operation, result)
+          result
+        end)
+      end,
+      fn
+        {:ok, %{merged: count}} -> %{segments: count}
+        {:ok, count} when is_integer(count) -> %{segments: count}
+        _ -> %{}
+      end
+    )
   end
 
   defp do_cleanup(tenant, config, opts) do
