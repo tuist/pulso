@@ -120,6 +120,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         # hiding it from admission checks. Late publication remains conditional.
         Process.demonitor(task.ref, [:flush])
         :pg.leave(CompactionOwnership.scope(), CompactionOwnership.group(config), self())
+        :telemetry.execute([:pulso, :compaction, :timeout], %{}, %{operation: name})
         report_failure(tenant, name, :timeout)
     end
   end

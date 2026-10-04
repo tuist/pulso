@@ -3,7 +3,6 @@ defmodule PulsoWeb.OTLPController do
 
   alias Pulso.Auth
   alias Pulso.OTLP.Logs
-  alias Pulso.Storage
 
   @default_tenant "default"
 
@@ -33,7 +32,7 @@ defmodule PulsoWeb.OTLPController do
          :ok <- Auth.verify(conn, tenant),
          :ok <- Pulso.IngestLimits.validate(:otlp, params),
          {records, rejected} = Logs.decode(params),
-         :ok <- Storage.append(:logs, tenant, records, opts) do
+         :ok <- Pulso.Metrics.append(:logs, tenant, records, rejected, opts) do
       # OTLP requires the receiver to signal partial success via a
       # top-level `partialSuccess` block instead of a plain success. That
       # lets the sender know some records did not make it into storage

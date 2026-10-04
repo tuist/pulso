@@ -14,6 +14,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
+  alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.MetricsCompactor
   alias Pulso.Test.CompactionPeer
@@ -137,6 +138,91 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     # Deliberately serve a fresh-looking obsolete snapshot; missing files restart the scan.
     Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
     assert S3.query(:metrics, ctx.tenant, []) == hd(before)
+  end
+
+  @tag timeout: 5_000
+  test "queue metrics can be scraped while manifest publication is blocked in native I/O", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "metrics")
+    parent = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => parent}})
+
+    pid =
+      start_supervised!(
+        {Task,
+         fn ->
+           send(parent, {:append_finished, S3.append(:metrics, ctx.tenant, [sample(1, 1.0)])})
+         end}
+      )
+
+    ref = Process.monitor(pid)
+    assert_receive {:storage_barrier, storage, "PUT", ^key}, 1_000
+    calls_before = Agent.get(ctx.agent, &length(&1.requests))
+    rendered = Pulso.Metrics.render()
+    assert rendered =~ "pulso_manifest_pending_segments 1\n"
+    assert rendered =~ "pulso_manifest_waiting_requests 1\n"
+    assert Agent.get(ctx.agent, &length(&1.requests)) == calls_before
+    send(storage, {:release_storage, key})
+    assert_receive {:append_finished, :ok}, 1_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    assert Pulso.Metrics.render() =~ "pulso_manifest_pending_segments 0\n"
+    assert Pulso.Metrics.render() =~ "pulso_manifest_waiting_requests 0\n"
+  end
+
+  @tag timeout: 5_000
+  test "worker deadlines are observable before the stalled native operation finishes", ctx do
+    for ts <- 1..2, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    source = hd(load(ctx).segments).key
+    parent = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", source} => parent}})
+    key = {"pulso_compaction_timeouts_total", [{"operation", "merge"}]}
+
+    before_count =
+      case :ets.lookup(Pulso.Metrics, key) do
+        [{_, count}] -> count
+        [] -> 0
+      end
+
+    config = ctx.config |> Map.put(:compaction_timeout_ms, 200) |> Map.put(:compaction_interval_ms, 3_600_000)
+    worker = start_supervised!({CompactionWorker, config})
+    send(worker, :compact)
+    assert_receive {:storage_barrier, storage, "GET", ^source}, 1_000
+    _ = :sys.get_state(worker)
+    assert [{^key, count}] = :ets.lookup(Pulso.Metrics, key)
+    assert count == before_count + 1
+    assert [task] = Task.Supervisor.children(CompactionTasks)
+    ref = Process.monitor(task)
+    rendered = Pulso.Metrics.render()
+    assert rendered =~ ~s(pulso_compaction_timeouts_total{operation="merge"})
+    assert Agent.get(ctx.agent, &Map.has_key?(&1.barriers, {"GET", source}))
+    send(storage, {:release_storage, source})
+    assert_receive {:DOWN, ^ref, :process, ^task, :normal}, 1_000
+    assert [{^key, count}] = :ets.lookup(Pulso.Metrics, key)
+    assert count == before_count + 1
+  end
+
+  test "self-monitoring counts completed merges and cleanup without storing monitoring records", ctx do
+    count = fn operation ->
+      case :ets.lookup(Pulso.Metrics, {"pulso_compaction_segments_total", [{"operation", operation}]}) do
+        [{_, value}] -> value
+        [] -> 0
+      end
+    end
+
+    before_merge = count.("compact")
+    before_cleanup = count.("cleanup")
+    for ts <- 1..2, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    assert {:ok, %{merged: 2}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    assert count.("compact") == before_merge + 2
+    assert {:ok, 2} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    assert count.("cleanup") == before_cleanup + 2
+    assert {:ok, %{merged: 0}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+    assert {:ok, 0} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    assert count.("compact") == before_merge + 2
+    assert count.("cleanup") == before_cleanup + 2
+    assert {:ok, samples} = S3.query(:metrics, ctx.tenant, [])
+    assert length(samples) == 2
+    [{_pid, info}] = Registry.lookup(ManifestRegistry, {ctx.tenant, "metrics"})
+    assert info == %{pending: 0, waiters: 0}
   end
 
   test "compacted name summaries preserve selective query budgets and retirement metadata", ctx do

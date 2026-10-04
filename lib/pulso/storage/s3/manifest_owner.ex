@@ -380,6 +380,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # timer. Under bursty load this bounds tail latency.
   defp enqueue_and_maybe_flush(state, from, segments) do
     state = %{state | pending: state.pending ++ segments, waiters: [from | state.waiters]}
+    publish_queue_depth(state)
 
     cond do
       length(state.pending) >= state.flush_batch_max ->
@@ -392,6 +393,12 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       true ->
         {:noreply, state}
     end
+  end
+
+  defp publish_queue_depth(state) do
+    Registry.update_value(@registry, {state.tenant, state.signal}, fn _ ->
+      %{pending: length(state.pending), waiters: length(state.waiters)}
+    end)
   end
 
   defp cancel_timer(%{timer_ref: nil} = state), do: state
@@ -423,7 +430,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp do_flush(state) do
     state = %{state | timer_ref: nil}
 
-    case cas_with_retry(state, state.pending, @cas_max_retries) do
+    result = cas_with_retry(state, state.pending, @cas_max_retries)
+    publish_queue_depth(%{state | pending: [], waiters: []})
+
+    case result do
       {:ok, manifest, etag} ->
         ManifestCache.put(state.tenant, state.signal, manifest, etag)
         Enum.each(state.waiters, &GenServer.reply(&1, :ok))

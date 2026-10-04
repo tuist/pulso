@@ -155,6 +155,31 @@ Expressions are limited to 16,384 bytes, 64 matchers per selector, and 1,024 byt
 
 Each node maintains an LRU cache of recent Parquet segments and sidecar indexes on local NVMe. Cache eviction is best-effort; a miss just triggers a range GET to S3. Cache warming happens organically via queries; there is no proactive prefetch.
 
+## Operational self-monitoring
+
+`GET /metrics` exports Prometheus-text self-monitoring from supervised,
+node-local ETS counters and live registry/VM gauges. It never reads or writes
+Pulso storage, and reporting has no mailbox. Labels have a finite vocabulary;
+tenants, expressions, object keys, and raw errors are not retained. Counters
+reset when the metrics process or node restarts. Manifest owners publish batch
+queue depths in their existing registry entries, so scrapes do not wait for
+owners blocked in native I/O; registry cleanup removes terminated owners.
+
+Receiver records count acknowledged deliveries after successful append and
+known decoder/append rejections, not unique stored rows. Pre-decode failures
+count rejected requests without inventing record counts. Public HTTP queries
+and MCP tool results expose failures, including tool errors transported as
+HTTP 200. Object operations report logical calls, CAS outcomes, and successful
+body bytes, not all provider-billed retries or transfer. Compaction and cleanup
+report completed attempts and confirmed segment counts. A separate background
+worker deadline counter exposes timeouts even before stalled native work finishes. See
+[self-monitoring](self-monitoring.md) for the full contract and limitations.
+Scrape every node into an independent monitor during rollout. The endpoint is
+not tenant-authenticated and shares the ingest listener. Keep the whole listener
+private, or deny/separately authenticate router-equivalent metrics paths at every
+public ingress proxy; port-level network policy cannot isolate this path from
+ingest. It adds no cluster state or admission policy.
+
 ## Alerting
 
 ### Rule storage
