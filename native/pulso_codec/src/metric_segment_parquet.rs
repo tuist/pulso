@@ -573,6 +573,10 @@ pub fn decode<'a>(
         atoms::labels().encode(env),
     ];
     let struct_name = atoms::metric_sample().encode(env);
+    // Arrow reconstructs array wrappers across batches, but dictionary
+    // value/offset buffers remain shared. Retain the previous array owner
+    // so buffer identities cannot be recycled while comparing them.
+    let mut previous_arena: Option<(arrow::array::ArrayRef, BinaryArena<'a>)> = None;
 
     for batch_result in reader {
         let batch = batch_result.map_err(|_| DecodeError::Reader)?;
@@ -587,7 +591,18 @@ pub fn decode<'a>(
         let labels_dict = col::<DictionaryArray<Int32Type>>(&batch, 3)?;
         let labels_arr = labels_dict.values().as_any().downcast_ref::<BinaryArray>()
             .ok_or(DecodeError::Reader)?;
-        let labels_arena = BinaryArena::from(env, labels_arr);
+        let same_dictionary = previous_arena.as_ref().is_some_and(|(values, _)| {
+            values.as_any().downcast_ref::<BinaryArray>().is_some_and(|previous| {
+                previous.value_data().as_ptr() == labels_arr.value_data().as_ptr()
+                    && previous.value_data().len() == labels_arr.value_data().len()
+                    && previous.value_offsets().as_ptr() == labels_arr.value_offsets().as_ptr()
+                    && previous.value_offsets().len() == labels_arr.value_offsets().len()
+            })
+        });
+        if !same_dictionary {
+            previous_arena = Some((Arc::clone(labels_dict.values()), BinaryArena::from(env, labels_arr)));
+        }
+        let labels_arena = &previous_arena.as_ref().ok_or(DecodeError::Reader)?.1;
         // The whole-column byte view — the per-row canonical slices we
         // scan during the row loop point into this slice.
         let labels_bytes: &[u8] = labels_arena.arena_bytes().unwrap_or(&[]);

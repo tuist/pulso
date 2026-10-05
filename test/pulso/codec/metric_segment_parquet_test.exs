@@ -145,6 +145,25 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert :binary.referenced_byte_size(selected.labels["annotation"]) < 2 * byte_size(long)
   end
 
+  test "batches sharing a label dictionary retain a single Erlang arena" do
+    supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.ArenaSupervisor})
+    long = String.duplicate("annotation", 100)
+    labels = %{"__name__" => "counter", "annotation" => long}
+    {payload, _, _, _} = encode!(for ts <- 1..2000, do: sample(ts, ts * 1.0, labels))
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        decoded = decode!(payload)
+        :erlang.garbage_collect()
+        size = :binary.referenced_byte_size(hd(decoded).labels["annotation"])
+        {:binary, binaries} = Process.info(self(), :binary)
+        count = binaries |> Enum.uniq_by(&elem(&1, 0)) |> Enum.count(&(elem(&1, 1) == size))
+        {count, length(decoded)}
+      end)
+
+    assert Task.await(task) == {1, 2000}
+  end
+
   test "dictionary-preserving reads support high-cardinality plain fallback pages" do
     samples =
       for ts <- 1..2000 do
