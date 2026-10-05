@@ -2,6 +2,7 @@
 set -euo pipefail
 export MIX_ENV=test PULSO_NIF_FORCE_BUILD=true
 export ERL_FLAGS="+S 4:4 +SDcpu 4"
+if [[ ! -f .auto/reference/libpulso_codec_reference.so ]]; then bash .auto/build-reference.sh; fi
 mix compile --warnings-as-errors > .auto/compile.out 2>&1 || { tail -80 .auto/compile.out; exit 1; }
 /usr/bin/time -l mix run --no-compile .auto/workload.exs 2> .auto/time.out
 python3 - <<'PY'

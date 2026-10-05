@@ -1,3 +1,5 @@
+Code.require_file(".auto/reference_nif.exs")
+
 defmodule CapacityBench do
   alias Pulso.Codec.NIF
   alias Pulso.Record.{Log, MetricSample}
@@ -10,7 +12,7 @@ defmodule CapacityBench do
     end
   end
 
-  def cases do
+  def cases(nif) do
     repeated = metrics(80, 100)
     unique = metrics(2000, 1)
     {:ok, repeated_blob, _, _, _} = NIF.encode_metric_segment_parquet(repeated)
@@ -24,13 +26,33 @@ defmodule CapacityBench do
     {:ok, log_blob, _, _} = Pulso.Storage.S3.encode_segment(:logs, logs)
     json = JSON.encode!(Enum.map(logs, &Map.from_struct/1))
     [
-      {"metric_read_repeated", fn -> {:ok, rows} = NIF.decode_metric_segment_parquet(repeated_blob, nil, nil, []); rows end},
-      {"metric_read_unique", fn -> {:ok, rows} = NIF.decode_metric_segment_parquet(unique_blob, nil, nil, []); rows end},
-      {"metric_read_filtered", fn -> {:ok, rows} = NIF.decode_metric_segment_parquet(repeated_blob, 20_000_000_000, 40_000_000_000, [{"region", :eq, "region-1"}]); rows end},
-      {"log_read", fn -> {:ok, rows} = Pulso.Storage.S3.decode_segment(:logs, log_blob, nil, nil, []); rows end},
-      {"json_roundtrip", fn -> rows = Pulso.JSON.decode!(json); {rows, Pulso.JSON.encode!(rows)} end},
-      {"metric_write", fn -> {:ok, blob, _, _, 8000} = NIF.encode_metric_segment_parquet(repeated); blob end}
+      {"metric_read_repeated", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(repeated_blob, nil, nil, []); rows end},
+      {"metric_read_unique", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(unique_blob, nil, nil, []); rows end},
+      {"metric_read_filtered", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(repeated_blob, 20_000_000_000, 40_000_000_000, [{"region", :eq, "region-1"}]); rows end},
+      {"log_read", fn -> {:ok, rows} = nif.decode_log_segment_parquet(log_blob, nil, nil, nil, [], []); rows end},
+      {"json_roundtrip", fn -> rows = json_decode(nif, json); {rows, json_encode(nif, rows)} end},
+      {"metric_write", fn -> {:ok, blob, _, _, 8000} = nif.encode_metric_segment_parquet(repeated); blob end}
     ]
+  end
+
+  # Same public Pulso.JSON dispatch for candidate and frozen control.
+  def json_decode(nif, bytes) do
+    result = if byte_size(bytes) <= 65536, do: nif.json_decode(bytes), else: nif.json_decode_dirty(bytes)
+    case result do
+      {:ok, term} -> term
+      :fallback -> JSON.decode!(bytes)
+    end
+  end
+
+  def json_encode(nif, term) do
+    result = case nif.json_encode(term, 65536) do
+      :too_big -> nif.json_encode_dirty(term)
+      result -> result
+    end
+    case result do
+      {:ok, bytes} -> bytes
+      :fallback -> JSON.encode!(term)
+    end
   end
 
   def retained(fun) do
@@ -45,34 +67,57 @@ defmodule CapacityBench do
     end) |> Task.await(:infinity)
   end
 
-  def measure({name, fun}) do
-    fun.()
+  def rate(fun) do
+    {us, counts} = :timer.tc(fn ->
+      1..4 |> Task.async_stream(fn _ ->
+        for _ <- 1..120 do
+          result = fun.()
+          if is_binary(result), do: byte_size(result), else: :erlang.phash2(result)
+        end |> length()
+      end, max_concurrency: 4, timeout: :infinity) |> Enum.map(fn {:ok, n} -> n end)
+    end)
+    Enum.sum(counts) * 1_000_000 / us
+  end
+
+  def canonical("metric_write", blob) do
+    {:ok, rows} = NIF.decode_metric_segment_parquet(blob, nil, nil, [])
+    rows
+  end
+  def canonical("json_roundtrip", {rows, json}), do: {rows, JSON.decode!(json)}
+  def canonical(_, result), do: result
+
+  def measure({{name, fun}, {name, ref_fun}}) do
+    unless canonical(name, fun.()) == canonical(name, ref_fun.()), do: raise("reference mismatch: #{name}")
     {bytes, words} = retained(fun)
-    rates = for _ <- 1..5 do
-      {us, counts} = :timer.tc(fn ->
-        1..4 |> Task.async_stream(fn _ ->
-          for _ <- 1..120 do
-            result = fun.()
-            if is_binary(result), do: byte_size(result), else: :erlang.phash2(result)
-          end |> length()
-        end, max_concurrency: 4, timeout: :infinity) |> Enum.map(fn {:ok, n} -> n end)
-      end)
-      Enum.sum(counts) * 1_000_000 / us
+    {ref_bytes, _} = retained(ref_fun)
+    runs = for round <- 1..7 do
+      # Alternate which version goes first, preserving identical work.
+      {candidate, reference} = if rem(round, 2) == 1 do
+        candidate = rate(fun)
+        {candidate, rate(ref_fun)}
+      else
+        reference = rate(ref_fun)
+        {rate(fun), reference}
+      end
+      {candidate, candidate / reference}
     end
-    rate = rates |> Enum.sort() |> Enum.at(2)
+    median = fn values -> values |> Enum.sort() |> Enum.at(3) end
+    rps = median.(Enum.map(runs, &elem(&1, 0)))
+    ratio = median.(Enum.map(runs, &elem(&1, 1)))
     mb = bytes / 1_048_576
-    IO.puts("METRIC #{name}_rps=#{rate}")
+    IO.puts("METRIC #{name}_rps=#{rps}")
     IO.puts("METRIC #{name}_live_mb=#{mb}")
     IO.puts("METRIC #{name}_words=#{words}")
-    {rate, mb}
+    IO.puts("PAIR #{name} throughput_ratio=#{ratio} memory_ratio=#{ref_bytes / bytes}")
+    {rps, mb, ratio * ref_bytes / bytes}
   end
 
   def run do
-    results = cases() |> Enum.map(&measure/1)
+    results = Enum.zip(cases(NIF), cases(Pulso.AutoReferenceNIF)) |> Enum.map(&measure/1)
     geometric = fn values -> :math.exp(Enum.sum(Enum.map(values, &:math.log/1)) / length(values)) end
     IO.puts("METRIC throughput_rps=#{geometric.(Enum.map(results, &elem(&1, 0)))}")
     IO.puts("METRIC live_mb=#{geometric.(Enum.map(results, &elem(&1, 1)))}")
-    IO.puts("METRIC capacity_index=#{geometric.(Enum.map(results, fn {rps, mb} -> rps / mb end))}")
+    IO.puts("METRIC capacity_index=#{geometric.(Enum.map(results, &elem(&1, 2)))}")
   end
 end
 CapacityBench.run()
