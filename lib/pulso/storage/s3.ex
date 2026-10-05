@@ -108,14 +108,18 @@ defmodule Pulso.Storage.S3 do
     keyed? = opts[:idempotency_key] not in [nil, ""]
 
     if not keyed? and Map.get(config, :ingest_flush_interval_ms, 0) > 0 do
-      with :ok <- validate_tenant(tenant) do
-        case AppendBuffer.append(signal, tenant, records, config) do
-          :unbuffered -> append_unbuffered(signal, tenant, records, opts, config)
-          result -> result
-        end
-      end
+      append_buffered(signal, tenant, records, opts, config)
     else
       append_unbuffered(signal, tenant, records, opts)
+    end
+  end
+
+  defp append_buffered(signal, tenant, records, opts, config) do
+    with :ok <- validate_tenant(tenant) do
+      case AppendBuffer.append(signal, tenant, records, config) do
+        :unbuffered -> append_unbuffered(signal, tenant, records, opts, config)
+        result -> result
+      end
     end
   end
 

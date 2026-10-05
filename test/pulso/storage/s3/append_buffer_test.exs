@@ -36,7 +36,9 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
       bucket: "pulso",
       endpoint: "http://localhost:#{port}",
       region: "us-east-1",
-      access_key_id: "test",
+      # Native clients cache connection pools by full config. Unique test
+      # credentials prevent reusing a stale pool if the OS recycles a port.
+      access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
       allow_http: true,
       refresh_stale_ms: 0,
@@ -98,11 +100,18 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert ManifestCache.get(ctx.tenant, "logs") == nil
     assert [{:pending, 2, bytes, 2}] = :ets.lookup(ctx.admission, :pending)
     assert bytes > 0
+    # Scraping reads reservation tables, even while the owner is blocked in I/O.
+    assert AppendBuffer.stats() == {1, 2, bytes, 2}
+    report = Pulso.Metrics.render()
+    assert report =~ "pulso_ingest_buffer_reserved_calls 2\n"
+    assert report =~ "pulso_ingest_buffer_input_bytes #{bytes}\n"
+    assert report =~ "pulso_ingest_buffer_rows 2\n"
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     send(writer, {:release_storage, manifest_key})
     assert Enum.all?(tasks, &(Task.await(&1, 10_000) == :ok))
     _ = :sys.get_state(ctx.buffer)
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    assert AppendBuffer.stats() == {1, 0, 0, 0}
     assert segment_puts(ctx.agent) == 1
     assert {:ok, [^record, ^record]} = S3.query(:logs, ctx.tenant, [])
   end
@@ -157,9 +166,18 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert Task.await(caller) == :timed_out
     assert length(:sys.get_state(ctx.buffer).pending) == 1
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 1, bytes, 1}]
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}})
     send(ctx.buffer, {:flush, token})
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 5000
+    assert :ets.lookup(ctx.admission, :pending) == [{:pending, 1, bytes, 1}]
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    send(writer, {:release_storage, key})
     _ = :sys.get_state(ctx.buffer)
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    assert %{etag: etag} = ManifestCache.get(ctx.tenant, "logs")
+    assert is_binary(etag)
     assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, [])
   end
 

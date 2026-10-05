@@ -188,7 +188,11 @@ latency summaries, distinct decoder-rejected/publication-failed record counts,
 and aggregate payload/progress metrics. Query instrumentation covers HTTP, MCP,
 evaluators, and storage as separate layers. The `Pulso.Metrics` detailed view adds
 route/tool distinctions, purpose-aware object bytes, histograms, and separate
-queue/runtime gauges. Overlapping operation, duration, and compaction family
+queue/runtime gauges. Optional unkeyed append buffers expose active count and
+queued/executing caller, row, and estimated input-byte reservations through
+direct ETS reads, without messaging buffers blocked in storage I/O. These
+estimates are not heap memory measurements, and unbuffered overflow is excluded.
+Overlapping operation, duration, and compaction family
 names use `pulso_detailed_` prefixes; receiver-only delivery counts use
 `pulso_ingest_delivery_records_total`. The two views describe overlapping work
 and must not be summed. Native operations and record publication run once.

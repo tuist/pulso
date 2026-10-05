@@ -335,7 +335,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         {:ok, manifest, etag} ->
           # A rebuilt manifest without an ETag is not yet published. Do not
           # expose it through the shared query cache until the CAS succeeds.
-          if etag, do: ManifestCache.put(state.tenant, state.signal, manifest, etag)
+          cache_loaded(state, manifest, etag)
 
           state
           |> Map.merge(%{manifest: manifest, etag: etag, loaded?: true})
@@ -357,6 +357,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     # manual `garbage_collect/1` beforehand would be redundant.
     {:noreply, state, :hibernate}
   end
+
+  defp cache_loaded(_state, _manifest, nil), do: :ok
+
+  defp cache_loaded(state, manifest, etag), do: ManifestCache.put(state.tenant, state.signal, manifest, etag)
 
   # ---- flush pipeline -------------------------------------------------------
 

@@ -21,37 +21,35 @@ defmodule Pulso.Storage.S3.MetricLabelSummary do
 
     sets = Map.new(names, &{&1, MapSet.new()})
 
-    sets =
-      Enum.reduce_while(records, sets, fn record, sets ->
-        if Enum.all?(Map.keys(record.labels), &valid_utf8?/1) do
-          sets = Map.new(sets, fn {name, values} -> {name, collect(values, Map.get(record.labels, name, ""))} end)
-          {:cont, sets}
-        else
-          # Native JSON materialization normalizes invalid UTF-8 keys, which
-          # could collide with a selected name. Never summarize that case.
-          {:halt, %{}}
-        end
-      end)
+    sets = Enum.reduce_while(records, sets, &collect_record/2)
 
     {summary, _bytes} =
-      Enum.reduce(names, {%{}, 2}, fn name, {summary, bytes} ->
-        case Map.get(sets, name) do
-          %MapSet{} = values ->
-            values = values |> Enum.map(&:binary.copy/1) |> Enum.sort()
-            field = %{name => values}
-            added = IO.iodata_length(Pulso.JSON.encode_to_iodata!(field))
-
-            if bytes + added <= @max_bytes,
-              do: {Map.put(summary, :binary.copy(name), values), bytes + added},
-              else: {summary, bytes}
-
-          _ ->
-            {summary, bytes}
-        end
-      end)
+      Enum.reduce(names, {%{}, 2}, fn name, acc -> add_label(name, Map.get(sets, name), acc) end)
 
     if map_size(summary) > 0, do: summary
   end
+
+  defp collect_record(record, sets) do
+    if Enum.all?(Map.keys(record.labels), &valid_utf8?/1) do
+      sets = Map.new(sets, fn {name, values} -> {name, collect(values, Map.get(record.labels, name, ""))} end)
+      {:cont, sets}
+    else
+      # Native JSON materialization normalizes invalid UTF-8 keys, which
+      # could collide with a selected name. Never summarize that case.
+      {:halt, %{}}
+    end
+  end
+
+  defp add_label(name, %MapSet{} = values, {summary, bytes}) do
+    values = values |> Enum.map(&:binary.copy/1) |> Enum.sort()
+    added = IO.iodata_length(Pulso.JSON.encode_to_iodata!(%{name => values}))
+
+    if bytes + added <= @max_bytes,
+      do: {Map.put(summary, :binary.copy(name), values), bytes + added},
+      else: {summary, bytes}
+  end
+
+  defp add_label(_name, _unknown, acc), do: acc
 
   defp collect(nil, _value), do: nil
 

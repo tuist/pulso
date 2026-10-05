@@ -395,6 +395,9 @@ fn writer_properties() -> WriterProperties {
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
+        // The current decoder reads whole selected row groups, not row-number
+        // page seeks, so offset indexes only increase object metadata.
+        .set_offset_index_disabled(true)
         // Bound uncompressed label extrema in the footer, not the stored
         // labels. Truncated string bounds remain conservative for readers.
         .set_statistics_truncate_length(Some(64))

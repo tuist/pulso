@@ -176,21 +176,18 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   @doc "Attach a complete bounded set of nonempty promoted log services, or leave it unknown."
   def summarize_logs(segment, records) do
-    services =
-      Enum.reduce_while(records, MapSet.new(), fn record, services ->
-        service = record.service
-
-        if is_binary(service) and byte_size(service) in 1..256 do
-          services = MapSet.put(services, service)
-          if MapSet.size(services) <= 128, do: {:cont, services}, else: {:halt, nil}
-        else
-          {:halt, nil}
-        end
-      end)
+    services = Enum.reduce_while(records, MapSet.new(), &collect_log_service/2)
 
     services = if services, do: services |> Enum.map(&:binary.copy/1) |> Enum.sort()
     %{segment | log_services: services}
   end
+
+  defp collect_log_service(%{service: service}, services) when is_binary(service) and byte_size(service) in 1..256 do
+    services = MapSet.put(services, service)
+    if MapSet.size(services) <= 128, do: {:cont, services}, else: {:halt, nil}
+  end
+
+  defp collect_log_service(_record, _services), do: {:halt, nil}
 
   @doc "Prune known log services for exact promoted-field selectors; unknown summaries always scan."
   def matches_log_service?(%__MODULE__{log_services: nil}, _opts), do: true

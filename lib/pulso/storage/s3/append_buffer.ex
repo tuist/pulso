@@ -18,6 +18,32 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   @max_bytes 10 * 1024 * 1024
   @idle_ms 30_000
 
+  @doc "Read node-local buffer reservations without messaging owners or doing storage I/O."
+  def stats do
+    if Process.whereis(AppendRegistry) do
+      AppendRegistry
+      |> Registry.select([{{:_, :_, :"$1"}, [], [:"$1"]}])
+      |> Enum.reduce({0, 0, 0, 0}, fn table, totals -> add_stats(table, totals) end)
+    else
+      {0, 0, 0, 0}
+    end
+  rescue
+    ArgumentError -> {0, 0, 0, 0}
+  end
+
+  defp add_stats(table, {buffers, callers, bytes, rows} = totals) do
+    case :ets.lookup(table, :pending) do
+      [{:pending, reserved_callers, reserved_bytes, reserved_rows}] ->
+        {buffers + 1, callers + reserved_callers, bytes + reserved_bytes, rows + reserved_rows}
+
+      _ ->
+        totals
+    end
+  rescue
+    # An idle or failed buffer can disappear during the scrape.
+    ArgumentError -> totals
+  end
+
   def append(signal, tenant, records, config) do
     rows = length(records)
     bytes = :erlang.external_size(records)

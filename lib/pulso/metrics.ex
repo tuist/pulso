@@ -8,6 +8,7 @@ defmodule Pulso.Metrics do
   use GenServer
 
   alias Pulso.PromQL.QuerySlots
+  alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.ManifestRegistry
 
   @table __MODULE__
@@ -71,6 +72,11 @@ defmodule Pulso.Metrics do
     "pulso_manifest_mailbox_messages" => "Messages in node-local manifest-owner mailboxes.",
     "pulso_manifest_pending_segments" => "Segments in node-local publication batches, including in-flight batches.",
     "pulso_manifest_waiting_requests" => "Requests waiting in node-local manifest publication batches.",
+    "pulso_ingest_buffers" => "Active node-local unkeyed ingest buffers.",
+    "pulso_ingest_buffer_reserved_calls" => "Queued and executing requests reserved in unkeyed ingest buffers.",
+    "pulso_ingest_buffer_input_bytes" =>
+      "Estimated external-term bytes reserved in unkeyed ingest buffers, not heap size.",
+    "pulso_ingest_buffer_rows" => "Queued and executing rows reserved in unkeyed ingest buffers.",
     "pulso_query_occupied_slots" => "Registered node-local PromQL tenant query slots.",
     "pulso_vm_memory_bytes" => "Total BEAM-reported memory in bytes.",
     "pulso_vm_run_queue" => "BEAM scheduler run-queue length."
@@ -324,11 +330,16 @@ defmodule Pulso.Metrics do
 
   defp render_gauges do
     {mailbox, pending, waiters} = manifest_queues()
+    {buffers, reserved_calls, input_bytes, input_rows} = AppendBuffer.stats()
 
     [
       gauge("pulso_manifest_mailbox_messages", mailbox),
       gauge("pulso_manifest_pending_segments", pending),
       gauge("pulso_manifest_waiting_requests", waiters),
+      gauge("pulso_ingest_buffers", buffers),
+      gauge("pulso_ingest_buffer_reserved_calls", reserved_calls),
+      gauge("pulso_ingest_buffer_input_bytes", input_bytes),
+      gauge("pulso_ingest_buffer_rows", input_rows),
       gauge("pulso_query_occupied_slots", occupied_queries()),
       gauge("pulso_vm_memory_bytes", :erlang.memory(:total)),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue))
