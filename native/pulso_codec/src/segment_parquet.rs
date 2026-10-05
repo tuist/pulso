@@ -527,6 +527,10 @@ fn materialize<'a>(
     let has_matchers = !filter.matchers.is_empty();
     let has_line_filters = !filter.line_filters.is_empty();
     let mut stacks: Stacks<Term<'a>> = Stacks::new();
+    // Resource metadata is commonly repeated for a run of records. Share
+    // the immutable decoded map only after comparing the complete JSON
+    // bytes; a single entry bounds memory for high-cardinality resources.
+    let mut previous_resource: Option<(&[u8], Term<'a>)> = None;
 
     for i in 0..batch.num_rows() {
         // Apply per-row filters before building any Erlang terms so the
@@ -564,7 +568,19 @@ fn materialize<'a>(
         let trace_id_term = sub_term(env, &trace_id, i, nil)?;
         let span_id_term = sub_term(env, &span_id, i, nil)?;
         let attributes_term = map_json_term(env, &attributes, i, empty_map, &mut stacks)?;
-        let resource_term = map_json_term(env, &resource, i, empty_map, &mut stacks)?;
+        let resource_term = if resource.is_null(i) || resource.is_empty(i) {
+            empty_map
+        } else {
+            let bytes = resource.value_bytes(i);
+            match previous_resource {
+                Some((previous, term)) if previous == bytes => term,
+                _ => {
+                    let term = map_json_term(env, &resource, i, empty_map, &mut stacks)?;
+                    previous_resource = Some((bytes, term));
+                    term
+                }
+            }
+        };
 
         // Field order matches `field_atoms/1`.
         let values = [

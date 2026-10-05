@@ -117,6 +117,22 @@ defmodule Pulso.Storage.S3CodecTest do
       assert Enum.sort(Enum.map(kept, & &1.timestamp_ns)) == [1, 3]
     end
 
+    test "repeated resource maps share immutable terms without confusing metadata transitions" do
+      resources = [%{}, %{"region" => "east"}, %{"region" => "east"}, %{}, %{"region" => "west"}]
+
+      records =
+        resources
+        |> Enum.with_index(1)
+        |> Enum.map(fn {resource, ts} -> %Log{timestamp_ns: ts, service: "api", resource: resource} end)
+
+      {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+      {:ok, decoded} = S3.decode_segment(:logs, payload, nil, nil, [])
+      assert Enum.map(decoded, & &1.resource) == resources
+      assert :erts_debug.same(Enum.at(decoded, 1).resource, Enum.at(decoded, 2).resource)
+      {:ok, filtered} = S3.decode_segment(:logs, payload, 3, 5, [])
+      assert Enum.map(filtered, & &1.resource) == Enum.drop(resources, 2)
+    end
+
     test "drops nil-timestamp records under any time filter" do
       records = [%Log{timestamp_ns: nil, body: "x"}, %Log{timestamp_ns: 5, body: "y"}]
       {:ok, payload, _, _} = S3.encode_segment(:logs, records)
