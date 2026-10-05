@@ -362,7 +362,9 @@ fn writer_properties() -> WriterProperties {
         .set_column_encoding(ColumnPath::from("trace_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
         .set_column_dictionary_enabled(ColumnPath::from("span_id"), false)
         .set_column_encoding(ColumnPath::from("span_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
-        .set_statistics_enabled(EnabledStatistics::Page)
+        // Queries prune at row-group granularity; per-page statistics and
+        // column indexes add bytes to every small object without being read.
+        .set_statistics_enabled(EnabledStatistics::Chunk)
         // Footer statistics are uncompressed. Bound long JSON/string extrema
         // without truncating column data; parquet-rs widens truncated bounds
         // and marks them inexact. Integer timestamp bounds remain exact.
@@ -799,4 +801,47 @@ fn parse_json_sub<'a>(
     let bin = arena.sub_binary(i)?;
     let mut builder = TermBuilder::new(env, &bin);
     Parser::new(bin.as_slice()).document_with(&mut builder, stacks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_utf8_statistics_are_conservative_and_timestamp_bounds_stay_exact() {
+        let lo = format!("a{}", "界🌍".repeat(200));
+        let hi = format!("z{}", "界🌍".repeat(200));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("timestamp_ns", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec![lo.as_str(), hi.as_str()])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ]).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_properties())).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf)).unwrap();
+        let group = builder.metadata().row_group(0);
+        let strings = group.column(0).statistics().unwrap();
+        assert!(strings.min_bytes_opt().unwrap().len() <= 64);
+        assert!(strings.max_bytes_opt().unwrap().len() <= 64);
+        assert!(strings.min_bytes_opt().unwrap() <= lo.as_bytes());
+        assert!(strings.max_bytes_opt().unwrap() >= hi.as_bytes());
+        assert!(!strings.min_is_exact());
+        assert!(!strings.max_is_exact());
+        match group.column(1).statistics().unwrap() {
+            Statistics::Int64(stats) => {
+                assert_eq!(stats.min_opt(), Some(&10));
+                assert_eq!(stats.max_opt(), Some(&20));
+            }
+            _ => panic!("timestamp stats must be Int64"),
+        }
+        let decoded = builder.build().unwrap().next().unwrap().unwrap();
+        let strings = decoded.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value(0), lo);
+        assert_eq!(strings.value(1), hi);
+    }
 }
