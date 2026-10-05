@@ -584,6 +584,10 @@ pub fn decode<'a>(
         let mut previous_labels: Option<&[u8]> = None;
         let mut previous_matches = false;
         let mut previous_term: Option<Term<'a>> = None;
+        // Updating a fixed-key flat map shares its key tuple, unlike
+        // constructing one from arrays for every row. Compare exact terms
+        // so unchanged fields (and duplicate samples) require no update.
+        let mut previous_record: Option<(Term<'a>, [Term<'a>; 5])> = None;
 
         for row in 0..batch.num_rows() {
             let ts = ts_arr.value(row) as i128;
@@ -652,8 +656,19 @@ pub fn decode<'a>(
                 value.encode(env),
                 labels_term,
             ];
-            records
-                .push(Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?);
+            let record = match previous_record {
+                Some((mut record, previous_fields)) => {
+                    for ((key, field), previous) in keys.iter().zip(fields.iter()).zip(previous_fields.iter()) {
+                        if field != previous {
+                            record = record.map_update(*key, *field).map_err(|_| DecodeError::Reader)?;
+                        }
+                    }
+                    record
+                }
+                None => Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?,
+            };
+            previous_record = Some((record, fields));
+            records.push(record);
         }
     }
 

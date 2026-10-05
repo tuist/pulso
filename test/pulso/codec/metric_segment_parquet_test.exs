@@ -119,6 +119,23 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     end
   end
 
+  test "record key sharing preserves duplicates, changing labels, and equal-time conflicting values" do
+    labels = %{"__name__" => "counter"}
+
+    samples = [
+      %{sample(1, 1.0, labels) | series_id: 1},
+      %{sample(1, 1.0, labels) | series_id: 1},
+      %{sample(1, 2.0, labels) | series_id: 1},
+      %{sample(1, 2.0, %{}) | series_id: 1},
+      %{sample(2, 3.0, labels) | series_id: 2}
+    ]
+
+    {payload, _, _, _} = encode!(samples)
+    decoded = decode!(payload)
+    assert decoded == samples
+    assert :erts_debug.same(hd(decoded), Enum.at(decoded, 1))
+  end
+
   test "same label set hashes to the same series_id across samples" do
     labels = %{"__name__" => "cpu", "instance" => "node-1"}
     a = sample(10, 0.1, labels)
