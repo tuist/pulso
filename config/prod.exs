@@ -9,14 +9,12 @@ config :logger, level: :info
 # fallback that ships in config.exs.
 config :pulso, Pulso.Auth, module: :must_configure_at_runtime
 
-config :pulso, PulsoWeb.Endpoint,
-  force_ssl: [
-    rewrite_on: [:x_forwarded_proto],
-    exclude: [
-      # paths: ["/health"],
-      hosts: ["localhost", "127.0.0.1"]
-    ]
-  ]
+# No `force_ssl`: Pulso serves plain HTTP behind a TLS-terminating proxy or
+# ingress. Phoenix applies `force_ssl` at compile time, so it would redirect
+# every in-cluster request (collectors, scrapes, orchestrator probes) whose
+# Host is not localhost. Redirecting an API call also protects nothing: the
+# bearer token has already crossed the wire by the time the redirect is sent.
+# Terminate TLS in front of Pulso and keep its listener off public networks.
 
 # Runtime production configuration, including reading
 # of environment variables, is done on config/runtime.exs.

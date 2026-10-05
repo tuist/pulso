@@ -1,0 +1,21 @@
+Pulso {{ .Chart.AppVersion }} is running as {{ include "pulso.fullname" . }} in {{ .Release.Namespace }}.
+
+In-cluster endpoints (plain HTTP on port {{ .Values.service.port }}):
+
+  http://{{ include "pulso.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+  POST /v1/logs             OpenTelemetry logs (JSON)
+  POST /loki/api/v1/push    Loki push
+  POST /api/v1/write        Prometheus remote write
+  POST /mcp                 Model Context Protocol
+  GET  /metrics             Pulso's own metrics; keep private
+
+Ingest and query requests send "Authorization: Bearer <token>" and
+"X-Scope-OrgID: <tenant>" (omitting the header selects the tenant "default").
+Model Context Protocol tools take the tenant as an argument and use the same
+bearer token.
+
+Check readiness:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pulso.fullname" . }} 4000:{{ .Values.service.port }}
+  curl -s localhost:4000/readyz

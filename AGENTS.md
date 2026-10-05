@@ -83,6 +83,8 @@ lib/
     router.ex
     telemetry.ex
 config/                   # Standard Phoenix config; Loki base_url lives here
+charts/pulso/             # Helm chart, published with each release
+docs/                     # User-facing documentation; docs/README.md is the index
 ```
 
 Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` and analogous config keys for future backends. Never hardcode.
@@ -99,6 +101,14 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
 - **Rust NIF distribution**: the NIF crates under `native/` (`pulso_object_store`, `pulso_codec`) ship via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for each crate and the target triples in its `lib/pulso/*/nif.ex` module and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.
 - **Memory copies across the NIF boundary**: minimize them. GET streams the S3 body into a Rustler `NewBinary` allocated on the Erlang heap (one copy total, no Rust-side intermediate). PUT does not copy: the Erlang binary is saved into a process-independent `OwnedEnv` and wrapped with `Bytes::from_owner`, so every clone reqwest's retry layer makes shares an owner that keeps the binary alive (a lifetime-extended slice would be unsound for exactly that reason). S3 clients are cached per config so connections are reused. The codec (`pulso_codec`) writes encoder output straight into an Erlang binary and never copies it at the end. The Loki decoder decompresses once into a `NewBinary` and returns every string as a sub-binary of it, and the JSON and segment decoders return strings over 64 bytes as sub-binaries of their input, so retained decoded data pins its source buffer: `:binary.copy/1` anything kept past the request. The Parquet segment decoder allocates one Erlang binary per string column per batch (the arena) and returns every row's string field as a sub-binary of it — a batch of N rows costs 7 fresh binaries per column, not 7 × N. It skips UTF-8 revalidation on Arrow's `StringBuilder` output on encode (the JSON encoder is documented to emit valid UTF-8 already), so per-row string-column encode cost is a single memcpy. The Parquet reader still copies the whole input blob into a `Bytes` for `ChunkReader` ownership — one memcpy per read per segment, revisit when the query path is hot.
+
+## Documentation
+
+User-facing documentation lives in `docs/`, with [`docs/README.md`](./docs/README.md) as the index. Keep it current in the same change that alters behavior: new or renamed environment variables, endpoints, limits, chart values, storage requirements, or operational procedures must update the relevant page (and the index when a page is added).
+
+- Write for people self-hosting Pulso: what to configure, what to expose, how to operate and upgrade it, and what is not supported yet.
+- Leave out internal details that do not help an operator: module names, implementation history, review notes, and anything specific to a particular organization's deployment, rollout, or companion services. Contributor-facing design belongs in `docs/architecture.md`; rollout planning belongs in `plans/`.
+- The Helm chart in `charts/pulso` ships with every release alongside the container image, at the same version. Keep `charts/pulso/values.yaml` comments, `docs/deployment.md`, and `docs/configuration.md` in sync with `config/runtime.exs`.
 
 ## Development workflow
 

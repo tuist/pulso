@@ -1,0 +1,139 @@
+{{- include "pulso.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pulso.fullname" . }}
+  labels:
+    {{- include "pulso.labels" . | nindent 4 }}
+spec:
+  # Pulso is supported as a single node; see values.yaml.
+  replicas: 1
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pulso.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.existingSecret }}
+        checksum/secret: {{ include "pulso.secretChecksum" . }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "pulso.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "pulso.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pulso
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "4000"
+            # The release writes temporary files under RELEASE_TMP; keep them
+            # on the writable scratch volume so the root filesystem can be
+            # read-only.
+            - name: RELEASE_TMP
+              value: /tmp
+            - name: ERL_CRASH_DUMP
+              value: /tmp/erl_crash.dump
+            - name: PULSO_S3_BUCKET
+              value: {{ .Values.storage.bucket | quote }}
+            - name: PULSO_S3_REGION
+              value: {{ .Values.storage.region | quote }}
+            {{- with .Values.storage.endpoint }}
+            - name: PULSO_S3_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: PULSO_S3_ALLOW_HTTP
+              value: {{ .Values.storage.allowHttp | quote }}
+            - name: PULSO_METRICS_COMPACTION_ENABLED
+              value: {{ .Values.metricsCompaction.enabled | quote }}
+            {{- with .Values.mcp.allowedOrigins }}
+            - name: PULSO_MCP_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- range $key, $value := .Values.ingestLimits }}
+            - name: {{ printf "PULSO_INGEST_%s" (upper $key) }}
+              value: {{ include "pulso.ingestLimitValue" (list $key $value) | quote }}
+            {{- end }}
+            {{- range $key := list "SECRET_KEY_BASE" "PULSO_TENANT_TOKENS" "PULSO_S3_ACCESS_KEY_ID" "PULSO_S3_SECRET_ACCESS_KEY" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulso.secretName" $ }}
+                  key: {{ $key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.preStopSleepSeconds }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.preStopSleepSeconds }}"]
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
