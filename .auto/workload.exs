@@ -51,7 +51,7 @@ defmodule CapacityBench do
     rates = for _ <- 1..5 do
       {us, counts} = :timer.tc(fn ->
         1..4 |> Task.async_stream(fn _ ->
-          for _ <- 1..12 do
+          for _ <- 1..120 do
             result = fun.()
             if is_binary(result), do: byte_size(result), else: :erlang.phash2(result)
           end |> length()

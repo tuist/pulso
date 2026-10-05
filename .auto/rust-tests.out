@@ -1,57 +1,56 @@
-   Compiling pulso_codec v0.1.0 (/Users/pepicrft/.superconductor/worktrees/pulso/sc-entangled-boson-2d05/native/pulso_codec)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.41s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
      Running unittests src/lib.rs (native/pulso_codec/target/debug/deps/pulso_codec-f9953fc0900658f6)
 
 running 57 tests
-test json_write::tests::escapes_like_elixir ... ok
-test ingest_limits::tests::duplicate_pairs_and_bytes_are_bounded ... ok
-test ingest_limits::tests::corrupt_wire_does_not_pass_preflight ... ok
 test ingest_limits::tests::counts_empty_and_malformed_entries_before_decoding ... ok
-test labels::tests::plain_values_borrow_from_input ... ok
+test json_write::tests::escapes_like_elixir ... ok
+test ingest_limits::tests::corrupt_wire_does_not_pass_preflight ... ok
+test ingest_limits::tests::duplicate_pairs_and_bytes_are_bounded ... ok
 test labels::tests::empty_set ... ok
-test ingest_limits::tests::loki_labels_are_checked_before_last_wins ... ok
-test json_write::tests::numbers ... ok
-test json_read::tests::raw_object_returns_value_slices ... ok
-test labels::tests::accepts_trailing_comma ... ok
-test labels::tests::pairs_and_whitespace ... ok
-test labels::tests::common_and_control_escapes ... ok
-test json_read::tests::scalars_and_whitespace ... ok
-test labels::tests::rejects_malformed_escapes ... ok
-test labels::tests::hex_unicode_and_octal_escapes ... ok
-test json_read::tests::containers ... ok
 test labels::tests::rejects_malformed_structure ... ok
+test ingest_limits::tests::loki_labels_are_checked_before_last_wins ... ok
+test labels::tests::plain_values_borrow_from_input ... ok
+test json_write::tests::numbers ... ok
+test json_read::tests::containers ... ok
+test labels::tests::accepts_trailing_comma ... ok
+test json_read::tests::raw_object_returns_value_slices ... ok
 test json_read::tests::strings ... ok
-test loki::tests::empty_request_and_empty_stream ... ok
-test loki::tests::falls_back_to_service_and_detected_level ... ok
-test loki::tests::missing_line_defaults_to_empty ... ok
-test loki::tests::rejects_records_individually ... ok
-test loki::tests::decodes_labels_timestamp_and_metadata ... ok
-test loki::tests::duplicates_resolve_last_wins ... ok
-test loki::tests::rejects_whole_stream_on_bad_labels ... ok
-test loki::tests::wire_corruption_fails_the_request ... ok
+test labels::tests::pairs_and_whitespace ... ok
 test metric_json::tests::parity_control_chars_including_named_and_generic ... ok
 test metric_json::tests::parity_empty_and_short_ascii ... ok
 test metric_json::tests::parity_quotes_and_backslashes ... ok
 test metric_json::tests::parity_long_clean_runs_cross_bulk_boundary ... ok
-test query_filter::tests::find_label_empty_object ... ok
+test labels::tests::rejects_malformed_escapes ... ok
+test loki::tests::empty_request_and_empty_stream ... ok
+test json_read::tests::scalars_and_whitespace ... ok
+test loki::tests::rejects_whole_stream_on_bad_labels ... ok
+test loki::tests::missing_line_defaults_to_empty ... ok
+test loki::tests::wire_corruption_fails_the_request ... ok
+test labels::tests::common_and_control_escapes ... ok
 test query_filter::tests::find_label_missing ... ok
 test query_filter::tests::find_label_simple ... ok
-test query_filter::tests::find_label_skips_non_string_values ... ok
+test query_filter::tests::find_label_empty_object ... ok
+test labels::tests::hex_unicode_and_octal_escapes ... ok
 test query_filter::tests::find_label_with_escaped_newline_in_value ... ok
+test query_filter::tests::find_label_skips_non_string_values ... ok
 test query_filter::tests::find_label_with_escaped_value_returns_decoded ... ok
+test loki::tests::falls_back_to_service_and_detected_level ... ok
 test query_filter::tests::find_label_with_unicode_escape ... ok
+test loki::tests::rejects_records_individually ... ok
 test query_filter::tests::find_label_with_whitespace ... ok
-test query_filter::tests::matcher_literal_eq ... ok
+test loki::tests::duplicates_resolve_last_wins ... ok
+test loki::tests::decodes_labels_timestamp_and_metadata ... ok
 test query_filter::tests::matcher_literal_neq_on_absent ... ok
-test query_filter::tests::line_filter_substring ... ok
+test query_filter::tests::matcher_literal_eq ... ok
 test stable_hash::tests::empty_labels_hashes_to_empty_xxh64 ... ok
 test stable_hash::tests::pinned_prometheus_vectors_are_consistent_with_oracle ... ok
-test stable_hash::tests::streaming_matches_one_shot_for_large_label_set ... ok
-test stable_hash::tests::single_label_matches_oracle ... ok
-test stable_hash::tests::order_sensitive ... ok
 test stable_hash::tests::two_labels_match_oracle ... ok
+test stable_hash::tests::single_label_matches_oracle ... ok
 test wire::tests::reads_varint_and_bytes_fields ... ok
+test stable_hash::tests::order_sensitive ... ok
 test wire::tests::rejects_group_wire_types ... ok
+test stable_hash::tests::streaming_matches_one_shot_for_large_label_set ... ok
+test query_filter::tests::line_filter_substring ... ok
 test wire::tests::rejects_length_past_end ... ok
 test wire::tests::rejects_overlong_varint ... ok
 test query_filter::tests::matcher_regex_re ... ok
@@ -61,5 +60,5 @@ test metric_json::tests::parity_randomised_corpus ... ok
 test loki::tests::survives_mutated_inputs ... ok
 test json_read::tests::survives_mutated_inputs ... ok
 
-test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
 
