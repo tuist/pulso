@@ -1,8 +1,8 @@
 # Self-monitoring Pulso
 
 Scrape `GET /metrics` on **every node**, not a load-balanced service address that
-alternates nodes. Send scrapes to the existing Prometheus/Grafana Cloud monitoring
-destination during the pilot, **not back into Pulso**. The endpoint exports
+alternates nodes. Send scrapes to a separate monitoring system (for example an existing
+Prometheus), **not back into Pulso**. The endpoint exports
 Prometheus text format 0.0.4 without content negotiation or caching. It reads only
 node-local counters, registry metadata, mailbox lengths, and VM statistics. It
 never queries or appends to signal storage or waits for manifest owners blocked
@@ -17,7 +17,7 @@ operational signals, not accounting ledgers or deployment-readiness gates.
 ## Exposure and independent collection
 
 The endpoint does not authenticate with tenant ingest tokens and shares the
-listener with ingest and MCP. Keep the **entire listener private** for the pilot.
+listener with ingest and MCP. Keep the **entire listener private**.
 Port-level network policy cannot isolate `/metrics` from ingest on that port.
 If ingest or MCP is exposed outside the trusted monitoring network, a path-aware
 proxy **must deny `/metrics` on that ingress**, or require separate monitoring
@@ -44,8 +44,9 @@ scrape_configs:
       - targets: [pulso-node-1.internal:4000]
 ```
 
-A collector must retain its independent destination and retry policy. This
-repository supplies the endpoint, not the Tuist collector or chart rollout.
+A collector must retain its independent destination and retry policy. The
+[Helm chart](deployment.md) can create a Prometheus Operator `ServiceMonitor`
+for this endpoint.
 
 ## Canonical metric contract
 
@@ -161,7 +162,7 @@ slots do not describe all log/raw query concurrency. No new query/ingest admissi
 or buffered ingest queues are introduced. Histogram updates may be observed
 partway through an update; metric snapshots are best effort.
 
-## Useful pilot queries
+## Useful queries
 
 Keep the scrape job and node `instance` label in dashboards:
 
@@ -194,5 +195,5 @@ sum by (instance, operation) (rate(pulso_compaction_timeouts_total[5m]))
 ```
 
 Alert on scrape failure (`up == 0`) through the independent monitor. Choose
-latency, queue, rejection-rate, and compaction thresholds from the measured pilot
+latency, queue, rejection-rate, and compaction thresholds from your measured
 load. Instrumentation alone establishes neither safe capacity nor readiness.

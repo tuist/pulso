@@ -1,109 +1,51 @@
 # Pulso 🫀
 
-A headless, open-source observability backend: unified logs, metrics, and traces access, built-in alerting, and a native Model Context Protocol (MCP) interface, built on Elixir/OTP with a Rust hot path for columnar data.
+An open-source, headless observability backend built for AI agents as much as for humans.
 
-Pulso ships no UI. It exists to be talked to by humans through their own dashboards and, first-class, by AI agents through MCP.
+Pulso accepts logs and metrics over the protocols your collectors already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores them as Parquet in an S3-compatible bucket, and lets agents investigate them through a native [Model Context Protocol](https://modelcontextprotocol.io/) interface. Prometheus- and Loki-compatible query APIs keep existing dashboards working.
+
+## Why Pulso
+
+- **One system instead of three.** Logs and metrics (and, later, traces and alerting) share one ingest path, one storage format, and one query surface.
+- **Object storage is the source of truth.** No database, no local disks to back up, no consensus service. Nodes are disposable.
+- **Agent-native.** Diagnosis tools are part of the server, not a wrapper bolted on afterwards, and they stay read-only by design.
+- **No UI.** Bring your own dashboards, or your own agent.
 
 > [!WARNING]
-> Pulso is in **early scaffolding**. The design is settled in [`docs/architecture.md`](./docs/architecture.md); the codebase is still catching up to it. Expect the shape to change without warning until we tag a first release.
+> Pulso is early software. Logs and metrics work end to end; traces, alerting, and retention are not implemented yet. Expect breaking changes between releases.
 
-## 🧭 Design
+## Try it locally
 
-The [Tuist deployment plan](plans/tuist-deployment-plan.md) describes the implementation milestones, cost measurements, and rollout gates for collecting logs, metrics, and traces and replacing Grafana Cloud services.
-
-The architecture is documented in **[`docs/architecture.md`](./docs/architecture.md)**. Read that first if you want to understand what Pulso is trying to be. The short version:
-
-- ☁️ **Object storage is the source of truth.** S3 (or R2, GCS, Azure Blob, MinIO) holds every acknowledged record. Local disk is a warm cache and nothing more.
-- 🧩 **Shared-nothing nodes.** No shared database, no leader election, no consensus service. Nodes coordinate only through S3 conditional writes and rendezvous hashing.
-- ⚙️ **BEAM for orchestration, Rust for bytes.** Elixir/OTP owns concurrency, supervision, backpressure, and the MCP surface. Rust owns Parquet, DataFusion, and the S3 client, called via Rustler NIFs.
-- 🤖 **MCP first-class.** The primary read surface is MCP tools. HTTP wire protocols (OTLP, Prometheus `remote_write`, Loki push) exist to accept telemetry from existing agents unchanged.
-
-## 🚀 Getting started
-
-The Erlang, Elixir, and Rust toolchains are needed to build Pulso. Erlang and Elixir are pinned in [`mise.toml`](./mise.toml); a stable Rust toolchain (from `rustup` or your package manager) covers the NIF. With [mise](https://mise.jdx.dev/) installed:
+You need [mise](https://mise.jdx.dev/), a stable Rust toolchain, and Docker.
 
 ```sh
-mise install
+mise install                  # Erlang and Elixir
+docker compose up -d          # local S3-compatible storage
 mix setup
-mix test
-```
-
-The first build compiles the Rust NIFs under [`native/pulso_object_store`](./native/pulso_object_store) and [`native/pulso_codec`](./native/pulso_codec) and copies the shared objects into `priv/native/`. Subsequent builds are incremental.
-
-To boot the app locally:
-
-```sh
 mix phx.server
 ```
 
-- OTLP/HTTP JSON logs land at `POST /v1/logs`. Tenant is picked up from `X-Scope-OrgID` (Loki/Cortex convention), defaulting to `default`.
-- Loki push lands at `POST /loki/api/v1/push` (same tenant convention), both as JSON (optionally gzip-encoded) and as Snappy-compressed protobuf, the default Grafana Alloy and Promtail send. The protobuf path is decoded in Rust.
-- The MCP endpoint is exposed at `POST /mcp`. It implements the stateless [MCP `2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28) Streamable HTTP transport: no handshake or session, each request carries its version and capabilities in `params._meta` and mirrors them in `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`) `Mcp-Name` headers. Methods: `server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`. Browser origins must be allowlisted with `PULSO_MCP_ALLOWED_ORIGINS`.
-
-- Self-monitoring is exposed at `GET /metrics` in Prometheus text format. Scrape each node into an independent monitoring system, not Pulso itself. Keep the listener private; any public ingest/MCP proxy must deny or separately authenticate the metrics path, since port-level network policy cannot separate it from ingest. See [self-monitoring](docs/self-monitoring.md) for metrics, counting boundaries, and example queries.
-
-All ingest receivers enforce per-request record and attribute budgets and reject
-oversized batches in full with HTTP 413. See [ingest limits](docs/ingest-limits.md)
-for defaults, runtime configuration, counting rules, and authentication boundaries.
-
-## 🐳 Local S3 (MinIO)
-
-The Rust NIF talks to any S3-compatible endpoint. [`docker-compose.yml`](./docker-compose.yml) brings up MinIO and preseeds a bucket:
+In another terminal, push a log line and read it back (local development accepts any tenant without a token):
 
 ```sh
-docker compose up -d
+curl -X POST localhost:4000/loki/api/v1/push \
+  -H 'Content-Type: application/json' -H 'X-Scope-OrgID: demo' \
+  -d "{\"streams\":[{\"stream\":{\"service_name\":\"api\"},\"values\":[[\"$(date +%s)000000000\",\"hello pulso\"]]}]}"
+
+curl -G localhost:4000/loki/api/v1/query_range \
+  -H 'X-Scope-OrgID: demo' --data-urlencode 'query={service_name="api"}'
 ```
 
-- API on `http://localhost:9000`, console on `http://localhost:9001` (`minioadmin` / `minioadmin`).
-- Preseeded bucket: `pulso`.
+The listener port can differ per checkout; `mix phx.server` prints the one it uses.
 
-To run the integration test suite against MinIO:
+## Documentation
 
-```sh
-PULSO_INTEGRATION=1 mix test --only integration
-```
+The [documentation](docs/README.md) covers deploying Pulso with the Helm chart or container image published with every release, configuration, sending telemetry, querying, limits, and monitoring Pulso itself. The [architecture](docs/architecture.md) explains the design.
 
-Every `PULSO_MINIO_*` variable defaults to the values docker-compose sets up, so no other environment is needed when running against the local stack.
+## Contributing
 
-## 🛠️ Development
+Run `mix precommit` before opening a pull request; it runs the same compile, format, and test checks as CI. [`AGENTS.md`](AGENTS.md) describes the codebase conventions.
 
-Before opening a pull request:
+## License
 
-```sh
-mix precommit
-```
-
-This runs `mix compile --warnings-as-errors`, `mix deps.unlock --unused`, `mix format`, and `mix test` — the same checks CI runs.
-
-## 📄 License
-
-Pulso is released under the [MIT License](./LICENSE).
-
-## Metrics queries
-
-Prometheus `remote_write` samples ingested at `POST /api/v1/write` can be queried
-through the read-only `query_promql` [Model Context Protocol](https://modelcontextprotocol.io/) tool.
-Its `tenant` and `query` arguments are required. `end_ts_ns` selects the instant
-evaluation time (defaults to now); adding `start_ts_ns` and a positive `step_ms`
-selects a range query.
-
-The initial [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/)
-subset supports selectors, `rate`, `increase`, `irate`, `delta`, five over-time
-functions (`sum`, `avg`, `min`, `max`, `count`), and nested vector aggregations
-with `by`/`without` grouping. For example:
-
-```text
-sum by (job) (rate(http_requests_total{job="api"}[5m]))
-avg without (instance) (process_resident_memory_bytes)
-```
-
-Compatibility endpoints `GET|POST /api/v1/query` and `/api/v1/query_range` accept
-Prometheus parameters (`query`, `time`, or `start`/`end`/`step`) and the same
-`X-Scope-OrgID` tenant and authorization headers as ingestion. Timestamps accept
-Unix seconds or date-time strings with a timezone; steps accept seconds or
-unit durations such as `15s`. Client `timeout` values are accepted and capped at ten seconds. Results use Prometheus vector or matrix envelopes.
-
-Queries have sample, work, result, time, and heap budgets. Conflicting samples at the same timestamp resolve deterministically with a warning. Unsupported parameter overrides and expressions return an error. Binary operations, scalar expressions,
-subqueries, histograms, negative offsets, `@`, and stale-marker semantics are
-not included yet. See [the architecture](docs/architecture.md) for query limits
-and the remaining compatibility gaps.
+Pulso is released under the [MIT License](LICENSE).
