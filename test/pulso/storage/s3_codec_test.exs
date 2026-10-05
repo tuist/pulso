@@ -39,6 +39,27 @@ defmodule Pulso.Storage.S3CodecTest do
       end
     end
 
+    test "bounded footer statistics preserve long Unicode data and exact time filters" do
+      prefix = String.duplicate("界🌍", 1000)
+
+      records =
+        for ts <- [10, 20],
+            do: %Log{
+              timestamp_ns: ts,
+              service: prefix <> "#{ts}",
+              body: prefix <> "#{ts}",
+              attributes: %{"context" => prefix},
+              resource: %{"long" => prefix}
+            }
+
+      assert {:ok, payload, 10, 20} = S3.encode_segment(:logs, records)
+      assert {:ok, decoded} = S3.decode_segment(:logs, payload, nil, nil, [])
+      assert canonicalize(decoded) == canonicalize(records)
+      assert {:ok, [selected]} = S3.decode_segment(:logs, payload, 20, 20, service: prefix <> "20")
+      assert selected == List.last(records)
+      assert {:ok, []} = S3.decode_segment(:logs, payload, 21, nil, [])
+    end
+
     test "preserves the caller's timestamp bounds" do
       records = for ts <- [50, 10, 30], do: %Log{timestamp_ns: ts}
       assert {:ok, _payload, 10, 50} = S3.encode_segment(:logs, records)

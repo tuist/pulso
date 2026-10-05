@@ -14,6 +14,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
+  alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.MetricsCompactor
@@ -94,6 +95,89 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     Agent.get_and_update(agent, fn state ->
       {Enum.count(state.reads, &String.ends_with?(&1, ".parquet")), %{state | reads: []}}
     end)
+  end
+
+  test "first registration publishes one complete manifest and exposes no uncommitted cache", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}})
+    supervisor = start_supervised!(Task.Supervisor)
+
+    append =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "api"}])
+      end)
+
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 5_000
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    {_, body} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, key))
+    assert {:ok, %Manifest{segments: [segment]}} = Manifest.decode(body)
+    assert segment.row_count == 1
+    assert segment.byte_size > 0
+    assert segment.log_services == ["api"]
+    assert Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", key} end)) == 1
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    send(writer, {:release_storage, key})
+    assert Task.await(append, 10_000) == :ok
+    assert %{etag: etag} = ManifestCache.get(ctx.tenant, "logs")
+    assert is_binary(etag)
+  end
+
+  test "read-only legacy migration still durably creates a missing manifest", ctx do
+    records = [%Log{timestamp_ns: 1, service: "legacy"}]
+    {:ok, payload, mn, mx} = S3.encode_segment(:logs, records)
+    key = S3.object_key(ctx.tenant, "logs", mn, mx, "legacy", nil)
+    assert {:ok, _} = ObjectStore.put(ctx.config, key, payload)
+    assert {:ok, ^records} = S3.query(:logs, ctx.tenant, [])
+    manifest_key = Manifest.manifest_key(ctx.tenant, "logs")
+    assert {:ok, _, body} = ObjectStore.get_if_none_match(ctx.config, manifest_key, nil)
+    assert {:ok, %Manifest{segments: [%Segment{key: ^key}]}} = Manifest.decode(body)
+    assert Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", manifest_key} end)) == 1
+  end
+
+  test "log service pruning survives cache reload and unknown legacy summaries still scan", ctx do
+    assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "wanted"}])
+    assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 2, service: "other"}])
+    {:ok, entry} = ManifestOwner.ensure_loaded(ctx.tenant, "logs", ctx.config)
+    other = Enum.find(entry.manifest.segments, &(&1.log_services == ["other"]))
+    assert {:ok, _} = ObjectStore.put(ctx.config, other.key, "corrupt")
+    ManifestCache.drop(ctx.tenant, "logs")
+    assert {:ok, [%Log{service: "wanted"}]} = S3.query(:logs, ctx.tenant, matchers: [{"service_name", :eq, "wanted"}])
+    assert {:error, _} = S3.query(:logs, ctx.tenant, [])
+
+    legacy = %{entry.manifest | segments: Enum.map(entry.manifest.segments, &%{&1 | log_services: nil})}
+
+    assert {:ok, _} =
+             ObjectStore.put(
+               ctx.config,
+               Manifest.manifest_key(ctx.tenant, "logs"),
+               legacy |> Manifest.encode() |> IO.iodata_to_binary()
+             )
+
+    ManifestCache.drop(ctx.tenant, "logs")
+    assert {:error, _} = S3.query(:logs, ctx.tenant, service: "wanted")
+  end
+
+  test "exact arbitrary metric labels prune corrupt unrelated segments after cache reload", ctx do
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(1, 1.0, "a")])
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(2, 2.0, "b")])
+    other = Enum.find(load(ctx).segments, &(&1.metric_labels == %{"host" => ["b"]}))
+    assert {:ok, _} = ObjectStore.put(ctx.config, other.key, "corrupt")
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert {:ok, [%MetricSample{value: 1.0}]} = S3.query(:metrics, ctx.tenant, matchers: [{"host", :eq, "a"}])
+    assert {:error, _} = S3.query(:metrics, ctx.tenant, [])
+  end
+
+  test "compaction rebuilds complete metric label sets without excluding samples", ctx do
+    for ts <- 1..4,
+        do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1, "a"), sample(ts, ts / 1, "b")]))
+
+    matchers = [{"host", :eq, "a"}]
+    before = S3.query(:metrics, ctx.tenant, matchers: matchers)
+    assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert S3.query(:metrics, ctx.tenant, matchers: matchers) == before
+    assert [%Segment{metric_labels: %{"host" => ["a", "b"]}}] = load(ctx).segments
   end
 
   test "an absent value is rejected while finite samples survive compaction and evaluation", ctx do

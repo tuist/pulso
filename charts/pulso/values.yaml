@@ -58,6 +58,13 @@ metricsCompaction:
   # of which objects are live. See docs/configuration.md.
   enabled: false
 
+ingestBatching:
+  # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
+  # 0 disables it; 1..1000 adds up to that many ms before durable publication.
+  # Buffers hold at most 128 callers, 100000 rows and 10 MiB of estimated terms.
+  # Overflow uses the original direct path. Keyed requests always remain direct.
+  flushIntervalMs: 0
+
 mcp:
   # Browser origins allowed to call POST /mcp. Requests without an Origin
   # header (most agents and servers) are always accepted.

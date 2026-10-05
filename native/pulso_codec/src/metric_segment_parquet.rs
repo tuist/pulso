@@ -158,7 +158,7 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
 
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
     let mut buf: Vec<u8> = Vec::with_capacity(64 + rows.len() * 32);
-    let props = writer_properties();
+    let props = writer_properties(row_group_size(&rows));
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
@@ -390,19 +390,45 @@ fn append_string(b: &mut StringBuilder, bytes: &[u8]) {
     }
 }
 
-fn writer_properties() -> WriterProperties {
+// A long sorted series can fill whole groups with a narrow time interval,
+// making 8192-row timestamp statistics useful. Short series runs mix many
+// time intervals in every group; larger groups avoid repeated dictionaries
+// and footer overhead there. Hash collisions can only choose smaller groups,
+// never change sample identity or filtering.
+fn row_group_size(rows: &[Row]) -> usize {
+    if rows.len() <= 8192 {
+        return 8192;
+    }
+    let mut previous = None;
+    let mut run = 0;
+    for row in rows {
+        if previous == Some(row.series_id) {
+            run += 1;
+        } else {
+            previous = Some(row.series_id);
+            run = 1;
+        }
+        if run >= 8192 {
+            return 8192;
+        }
+    }
+    65_536
+}
+
+fn writer_properties(max_rows: usize) -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        // Smaller row groups than parquet-rs's default (1M rows): the
-        // metric read path prunes by row-group `timestamp_ns` stats
-        // before any column pages are read, so narrower groups let
-        // a tighter time filter skip proportionally more of the
-        // segment. 8192 rows is a decent compromise — large enough
-        // that zstd on each group still gets its context, small
-        // enough that a 10 000-sample segment splits into two groups.
-        .set_max_row_group_size(8192);
+        // The current decoder reads whole selected row groups, not row-number
+        // page seeks, so offset indexes only increase object metadata.
+        .set_offset_index_disabled(true)
+        // Bound uncompressed label extrema in the footer, not the stored
+        // labels. Truncated string bounds remain conservative for readers.
+        .set_statistics_truncate_length(Some(64))
+        // Bound all groups well below parquet-rs's million-row default;
+        // preserve narrow groups when long series runs enable time pruning.
+        .set_max_row_group_size(max_rows);
 
     // Delta-binary-packed on the sort key: back-to-back samples for the
     // same series differ by a scrape interval, which packs down to a few
@@ -812,4 +838,47 @@ fn labels_match(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(series_id: i64, timestamp_ns: i64) -> Row {
+        Row {
+            series_id,
+            timestamp_ns,
+            value: 1.0,
+            metric_name: b"work".to_vec(),
+            labels_canonical: b"host\xffnode\xff".to_vec(),
+            labels_json: b"{\"host\":\"node\"}".to_vec(),
+        }
+    }
+
+    #[test]
+    fn grouping_retains_time_pruning_for_long_series_and_batches_small_inputs() {
+        let small: Vec<_> = (0..100).map(|i| row(i, i)).collect();
+        assert_eq!(row_group_size(&small), 8192);
+        let short_runs: Vec<_> = (0..20_000).map(|i| row(i / 10, i)).collect();
+        assert_eq!(row_group_size(&short_runs), 65_536);
+        let long_run: Vec<_> = (0..20_000).map(|i| row(1, i)).collect();
+        assert_eq!(row_group_size(&long_run), 8192);
+
+        for rows in [short_runs, long_run] {
+            let batch = build_batch(&rows).unwrap();
+            let mut buf = Vec::new();
+            let props = writer_properties(row_group_size(&rows));
+            let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf)).unwrap();
+            assert_eq!(builder.metadata().file_metadata().num_rows(), 20_000);
+            let expected = if rows[0].series_id == rows.last().unwrap().series_id {
+                3
+            } else {
+                1
+            };
+            assert_eq!(builder.metadata().num_row_groups(), expected);
+        }
+    }
 }

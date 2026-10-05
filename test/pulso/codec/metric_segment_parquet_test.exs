@@ -42,6 +42,17 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert is_integer(decoded.series_id)
   end
 
+  test "bounded footer statistics do not truncate long Unicode labels or time bounds" do
+    prefix = String.duplicate("界🌍", 1000)
+    samples = for ts <- [10, 20], do: sample(ts, ts / 1, %{"__name__" => "long", "context" => prefix <> "#{ts}"})
+    {payload, 10, 20, 2} = encode!(samples)
+    decoded = decode!(payload) |> Enum.sort_by(& &1.timestamp_ns)
+    assert Enum.map(decoded, & &1.labels) == Enum.map(samples, & &1.labels)
+    assert [kept] = decode!(payload, start_ts: 20, end_ts: 20, matchers: [{"context", :eq, prefix <> "20"}])
+    assert kept.value == 20.0
+    assert decode!(payload, start_ts: 21) == []
+  end
+
   test "does not encode an unsupported value beside a finite sample" do
     labels = %{"__name__" => "up"}
     assert :fallback = NIF.encode_metric_segment_parquet([sample(1, 1.0, labels), sample(2, nil, labels)])

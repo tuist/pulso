@@ -29,6 +29,7 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_S3_ALLOW_HTTP` | `false` | Allow a plain-HTTP storage endpoint. Use only for storage on a private network. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
+| `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request record and attribute budgets for ingestion. |
 | `PHX_HOST` | `example.com` | Host name used when Pulso generates absolute URLs. Pulso does not currently emit any, so this can stay unset. |
 
@@ -103,6 +104,36 @@ modify that prefix. Its readiness check lists the `.pulso/` prefix. Do not confi
 bucket lifecycle rules that expire objects under `tenants/`: Pulso tracks live
 objects in per-tenant manifests and does not yet implement retention, so an
 object that disappears underneath it makes queries fail.
+
+## Ingest coalescing
+
+Set `PULSO_INGEST_FLUSH_INTERVAL_MS=50` (chart `ingestBatching.flushIntervalMs: 50`)
+to let concurrent unkeyed requests for the same tenant and signal share a Parquet
+segment and manifest publication. It is disabled by default. Keyed requests
+always use the original direct path, preserving their retry fingerprints.
+Sequential producers cannot share a flush, so they gain no request savings.
+
+Each node-local buffer reserves at most 128 callers, 100,000 rows, and 10 MiB of
+estimated input term bytes, including work already executing. Oversized requests
+and overflow go through the original unbuffered path, not an unbounded queue.
+These bounds are not node-wide ingest rate limits or exact heap-memory ceilings;
+encoding and the request processes need additional memory. Idle buffers terminate
+after 30 seconds. Buffers for different tenants, signals, or storage configurations
+are isolated.
+
+The window adds up to its configured delay before storage I/O. Every request
+still waits for the shared segment PUT and manifest conditional write before
+acknowledgment. No local WAL is introduced; a node crash before acknowledgment
+requires collector retry. Unkeyed delivery remains at-least-once: a lost response
+and retry can duplicate data, just as on the unbuffered path. A shared storage
+failure fails all requests in that flush; it never falls back to individual writes
+after an ambiguous publication. Invalid encodings are isolated before upload.
+
+Enable this on a test deployment first. Compare provider PUT counts, received and
+acknowledged records, failures, node memory, and delivery latency. Larger source
+batches and low concurrency may already make coalescing unnecessary. Disable it
+by setting the window back to `0` and restarting nodes; stored data needs no
+migration.
 
 ## Metrics compaction
 
