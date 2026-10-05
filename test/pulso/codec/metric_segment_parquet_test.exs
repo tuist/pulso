@@ -98,6 +98,27 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert Enum.all?(decoded, &(&1.labels == labels))
   end
 
+  test "writer metadata reuse preserves varying IDs, Unicode labels, and invalid input rejection" do
+    labels = %{"__name__" => "counter", "instance" => "é😀\"\\\n"}
+
+    samples = [
+      sample(1, 1, labels),
+      %{sample(2, 2, labels) | series_id: 42},
+      sample(3, 3, %{}),
+      sample(4, 4, labels)
+    ]
+
+    {payload, _, _, _} = encode!(samples)
+    decoded = decode!(payload) |> Enum.sort_by(& &1.timestamp_ns)
+    assert Enum.map(decoded, & &1.labels) == Enum.map(samples, & &1.labels)
+    assert Enum.at(decoded, 1).series_id == 42
+    assert hd(decoded).series_id == List.last(decoded).series_id
+
+    for invalid <- [%{labels | "instance" => :invalid}, %{bad: "value"}, nil] do
+      assert :fallback = NIF.encode_metric_segment_parquet([hd(samples), %{hd(samples) | labels: invalid}])
+    end
+  end
+
   test "same label set hashes to the same series_id across samples" do
     labels = %{"__name__" => "cpu", "instance" => "node-1"}
     a = sample(10, 0.1, labels)
