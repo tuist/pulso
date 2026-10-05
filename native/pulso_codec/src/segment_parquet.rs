@@ -355,6 +355,13 @@ fn writer_properties() -> WriterProperties {
         .set_column_dictionary_enabled(ColumnPath::from("severity_number"), true)
         .set_column_dictionary_enabled(ColumnPath::from("severity_text"), true)
         .set_column_dictionary_enabled(ColumnPath::from("service"), true)
+        // Trace/span identifiers are usually unique. A dictionary adds an
+        // index stream without removing payload bytes; pack their lengths
+        // instead and let zstd compress the contiguous identifier bytes.
+        .set_column_dictionary_enabled(ColumnPath::from("trace_id"), false)
+        .set_column_encoding(ColumnPath::from("trace_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
+        .set_column_dictionary_enabled(ColumnPath::from("span_id"), false)
+        .set_column_encoding(ColumnPath::from("span_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
         .set_statistics_enabled(EnabledStatistics::Page)
         .build()
 }
