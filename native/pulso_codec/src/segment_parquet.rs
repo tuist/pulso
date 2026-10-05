@@ -339,7 +339,7 @@ fn append_bytes(builder: &mut StringBuilder, bytes: &[u8]) {
 fn writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         // Delta packing on timestamps requires dictionary encoding off
         // for those columns; the Parquet spec disallows both at once.
         .set_column_encoding(

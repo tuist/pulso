@@ -393,7 +393,7 @@ fn append_string(b: &mut StringBuilder, bytes: &[u8]) {
 fn writer_properties() -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
         // Smaller row groups than parquet-rs's default (1M rows): the
         // metric read path prunes by row-group `timestamp_ns` stats
