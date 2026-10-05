@@ -146,6 +146,7 @@ defmodule Pulso.PromQL.Evaluator do
     case Storage.query(:metrics, tenant, opts) do
       {:ok, samples} -> {:ok, samples}
       {:error, reason} when reason in [:query_sample_limit, :query_scan_limit, :query_timeout] -> {:error, reason}
+      {:error, :non_finite_sample_value} -> {:error, :invalid_stored_sample}
       {:error, reason} -> {:error, {:storage_error, reason}}
     end
   end

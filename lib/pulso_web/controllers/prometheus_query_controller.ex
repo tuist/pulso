@@ -37,6 +37,9 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, :query_overloaded} ->
         error(conn, :too_many_requests, "execution", "Query capacity is busy; retry later.")
 
+      {:error, :invalid_stored_sample} ->
+        error(conn, :internal_server_error, "execution", "Stored metric data contains an unsupported sample value.")
+
       {:error, {:storage_error, _}} ->
         error(conn, :service_unavailable, "execution", "Metric storage is unavailable.")
 

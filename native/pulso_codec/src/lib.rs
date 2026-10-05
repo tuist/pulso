@@ -54,6 +54,7 @@ mod atoms {
         fallback,
         too_big,
         query_sample_limit,
+        non_finite_sample_value,
         storage,
         lines,
         eq,
@@ -550,6 +551,9 @@ fn decode_metrics<'a>(
         Ok(records) => (atoms::ok(), records).encode(env),
         Err(metric_segment_parquet::DecodeError::TooManySamples) => {
             (atoms::error(), atoms::query_sample_limit()).encode(env)
+        }
+        Err(metric_segment_parquet::DecodeError::NonFiniteValue) => {
+            (atoms::error(), atoms::non_finite_sample_value()).encode(env)
         }
         Err(_) => atoms::fallback().encode(env),
     }
