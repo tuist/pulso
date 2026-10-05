@@ -42,6 +42,17 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert is_integer(decoded.series_id)
   end
 
+  test "bounded footer statistics do not truncate long Unicode labels or time bounds" do
+    prefix = String.duplicate("界🌍", 1000)
+    samples = for ts <- [10, 20], do: sample(ts, ts / 1, %{"__name__" => "long", "context" => prefix <> "#{ts}"})
+    {payload, 10, 20, 2} = encode!(samples)
+    decoded = decode!(payload) |> Enum.sort_by(& &1.timestamp_ns)
+    assert Enum.map(decoded, & &1.labels) == Enum.map(samples, & &1.labels)
+    assert [kept] = decode!(payload, start_ts: 20, end_ts: 20, matchers: [{"context", :eq, prefix <> "20"}])
+    assert kept.value == 20.0
+    assert decode!(payload, start_ts: 21) == []
+  end
+
   test "does not encode an unsupported value beside a finite sample" do
     labels = %{"__name__" => "up"}
     assert :fallback = NIF.encode_metric_segment_parquet([sample(1, 1.0, labels), sample(2, nil, labels)])
@@ -173,6 +184,24 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     {payload, _, _, _} = encode!(samples)
     assert decode!(payload) == samples
     assert decode!(payload, start_ts: 1000, end_ts: 1100) == Enum.slice(samples, 999, 101)
+  end
+
+  test "dictionary reuse preserves changing labels across adaptive row groups" do
+    samples =
+      for series <- 1..2, ts <- 1..9_000 do
+        labels = %{"__name__" => "counter", "instance" => String.duplicate("node-#{series}", 100)}
+        %{sample(ts, ts * 1.0, labels) | series_id: series}
+      end
+
+    {payload, 1, 9_000, 18_000} = encode!(samples)
+    assert decode!(payload) == samples
+
+    matchers = [{"instance", :eq, String.duplicate("node-2", 100)}]
+    expected = Enum.filter(samples, &(&1.series_id == 2 and &1.timestamp_ns >= 8_999))
+    assert decode!(payload, start_ts: 8_999, matchers: matchers) == expected
+
+    assert {:error, :query_sample_limit} =
+             NIF.decode_metric_segment_parquet_bounded(payload, nil, nil, matchers, 8_999)
   end
 
   test "same label set hashes to the same series_id across samples" do

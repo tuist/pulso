@@ -34,12 +34,14 @@
 use crate::stable_hash;
 
 use arrow::array::{
-    Array, BinaryArray, BinaryBuilder, DictionaryArray, Float64Array, Float64Builder, Int64Array, Int64Builder,
-    RecordBatch, StringBuilder,
+    Array, BinaryArray, BinaryBuilder, DictionaryArray, Float64Array, Float64Builder, Int64Array,
+    Int64Builder, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::RowGroupMetaData;
@@ -163,12 +165,12 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     });
 
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
+    let props = writer_properties(row_group_size(&rows));
     // Arrow owns the finished columns now. Do not retain the input row
     // metadata through compression, when writer buffers are at their peak.
     drop(rows);
     drop(previous_labels);
     let mut buf: Vec<u8> = Vec::with_capacity(64 + len * 32);
-    let props = writer_properties();
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
@@ -260,7 +262,8 @@ fn encode_labels<'a>(labels_term: Term<'a>) -> Result<EncodedLabels, EncodeError
         pairs.push((kb.as_slice(), vb.as_slice()));
     }
     pairs.sort_by(|a, b| a.0.cmp(b.0));
-    let metric_name = pairs.iter()
+    let metric_name = pairs
+        .iter()
         .find(|(name, _)| *name == b"__name__")
         .map(|(_, value)| value.to_vec())
         .unwrap_or_default();
@@ -410,19 +413,45 @@ fn append_string(b: &mut StringBuilder, bytes: &[u8]) {
     }
 }
 
-fn writer_properties() -> WriterProperties {
+// A long sorted series can fill whole groups with a narrow time interval,
+// making 8192-row timestamp statistics useful. Short series runs mix many
+// time intervals in every group; larger groups avoid repeated dictionaries
+// and footer overhead there. Hash collisions can only choose smaller groups,
+// never change sample identity or filtering.
+fn row_group_size(rows: &[Row]) -> usize {
+    if rows.len() <= 8192 {
+        return 8192;
+    }
+    let mut previous = None;
+    let mut run = 0;
+    for row in rows {
+        if previous == Some(row.series_id) {
+            run += 1;
+        } else {
+            previous = Some(row.series_id);
+            run = 1;
+        }
+        if run >= 8192 {
+            return 8192;
+        }
+    }
+    65_536
+}
+
+fn writer_properties(max_rows: usize) -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        // Smaller row groups than parquet-rs's default (1M rows): the
-        // metric read path prunes by row-group `timestamp_ns` stats
-        // before any column pages are read, so narrower groups let
-        // a tighter time filter skip proportionally more of the
-        // segment. 8192 rows is a decent compromise — large enough
-        // that zstd on each group still gets its context, small
-        // enough that a 10 000-sample segment splits into two groups.
-        .set_max_row_group_size(8192);
+        // The current decoder reads whole selected row groups, not row-number
+        // page seeks, so offset indexes only increase object metadata.
+        .set_offset_index_disabled(true)
+        // Bound uncompressed label extrema in the footer, not the stored
+        // labels. Truncated string bounds remain conservative for readers.
+        .set_statistics_truncate_length(Some(64))
+        // Bound all groups well below parquet-rs's million-row default;
+        // preserve narrow groups when long series runs enable time pruning.
+        .set_max_row_group_size(max_rows);
 
     // Delta-binary-packed on the sort key: back-to-back samples for the
     // same series differ by a scrape interval, which packs down to a few
@@ -503,13 +532,24 @@ pub fn decode<'a>(
     if labels_field.data_type() != &DataType::Binary {
         return Err(DecodeError::Reader);
     }
-    fields[4] = Arc::new(labels_field.as_ref().clone().with_data_type(
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+    fields[4] = Arc::new(
+        labels_field
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Binary),
+            )),
+    );
+    let read_schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.schema().metadata().clone(),
     ));
-    let read_schema = Arc::new(Schema::new_with_metadata(fields, metadata.schema().metadata().clone()));
     let read_metadata = ArrowReaderMetadata::try_new(
-        Arc::clone(metadata.metadata()), ArrowReaderOptions::new().with_schema(read_schema),
-    ).map_err(|_| DecodeError::Reader)?;
+        Arc::clone(metadata.metadata()),
+        ArrowReaderOptions::new().with_schema(read_schema),
+    )
+    .map_err(|_| DecodeError::Reader)?;
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, read_metadata);
 
     // Column projection: only the four columns the decoder actually
@@ -533,8 +573,8 @@ pub fn decode<'a>(
     // Row-group pruning: when a time filter is set, consult each row
     // group's `timestamp_ns` min/max chunk stats and only read the
     // groups that could contain surviving rows. The segment writer
-    // caps groups at 8192 rows, so a tight filter reads a strict
-    // fraction of the segment and skips the rest without opening any
+    // caps groups at 8192 rows for long series runs and 65536 otherwise,
+    // so a tight filter can skip irrelevant groups without opening any
     // column pages.
     let metadata = builder.metadata().clone();
     let ts_col: Option<usize> = metadata
@@ -589,18 +629,27 @@ pub fn decode<'a>(
         // `series_id`, so every label slice is returned as a sub-binary
         // of the arena without a per-row JSON parse.
         let labels_dict = col::<DictionaryArray<Int32Type>>(&batch, 3)?;
-        let labels_arr = labels_dict.values().as_any().downcast_ref::<BinaryArray>()
+        let labels_arr = labels_dict
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
             .ok_or(DecodeError::Reader)?;
         let same_dictionary = previous_arena.as_ref().is_some_and(|(values, _)| {
-            values.as_any().downcast_ref::<BinaryArray>().is_some_and(|previous| {
-                previous.value_data().as_ptr() == labels_arr.value_data().as_ptr()
-                    && previous.value_data().len() == labels_arr.value_data().len()
-                    && previous.value_offsets().as_ptr() == labels_arr.value_offsets().as_ptr()
-                    && previous.value_offsets().len() == labels_arr.value_offsets().len()
-            })
+            values
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .is_some_and(|previous| {
+                    previous.value_data().as_ptr() == labels_arr.value_data().as_ptr()
+                        && previous.value_data().len() == labels_arr.value_data().len()
+                        && previous.value_offsets().as_ptr() == labels_arr.value_offsets().as_ptr()
+                        && previous.value_offsets().len() == labels_arr.value_offsets().len()
+                })
         });
         if !same_dictionary {
-            previous_arena = Some((Arc::clone(labels_dict.values()), BinaryArena::from(env, labels_arr)));
+            previous_arena = Some((
+                Arc::clone(labels_dict.values()),
+                BinaryArena::from(env, labels_arr),
+            ));
         }
         let labels_arena = &previous_arena.as_ref().ok_or(DecodeError::Reader)?.1;
         // The whole-column byte view — the per-row canonical slices we
@@ -680,7 +729,8 @@ pub fn decode<'a>(
                         let name_off = (name.as_ptr() as usize) - base;
                         let value_off = (value.as_ptr() as usize) - base;
                         name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
-                        value_terms.push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
+                        value_terms
+                            .push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
                     }
                     let term = Term::map_from_arrays(env, &name_terms, &value_terms)
                         .map_err(|_| DecodeError::Reader)?;
@@ -698,14 +748,20 @@ pub fn decode<'a>(
             ];
             let record = match previous_record {
                 Some((mut record, previous_fields)) => {
-                    for ((key, field), previous) in keys.iter().zip(fields.iter()).zip(previous_fields.iter()) {
+                    for ((key, field), previous) in
+                        keys.iter().zip(fields.iter()).zip(previous_fields.iter())
+                    {
                         if field.as_c_arg() != previous.as_c_arg() && field != previous {
-                            record = record.map_update(*key, *field).map_err(|_| DecodeError::Reader)?;
+                            record = record
+                                .map_update(*key, *field)
+                                .map_err(|_| DecodeError::Reader)?;
                         }
                     }
                     record
                 }
-                None => Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?,
+                None => {
+                    Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?
+                }
             };
             previous_record = Some((record, fields));
             records.push(record);
@@ -898,4 +954,51 @@ fn labels_match(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(series_id: i64, timestamp_ns: i64) -> Row {
+        Row {
+            series_id,
+            timestamp_ns,
+            value: 1.0,
+            labels: Rc::new(EncodedLabels {
+                series_hash: stable_hash::stable_hash([(b"host".as_slice(), b"node".as_slice())])
+                    as i64,
+                metric_name: b"work".to_vec(),
+                canonical: b"host\xffnode\xff".to_vec(),
+                json: b"{\"host\":\"node\"}".to_vec(),
+            }),
+        }
+    }
+
+    #[test]
+    fn grouping_retains_time_pruning_for_long_series_and_batches_small_inputs() {
+        let small: Vec<_> = (0..100).map(|i| row(i, i)).collect();
+        assert_eq!(row_group_size(&small), 8192);
+        let short_runs: Vec<_> = (0..20_000).map(|i| row(i / 10, i)).collect();
+        assert_eq!(row_group_size(&short_runs), 65_536);
+        let long_run: Vec<_> = (0..20_000).map(|i| row(1, i)).collect();
+        assert_eq!(row_group_size(&long_run), 8192);
+
+        for rows in [short_runs, long_run] {
+            let batch = build_batch(&rows).unwrap();
+            let mut buf = Vec::new();
+            let props = writer_properties(row_group_size(&rows));
+            let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf)).unwrap();
+            assert_eq!(builder.metadata().file_metadata().num_rows(), 20_000);
+            let expected = if rows[0].series_id == rows.last().unwrap().series_id {
+                3
+            } else {
+                1
+            };
+            assert_eq!(builder.metadata().num_row_groups(), expected);
+        }
+    }
 }

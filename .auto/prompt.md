@@ -1,5 +1,8 @@
 # Autoresearch: stateless node memory and request capacity
 
+## Independent experiment histories
+The storage-cost session merged from origin/main is preserved separately in `.auto/storage-cost-prompt.md`, `.auto/storage-cost-ideas.md`, and `.auto/storage-cost-log.jsonl`, with `.auto/storage-cost-measure.sh` and `.auto/storage-cost-checks.sh` as its entry points. The existing `.auto/measure.sh`, `.auto/checks.sh`, and `.auto/log.jsonl` remain the memory-capacity session. Do not mix their scores or histories.
+
 ## Objective
 Improve Pulso's Rust-backed request hot paths without changing results, protocol semantics, durability, admission limits, or storage format. Work in this active worktree, do not create a branch/worktree. User requested memory optimization and more requests handled, explicitly no benchmark cheating or overfitting.
 

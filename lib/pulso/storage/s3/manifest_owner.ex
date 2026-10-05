@@ -300,26 +300,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       timer_ref: nil
     }
 
-    {:ok, state, {:continue, :load}}
-  end
-
-  @impl GenServer
-  def handle_continue(:load, state) do
-    case load_manifest(state) do
-      {:ok, manifest, etag} ->
-        ManifestCache.put(state.tenant, state.signal, manifest, etag)
-
-        {:noreply, %{state | manifest: manifest, etag: etag, loaded?: true}, @idle_hibernate_ms}
-
-      {:error, reason} ->
-        # We do NOT terminate the process — a load failure is transient
-        # (network blip, S3 throttle). Callers will see `{:error, reason}`
-        # on the first `register_segments`/`ensure_loaded` after this,
-        # and retry.
-        Logger.warning("manifest load failed tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}")
-
-        {:noreply, state, @idle_hibernate_ms}
-    end
+    # Load on the first request so an initial registration can create the
+    # complete manifest in its publication CAS, without an intermediate PUT.
+    {:ok, state, @idle_hibernate_ms}
   end
 
   @impl GenServer
@@ -348,9 +331,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     if state.loaded? do
       enqueue_and_maybe_flush(state, from, segments)
     else
-      case load_manifest(state) do
+      case load_manifest(state, false) do
         {:ok, manifest, etag} ->
-          ManifestCache.put(state.tenant, state.signal, manifest, etag)
+          # A rebuilt manifest without an ETag is not yet published. Do not
+          # expose it through the shared query cache until the CAS succeeds.
+          cache_loaded(state, manifest, etag)
 
           state
           |> Map.merge(%{manifest: manifest, etag: etag, loaded?: true})
@@ -372,6 +357,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     # manual `garbage_collect/1` beforehand would be redundant.
     {:noreply, state, :hibernate}
   end
+
+  defp cache_loaded(_state, _manifest, nil), do: :ok
+
+  defp cache_loaded(state, manifest, etag), do: ManifestCache.put(state.tenant, state.signal, manifest, etag)
 
   # ---- flush pipeline -------------------------------------------------------
 
@@ -506,7 +495,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   # ---- initial load / migration ---------------------------------------------
 
-  defp load_manifest(state) do
+  defp load_manifest(state, publish_legacy? \\ true) do
     key = Manifest.manifest_key(state.tenant, state.signal)
 
     case ObjectStore.get_if_none_match(state.config, key, nil) do
@@ -517,7 +506,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         end
 
       {:error, :not_found} ->
-        rebuild_from_prefix(state)
+        rebuild_from_prefix(state, publish_legacy?)
 
       {:error, _} = err ->
         err
@@ -529,26 +518,27 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # PUT it with `put_if_none_match`. If another node beats us to the
   # create, we lose gracefully and reload their version. The LIST is
   # recursive — the `date=/hour=` partitions are swept in one call.
-  defp rebuild_from_prefix(state) do
+  defp rebuild_from_prefix(state, publish_legacy?) do
     prefix = "tenants/#{state.tenant}/v4/signal=#{state.signal}/"
 
     with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
-      publish_rebuilt_manifest(state, keys)
+      publish_rebuilt_manifest(state, keys, publish_legacy?)
     end
   end
 
-  defp publish_rebuilt_manifest(state, keys) do
+  defp publish_rebuilt_manifest(state, keys, publish_legacy?) do
     if Enum.any?(keys, &String.contains?(Path.basename(&1), "-compact-")) do
       # Once compacted, only the manifest can distinguish published replacements
       # from orphan uploads and retired sources. Never guess by listing objects.
       {:error, :compacted_manifest_missing}
     else
-      publish_legacy_manifest(state, keys)
+      manifest = Manifest.merge(Manifest.new(), rebuild_segments(keys))
+
+      if publish_legacy?, do: publish_legacy_manifest(state, manifest), else: {:ok, manifest, nil}
     end
   end
 
-  defp publish_legacy_manifest(state, keys) do
-    manifest = Manifest.merge(Manifest.new(), rebuild_segments(keys))
+  defp publish_legacy_manifest(state, manifest) do
     payload = manifest |> Manifest.encode() |> IO.iodata_to_binary()
     manifest_key = Manifest.manifest_key(state.tenant, state.signal)
 

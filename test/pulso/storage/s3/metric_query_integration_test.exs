@@ -115,7 +115,7 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
              )
 
     assert {:error, :query_scan_limit} =
-             S3.query(:metrics, tenant, max_scan_bytes: 1, matchers: [{"job", :eq, "absent"}])
+             S3.query(:metrics, tenant, max_scan_bytes: 1, matchers: [{"job", :re, "absent"}])
   end
 
   test "sample budgets span multiple segments", %{tenant: tenant} do
@@ -126,7 +126,7 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
     assert length(found) == 4
 
     for budget <- [[max_scan_segments: 1], [max_scan_bytes: 1], [max_scan_rows: 3]] do
-      assert {:error, :query_scan_limit} = S3.query(:metrics, tenant, [{:matchers, [{"job", :eq, "absent"}]} | budget])
+      assert {:error, :query_scan_limit} = S3.query(:metrics, tenant, [{:matchers, [{"job", :re, "absent"}]} | budget])
     end
 
     assert {:error, :query_timeout} = S3.query(:metrics, tenant, deadline_ms: System.monotonic_time(:millisecond) - 1)

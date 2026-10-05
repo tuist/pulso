@@ -66,6 +66,15 @@ Each `(tenant, signal)` has a rendezvous-hashed owner among the current live nod
 Ownership is an *optimization*, not a correctness property. It determines which node is expected to buffer records for a (tenant, signal) and thus have the warmest cache for it. Any node can serve any query; any node can accept any ingest and forward if it isn't the owner.
 
 Implemented ownership currently covers background metrics merge and cleanup.
+Optional unkeyed append buffers are node-local, not rendezvous-owned. They can
+coalesce concurrent requests within a configured 1–1000 ms window before encoding
+one segment. Keyed requests stay on the original direct path. Admission counters
+reserve at most 128 callers, 100,000 rows and 10 MiB of estimated input terms per
+buffer, including queued and executing work; overflow is processed unbuffered.
+Reservations are released by the buffer only after publication finishes, never by
+caller timeouts. Both segment PUT and manifest CAS precede every acknowledgment.
+No local durability or new cluster state is introduced; unkeyed lost-response
+retries still have at-least-once semantics. Idle buffers terminate after 30 seconds.
 `ManifestOwner` is a node-local request coalescer, not a cluster-wide owner;
 conditional object-storage writes arbitrate concurrent ingest from multiple
 nodes. Ingest forwarding, buffered ingest ownership, and alert evaluation remain
@@ -75,6 +84,13 @@ Query caches and query admission limits deliberately remain local to each node.
 ### S3 CAS for manifest updates
 
 Manifest updates use S3 conditional PUT (`If-Match: <etag>` on writes; `If-None-Match: *` for first-time creation). All major S3-compatible providers support this as of 2024.
+
+Initial ingest into a prefix without a manifest reconstructs legacy segments by
+listing, then publishes the rebuilt entries and new segment metadata in one
+conditional creation. There is no intermediate bootstrap manifest PUT. The
+unpublished snapshot does not enter the query cache. Read-first legacy migration
+still publishes its reconstruction before returning, and compacted prefixes
+without a manifest still fail closed.
 
 Under normal operation there is exactly one writer per manifest (the current rendezvous owner), so CAS conflicts do not happen. During failover or a cluster resize, two nodes may briefly race; the loser retries with the new etag. This is the failover mechanism — no explicit election.
 
@@ -172,7 +188,11 @@ latency summaries, distinct decoder-rejected/publication-failed record counts,
 and aggregate payload/progress metrics. Query instrumentation covers HTTP, MCP,
 evaluators, and storage as separate layers. The `Pulso.Metrics` detailed view adds
 route/tool distinctions, purpose-aware object bytes, histograms, and separate
-queue/runtime gauges. Overlapping operation, duration, and compaction family
+queue/runtime gauges. Optional unkeyed append buffers expose active count and
+queued/executing caller, row, and estimated input-byte reservations through
+direct ETS reads, without messaging buffers blocked in storage I/O. These
+estimates are not heap memory measurements, and unbuffered overflow is excluded.
+Overlapping operation, duration, and compaction family
 names use `pulso_detailed_` prefixes; receiver-only delivery counts use
 `pulso_ingest_delivery_records_total`. The two views describe overlapping work
 and must not be summed. Native operations and record publication run once.
@@ -327,6 +347,16 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 
 ### Logs
 
+New segment manifest entries optionally carry `ls`, a complete set of at most
+128 nonempty promoted service values, each at most 256 bytes. Exact `service`
+and `service_name` matchers and the direct service filter prune known irrelevant
+segments before download. A null/empty promoted service can fall back to resource
+labels in native matchers, so such batches omit the summary rather than risk
+false negatives. Legacy, malformed, and over-budget summaries always scan.
+The additive field needs no segment migration; older writers may erase it,
+which only loses the optimization. Other labels and regular expressions remain
+native decoder filters.
+
 - LogQL subset. Label filter + substring/regex match on message.
 - Sort row groups by `(service, ts)`.
 - Sidecar: label→segment posting list; optional token inverted index for `|=`/`!=` filters.
@@ -336,8 +366,9 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 - Ingest wire protocol: **Prometheus `remote_write` v1** (Snappy-compressed protobuf), at `POST /api/v1/write`. Full receiver contract: `Content-Type: application/x-protobuf`, `Content-Encoding: snappy` (strict — unlike Loki push, an absent header is rejected), `X-Prometheus-Remote-Write-Version: 0.*` (0.1.0 in practice), `X-Scope-OrgID` for tenant (defaults to `"default"`), `Idempotency-Key` propagated to storage. `204` on success, `400` for invalid snappy/protobuf, `415` on wrong content-type/encoding, `429` on `:owner_overloaded` backpressure, `5xx` on storage transients. OTLP/HTTP metrics (`/v1/metrics`) is a follow-up PR.
 - Sort row groups by `(series_id, timestamp_ns)`.
 - `series_id` is Pulso's port of Prometheus's `labels.StableHash` — xxhash64 over `name<0xff>value<0xff>…` across labels sorted by name. Byte-exact compatibility with the Go reference is pinned by `native/pulso_codec/src/stable_hash.rs` and its oracle test. Treat `series_id` as an accelerator only — the canonical labels are the identity, and readers must compare them, not the hash.
-- Parquet schema: `series_id Int64`, `timestamp_ns Int64`, `value Float64`, `metric_name Utf8` (dictionary-encoded), `labels_canonical Utf8` (the bytes `StableHash` consumes), `labels_json Utf8` (for materialisation on read). Delta-binary-packed on `timestamp_ns`, zstd column compression.
-- Sidecar: **not yet built.** Manifests now optionally carry a complete metric-name set (shared `names` dictionary and segment `ni` reference on the wire; legacy inline `n` is still read), capped at 128 names of at most 256 bytes each. Exceeding either bound omits the summary entirely rather than truncating it. The dictionary has a 65,536-byte budget per manifest; additional sets remain unknown. Exact `__name__` matchers prune known irrelevant segments before download; absent or malformed summaries remain eligible. Pruning benefits exact-name queries against small or repeated name sets; varied or large batches frequently lose their summary under these budgets. This is an additive manifest field, so existing segments need no migration. Top-label summaries and label postings remain follow-ups.
+- Parquet schema: `series_id Int64`, `timestamp_ns Int64`, `value Float64`, `metric_name Utf8` (dictionary-encoded), `labels_canonical Utf8` (the bytes `StableHash` consumes), `labels_json Utf8` (for materialisation on read). Timestamp dictionaries with delta-binary-packed fallback, zstd column compression. Row groups stay at 8,192 rows for small batches or when a sorted series run reaches that size, preserving useful time pruning. Segments made of shorter series runs use 65,536-row groups to reduce repeated dictionaries and footers; these groups are still bounded well below the library's million-row default. The row-group choice uses `series_id` only as an optimization: collisions can select smaller groups, never alter sample identity or filtering.
+- Sidecar: **not yet built.** Manifests now optionally carry a complete metric-name set (shared `names` dictionary and segment `ni` reference on the wire; legacy inline `n` is still read), capped at 128 names of at most 256 bytes each. Exceeding either bound omits the summary entirely rather than truncating it. The dictionary has a 65,536-byte budget per manifest; additional sets remain unknown. Exact `__name__` matchers prune known irrelevant segments before download; absent or malformed summaries remain eligible. Pruning benefits exact-name queries against small or repeated name sets; varied or large batches frequently lose their summary under these budgets. This is an additive manifest field, so existing segments need no migration. Generic bounded label-value summaries now augment name pruning (below); label postings remain a follow-up.
+- Exact label matchers also prune using optional complete value sets for at most 16 label names chosen from the first sample, excluding `__name__`. Each label has at most 32 values of at most 256 bytes, including `""` for samples missing that label. High-cardinality, long, or invalid values omit that label's summary rather than truncate it; invalid UTF-8 names omit the whole summary because native label JSON can normalize them. Per-segment summaries have a 4 KiB budget. A separate 64 KiB manifest `labels` dictionary deduplicates repeated summaries; segments carry `li` references. Absent, malformed, or budget-exhausted references remain scan-eligible. Compaction computes summaries from the replacement's complete sample set. Older writers may remove summaries but cannot change data. Regular expressions and negative matchers remain decoder filters.
 - Native histograms and exemplars are deliberately out of v1. If OTLP metrics ships before they do, the receiver must reject unsupported histogram/summary types with partial success rather than silently coercing.
 - Caveat: very high active-series cardinality (100M+) may eventually justify a specialized TSDB block layout beside Parquet. Not v1.
 

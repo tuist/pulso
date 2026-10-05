@@ -92,6 +92,44 @@ jobs:
           "$RUNNER_TEMP/prometheus-3.5.0.linux-amd64/promtool" test rules test/fixtures/promql/prometheus.yml
           PULSO_PROMTOOL="$RUNNER_TEMP/prometheus-3.5.0.linux-amd64/promtool" mix test test/pulso/promql/conformance_test.exs
 
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Lint and validate rendered manifests
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" kubeconform
+          digest="sha256\$$(printf '%s' ci-token | sha256sum | cut -d' ' -f1)"
+          args=(--set storage.bucket=ci --set storage.region=us-east-1
+                --set storage.accessKeyId=ci --set storage.secretAccessKey=ci
+                --set-string "tenantTokens.ci=${digest}")
+          helm lint --strict charts/pulso "${args[@]}"
+          helm template pulso charts/pulso "${args[@]}" \
+            --set ingress.enabled=true --set ingress.host=pulso.example.com \
+            --set serviceMonitor.enabled=true --set ingestLimits.max_records=5000 \
+            | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas
+          helm template pulso charts/pulso --set storage.bucket=ci --set storage.region=us-east-1 \
+            --set existingSecret=pulso-credentials \
+            | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas
+          # Required values must fail at render time.
+          if helm template pulso charts/pulso > /dev/null 2>&1; then
+            echo "rendering without required values should fail" >&2
+            exit 1
+          fi
+          if helm template pulso charts/pulso "${args[@]}" --set-string ingestLimits.max_records=oops > /dev/null 2>&1; then
+            echo "rendering with an invalid ingest limit should fail" >&2
+            exit 1
+          fi
+
   integration:
     name: Integration
     runs-on: ubuntu-latest

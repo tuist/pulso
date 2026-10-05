@@ -11,7 +11,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
-  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names]
+  alias Pulso.Storage.S3.MetricLabelSummary
+
+  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names, :log_services, :metric_labels]
 
   @type t :: %__MODULE__{
           key: String.t(),
@@ -19,7 +21,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           max_ts: non_neg_integer() | nil,
           row_count: non_neg_integer() | nil,
           byte_size: non_neg_integer() | nil,
-          metric_names: [String.t()] | nil
+          metric_names: [String.t()] | nil,
+          log_services: [String.t()] | nil,
+          metric_labels: %{String.t() => [String.t()]} | nil
         }
 
   @doc """
@@ -73,7 +77,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     }
 
     base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
-    if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
+    base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
+    base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
+    if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
   end
 
   @doc """
@@ -94,7 +100,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        max_ts: max_ts,
        row_count: row_count,
        byte_size: byte_size,
-       metric_names: valid_names(wire["n"])
+       metric_names: valid_names(wire["n"]),
+       log_services: valid_services(wire["ls"]),
+       metric_labels: MetricLabelSummary.parse(wire["l"])
      }}
   end
 
@@ -127,7 +135,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     names = Enum.reduce_while(records, MapSet.new(), &collect_metric_name/2)
 
     names = if names, do: names |> Enum.map(&:binary.copy/1) |> Enum.sort()
-    %{segment | metric_names: names}
+    %{segment | metric_names: names, metric_labels: MetricLabelSummary.build(records)}
   end
 
   defp collect_metric_name(record, names) do
@@ -148,6 +156,52 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     Enum.all?(matchers, fn
       {"__name__", :eq, value} -> value in names
       _ -> true
+    end)
+  end
+
+  # Only nonempty promoted fields are summarized: null/empty services fall
+  # back to resource labels in the native matcher, so they remain unknown.
+  @doc "Prune metrics only when a complete name or label value set proves an exact mismatch."
+  def matches_metrics?(segment, matchers) do
+    matches_metric_name?(segment, matchers) and MetricLabelSummary.matches?(segment.metric_labels, matchers)
+  end
+
+  defp valid_services([_ | _] = services) do
+    if length(services) <= 128 and
+         Enum.all?(services, &(is_binary(&1) and byte_size(&1) in 1..256)),
+       do: services
+  end
+
+  defp valid_services(_), do: nil
+
+  @doc "Attach a complete bounded set of nonempty promoted log services, or leave it unknown."
+  def summarize_logs(segment, records) do
+    services = Enum.reduce_while(records, MapSet.new(), &collect_log_service/2)
+
+    services = if services, do: services |> Enum.map(&:binary.copy/1) |> Enum.sort()
+    %{segment | log_services: services}
+  end
+
+  defp collect_log_service(%{service: service}, services) when is_binary(service) and byte_size(service) in 1..256 do
+    services = MapSet.put(services, service)
+    if MapSet.size(services) <= 128, do: {:cont, services}, else: {:halt, nil}
+  end
+
+  defp collect_log_service(_record, _services), do: {:halt, nil}
+
+  @doc "Prune known log services for exact promoted-field selectors; unknown summaries always scan."
+  def matches_log_service?(%__MODULE__{log_services: nil}, _opts), do: true
+
+  def matches_log_service?(%__MODULE__{log_services: services}, opts) do
+    direct = Keyword.get(opts, :service)
+    matchers = Keyword.get(opts, :matchers, [])
+
+    Enum.any?(services, fn service ->
+      (is_nil(direct) or service == direct) and
+        Enum.all?(matchers, fn
+          {name, :eq, value} when name in ["service", "service_name"] -> service == value
+          _ -> true
+        end)
     end)
   end
 

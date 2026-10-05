@@ -26,6 +26,13 @@ end
 # Opt in only after all writers understand compaction retirement metadata.
 metrics_compaction_enabled = System.get_env("PULSO_METRICS_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 
+# Optional node-local unkeyed coalescing; disabled unless explicitly enabled.
+ingest_flush_interval_ms =
+  case Integer.parse(System.get_env("PULSO_INGEST_FLUSH_INTERVAL_MS", "0")) do
+    {value, ""} when value in 0..1000 -> value
+    _ -> raise "PULSO_INGEST_FLUSH_INTERVAL_MS must be an integer in 0..1000"
+  end
+
 # Optional per-request ingest budgets. Only supplied environment values
 # override config/config.exs; invalid values fail at startup, not on traffic.
 parse_ingest_limit = fn name, raw ->
@@ -74,6 +81,7 @@ case config_env() do
 
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
+      ingest_flush_interval_ms: ingest_flush_interval_ms,
       bucket: System.get_env("PULSO_S3_BUCKET", "pulso"),
       # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
       # The fallback matches the docker-compose default host port when mise
@@ -130,6 +138,7 @@ case config_env() do
 
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
+      ingest_flush_interval_ms: ingest_flush_interval_ms,
       bucket: require_env.("PULSO_S3_BUCKET"),
       endpoint: System.get_env("PULSO_S3_ENDPOINT"),
       region: require_env.("PULSO_S3_REGION"),

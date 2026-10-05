@@ -53,6 +53,10 @@ defmodule Pulso.MetricsTest do
     assert conn.resp_body =~ "# TYPE pulso_detailed_operation_duration_seconds histogram\n"
     assert conn.resp_body =~ "pulso_manifest_pending_segments 0\n"
     assert conn.resp_body =~ "pulso_query_occupied_slots 0\n"
+    assert conn.resp_body =~ "pulso_ingest_buffers 0\n"
+    assert conn.resp_body =~ "pulso_ingest_buffer_reserved_calls 0\n"
+    assert conn.resp_body =~ "pulso_ingest_buffer_input_bytes 0\n"
+    assert conn.resp_body =~ "pulso_ingest_buffer_rows 0\n"
     assert :ets.tab2list(Metrics) |> Enum.sort() == before
   end
 

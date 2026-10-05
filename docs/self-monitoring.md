@@ -1,8 +1,8 @@
 # Self-monitoring Pulso
 
 Scrape `GET /metrics` on **every node**, not a load-balanced service address that
-alternates nodes. Send scrapes to the existing Prometheus/Grafana Cloud monitoring
-destination during the pilot, **not back into Pulso**. The endpoint exports
+alternates nodes. Send scrapes to a separate monitoring system (for example an existing
+Prometheus), **not back into Pulso**. The endpoint exports
 Prometheus text format 0.0.4 without content negotiation or caching. It reads only
 node-local counters, registry metadata, mailbox lengths, and VM statistics. It
 never queries or appends to signal storage or waits for manifest owners blocked
@@ -17,7 +17,7 @@ operational signals, not accounting ledgers or deployment-readiness gates.
 ## Exposure and independent collection
 
 The endpoint does not authenticate with tenant ingest tokens and shares the
-listener with ingest and MCP. Keep the **entire listener private** for the pilot.
+listener with ingest and MCP. Keep the **entire listener private**.
 Port-level network policy cannot isolate `/metrics` from ingest on that port.
 If ingest or MCP is exposed outside the trusted monitoring network, a path-aware
 proxy **must deny `/metrics` on that ingress**, or require separate monitoring
@@ -44,8 +44,9 @@ scrape_configs:
       - targets: [pulso-node-1.internal:4000]
 ```
 
-A collector must retain its independent destination and retry policy. This
-repository supplies the endpoint, not the Tuist collector or chart rollout.
+A collector must retain its independent destination and retry policy. The
+[Helm chart](deployment.md) can create a Prometheus Operator `ServiceMonitor`
+for this endpoint.
 
 ## Canonical metric contract
 
@@ -103,6 +104,10 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_manifest_mailbox_messages` | Gauge | None | Sum of manifest-owner mailbox lengths |
 | `pulso_manifest_pending_segments` | Gauge | None | Enqueued segments, including segments currently being published |
 | `pulso_manifest_waiting_requests` | Gauge | None | Publication callers, including callers in the current flush |
+| `pulso_ingest_buffers` | Gauge | None | Active optional node-local unkeyed ingest buffers |
+| `pulso_ingest_buffer_reserved_calls` | Gauge | None | Queued and executing requests reserved in unkeyed buffers |
+| `pulso_ingest_buffer_input_bytes` | Gauge | None | Estimated external-term bytes reserved in unkeyed buffers, not actual heap memory |
+| `pulso_ingest_buffer_rows` | Gauge | None | Queued and executing rows reserved in unkeyed buffers |
 | `pulso_query_occupied_slots` | Gauge | None | Registered PromQL tenant slots, including admitted native work that outlives the response deadline |
 | `pulso_vm_memory_bytes` | Gauge | None | Total BEAM-reported memory |
 | `pulso_vm_run_queue` | Gauge | None | BEAM scheduler run-queue length |
@@ -157,11 +162,16 @@ report timeouts immediately.
 Queue gauges are instantaneous snapshots, not admission guarantees. Mailbox
 messages and publication batches are different stages; inspect both. Registry
 cleanup removes terminated owners. Scrapes do not wait for native I/O. PromQL
-slots do not describe all log/raw query concurrency. No new query/ingest admission
-or buffered ingest queues are introduced. Histogram updates may be observed
-partway through an update; metric snapshots are best effort.
+slots do not describe all log/raw query concurrency. Optional [ingest coalescing](configuration.md#ingest-coalescing)
+adds bounded unkeyed input buffers; their gauges read reservation tables directly,
+including while publication is blocked. They include queued and executing inputs,
+not just records waiting for the flush timer. Values are zero when no buffers are
+active. Overflow/oversized input processed directly is not in these gauges.
+There is still no node-wide ingest rate admission. Histogram updates and buffer
+reservation attempts may be observed partway through an update; metric snapshots
+are best effort.
 
-## Useful pilot queries
+## Useful queries
 
 Keep the scrape job and node `instance` label in dashboards:
 
@@ -194,5 +204,5 @@ sum by (instance, operation) (rate(pulso_compaction_timeouts_total[5m]))
 ```
 
 Alert on scrape failure (`up == 0`) through the independent monitor. Choose
-latency, queue, rejection-rate, and compaction thresholds from the measured pilot
+latency, queue, rejection-rate, and compaction thresholds from your measured
 load. Instrumentation alone establishes neither safe capacity nor readiness.

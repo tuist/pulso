@@ -1,0 +1,197 @@
+# Default values for the Pulso chart. See docs/deployment.md for a
+# walkthrough and docs/configuration.md for what each setting does.
+
+image:
+  repository: ghcr.io/tuist/pulso
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Name of an existing Secret holding the sensitive settings. When set, the
+# chart does not render its own Secret and ignores `secretKeyBase`,
+# `tenantTokens`, and the storage credentials below. The Secret must contain
+# these keys:
+#
+#   SECRET_KEY_BASE              at least 64 random characters
+#   PULSO_TENANT_TOKENS          JSON object, tenant name => "sha256$<hex>"
+#   PULSO_S3_ACCESS_KEY_ID       object storage access key
+#   PULSO_S3_SECRET_ACCESS_KEY   object storage secret key
+existingSecret: ""
+
+# Phoenix secret key base. Leave empty to have the chart generate one and keep
+# it across upgrades.
+secretKeyBase: ""
+
+# Tenant name => SHA-256 digest of that tenant's bearer token, written as
+# "sha256$<64 lowercase hex characters>". Store digests, never plaintext
+# tokens. Generate one with:
+#
+#   printf '%s' "$TOKEN" | shasum -a 256 | awk '{print "sha256$" $1}'
+#
+# At least one tenant is required.
+tenantTokens: {}
+#  production: "sha256$5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+
+storage:
+  # Bucket that holds every acknowledged record. Required.
+  bucket: ""
+  # Region name passed to the S3 client. Required, even for providers that
+  # ignore it (use "auto" for Cloudflare R2, for example).
+  region: ""
+  # S3-compatible endpoint URL. Leave empty for Amazon S3.
+  endpoint: ""
+  # Allow a plain-HTTP endpoint. Only for object storage on a private network.
+  allowHttp: false
+  # Static credentials. Pulso does not read ambient cloud credentials, so
+  # these are required unless `existingSecret` provides them.
+  accessKeyId: ""
+  secretAccessKey: ""
+
+metricsCompaction:
+  # Merges small metrics segments in the background. Enable it only once every
+  # Pulso version writing to the bucket supports compaction, and turn on
+  # bucket versioning first: after compaction the manifest is the only record
+  # of which objects are live. See docs/configuration.md.
+  enabled: false
+
+ingestBatching:
+  # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
+  # 0 disables it; 1..1000 adds up to that many ms before durable publication.
+  # Buffers hold at most 128 callers, 100000 rows and 10 MiB of estimated terms.
+  # Overflow uses the original direct path. Keyed requests always remain direct.
+  flushIntervalMs: 0
+
+mcp:
+  # Browser origins allowed to call POST /mcp. Requests without an Origin
+  # header (most agents and servers) are always accepted.
+  allowedOrigins: []
+
+# Per-request ingest budgets, keyed by setting name. Unset keys keep their
+# defaults. See docs/ingest-limits.md.
+ingestLimits: {}
+#  max_records: 10000
+#  max_attributes: 128
+#  max_key_bytes: 256
+#  max_value_bytes: 16384
+#  max_attribute_bytes: 65536
+#  max_depth: 16
+#  max_nodes: 1024
+
+# Additional environment variables for the Pulso container.
+extraEnv: []
+extraEnvFrom: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automount: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 4000
+  annotations: {}
+
+# Optional public ingress. TLS terminates here; Pulso itself serves plain
+# HTTP. Only the listed paths are routed, so the self-monitoring endpoint
+# (/metrics) and the probes stay private. Keep that property if you change
+# `paths`: routing "/" would expose /metrics.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls: []
+  #  - secretName: pulso-tls
+  #    hosts:
+  #      - pulso.example.com
+  paths:
+    - path: /v1/logs
+      pathType: Exact
+    - path: /loki/api/v1
+      pathType: Prefix
+    - path: /api/v1
+      pathType: Prefix
+    - path: /mcp
+      pathType: Exact
+
+# Prometheus Operator ServiceMonitor for Pulso's self-monitoring endpoint.
+# Send these metrics to a monitoring system other than Pulso itself.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+
+# Starting points, not measured capacity. Each node runs at most four
+# concurrent queries with a heap ceiling per query; size memory for that plus
+# ingest traffic, then adjust from the self-monitoring metrics.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+
+# Pulso is supported as a single node today. Rolling updates briefly run two
+# nodes, which object-storage conditional writes keep safe.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Time to finish in-flight requests on shutdown. Collectors retry anything
+# that was not acknowledged.
+terminationGracePeriodSeconds: 30
+# Delay before shutdown so load balancers stop routing to the pod first.
+preStopSleepSeconds: 5
+
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 2
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+# Readiness reflects a background object-storage check that runs every
+# 15 seconds, so a pod becomes ready shortly after storage is reachable.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

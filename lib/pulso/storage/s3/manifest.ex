@@ -70,7 +70,7 @@ defmodule Pulso.Storage.S3.Manifest do
   """
   @spec encode(t()) :: iodata()
   def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor}) do
-    {wire_segments, names} = encode_segments(segments)
+    {wire_segments, names, labels} = encode_segments(segments)
 
     wire = %{
       "v" => version,
@@ -80,6 +80,7 @@ defmodule Pulso.Storage.S3.Manifest do
     }
 
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
+    wire = if labels == [], do: wire, else: Map.put(wire, "labels", labels)
     Pulso.JSON.encode_to_iodata!(wire)
   end
 
@@ -96,7 +97,7 @@ defmodule Pulso.Storage.S3.Manifest do
     with {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(binary),
          :ok <- validate_version(version),
          :ok <- validate_fields(version, wire),
-         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"])),
+         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"]), name_dictionary(wire["labels"])),
          {:ok, retired} <- decode_retired(Map.get(wire, "retired", %{})),
          {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")) do
       {:ok,
@@ -168,33 +169,35 @@ defmodule Pulso.Storage.S3.Manifest do
     e -> {:error, {:decode_failed, e}}
   end
 
-  defp decode_segments(list, dictionary) when is_list(list) do
+  defp decode_segments(list, dictionary, labels) when is_list(list) do
     Enum.reduce_while(list, {:ok, []}, fn wire, {:ok, acc} ->
-      case Segment.from_wire(expand_names(wire, dictionary)) do
+      wire = wire |> expand_names(dictionary) |> expand_labels(labels)
+
+      case Segment.from_wire(wire) do
         {:ok, segment} -> {:cont, {:ok, [segment | acc]}}
         {:error, _} = err -> {:halt, err}
       end
     end)
   end
 
-  defp decode_segments(_, _), do: {:error, :invalid_manifest}
+  defp decode_segments(_, _, _), do: {:error, :invalid_manifest}
 
   # Exact name sets repeat across ingest batches. One dictionary entry per set
   # keeps that repetition off the hot manifest, with a hard byte budget for
   # distinct sets. Omitted sets remain unknown, so budget exhaustion is safe.
   defp encode_segments(segments) do
-    state = %{ids: %{}, names: [], bytes: 2, segments: []}
+    state = %{ids: %{}, names: [], bytes: 2, segments: [], label_ids: %{}, labels: [], label_bytes: 2}
     state = Enum.reduce(segments, state, &encode_segment/2)
-    {Enum.reverse(state.segments), Enum.reverse(state.names)}
+    {Enum.reverse(state.segments), Enum.reverse(state.names), Enum.reverse(state.labels)}
   end
 
   defp encode_segment(segment, state) do
-    wire = Segment.to_wire(segment) |> Map.delete("n")
-
-    case dictionary_id(segment.metric_names, state) do
-      {nil, state} -> %{state | segments: [wire | state.segments]}
-      {id, state} -> %{state | segments: [Map.put(wire, "ni", id) | state.segments]}
-    end
+    wire = Segment.to_wire(segment) |> Map.drop(["n", "l"])
+    {name_id, state} = dictionary_id(segment.metric_names, state)
+    {label_id, state} = label_dictionary_id(segment.metric_labels, state)
+    wire = if is_nil(name_id), do: wire, else: Map.put(wire, "ni", name_id)
+    wire = if is_nil(label_id), do: wire, else: Map.put(wire, "li", label_id)
+    %{state | segments: [wire | state.segments]}
   end
 
   defp dictionary_id(nil, state), do: {nil, state}
@@ -216,6 +219,38 @@ defmodule Pulso.Storage.S3.Manifest do
       {nil, state}
     end
   end
+
+  defp label_dictionary_id(nil, state), do: {nil, state}
+
+  defp label_dictionary_id(labels, state) do
+    case Map.fetch(state.label_ids, labels) do
+      {:ok, id} ->
+        {id, state}
+
+      :error ->
+        bytes = IO.iodata_length(Pulso.JSON.encode_to_iodata!(labels))
+
+        if state.label_bytes + bytes + 1 <= @name_dictionary_bytes do
+          id = map_size(state.label_ids)
+
+          {id,
+           %{
+             state
+             | label_ids: Map.put(state.label_ids, labels, id),
+               labels: [labels | state.labels],
+               label_bytes: state.label_bytes + bytes + 1
+           }}
+        else
+          {nil, state}
+        end
+    end
+  end
+
+  defp expand_labels(%{"li" => id} = wire, dictionary) when is_integer(id) and id >= 0 and id < tuple_size(dictionary),
+    do: Map.put(wire, "l", elem(dictionary, id))
+
+  defp expand_labels(%{"li" => _} = wire, _), do: Map.put(wire, "l", nil)
+  defp expand_labels(wire, _), do: wire
 
   defp name_dictionary(names) when is_list(names), do: List.to_tuple(names)
   defp name_dictionary(_), do: {}
