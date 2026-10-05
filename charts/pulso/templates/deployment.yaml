@@ -19,7 +19,7 @@ spec:
     metadata:
       annotations:
         {{- if not .Values.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "pulso.secretChecksum" . }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -81,7 +81,7 @@ spec:
             {{- end }}
             {{- range $key, $value := .Values.ingestLimits }}
             - name: {{ printf "PULSO_INGEST_%s" (upper $key) }}
-              value: {{ $value | int64 | toString | quote }}
+              value: {{ include "pulso.ingestLimitValue" (list $key $value) | quote }}
             {{- end }}
             {{- range $key := list "SECRET_KEY_BASE" "PULSO_TENANT_TOKENS" "PULSO_S3_ACCESS_KEY_ID" "PULSO_S3_SECRET_ACCESS_KEY" }}
             - name: {{ $key }}

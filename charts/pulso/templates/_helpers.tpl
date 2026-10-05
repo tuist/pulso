@@ -59,6 +59,20 @@ crash on boot.
 {{- if not (has $key $knownLimits) }}
 {{- fail (printf "ingestLimits: unknown setting %q (expected one of %s)" $key (join ", " $knownLimits)) }}
 {{- end }}
+{{- $_ := include "pulso.ingestLimitValue" (list $key $value) }}
+{{- end }}
+{{- if .Values.ingress.enabled }}
+{{- if not .Values.ingress.paths }}
+{{- fail "ingress.paths needs at least one path when ingress.enabled is true" }}
+{{- end }}
+{{- range .Values.ingress.paths }}
+{{- if not (hasPrefix "/" (toString .path)) }}
+{{- fail (printf "ingress.paths: %q must start with /" (toString .path)) }}
+{{- end }}
+{{- if not (has .pathType (list "Exact" "Prefix" "ImplementationSpecific")) }}
+{{- fail (printf "ingress.paths: pathType for %q must be Exact, Prefix, or ImplementationSpecific" (toString .path)) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if not .Values.existingSecret }}
 {{- if not .Values.tenantTokens }}
@@ -76,4 +90,40 @@ crash on boot.
 {{- fail "storage.accessKeyId and storage.secretAccessKey are required (or set existingSecret)" }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+Renders an ingest limit as a decimal string, failing unless it is an integer
+in 1..2147483647, the range config/runtime.exs accepts. Values files parse
+numbers as floats and --set-string passes strings, so both are handled.
+Takes (list key value).
+*/}}
+{{- define "pulso.ingestLimitValue" -}}
+{{- $key := index . 0 }}
+{{- $value := index . 1 }}
+{{- $n := -1 }}
+{{- if kindIs "string" $value }}
+{{- if regexMatch "^[0-9]{1,10}$" $value }}
+{{- $n = atoi $value }}
+{{- end }}
+{{- else if kindIs "float64" $value }}
+{{- if eq (float64 (int64 $value)) $value }}
+{{- $n = int64 $value }}
+{{- end }}
+{{- else if or (kindIs "int" $value) (kindIs "int64" $value) }}
+{{- $n = int64 $value }}
+{{- end }}
+{{- if or (lt (int64 $n) 1) (gt (int64 $n) 2147483647) }}
+{{- fail (printf "ingestLimits.%s must be an integer between 1 and 2147483647, got %v" $key $value) }}
+{{- end }}
+{{- printf "%d" (int64 $n) }}
+{{- end }}
+
+{{/*
+Checksum of the deterministic Secret inputs, so pods roll when credentials
+change. A generated secret key base is excluded: it never changes once
+created, and hashing a second random draw would differ from the stored one.
+*/}}
+{{- define "pulso.secretChecksum" -}}
+{{- dict "secretKeyBase" .Values.secretKeyBase "tenantTokens" .Values.tenantTokens "accessKeyId" .Values.storage.accessKeyId "secretAccessKey" .Values.storage.secretAccessKey | toJson | sha256sum }}
 {{- end }}
