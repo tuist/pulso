@@ -22,6 +22,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
   attributes, and payload sizes, and how to tune them.
 - [Self-monitoring](self-monitoring.md): the `/metrics` endpoint, what each
   metric means, and how to scrape it without exposing it.
+- [Storage costs](storage-costs.md): request and retained-byte cost drivers,
+  Tigris pricing examples, and avoiding small-object amplification.
 
 ## Understanding Pulso
 

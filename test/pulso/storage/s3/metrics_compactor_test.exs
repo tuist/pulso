@@ -14,6 +14,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
+  alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.MetricsCompactor
@@ -94,6 +95,29 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     Agent.get_and_update(agent, fn state ->
       {Enum.count(state.reads, &String.ends_with?(&1, ".parquet")), %{state | reads: []}}
     end)
+  end
+
+  test "log service pruning survives cache reload and unknown legacy summaries still scan", ctx do
+    assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "wanted"}])
+    assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 2, service: "other"}])
+    {:ok, entry} = ManifestOwner.ensure_loaded(ctx.tenant, "logs", ctx.config)
+    other = Enum.find(entry.manifest.segments, &(&1.log_services == ["other"]))
+    assert {:ok, _} = ObjectStore.put(ctx.config, other.key, "corrupt")
+    ManifestCache.drop(ctx.tenant, "logs")
+    assert {:ok, [%Log{service: "wanted"}]} = S3.query(:logs, ctx.tenant, matchers: [{"service_name", :eq, "wanted"}])
+    assert {:error, _} = S3.query(:logs, ctx.tenant, [])
+
+    legacy = %{entry.manifest | segments: Enum.map(entry.manifest.segments, &%{&1 | log_services: nil})}
+
+    assert {:ok, _} =
+             ObjectStore.put(
+               ctx.config,
+               Manifest.manifest_key(ctx.tenant, "logs"),
+               legacy |> Manifest.encode() |> IO.iodata_to_binary()
+             )
+
+    ManifestCache.drop(ctx.tenant, "logs")
+    assert {:error, _} = S3.query(:logs, ctx.tenant, service: "wanted")
   end
 
   test "an absent value is rejected while finite samples survive compaction and evaluation", ctx do

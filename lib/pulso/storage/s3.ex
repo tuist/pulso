@@ -151,9 +151,10 @@ defmodule Pulso.Storage.S3 do
   defp query_segments(manifest, signal, start_ts, end_ts, opts) do
     segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
 
-    if signal == :metrics,
-      do: Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, []))),
-      else: segments
+    case signal do
+      :metrics -> Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, [])))
+      :logs -> Enum.filter(segments, &Segment.matches_log_service?(&1, opts))
+    end
   end
 
   defp remaining_budget(opts, consumed) do
@@ -200,7 +201,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp summarize_segment(:metrics, segment, records), do: Segment.summarize_metrics(segment, records)
-  defp summarize_segment(_signal, segment, _records), do: segment
+  defp summarize_segment(:logs, segment, records), do: Segment.summarize_logs(segment, records)
 
   # -- helpers -----------------------------------------------------------------
 

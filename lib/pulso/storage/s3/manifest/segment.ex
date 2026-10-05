@@ -11,7 +11,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
-  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names]
+  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names, :log_services]
 
   @type t :: %__MODULE__{
           key: String.t(),
@@ -19,7 +19,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           max_ts: non_neg_integer() | nil,
           row_count: non_neg_integer() | nil,
           byte_size: non_neg_integer() | nil,
-          metric_names: [String.t()] | nil
+          metric_names: [String.t()] | nil,
+          log_services: [String.t()] | nil
         }
 
   @doc """
@@ -73,7 +74,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     }
 
     base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
-    if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
+    base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
+    if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
   end
 
   @doc """
@@ -94,7 +96,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        max_ts: max_ts,
        row_count: row_count,
        byte_size: byte_size,
-       metric_names: valid_names(wire["n"])
+       metric_names: valid_names(wire["n"]),
+       log_services: valid_services(wire["ls"])
      }}
   end
 
@@ -148,6 +151,50 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     Enum.all?(matchers, fn
       {"__name__", :eq, value} -> value in names
       _ -> true
+    end)
+  end
+
+  # Only nonempty promoted fields are summarized: null/empty services fall
+  # back to resource labels in the native matcher, so they remain unknown.
+  defp valid_services([_ | _] = services) do
+    if length(services) <= 128 and
+         Enum.all?(services, &(is_binary(&1) and byte_size(&1) in 1..256)),
+       do: services
+  end
+
+  defp valid_services(_), do: nil
+
+  @doc "Attach a complete bounded set of nonempty promoted log services, or leave it unknown."
+  def summarize_logs(segment, records) do
+    services =
+      Enum.reduce_while(records, MapSet.new(), fn record, services ->
+        service = record.service
+
+        if is_binary(service) and byte_size(service) in 1..256 do
+          services = MapSet.put(services, service)
+          if MapSet.size(services) <= 128, do: {:cont, services}, else: {:halt, nil}
+        else
+          {:halt, nil}
+        end
+      end)
+
+    services = if services, do: services |> Enum.map(&:binary.copy/1) |> Enum.sort()
+    %{segment | log_services: services}
+  end
+
+  @doc "Prune known log services for exact promoted-field selectors; unknown summaries always scan."
+  def matches_log_service?(%__MODULE__{log_services: nil}, _opts), do: true
+
+  def matches_log_service?(%__MODULE__{log_services: services}, opts) do
+    direct = Keyword.get(opts, :service)
+    matchers = Keyword.get(opts, :matchers, [])
+
+    Enum.any?(services, fn service ->
+      (is_nil(direct) or service == direct) and
+        Enum.all?(matchers, fn
+          {name, :eq, value} when name in ["service", "service_name"] -> service == value
+          _ -> true
+        end)
     end)
   end
 

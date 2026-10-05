@@ -327,6 +327,16 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 
 ### Logs
 
+New segment manifest entries optionally carry `ls`, a complete set of at most
+128 nonempty promoted service values, each at most 256 bytes. Exact `service`
+and `service_name` matchers and the direct service filter prune known irrelevant
+segments before download. A null/empty promoted service can fall back to resource
+labels in native matchers, so such batches omit the summary rather than risk
+false negatives. Legacy, malformed, and over-budget summaries always scan.
+The additive field needs no segment migration; older writers may erase it,
+which only loses the optimization. Other labels and regular expressions remain
+native decoder filters.
+
 - LogQL subset. Label filter + substring/regex match on message.
 - Sort row groups by `(service, ts)`.
 - Sidecar: label→segment posting list; optional token inverted index for `|=`/`!=` filters.
