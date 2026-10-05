@@ -1,0 +1,6 @@
+- Reuse labels maps/matcher results for consecutive equal canonical-label bytes in metric Parquet decoder, never by series_id alone (hash collisions and caller-supplied IDs).
+- Borrow label binary slices instead of copying into an owned HashMap per metric encode; sort borrowed pairs directly.
+- Avoid metrics label arena duplication: parse Arrow bytes directly, allocate only surviving distinct labels (watch long-label subbinary pinning).
+- Avoid whole Parquet blob memcpy with a safe owning ChunkReader implementation retaining the Erlang input via OwnedEnv/resource; revisit only after simpler improvements, no unsafe lifetime extension.
+- Logs: defer arena creation until rows pass predicates; currently all seven columns copied even for zero surviving rows. Small strings as heap binaries might reduce subbinary overhead but require profiling and careful memory tradeoffs.
+- Validate codec gains with real loopback HTTP requests (Plug/Bandit) as a separate holdout; production S3 latency/durability not modeled by this benchmark.
