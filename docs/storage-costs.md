@@ -65,12 +65,15 @@ Neither figure includes Pulso compute.
 
 ## Avoiding amplification
 
-Pulso currently writes one immutable Parquet segment per nonempty append and
+By default Pulso writes one immutable Parquet segment per nonempty append and
 acknowledges only after publishing it in the manifest. Concurrent manifest
-registrations can share a conditional write, but segment writes are not yet
-coalesced. Batch at the collector within Pulso's [ingest limits](ingest-limits.md);
-measure delivery latency as well as requests. A larger batch is not permission
-to acknowledge before durable publication.
+registrations can share a conditional write. Optional [ingest coalescing](configuration.md#ingest-coalescing)
+also lets concurrent unkeyed requests share the segment PUT, within bounded
+node-local buffers. It is disabled by default; keyed requests and buffer overflow
+keep the original direct path. Sequential producers cannot benefit from it.
+Batch at the collector within Pulso's [ingest limits](ingest-limits.md), and
+measure delivery latency and memory as well as requests. A larger batch or
+coalescing window is not permission to acknowledge before durable publication.
 
 Use bounded time ranges and exact metric-name, metric-label, or log service selectors.
 New metric segments retain complete value sets for a few low-cardinality labels;

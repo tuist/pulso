@@ -2,7 +2,7 @@ defmodule Pulso.Storage.S3 do
   @moduledoc """
   S3-backed signal storage.
 
-  Each `append/4` writes one Parquet object under a tenant- and
+  By default, each `append/4` writes one Parquet object under a tenant- and
   signal-scoped, versioned, time-partitioned prefix:
 
       tenants/<tenant>/v4/signal=<s>/date=<YYYY-MM-DD>/hour=<HH>/<min_ts>-<max_ts>-<suffix>.parquet
@@ -39,6 +39,15 @@ defmodule Pulso.Storage.S3 do
   back. Logs sort by `(service, timestamp_ns)`, metrics by
   `(series_id, timestamp_ns)`. See `Pulso.Codec.NIF`.
 
+  ## Optional unkeyed coalescing
+
+  With `ingest_flush_interval_ms` enabled, concurrent unkeyed requests can
+  share a segment. Node-local input reservations bound the buffer at 128
+  callers, 100,000 rows, and 10 MiB of estimated term bytes. Overflow and
+  oversized batches use the unbuffered path. Keyed requests retain their
+  original fingerprint/retry semantics and are never combined. Every caller
+  still waits for segment PUT and manifest CAS before acknowledgment.
+
   ## Manifest coordination
 
   Every accepted append is registered in the per-`(tenant, signal)`
@@ -68,6 +77,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
@@ -94,11 +104,28 @@ defmodule Pulso.Storage.S3 do
   end
 
   def append(signal, tenant, records, opts) when is_atom(signal) and is_binary(tenant) and is_list(records) do
+    config = Map.new(Application.get_env(:pulso, __MODULE__) || %{})
+    keyed? = opts[:idempotency_key] not in [nil, ""]
+
+    if not keyed? and Map.get(config, :ingest_flush_interval_ms, 0) > 0 do
+      with :ok <- validate_tenant(tenant) do
+        case AppendBuffer.append(signal, tenant, records, config) do
+          :unbuffered -> append_unbuffered(signal, tenant, records, opts, config)
+          result -> result
+        end
+      end
+    else
+      append_unbuffered(signal, tenant, records, opts)
+    end
+  end
+
+  @doc false
+  def append_unbuffered(signal, tenant, records, opts, config \\ nil) do
     idempotency_key = Keyword.get(opts, :idempotency_key)
 
     with :ok <- validate_tenant(tenant),
          {:ok, payload, min_ts, max_ts} <- encode_segment(signal, records) do
-      config = config!()
+      config = config || config!()
 
       key =
         object_key(

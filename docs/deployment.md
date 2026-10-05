@@ -74,6 +74,7 @@ The ones you are most likely to change:
 | `serviceMonitor.enabled` | Create a Prometheus Operator `ServiceMonitor` for self-monitoring. |
 | `metricsCompaction.enabled` | Merge small metrics segments. Read [the prerequisites](configuration.md#metrics-compaction) first. |
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
+| `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
 | `resources` | CPU and memory. The defaults are starting points, not measured capacity. |
 

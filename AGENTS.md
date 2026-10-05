@@ -27,6 +27,7 @@ Early scaffolding. In place:
 - Metrics manifests carry complete, bounded metric-name and low-cardinality label-value sets for exact-match pruning, dictionary-deduplicated with independent budgets. Log manifests carry bounded nonempty promoted-service sets. Unknown summaries are always scanned.
 
 - `Pulso.Storage.S3.CompactionWorker` and `MetricsCompactor` provide opt-in metrics compaction, rendezvous ownership among live eligible workers, durable manifest-based tenant discovery, and restart-safe retirement cleanup. See the metrics compaction section in `docs/architecture.md`.
+- `Pulso.Storage.S3.AppendBuffer` provides opt-in bounded node-local coalescing of unkeyed appends before segment upload. Keyed requests and overflow remain direct; every acknowledgment still waits for segment PUT and manifest CAS. `PULSO_INGEST_FLUSH_INTERVAL_MS` defaults to `0` (disabled). This is not rendezvous-owned ingest forwarding or node-wide admission.
 
 Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, ingest forwarding and ownership. Follow-up priority: label posting indexes, OpenTelemetry metrics ingestion, then alert evaluation.
 

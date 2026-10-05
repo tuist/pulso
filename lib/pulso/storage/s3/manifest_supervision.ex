@@ -2,7 +2,7 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
   @moduledoc """
   Supervision tree fragment for the manifest layer.
 
-  Runs three children in this order:
+  Runs five children in this order:
 
     1. `Pulso.Storage.S3.ManifestRegistry` — via-name lookup for owners.
     2. `Pulso.Storage.S3.ManifestSupervisor` — `DynamicSupervisor`
@@ -10,12 +10,17 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
     3. `Pulso.Storage.S3.ManifestCache` — the ETS-backed hot-path
        cache. Started last so any prior owner-recovery attempt hits an
        empty table cleanly.
+    4. `Pulso.Storage.S3.AppendRegistry` — optional unkeyed buffer lookup.
+    5. `Pulso.Storage.S3.AppendSupervisor` — bounded input buffers. Buffers
+       are created only when ingest coalescing is enabled.
 
   Wired into `Pulso.Application` only when the S3 adapter is active.
   """
 
   use Supervisor
 
+  alias Pulso.Storage.S3.AppendRegistry
+  alias Pulso.Storage.S3.AppendSupervisor
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervisor
@@ -30,7 +35,9 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
     children = [
       {Registry, keys: :unique, name: ManifestRegistry},
       {DynamicSupervisor, strategy: :one_for_one, name: ManifestSupervisor},
-      ManifestCache
+      ManifestCache,
+      {Registry, keys: :unique, name: AppendRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: AppendSupervisor}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

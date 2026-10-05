@@ -66,6 +66,15 @@ Each `(tenant, signal)` has a rendezvous-hashed owner among the current live nod
 Ownership is an *optimization*, not a correctness property. It determines which node is expected to buffer records for a (tenant, signal) and thus have the warmest cache for it. Any node can serve any query; any node can accept any ingest and forward if it isn't the owner.
 
 Implemented ownership currently covers background metrics merge and cleanup.
+Optional unkeyed append buffers are node-local, not rendezvous-owned. They can
+coalesce concurrent requests within a configured 1–1000 ms window before encoding
+one segment. Keyed requests stay on the original direct path. Admission counters
+reserve at most 128 callers, 100,000 rows and 10 MiB of estimated input terms per
+buffer, including queued and executing work; overflow is processed unbuffered.
+Reservations are released by the buffer only after publication finishes, never by
+caller timeouts. Both segment PUT and manifest CAS precede every acknowledgment.
+No local durability or new cluster state is introduced; unkeyed lost-response
+retries still have at-least-once semantics. Idle buffers terminate after 30 seconds.
 `ManifestOwner` is a node-local request coalescer, not a cluster-wide owner;
 conditional object-storage writes arbitrate concurrent ingest from multiple
 nodes. Ingest forwarding, buffered ingest ownership, and alert evaluation remain
