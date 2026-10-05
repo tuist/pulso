@@ -562,6 +562,13 @@ pub fn decode<'a>(
         let mut name_terms: Vec<Term<'a>> = Vec::with_capacity(16);
         let mut value_terms: Vec<Term<'a>> = Vec::with_capacity(16);
         let mut label_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+        // Cache just the previous canonical label set, not the series hash:
+        // hashes may collide and callers may supply their own series IDs.
+        // Runs of samples from one series share both matcher work and the
+        // immutable Erlang labels map. The cache is bounded to one entry.
+        let mut previous_labels: Option<&[u8]> = None;
+        let mut previous_matches = false;
+        let mut previous_term: Option<Term<'a>> = None;
 
         for row in 0..batch.num_rows() {
             let ts = ts_arr.value(row) as i128;
@@ -578,15 +585,17 @@ pub fn decode<'a>(
 
             let (row_start, row_end) = labels_arena.row_bounds(row);
 
-            label_pairs.clear();
-            if row_end > row_start {
-                let row_bytes = &labels_bytes[row_start..row_end];
-                if parse_canonical_pairs(row_bytes, &mut label_pairs).is_err() {
-                    return Err(DecodeError::Reader);
-                }
+            let row_bytes = &labels_bytes[row_start..row_end];
+            if previous_labels != Some(row_bytes) {
+                label_pairs.clear();
+                parse_canonical_pairs(row_bytes, &mut label_pairs)
+                    .map_err(|_| DecodeError::Reader)?;
+                previous_labels = Some(row_bytes);
+                previous_matches = labels_match(&label_pairs, &filter.matchers, &regex_cache);
+                previous_term = None;
             }
 
-            if !labels_match(&label_pairs, &filter.matchers, &regex_cache) {
+            if !previous_matches {
                 continue;
             }
 
@@ -603,16 +612,23 @@ pub fn decode<'a>(
             // slice pointer arithmetic recovers each slice's absolute
             // offset inside the arena so the sub-binary points at the
             // right bytes — no second copy.
-            name_terms.clear();
-            value_terms.clear();
-            for (name, value) in &label_pairs {
-                let name_off = (name.as_ptr() as usize) - base;
-                let value_off = (value.as_ptr() as usize) - base;
-                name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
-                value_terms.push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
-            }
-            let labels_term = Term::map_from_arrays(env, &name_terms, &value_terms)
-                .map_err(|_| DecodeError::Reader)?;
+            let labels_term = match previous_term {
+                Some(term) => term,
+                None => {
+                    name_terms.clear();
+                    value_terms.clear();
+                    for (name, value) in &label_pairs {
+                        let name_off = (name.as_ptr() as usize) - base;
+                        let value_off = (value.as_ptr() as usize) - base;
+                        name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
+                        value_terms.push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
+                    }
+                    let term = Term::map_from_arrays(env, &name_terms, &value_terms)
+                        .map_err(|_| DecodeError::Reader)?;
+                    previous_term = Some(term);
+                    term
+                }
+            };
 
             let fields = [
                 struct_name,

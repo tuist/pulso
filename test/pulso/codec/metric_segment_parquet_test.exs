@@ -59,6 +59,45 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert finite.labels == %{"__name__" => "safe"}
   end
 
+  test "consecutive label reuse compares canonical bytes rather than caller series IDs" do
+    labels = [%{}, %{"svc" => "api"}, %{"svc" => "api"}, %{"svc" => "web"}, %{"svc" => "web"}, %{}, %{"svc" => "api"}]
+
+    samples =
+      labels
+      |> Enum.with_index(1)
+      |> Enum.map(fn {set, ts} -> %{sample(ts, ts * 1.0, set) | series_id: 42} end)
+
+    {payload, _, _, _} = encode!(samples)
+    assert decode!(payload) == samples
+
+    for {op, value} <- [{:eq, "api"}, {:neq, "api"}, {:re, "api|web"}, {:nre, "api|web"}, {:eq, ""}] do
+      expected =
+        Enum.filter(samples, fn s ->
+          actual = Map.get(s.labels, "svc", "")
+
+          case op do
+            :eq -> actual == value
+            :neq -> actual != value
+            :re -> Regex.match?(~r/^(api|web)$/, actual)
+            :nre -> not Regex.match?(~r/^(api|web)$/, actual)
+          end
+        end)
+
+      assert decode!(payload, matchers: [{"svc", op, value}]) == expected
+    end
+
+    assert {:error, :query_sample_limit} =
+             NIF.decode_metric_segment_parquet_bounded(payload, nil, nil, [], 3)
+  end
+
+  test "repeated labels are shared in the decoded Erlang heap" do
+    labels = %{"__name__" => "counter", "instance" => String.duplicate("x", 100)}
+    {payload, _, _, _} = encode!(for ts <- 1..100, do: sample(ts, ts * 1.0, labels))
+    [first, second | _] = decoded = decode!(payload)
+    assert :erts_debug.same(first.labels, second.labels)
+    assert Enum.all?(decoded, &(&1.labels == labels))
+  end
+
   test "same label set hashes to the same series_id across samples" do
     labels = %{"__name__" => "cpu", "instance" => "node-1"}
     a = sample(10, 0.1, labels)
