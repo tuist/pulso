@@ -47,7 +47,6 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnPath;
 use rustler::{Binary, Encoder, Env, ListIterator, MapIterator, NewBinary, Term};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 mod atoms {
@@ -178,26 +177,18 @@ fn extract_row<'a>(
         .map_get(atoms::labels().encode(env))
         .map_err(|_| EncodeError::BadInput)?;
 
-    let labels_map: HashMap<Vec<u8>, Vec<u8>> = match MapIterator::new(labels_term) {
-        Some(iter) => {
-            let mut m = HashMap::new();
-            for (k, v) in iter {
-                let kb: Binary = k.decode().map_err(|_| EncodeError::BadInput)?;
-                let vb: Binary = v.decode().map_err(|_| EncodeError::BadInput)?;
-                m.insert(kb.as_slice().to_vec(), vb.as_slice().to_vec());
-            }
-            m
-        }
-        None => return Err(EncodeError::BadInput),
-    };
+    // Erlang binaries stay alive for this NIF call. Borrow them directly
+    // instead of building an owned hash map (two allocations per label).
+    // A map already guarantees unique keys; only byte ordering is needed.
+    let iter = MapIterator::new(labels_term).ok_or(EncodeError::BadInput)?;
+    let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
+    for (k, v) in iter {
+        let kb: Binary<'a> = k.decode().map_err(|_| EncodeError::BadInput)?;
+        let vb: Binary<'a> = v.decode().map_err(|_| EncodeError::BadInput)?;
+        pairs.push((kb.as_slice(), vb.as_slice()));
+    }
 
-    // Sorted-by-name byte pairs: identical to what Prometheus's
-    // `Labels` iterator yields. StableHash and the on-disk canonical
-    // byte sequence both depend on this ordering.
-    let mut pairs: Vec<(&[u8], &[u8])> = labels_map
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
+    // StableHash and the on-disk canonical bytes depend on name ordering.
     pairs.sort_by(|a, b| a.0.cmp(b.0));
 
     let series_id_term = sample
@@ -231,9 +222,10 @@ fn extract_row<'a>(
         return Err(EncodeError::BadInput);
     }
 
-    let metric_name = labels_map
-        .get(b"__name__".as_ref())
-        .cloned()
+    let metric_name = pairs
+        .iter()
+        .find(|(name, _)| *name == b"__name__")
+        .map(|(_, value)| value.to_vec())
         .unwrap_or_default();
     let labels_canonical = canonical_bytes(&pairs);
     let labels_json = labels_as_json(&pairs);

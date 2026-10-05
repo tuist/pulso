@@ -1,15 +1,15 @@
-Running ExUnit with seed: 879469, max_cases: 8
+Running ExUnit with seed: 793716, max_cases: 8
 Excluding tags: [:bench, :integration]
 
-.....................................................................................................................................................................................................................................................................................................................11:22:58.391 [warning] metrics compaction merge failed tenant=self-metrics-worker: :timeout
-...............................................................................................................................................................................................................................*.............................11:23:04.593 [warning] metrics compaction merge failed tenant=compact-3172: :compaction_conflict
-.....11:23:07.101 [warning] metrics compaction merge failed tenant=compact-3300: :timeout
-11:23:07.103 [warning] metrics compaction remains withdrawn while an earlier task is still running
-11:23:07.120 [warning] metrics compaction merge failed tenant=compact-3300: :compaction_conflict
-.....11:23:08.364 [warning] manifest load failed tenant=compact-21794 signal=metrics reason=:compacted_manifest_missing
-..........11:23:40.693 [warning] metrics compaction merge failed tenant=compact-24035-poison: {:decode_failed, :parquet_decoder_rejected_input}
-.............11:23:43.381 [warning] metrics compaction merge failed tenant=compact-24227: :timeout
+.......................................................................................................................................................................................................................................................................................*.........................................................................................................................................................................................................................11:30:00.669 [warning] metrics compaction merge failed tenant=self-metrics-worker: :timeout
+.............................................................11:30:03.822 [warning] metrics compaction merge failed tenant=compact-6468-poison: {:decode_failed, :parquet_decoder_rejected_input}
+.11:30:05.926 [warning] metrics compaction merge failed tenant=compact-16357: :timeout
+11:30:05.931 [warning] metrics compaction remains withdrawn while an earlier task is still running
+11:30:05.959 [warning] metrics compaction merge failed tenant=compact-16357: :compaction_conflict
+.....11:30:08.882 [warning] manifest load failed tenant=compact-16421 signal=metrics reason=:compacted_manifest_missing
+..........................11:30:20.059 [warning] metrics compaction merge failed tenant=compact-21282: :timeout
+.....11:30:23.098 [warning] metrics compaction merge failed tenant=compact-9091: :compaction_conflict
 ...........
-Finished in 49.7 seconds (2.1s async, 47.5s sync)
+Finished in 45.8 seconds (3.3s async, 42.5s sync)
 
 Result: 605 passed, 1 skipped, 39 excluded

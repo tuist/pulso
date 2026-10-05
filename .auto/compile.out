@@ -1,6 +1,4 @@
 Compiling 1 file (.ex)
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
 Compiling crate pulso_codec in release mode (native/pulso_codec)
 Compiling lib/pulso/codec/nif.ex (it's taking more than 10s)
 Copying /Users/pepicrft/.superconductor/worktrees/pulso/sc-entangled-boson-2d05/native/pulso_codec/target/release/libpulso_codec.dylib to priv/native/pulso_codec.so
