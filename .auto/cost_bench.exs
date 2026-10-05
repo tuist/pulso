@@ -60,8 +60,11 @@ defmodule PulsoCostBench do
       input = records(signal, shape, size * 6)
       Agent.update(agent, &%{&1 | objects: %{}, requests: [], reads: []})
       Agent.update(meter, fn _ -> %{a: 0, b: 0, read: 0} end)
-      {write_us, _} = :timer.tc(fn ->
-        for batch <- Enum.chunk_every(input, size), do: assert(:ok == S3.append(signal, tenant, batch, idempotency_key: token(hd(batch).timestamp_ns)))
+      {write_us, [initial | _]} = :timer.tc(fn ->
+        for {batch, index} <- input |> Enum.chunk_every(size) |> Enum.with_index() do
+          assert :ok == S3.append(signal, tenant, batch, idempotency_key: token(hd(batch).timestamp_ns))
+          if index == 0, do: Agent.get(meter, & &1)
+        end
       end)
       write = Agent.get(meter, & &1)
       stored = Agent.get(agent, fn s -> Enum.sum(for {_, {_, body}} <- s.objects, do: byte_size(body)) end)
@@ -88,10 +91,14 @@ defmodule PulsoCostBench do
       # Marginal steady-state cohort: one million records held for a month,
       # plus 1000 queries with the measured mix. No free-tier subtraction.
       retained = stored * scale
-      a = write.a * scale + query.a * 1000 / 6
-      b = write.b * scale + query.b * 1000 / 6
+      # Separate fixed bootstrap from per-append operations. One million
+      # records in ONE tenant does not bootstrap a new tenant every six batches.
+      warm_a = (write.a - initial.a) / 5
+      warm_b = (write.b - initial.b) / 5
+      a = warm_a * 1_000_000 / size + max(0, initial.a - warm_a) + query.a * 1000 / 6
+      b = warm_b * 1_000_000 / size + max(0, initial.b - warm_b) + query.b * 1000 / 6
       cost = retained / 1_073_741_824 * 0.02 + a * 0.000005 + b * 0.0000005
-      IO.puts("CASE #{tenant} usd=#{cost} bytes_per_record=#{stored / length(input)} write_a=#{write.a} query_b=#{query.b} read_bytes=#{query.read}")
+      IO.puts("CASE #{tenant} usd=#{cost} bytes_per_record=#{stored / length(input)} write_a=#{write.a} initial_a=#{initial.a} warm_a=#{warm_a} query_b=#{query.b} read_bytes=#{query.read}")
       %{cost_usd_per_million: cost, retained_bytes_per_million: retained, class_a_per_million: a,
         class_b_per_1000_queries: query.b * 1000 / 6, read_bytes_per_1000_queries: query.read * 1000 / 6,
         encode_us_per_record: write_us / length(input), query_us_per_record: query_us / (length(input) * 6)}
