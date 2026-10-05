@@ -51,20 +51,31 @@ defmodule PulsoCostBench do
     meter = start_supervised!(Supervisor.child_spec({Agent, fn -> %{a: 0, b: 0, read: 0} end}, id: :meter))
     server = start_supervised!({Bandit, plug: {PulsoCostStore, agent: agent, meter: meter}, port: 0})
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
-    config = %{bucket: "pulso", endpoint: "http://localhost:#{port}", region: "us-east-1", access_key_id: "test", secret_access_key: "test", allow_http: true, refresh_stale_ms: 0}
+    config = %{bucket: "pulso", endpoint: "http://localhost:#{port}", region: "us-east-1", access_key_id: "test", secret_access_key: "test", allow_http: true, refresh_stale_ms: 0, ingest_flush_interval_ms: 50}
     Application.put_env(:pulso, S3, config)
-    start_supervised!(ManifestSupervision)
+    start_supervised!({ManifestSupervision, config: config})
+    tasks = start_supervised!(Task.Supervisor)
 
-    results = for signal <- [:logs, :metrics], shape <- [:repeat, :churn], size <- [64, 1024, 10000] do
-      tenant = "cost-#{signal}-#{shape}-#{size}"
+    results = for mode <- [:keyed_sequential, :unkeyed_burst], signal <- [:logs, :metrics], shape <- [:repeat, :churn], size <- [64, 1024, 10000] do
+      tenant = "cost-#{mode}-#{signal}-#{shape}-#{size}"
       input = records(signal, shape, size * 6)
       Agent.update(agent, &%{&1 | objects: %{}, requests: [], reads: []})
       Agent.update(meter, fn _ -> %{a: 0, b: 0, read: 0} end)
-      {write_us, [initial | _]} = :timer.tc(fn ->
-        for {batch, index} <- input |> Enum.chunk_every(size) |> Enum.with_index() do
-          assert :ok == S3.append(signal, tenant, batch, idempotency_key: token(hd(batch).timestamp_ns))
-          if index == 0, do: Agent.get(meter, & &1)
+      append = fn batch ->
+        opts = if mode == :keyed_sequential, do: [idempotency_key: token(hd(batch).timestamp_ns)], else: []
+        assert :ok == S3.append(signal, tenant, batch, opts)
+      end
+      {write_us, initial} = :timer.tc(fn ->
+        [first | warm] = Enum.chunk_every(input, size)
+        append.(first)
+        initial = Agent.get(meter, & &1)
+        if mode == :unkeyed_burst do
+          Task.Supervisor.async_stream_nolink(tasks, warm, append, max_concurrency: 5, timeout: 60_000)
+          |> Enum.each(fn result -> assert match?({:ok, _}, result) end)
+        else
+          Enum.each(warm, append)
         end
+        initial
       end)
       write = Agent.get(meter, & &1)
       stored = Agent.get(agent, fn s -> Enum.sum(for {_, {_, body}} <- s.objects, do: byte_size(body)) end)
@@ -99,13 +110,18 @@ defmodule PulsoCostBench do
       b = warm_b * 1_000_000 / size + max(0, initial.b - warm_b) + query.b * 1000 / 6
       cost = retained / 1_073_741_824 * 0.02 + a * 0.000005 + b * 0.0000005
       IO.puts("CASE #{tenant} usd=#{cost} bytes_per_record=#{stored / length(input)} write_a=#{write.a} initial_a=#{initial.a} warm_a=#{warm_a} query_b=#{query.b} read_bytes=#{query.read}")
-      %{cost_usd_per_million: cost, retained_bytes_per_million: retained, class_a_per_million: a,
+      %{mode: mode, cost_usd_per_million: cost, retained_bytes_per_million: retained, class_a_per_million: a,
         class_b_per_1000_queries: query.b * 1000 / 6, read_bytes_per_1000_queries: query.read * 1000 / 6,
         encode_us_per_record: write_us / length(input), query_us_per_record: query_us / (length(input) * 6)}
     end
-    for key <- Map.keys(hd(results)) do
+    for key <- Map.keys(hd(results)) -- [:mode] do
       value = Enum.sum(Enum.map(results, &Map.fetch!(&1, key))) / length(results)
       IO.puts("METRIC #{key}=#{value}")
+    end
+    for mode <- [:keyed_sequential, :unkeyed_burst] do
+      subset = Enum.filter(results, &(&1.mode == mode))
+      value = Enum.sum(Enum.map(subset, & &1.cost_usd_per_million)) / length(subset)
+      IO.puts("METRIC #{mode}_cost=#{value}")
     end
   end
 end
