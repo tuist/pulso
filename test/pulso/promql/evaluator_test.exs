@@ -71,8 +71,12 @@ defmodule Pulso.PromQL.EvaluatorTest do
       Task.Supervisor.start_child(callers, fn -> send(owner, {:finished_metric_query, instant("m", 1, "beta")}) end)
 
     assert_receive {:blocked_metric_query, beta, "beta"}
+    refs = Enum.map([beta | workers], &Process.monitor/1)
     Enum.each([beta | workers], &send(&1, {:release, {:ok, []}}))
     for _ <- 1..3, do: assert_receive({:finished_metric_query, {:ok, _}})
+    # A result reaches the caller before its worker necessarily exits.
+    # Observe worker termination before asserting that slots are released.
+    for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal})
     _ = :sys.get_state(QuerySlots)
     assert Registry.lookup(QuerySlots, {"acme", 0}) == []
     assert Registry.lookup(QuerySlots, {"acme", 1}) == []

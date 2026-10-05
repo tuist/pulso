@@ -28,6 +28,11 @@ defmodule CapacityBench do
     [
       {"metric_read_repeated", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(repeated_blob, nil, nil, []); rows end},
       {"metric_read_unique", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(unique_blob, nil, nil, []); rows end},
+      {"metric_read_response", fn ->
+        {:ok, rows} = nif.decode_metric_segment_parquet(repeated_blob, nil, nil, [])
+        {:ok, response} = nif.encode_metric_samples(rows)
+        {rows, response}
+      end},
       {"metric_read_filtered", fn -> {:ok, rows} = nif.decode_metric_segment_parquet(repeated_blob, 20_000_000_000, 40_000_000_000, [{"region", :eq, "region-1"}]); rows end},
       {"log_read", fn -> {:ok, rows} = nif.decode_log_segment_parquet(log_blob, nil, nil, nil, [], []); rows end},
       {"json_roundtrip", fn -> rows = json_decode(nif, json); {rows, json_encode(nif, rows)} end},
@@ -83,7 +88,7 @@ defmodule CapacityBench do
     {:ok, rows} = NIF.decode_metric_segment_parquet(blob, nil, nil, [])
     rows
   end
-  def canonical("json_roundtrip", {rows, json}), do: {rows, JSON.decode!(json)}
+  def canonical(name, {rows, json}) when name in ["json_roundtrip", "metric_read_response"], do: {rows, JSON.decode!(json)}
   def canonical(_, result), do: result
 
   def measure({{name, fun}, {name, ref_fun}}) do
