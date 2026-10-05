@@ -133,6 +133,36 @@ defmodule Pulso.Storage.S3CodecTest do
       assert Enum.map(filtered, & &1.resource) == Enum.drop(resources, 2)
     end
 
+    test "JSON object keys are shared across rows and column documents without changing values" do
+      records =
+        for i <- 1..20 do
+          %Log{
+            timestamp_ns: i,
+            body: %{"shared_key" => i},
+            attributes: %{"shared_key" => "value-#{i}"},
+            resource: %{"shared_key" => i * 2}
+          }
+        end
+
+      {:ok, blob, _, _} = S3.encode_segment(:logs, records)
+      {:ok, decoded} = S3.decode_segment(:logs, blob, nil, nil, [])
+      assert decoded == records
+      [first, second | _] = decoded
+      assert :erts_debug.same(hd(Map.keys(first.body)), hd(Map.keys(second.attributes)))
+      assert :erts_debug.same(hd(Map.keys(first.body)), hd(Map.keys(second.resource)))
+    end
+
+    test "key interning remains correct past its bounded capacity and for escaped or long keys" do
+      records =
+        for i <- 1..200 do
+          %Log{timestamp_ns: i, attributes: %{"key-#{i}" => i, "escaped\nkey" => "v", String.duplicate("x", 40) => i}}
+        end
+
+      {:ok, blob, _, _} = S3.encode_segment(:logs, records)
+      {:ok, decoded} = S3.decode_segment(:logs, blob, nil, nil, [])
+      assert decoded == records
+    end
+
     test "drops nil-timestamp records under any time filter" do
       records = [%Log{timestamp_ns: nil, body: "x"}, %Log{timestamp_ns: 5, body: "y"}]
       {:ok, payload, _, _} = S3.encode_segment(:logs, records)

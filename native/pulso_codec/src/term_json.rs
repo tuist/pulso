@@ -189,13 +189,15 @@ fn key_bytes<'t>(k: Term<'t>) -> Res<Cow<'t, [u8]>> {
 /// Builds Erlang terms from parsed JSON. Values Elixir's `JSON` would
 /// produce: maps with binary keys, lists, binaries, integers, floats,
 /// `true`/`false`/`nil`.
+pub type InternedKeys<'a> = Vec<(&'a [u8], Term<'a>)>;
+
 pub struct TermBuilder<'a, 'b> {
     env: Env<'a>,
     input: &'b Binary<'a>,
     /// Object keys seen so far, so a key repeated across objects (OTLP's
     /// "key"/"value", a segment's attribute names, a manifest's field
     /// names) is one shared binary instead of one per occurrence.
-    keys: Vec<(&'a [u8], Term<'a>)>,
+    keys: InternedKeys<'a>,
 }
 
 const INTERN_MAX_KEY: usize = 32;
@@ -208,6 +210,17 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             input,
             keys: Vec::new(),
         }
+    }
+
+    /// Reuse the bounded interning cache across documents backed by binaries
+    /// in this same NIF environment. Borrowed key bytes must remain alive for
+    /// the entire environment (as with Parquet column arenas).
+    pub fn with_keys(env: Env<'a>, input: &'b Binary<'a>, keys: InternedKeys<'a>) -> Self {
+        TermBuilder { env, input, keys }
+    }
+
+    pub fn into_keys(self) -> InternedKeys<'a> {
+        self.keys
     }
 
     pub fn bytes(&self, s: &[u8]) -> Res<Term<'a>> {

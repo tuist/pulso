@@ -30,7 +30,7 @@
 
 use crate::json_read::{Fallback, Parser, Res, Stacks};
 use crate::query_filter::{find_label, line_bytes_for_match, LineFilter, Matcher};
-use crate::term_json::{Enc, EncodeError, JsonEncoder, TermBuilder};
+use crate::term_json::{Enc, EncodeError, InternedKeys, JsonEncoder, TermBuilder};
 
 use arrow::array::{
     Array, Int32Array, Int32Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
@@ -527,6 +527,9 @@ fn materialize<'a>(
     let has_matchers = !filter.matchers.is_empty();
     let has_line_filters = !filter.line_filters.is_empty();
     let mut stacks: Stacks<Term<'a>> = Stacks::new();
+    // Keep the existing bounded JSON key interner for the whole batch, not
+    // just one row. Column arenas keep borrowed key bytes alive in this env.
+    let mut interned_keys: InternedKeys<'a> = Vec::new();
     // Resource metadata is commonly repeated for a run of records. Share
     // the immutable decoded map only after comparing the complete JSON
     // bytes; a single entry bounds memory for high-cardinality resources.
@@ -564,10 +567,10 @@ fn materialize<'a>(
         let sev_num_term = int32_term(env, sev_num_col, i, nil);
         let sev_text_term = sub_term(env, &sev_text, i, nil)?;
         let service_term = sub_term(env, &service, i, nil)?;
-        let body_term = json_term(env, &body, i, nil, &mut stacks)?;
+        let body_term = json_term(env, &body, i, nil, &mut stacks, &mut interned_keys)?;
         let trace_id_term = sub_term(env, &trace_id, i, nil)?;
         let span_id_term = sub_term(env, &span_id, i, nil)?;
-        let attributes_term = map_json_term(env, &attributes, i, empty_map, &mut stacks)?;
+        let attributes_term = map_json_term(env, &attributes, i, empty_map, &mut stacks, &mut interned_keys)?;
         let resource_term = if resource.is_null(i) || resource.is_empty(i) {
             empty_map
         } else {
@@ -575,7 +578,7 @@ fn materialize<'a>(
             match previous_resource {
                 Some((previous, term)) if previous == bytes => term,
                 _ => {
-                    let term = map_json_term(env, &resource, i, empty_map, &mut stacks)?;
+                    let term = map_json_term(env, &resource, i, empty_map, &mut stacks, &mut interned_keys)?;
                     previous_resource = Some((bytes, term));
                     term
                 }
@@ -762,6 +765,7 @@ fn json_term<'a>(
     i: usize,
     nil: Term<'a>,
     stacks: &mut Stacks<Term<'a>>,
+    interned_keys: &mut InternedKeys<'a>,
 ) -> Res<Term<'a>> {
     if arena.is_null(i) {
         return Ok(nil);
@@ -769,7 +773,7 @@ fn json_term<'a>(
     if arena.is_empty(i) {
         return Ok(nil);
     }
-    parse_json_sub(env, arena, i, stacks)
+    parse_json_sub(env, arena, i, stacks, interned_keys)
 }
 
 fn map_json_term<'a>(
@@ -778,6 +782,7 @@ fn map_json_term<'a>(
     i: usize,
     empty_map: Term<'a>,
     stacks: &mut Stacks<Term<'a>>,
+    interned_keys: &mut InternedKeys<'a>,
 ) -> Res<Term<'a>> {
     if arena.is_null(i) || arena.is_empty(i) {
         return Ok(empty_map);
@@ -791,7 +796,7 @@ fn map_json_term<'a>(
             return Ok(empty_map);
         }
     }
-    parse_json_sub(env, arena, i, stacks)
+    parse_json_sub(env, arena, i, stacks, interned_keys)
 }
 
 fn parse_json_sub<'a>(
@@ -799,8 +804,11 @@ fn parse_json_sub<'a>(
     arena: &StringArena<'a, '_>,
     i: usize,
     stacks: &mut Stacks<Term<'a>>,
+    interned_keys: &mut InternedKeys<'a>,
 ) -> Res<Term<'a>> {
     let bin = arena.sub_binary(i)?;
-    let mut builder = TermBuilder::new(env, &bin);
-    Parser::new(bin.as_slice()).document_with(&mut builder, stacks)
+    let mut builder = TermBuilder::with_keys(env, &bin, std::mem::take(interned_keys));
+    let result = Parser::new(bin.as_slice()).document_with(&mut builder, stacks);
+    *interned_keys = builder.into_keys();
+    result
 }
