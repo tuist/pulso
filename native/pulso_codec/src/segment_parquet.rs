@@ -363,6 +363,11 @@ fn writer_properties() -> WriterProperties {
         .set_column_dictionary_enabled(ColumnPath::from("span_id"), false)
         .set_column_encoding(ColumnPath::from("span_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
         .set_statistics_enabled(EnabledStatistics::Page)
+        // Footer statistics are uncompressed. Bound long JSON/string extrema
+        // without truncating column data; parquet-rs widens truncated bounds
+        // and marks them inexact. Integer timestamp bounds remain exact.
+        .set_statistics_truncate_length(Some(64))
+        .set_column_index_truncate_length(Some(64))
         .build()
 }
 

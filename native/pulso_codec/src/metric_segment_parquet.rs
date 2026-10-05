@@ -395,6 +395,9 @@ fn writer_properties() -> WriterProperties {
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
+        // Bound uncompressed label extrema in the footer, not the stored
+        // labels. Truncated string bounds remain conservative for readers.
+        .set_statistics_truncate_length(Some(64))
         // Smaller row groups than parquet-rs's default (1M rows): the
         // metric read path prunes by row-group `timestamp_ns` stats
         // before any column pages are read, so narrower groups let
