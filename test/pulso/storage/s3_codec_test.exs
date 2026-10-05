@@ -163,6 +163,24 @@ defmodule Pulso.Storage.S3CodecTest do
       assert decoded == records
     end
 
+    test "record sharing preserves duplicates and every changed field" do
+      base = %Log{timestamp_ns: 1, service: "api", body: "message", resource: %{"region" => "east"}}
+
+      records = [
+        base,
+        base,
+        %{base | attributes: %{"request_id" => "new"}},
+        %{base | body: "different"},
+        %{base | trace_id: "trace", span_id: "span", severity_text: "ERROR", severity_number: 17}
+      ]
+
+      {:ok, blob, _, _} = S3.encode_segment(:logs, records)
+      {:ok, decoded} = S3.decode_segment(:logs, blob, nil, nil, [])
+      assert decoded == records
+      assert :erts_debug.same(hd(decoded), Enum.at(decoded, 1))
+      assert :erts_debug.same(hd(decoded).service, List.last(decoded).service)
+    end
+
     test "drops nil-timestamp records under any time filter" do
       records = [%Log{timestamp_ns: nil, body: "x"}, %Log{timestamp_ns: 5, body: "y"}]
       {:ok, payload, _, _} = S3.encode_segment(:logs, records)

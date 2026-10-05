@@ -659,7 +659,7 @@ pub fn decode<'a>(
             let record = match previous_record {
                 Some((mut record, previous_fields)) => {
                     for ((key, field), previous) in keys.iter().zip(fields.iter()).zip(previous_fields.iter()) {
-                        if field != previous {
+                        if field.as_c_arg() != previous.as_c_arg() && field != previous {
                             record = record.map_update(*key, *field).map_err(|_| DecodeError::Reader)?;
                         }
                     }

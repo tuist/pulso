@@ -534,6 +534,9 @@ fn materialize<'a>(
     // the immutable decoded map only after comparing the complete JSON
     // bytes; a single entry bounds memory for high-cardinality resources.
     let mut previous_resource: Option<(&[u8], Term<'a>)> = None;
+    // Share the fixed flat-map key tuple and unchanged field terms across
+    // records. Keep only one previous record; never conflate differing rows.
+    let mut previous_record: Option<(Term<'a>, [Term<'a>; 11])> = None;
 
     for i in 0..batch.num_rows() {
         // Apply per-row filters before building any Erlang terms so the
@@ -599,7 +602,20 @@ fn materialize<'a>(
             ts_term,
             trace_id_term,
         ];
-        let term = Term::map_from_arrays(env, &all_keys, &values).map_err(|_| Fallback)?;
+        let term = match previous_record {
+            Some((mut term, previous_values)) => {
+                for ((key, value), previous) in all_keys.iter().zip(values.iter()).zip(previous_values.iter()) {
+                    // Atom, immediate and already-shared terms need no FFI
+                    // comparison. Distinct terms still use exact equality.
+                    if value.as_c_arg() != previous.as_c_arg() && value != previous {
+                        term = term.map_update(*key, *value).map_err(|_| Fallback)?;
+                    }
+                }
+                term
+            }
+            None => Term::map_from_arrays(env, &all_keys, &values).map_err(|_| Fallback)?,
+        };
+        previous_record = Some((term, values));
         out.push(term);
     }
     Ok(())
