@@ -158,6 +158,28 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:error, _} = S3.query(:logs, ctx.tenant, service: "wanted")
   end
 
+  test "exact arbitrary metric labels prune corrupt unrelated segments after cache reload", ctx do
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(1, 1.0, "a")])
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(2, 2.0, "b")])
+    other = Enum.find(load(ctx).segments, &(&1.metric_labels == %{"host" => ["b"]}))
+    assert {:ok, _} = ObjectStore.put(ctx.config, other.key, "corrupt")
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert {:ok, [%MetricSample{value: 1.0}]} = S3.query(:metrics, ctx.tenant, matchers: [{"host", :eq, "a"}])
+    assert {:error, _} = S3.query(:metrics, ctx.tenant, [])
+  end
+
+  test "compaction rebuilds complete metric label sets without excluding samples", ctx do
+    for ts <- 1..4,
+        do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1, "a"), sample(ts, ts / 1, "b")]))
+
+    matchers = [{"host", :eq, "a"}]
+    before = S3.query(:metrics, ctx.tenant, matchers: matchers)
+    assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert S3.query(:metrics, ctx.tenant, matchers: matchers) == before
+    assert [%Segment{metric_labels: %{"host" => ["a", "b"]}}] = load(ctx).segments
+  end
+
   test "an absent value is rejected while finite samples survive compaction and evaluation", ctx do
     previous = Application.get_env(:pulso, Pulso.Storage)
     Application.put_env(:pulso, Pulso.Storage, adapter: S3)

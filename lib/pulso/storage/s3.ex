@@ -152,7 +152,7 @@ defmodule Pulso.Storage.S3 do
     segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
 
     case signal do
-      :metrics -> Enum.filter(segments, &Segment.matches_metric_name?(&1, Keyword.get(opts, :matchers, [])))
+      :metrics -> Enum.filter(segments, &Segment.matches_metrics?(&1, Keyword.get(opts, :matchers, [])))
       :logs -> Enum.filter(segments, &Segment.matches_log_service?(&1, opts))
     end
   end

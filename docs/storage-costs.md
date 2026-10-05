@@ -72,11 +72,15 @@ coalesced. Batch at the collector within Pulso's [ingest limits](ingest-limits.m
 measure delivery latency as well as requests. A larger batch is not permission
 to acknowledge before durable publication.
 
-Use bounded time ranges and exact metric-name or log service selectors. New log
+Use bounded time ranges and exact metric-name, metric-label, or log service selectors.
+New metric segments retain complete value sets for a few low-cardinality labels;
+exact mismatches skip downloads. High-cardinality, unknown, and over-budget sets
+still scan, including older segments. Compaction rebuilds these summaries without
+aggregation or data loss. New log
 segments with a complete small set of nonempty promoted services can be skipped
 before download for exact `service`/`service_name` selectors. Old segments, large
 service sets, and records needing resource-label fallback are still scanned.
-This optimization does not drop data or change query results. Other log labels,
+These optimizations do not drop data or change query results. Other log labels,
 regular expressions, and line filters still require segment reads.
 
 [Metrics compaction](configuration.md#metrics-compaction) reduces small-object

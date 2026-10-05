@@ -11,7 +11,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
-  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names, :log_services]
+  alias Pulso.Storage.S3.MetricLabelSummary
+
+  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names, :log_services, :metric_labels]
 
   @type t :: %__MODULE__{
           key: String.t(),
@@ -20,7 +22,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           row_count: non_neg_integer() | nil,
           byte_size: non_neg_integer() | nil,
           metric_names: [String.t()] | nil,
-          log_services: [String.t()] | nil
+          log_services: [String.t()] | nil,
+          metric_labels: %{String.t() => [String.t()]} | nil
         }
 
   @doc """
@@ -75,7 +78,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
     base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
     base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
-    if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
+    base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
+    if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
   end
 
   @doc """
@@ -97,7 +101,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        row_count: row_count,
        byte_size: byte_size,
        metric_names: valid_names(wire["n"]),
-       log_services: valid_services(wire["ls"])
+       log_services: valid_services(wire["ls"]),
+       metric_labels: MetricLabelSummary.parse(wire["l"])
      }}
   end
 
@@ -130,7 +135,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     names = Enum.reduce_while(records, MapSet.new(), &collect_metric_name/2)
 
     names = if names, do: names |> Enum.map(&:binary.copy/1) |> Enum.sort()
-    %{segment | metric_names: names}
+    %{segment | metric_names: names, metric_labels: MetricLabelSummary.build(records)}
   end
 
   defp collect_metric_name(record, names) do
@@ -156,6 +161,11 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   # Only nonempty promoted fields are summarized: null/empty services fall
   # back to resource labels in the native matcher, so they remain unknown.
+  @doc "Prune metrics only when a complete name or label value set proves an exact mismatch."
+  def matches_metrics?(segment, matchers) do
+    matches_metric_name?(segment, matchers) and MetricLabelSummary.matches?(segment.metric_labels, matchers)
+  end
+
   defp valid_services([_ | _] = services) do
     if length(services) <= 128 and
          Enum.all?(services, &(is_binary(&1) and byte_size(&1) in 1..256)),
