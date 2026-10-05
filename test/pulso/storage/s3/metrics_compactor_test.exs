@@ -97,6 +97,44 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     end)
   end
 
+  test "first registration publishes one complete manifest and exposes no uncommitted cache", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}})
+    supervisor = start_supervised!(Task.Supervisor)
+
+    append =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "api"}])
+      end)
+
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 5_000
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    {_, body} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, key))
+    assert {:ok, %Manifest{segments: [segment]}} = Manifest.decode(body)
+    assert segment.row_count == 1
+    assert segment.byte_size > 0
+    assert segment.log_services == ["api"]
+    assert Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", key} end)) == 1
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    send(writer, {:release_storage, key})
+    assert Task.await(append, 10_000) == :ok
+    assert %{etag: etag} = ManifestCache.get(ctx.tenant, "logs")
+    assert is_binary(etag)
+  end
+
+  test "read-only legacy migration still durably creates a missing manifest", ctx do
+    records = [%Log{timestamp_ns: 1, service: "legacy"}]
+    {:ok, payload, mn, mx} = S3.encode_segment(:logs, records)
+    key = S3.object_key(ctx.tenant, "logs", mn, mx, "legacy", nil)
+    assert {:ok, _} = ObjectStore.put(ctx.config, key, payload)
+    assert {:ok, ^records} = S3.query(:logs, ctx.tenant, [])
+    manifest_key = Manifest.manifest_key(ctx.tenant, "logs")
+    assert {:ok, _, body} = ObjectStore.get_if_none_match(ctx.config, manifest_key, nil)
+    assert {:ok, %Manifest{segments: [%Segment{key: ^key}]}} = Manifest.decode(body)
+    assert Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", manifest_key} end)) == 1
+  end
+
   test "log service pruning survives cache reload and unknown legacy summaries still scan", ctx do
     assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "wanted"}])
     assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 2, service: "other"}])

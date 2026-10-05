@@ -76,6 +76,13 @@ Query caches and query admission limits deliberately remain local to each node.
 
 Manifest updates use S3 conditional PUT (`If-Match: <etag>` on writes; `If-None-Match: *` for first-time creation). All major S3-compatible providers support this as of 2024.
 
+Initial ingest into a prefix without a manifest reconstructs legacy segments by
+listing, then publishes the rebuilt entries and new segment metadata in one
+conditional creation. There is no intermediate bootstrap manifest PUT. The
+unpublished snapshot does not enter the query cache. Read-first legacy migration
+still publishes its reconstruction before returning, and compacted prefixes
+without a manifest still fail closed.
+
 Under normal operation there is exactly one writer per manifest (the current rendezvous owner), so CAS conflicts do not happen. During failover or a cluster resize, two nodes may briefly race; the loser retries with the new etag. This is the failover mechanism — no explicit election.
 
 ### Freshness via conditional GET
