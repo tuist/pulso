@@ -43,6 +43,10 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<Vec<u8>, Error> {
 
     buf.push(b'[');
     let mut first = true;
+    // A bounded single-entry cache of the previous label JSON range in
+    // this output. Compare complete maps, not series IDs; repeated samples
+    // can copy encoded bytes without decoding/escaping each label again.
+    let mut previous_labels: Option<(Term<'a>, usize, usize)> = None;
     for sample in items {
         if !first {
             buf.push(b',');
@@ -66,7 +70,16 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<Vec<u8>, Error> {
         buf.extend_from_slice(b",\"value\":");
         write_float_or_null(&mut buf, val, nil)?;
         buf.extend_from_slice(b",\"labels\":");
-        write_labels_map(&mut buf, lbls)?;
+        match previous_labels {
+            Some((previous, start, end)) if previous == lbls => {
+                buf.extend_from_within(start..end);
+            }
+            _ => {
+                let start = buf.len();
+                write_labels_map(&mut buf, lbls)?;
+                previous_labels = Some((lbls, start, buf.len()));
+            }
+        }
         buf.push(b'}');
     }
     buf.push(b']');
