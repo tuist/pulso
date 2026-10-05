@@ -1,0 +1,154 @@
+{
+  "base": "a03616a8e05fb9c521fcf225724492b7c38e1496",
+  "final_tree": "c8ee06e7c1c97cb5118833a6f112a150dc1d1cb2",
+  "trunk": "main",
+  "kept": [
+    {
+      "run": 1,
+      "commit": "b177817830639a73781f66afd09d5cdcd19ea1ec",
+      "previous": "a03616a8e05fb9c521fcf225724492b7c38e1496",
+      "files": [],
+      "stat": ""
+    },
+    {
+      "run": 2,
+      "commit": "57537f9d7c4be2bfef318637981f760b1712950d",
+      "previous": "b177817830639a73781f66afd09d5cdcd19ea1ec",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "test/pulso/codec/metric_segment_parquet_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 50 ++++++++++++++++--------\n test/pulso/codec/metric_segment_parquet_test.exs | 39 ++++++++++++++++++\n 2 files changed, 72 insertions(+), 17 deletions(-)"
+    },
+    {
+      "run": 4,
+      "commit": "8876777aa80092cb1728b68f8bcd01fbcb36a1b4",
+      "previous": "57537f9d7c4be2bfef318637981f760b1712950d",
+      "files": [],
+      "stat": ""
+    },
+    {
+      "run": 8,
+      "commit": "1bdb0d81769e3b4a5a5ac8346fc3dcf7e20726b9",
+      "previous": "8876777aa80092cb1728b68f8bcd01fbcb36a1b4",
+      "files": [],
+      "stat": ""
+    },
+    {
+      "run": 9,
+      "commit": "5f8a4576a14ec95c64278840e8f74824d2a673eb",
+      "previous": "1bdb0d81769e3b4a5a5ac8346fc3dcf7e20726b9",
+      "files": [
+        "native/pulso_codec/src/segment_parquet.rs",
+        "test/pulso/storage/s3_codec_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/segment_parquet.rs | 18 +++++++++++++++++-\n test/pulso/storage/s3_codec_test.exs      | 16 ++++++++++++++++\n 2 files changed, 33 insertions(+), 1 deletion(-)"
+    },
+    {
+      "run": 10,
+      "commit": "6f66f13585e8e709639346759c7ea2d1f04adc46",
+      "previous": "5f8a4576a14ec95c64278840e8f74824d2a673eb",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 38 ++++++++++--------------\n 1 file changed, 15 insertions(+), 23 deletions(-)"
+    },
+    {
+      "run": 12,
+      "commit": "f554025dcb6b324e5fb5378cd93f08437e94cd69",
+      "previous": "6f66f13585e8e709639346759c7ea2d1f04adc46",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "test/pulso/codec/metric_segment_parquet_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 85 +++++++++++++++---------\n test/pulso/codec/metric_segment_parquet_test.exs | 21 ++++++\n 2 files changed, 75 insertions(+), 31 deletions(-)"
+    },
+    {
+      "run": 13,
+      "commit": "f982331de0de9e70d9208bafd2847c4d0aabab7c",
+      "previous": "f554025dcb6b324e5fb5378cd93f08437e94cd69",
+      "files": [],
+      "stat": ""
+    },
+    {
+      "run": 16,
+      "commit": "121f3992bb55285394b672b11f3b72529c11e8ae",
+      "previous": "f982331de0de9e70d9208bafd2847c4d0aabab7c",
+      "files": [
+        "test/pulso/promql/evaluator_test.exs"
+      ],
+      "stat": "test/pulso/promql/evaluator_test.exs | 4 ++++\n 1 file changed, 4 insertions(+)"
+    },
+    {
+      "run": 18,
+      "commit": "1e21354035e691c8184ee03a2377b5d0338c6144",
+      "previous": "121f3992bb55285394b672b11f3b72529c11e8ae",
+      "files": [
+        "native/pulso_codec/src/metric_json.rs",
+        "test/pulso/codec/metric_json_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_json.rs | 15 +++++++++-\n test/pulso/codec/metric_json_test.exs | 53 +++++++++++++++++++++++++++++++++++\n 2 files changed, 67 insertions(+), 1 deletion(-)"
+    },
+    {
+      "run": 20,
+      "commit": "91682ef7fbf116be331134bcf7c841065d495896",
+      "previous": "1e21354035e691c8184ee03a2377b5d0338c6144",
+      "files": [
+        "native/pulso_codec/src/segment_parquet.rs",
+        "native/pulso_codec/src/term_json.rs",
+        "test/pulso/storage/s3_codec_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/segment_parquet.rs | 24 ++++++++++++++++--------\n native/pulso_codec/src/term_json.rs       | 15 ++++++++++++++-\n test/pulso/storage/s3_codec_test.exs      | 30 ++++++++++++++++++++++++++++++\n 3 files changed, 60 insertions(+), 9 deletions(-)"
+    },
+    {
+      "run": 22,
+      "commit": "55cdcfb92682a2dc421cd28e50a1d433a33fd176",
+      "previous": "91682ef7fbf116be331134bcf7c841065d495896",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "test/pulso/codec/metric_segment_parquet_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 19 +++++++++++++++++--\n test/pulso/codec/metric_segment_parquet_test.exs | 17 +++++++++++++++++\n 2 files changed, 34 insertions(+), 2 deletions(-)"
+    },
+    {
+      "run": 24,
+      "commit": "df0c60da7790bd0abc129c630f23658376a63efc",
+      "previous": "55cdcfb92682a2dc421cd28e50a1d433a33fd176",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "native/pulso_codec/src/segment_parquet.rs",
+        "test/pulso/storage/s3_codec_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs |  2 +-\n native/pulso_codec/src/segment_parquet.rs        | 18 +++++++++++++++++-\n test/pulso/storage/s3_codec_test.exs             | 18 ++++++++++++++++++\n 3 files changed, 36 insertions(+), 2 deletions(-)"
+    },
+    {
+      "run": 26,
+      "commit": "b321a85fff32fbccb794780e1d4c0808b8dea30c",
+      "previous": "df0c60da7790bd0abc129c630f23658376a63efc",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 11 ++++++++---\n 1 file changed, 8 insertions(+), 3 deletions(-)"
+    },
+    {
+      "run": 27,
+      "commit": "4e64e88baaec66634aa4150e26912dd12ad78510",
+      "previous": "b321a85fff32fbccb794780e1d4c0808b8dea30c",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "test/pulso/codec/metric_segment_parquet_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 34 +++++++++++++++++++-----\n test/pulso/codec/metric_segment_parquet_test.exs | 20 ++++++++++++++\n 2 files changed, 47 insertions(+), 7 deletions(-)"
+    },
+    {
+      "run": 29,
+      "commit": "c8ee06e7c1c97cb5118833a6f112a150dc1d1cb2",
+      "previous": "4e64e88baaec66634aa4150e26912dd12ad78510",
+      "files": [
+        "native/pulso_codec/src/metric_segment_parquet.rs",
+        "test/pulso/codec/metric_segment_parquet_test.exs"
+      ],
+      "stat": "native/pulso_codec/src/metric_segment_parquet.rs | 17 ++++++++++++++++-\n test/pulso/codec/metric_segment_parquet_test.exs | 19 +++++++++++++++++++\n 2 files changed, 35 insertions(+), 1 deletion(-)"
+    }
+  ]
+}

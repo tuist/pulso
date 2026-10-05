@@ -34,12 +34,14 @@
 use crate::stable_hash;
 
 use arrow::array::{
-    Array, BinaryArray, BinaryBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
-    RecordBatch, StringBuilder,
+    Array, BinaryArray, BinaryBuilder, DictionaryArray, Float64Array, Float64Builder, Int64Array,
+    Int64Builder, RecordBatch, StringBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::RowGroupMetaData;
@@ -47,7 +49,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnPath;
 use rustler::{Binary, Encoder, Env, ListIterator, MapIterator, NewBinary, Term};
-use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod atoms {
@@ -98,9 +100,14 @@ struct Row {
     series_id: i64,
     timestamp_ns: i64,
     value: f64,
+    labels: Rc<EncodedLabels>,
+}
+
+struct EncodedLabels {
+    series_hash: i64,
     metric_name: Vec<u8>,
-    labels_canonical: Vec<u8>,
-    labels_json: Vec<u8>,
+    canonical: Vec<u8>,
+    json: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -124,6 +131,7 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     let expected = atoms::metric_sample().encode(env);
 
     let mut rows: Vec<Row> = Vec::with_capacity(len);
+    let mut previous_labels: Option<(Term<'a>, Rc<EncodedLabels>)> = None;
     let mut bounds = Bounds {
         min_ts: i128::MAX,
         max_ts: i128::MIN,
@@ -137,7 +145,7 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
         if tag.as_c_arg() != expected.as_c_arg() {
             return Err(EncodeError::BadInput);
         }
-        let row = extract_row(env, sample, &mut bounds)?;
+        let row = extract_row(env, sample, &mut bounds, &mut previous_labels)?;
         rows.push(row);
     }
 
@@ -157,8 +165,12 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     });
 
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + rows.len() * 32);
     let props = writer_properties(row_group_size(&rows));
+    // Arrow owns the finished columns now. Do not retain the input row
+    // metadata through compression, when writer buffers are at their peak.
+    drop(rows);
+    drop(previous_labels);
+    let mut buf: Vec<u8> = Vec::with_capacity(64 + len * 32);
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
@@ -171,6 +183,7 @@ fn extract_row<'a>(
     env: Env<'a>,
     sample: Term<'a>,
     bounds: &mut Bounds,
+    previous_labels: &mut Option<(Term<'a>, Rc<EncodedLabels>)>,
 ) -> Result<Row, EncodeError> {
     let nil = atoms::nil().encode(env);
 
@@ -178,27 +191,17 @@ fn extract_row<'a>(
         .map_get(atoms::labels().encode(env))
         .map_err(|_| EncodeError::BadInput)?;
 
-    let labels_map: HashMap<Vec<u8>, Vec<u8>> = match MapIterator::new(labels_term) {
-        Some(iter) => {
-            let mut m = HashMap::new();
-            for (k, v) in iter {
-                let kb: Binary = k.decode().map_err(|_| EncodeError::BadInput)?;
-                let vb: Binary = v.decode().map_err(|_| EncodeError::BadInput)?;
-                m.insert(kb.as_slice().to_vec(), vb.as_slice().to_vec());
-            }
-            m
+    // Compare complete maps, never series IDs. Reuse derived bytes for a
+    // consecutive run even when equivalent maps are separate Erlang terms.
+    // Only one lookup entry is retained; rows share immutable metadata.
+    let labels = match previous_labels.as_ref() {
+        Some((previous, labels)) if *previous == labels_term => Rc::clone(labels),
+        _ => {
+            let labels = Rc::new(encode_labels(labels_term)?);
+            *previous_labels = Some((labels_term, Rc::clone(&labels)));
+            labels
         }
-        None => return Err(EncodeError::BadInput),
     };
-
-    // Sorted-by-name byte pairs: identical to what Prometheus's
-    // `Labels` iterator yields. StableHash and the on-disk canonical
-    // byte sequence both depend on this ordering.
-    let mut pairs: Vec<(&[u8], &[u8])> = labels_map
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
 
     let series_id_term = sample
         .map_get(atoms::series_id().encode(env))
@@ -206,7 +209,7 @@ fn extract_row<'a>(
 
     // Caller may pre-fill series_id or leave it nil; recompute on nil.
     let series_id: i64 = if series_id_term.as_c_arg() == nil.as_c_arg() {
-        stable_hash::stable_hash(pairs.iter().copied()) as i64
+        labels.series_hash
     } else {
         series_id_term.decode().map_err(|_| EncodeError::BadInput)?
     };
@@ -231,13 +234,6 @@ fn extract_row<'a>(
         return Err(EncodeError::BadInput);
     }
 
-    let metric_name = labels_map
-        .get(b"__name__".as_ref())
-        .cloned()
-        .unwrap_or_default();
-    let labels_canonical = canonical_bytes(&pairs);
-    let labels_json = labels_as_json(&pairs);
-
     bounds.count += 1;
     let ts = i128::from(timestamp_ns);
     if ts < bounds.min_ts {
@@ -251,9 +247,31 @@ fn extract_row<'a>(
         series_id,
         timestamp_ns,
         value,
+        labels,
+    })
+}
+
+fn encode_labels<'a>(labels_term: Term<'a>) -> Result<EncodedLabels, EncodeError> {
+    // Erlang binaries stay alive for this NIF call. A map guarantees unique
+    // keys; only byte ordering is needed, with no owned per-label hash map.
+    let iter = MapIterator::new(labels_term).ok_or(EncodeError::BadInput)?;
+    let mut pairs: Vec<(&[u8], &[u8])> = Vec::new();
+    for (k, v) in iter {
+        let kb: Binary<'a> = k.decode().map_err(|_| EncodeError::BadInput)?;
+        let vb: Binary<'a> = v.decode().map_err(|_| EncodeError::BadInput)?;
+        pairs.push((kb.as_slice(), vb.as_slice()));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let metric_name = pairs
+        .iter()
+        .find(|(name, _)| *name == b"__name__")
+        .map(|(_, value)| value.to_vec())
+        .unwrap_or_default();
+    Ok(EncodedLabels {
+        series_hash: stable_hash::stable_hash(pairs.iter().copied()) as i64,
         metric_name,
-        labels_canonical,
-        labels_json,
+        canonical: canonical_bytes(&pairs),
+        json: labels_as_json(&pairs),
     })
 }
 
@@ -345,9 +363,14 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut series_id = Int64Builder::with_capacity(rows.len());
     let mut ts = Int64Builder::with_capacity(rows.len());
     let mut value = Float64Builder::with_capacity(rows.len());
-    let mut metric_name = StringBuilder::with_capacity(rows.len(), 0);
-    let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), 0);
-    let mut labels_json = StringBuilder::with_capacity(rows.len(), 0);
+    // The encoded label bytes already exist; reserve their total column
+    // size once rather than repeatedly reallocating and copying buffers.
+    let name_bytes = rows.iter().map(|row| row.labels.metric_name.len()).sum();
+    let canonical_bytes = rows.iter().map(|row| row.labels.canonical.len()).sum();
+    let json_bytes = rows.iter().map(|row| row.labels.json.len()).sum();
+    let mut metric_name = StringBuilder::with_capacity(rows.len(), name_bytes);
+    let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), canonical_bytes);
+    let mut labels_json = StringBuilder::with_capacity(rows.len(), json_bytes);
 
     for row in rows {
         series_id.append_value(row.series_id);
@@ -357,9 +380,9 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
         // (Prometheus restricts metric names, and our JSON encoder
         // escapes any sub-0x20 bytes), so the StringBuilder path is
         // the common case. `labels_canonical` is raw bytes.
-        append_string(&mut metric_name, &row.metric_name);
-        labels_canonical.append_value(&row.labels_canonical);
-        append_string(&mut labels_json, &row.labels_json);
+        append_string(&mut metric_name, &row.labels.metric_name);
+        labels_canonical.append_value(&row.labels.canonical);
+        append_string(&mut labels_json, &row.labels.json);
     }
 
     let batch = RecordBatch::try_new(
@@ -498,8 +521,36 @@ pub fn decode<'a>(
     let regex_cache = compile_regexes(&filter.matchers)?;
     let bytes = Bytes::copy_from_slice(blob.as_slice());
 
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| DecodeError::Reader)?;
+    // Preserve the label dictionary instead of expanding identical bytes
+    // for every sample. Plain/fallback pages remain supported: parquet-rs
+    // builds an Arrow dictionary for them. Keep all other inferred fields
+    // and metadata unchanged, including legacy fixture schemas.
+    let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
+        .map_err(|_| DecodeError::Reader)?;
+    let mut fields = metadata.schema().fields().to_vec();
+    let labels_field = fields.get(4).ok_or(DecodeError::Reader)?;
+    if labels_field.data_type() != &DataType::Binary {
+        return Err(DecodeError::Reader);
+    }
+    fields[4] = Arc::new(
+        labels_field
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Binary),
+            )),
+    );
+    let read_schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        metadata.schema().metadata().clone(),
+    ));
+    let read_metadata = ArrowReaderMetadata::try_new(
+        Arc::clone(metadata.metadata()),
+        ArrowReaderOptions::new().with_schema(read_schema),
+    )
+    .map_err(|_| DecodeError::Reader)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, read_metadata);
 
     // Column projection: only the four columns the decoder actually
     // reads. `metric_name` and `labels_json` stay in the file but are
@@ -522,8 +573,8 @@ pub fn decode<'a>(
     // Row-group pruning: when a time filter is set, consult each row
     // group's `timestamp_ns` min/max chunk stats and only read the
     // groups that could contain surviving rows. The segment writer
-    // caps groups at 8192 rows, so a tight filter reads a strict
-    // fraction of the segment and skips the rest without opening any
+    // caps groups at 8192 rows for long series runs and 65536 otherwise,
+    // so a tight filter can skip irrelevant groups without opening any
     // column pages.
     let metadata = builder.metadata().clone();
     let ts_col: Option<usize> = metadata
@@ -562,6 +613,10 @@ pub fn decode<'a>(
         atoms::labels().encode(env),
     ];
     let struct_name = atoms::metric_sample().encode(env);
+    // Arrow reconstructs array wrappers across batches, but dictionary
+    // value/offset buffers remain shared. Retain the previous array owner
+    // so buffer identities cannot be recycled while comparing them.
+    let mut previous_arena: Option<(arrow::array::ArrayRef, BinaryArena<'a>)> = None;
 
     for batch_result in reader {
         let batch = batch_result.map_err(|_| DecodeError::Reader)?;
@@ -573,8 +628,30 @@ pub fn decode<'a>(
         // the raw `name<0xff>value<0xff>...` bytes we hashed into
         // `series_id`, so every label slice is returned as a sub-binary
         // of the arena without a per-row JSON parse.
-        let labels_arr = col::<BinaryArray>(&batch, 3)?;
-        let labels_arena = BinaryArena::from(env, labels_arr);
+        let labels_dict = col::<DictionaryArray<Int32Type>>(&batch, 3)?;
+        let labels_arr = labels_dict
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or(DecodeError::Reader)?;
+        let same_dictionary = previous_arena.as_ref().is_some_and(|(values, _)| {
+            values
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .is_some_and(|previous| {
+                    previous.value_data().as_ptr() == labels_arr.value_data().as_ptr()
+                        && previous.value_data().len() == labels_arr.value_data().len()
+                        && previous.value_offsets().as_ptr() == labels_arr.value_offsets().as_ptr()
+                        && previous.value_offsets().len() == labels_arr.value_offsets().len()
+                })
+        });
+        if !same_dictionary {
+            previous_arena = Some((
+                Arc::clone(labels_dict.values()),
+                BinaryArena::from(env, labels_arr),
+            ));
+        }
+        let labels_arena = &previous_arena.as_ref().ok_or(DecodeError::Reader)?.1;
         // The whole-column byte view — the per-row canonical slices we
         // scan during the row loop point into this slice.
         let labels_bytes: &[u8] = labels_arena.arena_bytes().unwrap_or(&[]);
@@ -588,6 +665,17 @@ pub fn decode<'a>(
         let mut name_terms: Vec<Term<'a>> = Vec::with_capacity(16);
         let mut value_terms: Vec<Term<'a>> = Vec::with_capacity(16);
         let mut label_pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+        // Cache just the previous canonical label set, not the series hash:
+        // hashes may collide and callers may supply their own series IDs.
+        // Runs of samples from one series share both matcher work and the
+        // immutable Erlang labels map. The cache is bounded to one entry.
+        let mut previous_labels: Option<&[u8]> = None;
+        let mut previous_matches = false;
+        let mut previous_term: Option<Term<'a>> = None;
+        // Updating a fixed-key flat map shares its key tuple, unlike
+        // constructing one from arrays for every row. Compare exact terms
+        // so unchanged fields (and duplicate samples) require no update.
+        let mut previous_record: Option<(Term<'a>, [Term<'a>; 5])> = None;
 
         for row in 0..batch.num_rows() {
             let ts = ts_arr.value(row) as i128;
@@ -602,17 +690,20 @@ pub fn decode<'a>(
                 }
             }
 
-            let (row_start, row_end) = labels_arena.row_bounds(row);
+            let label_index = labels_dict.key(row).ok_or(DecodeError::Reader)?;
+            let (row_start, row_end) = labels_arena.row_bounds(label_index);
 
-            label_pairs.clear();
-            if row_end > row_start {
-                let row_bytes = &labels_bytes[row_start..row_end];
-                if parse_canonical_pairs(row_bytes, &mut label_pairs).is_err() {
-                    return Err(DecodeError::Reader);
-                }
+            let row_bytes = &labels_bytes[row_start..row_end];
+            if previous_labels != Some(row_bytes) {
+                label_pairs.clear();
+                parse_canonical_pairs(row_bytes, &mut label_pairs)
+                    .map_err(|_| DecodeError::Reader)?;
+                previous_labels = Some(row_bytes);
+                previous_matches = labels_match(&label_pairs, &filter.matchers, &regex_cache);
+                previous_term = None;
             }
 
-            if !labels_match(&label_pairs, &filter.matchers, &regex_cache) {
+            if !previous_matches {
                 continue;
             }
 
@@ -629,16 +720,24 @@ pub fn decode<'a>(
             // slice pointer arithmetic recovers each slice's absolute
             // offset inside the arena so the sub-binary points at the
             // right bytes — no second copy.
-            name_terms.clear();
-            value_terms.clear();
-            for (name, value) in &label_pairs {
-                let name_off = (name.as_ptr() as usize) - base;
-                let value_off = (value.as_ptr() as usize) - base;
-                name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
-                value_terms.push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
-            }
-            let labels_term = Term::map_from_arrays(env, &name_terms, &value_terms)
-                .map_err(|_| DecodeError::Reader)?;
+            let labels_term = match previous_term {
+                Some(term) => term,
+                None => {
+                    name_terms.clear();
+                    value_terms.clear();
+                    for (name, value) in &label_pairs {
+                        let name_off = (name.as_ptr() as usize) - base;
+                        let value_off = (value.as_ptr() as usize) - base;
+                        name_terms.push(labels_arena.sub_binary(name_off, name.len())?.encode(env));
+                        value_terms
+                            .push(labels_arena.sub_binary(value_off, value.len())?.encode(env));
+                    }
+                    let term = Term::map_from_arrays(env, &name_terms, &value_terms)
+                        .map_err(|_| DecodeError::Reader)?;
+                    previous_term = Some(term);
+                    term
+                }
+            };
 
             let fields = [
                 struct_name,
@@ -647,8 +746,25 @@ pub fn decode<'a>(
                 value.encode(env),
                 labels_term,
             ];
-            records
-                .push(Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?);
+            let record = match previous_record {
+                Some((mut record, previous_fields)) => {
+                    for ((key, field), previous) in
+                        keys.iter().zip(fields.iter()).zip(previous_fields.iter())
+                    {
+                        if field.as_c_arg() != previous.as_c_arg() && field != previous {
+                            record = record
+                                .map_update(*key, *field)
+                                .map_err(|_| DecodeError::Reader)?;
+                        }
+                    }
+                    record
+                }
+                None => {
+                    Term::map_from_arrays(env, &keys, &fields).map_err(|_| DecodeError::Reader)?
+                }
+            };
+            previous_record = Some((record, fields));
+            records.push(record);
         }
     }
 
@@ -849,9 +965,13 @@ mod tests {
             series_id,
             timestamp_ns,
             value: 1.0,
-            metric_name: b"work".to_vec(),
-            labels_canonical: b"host\xffnode\xff".to_vec(),
-            labels_json: b"{\"host\":\"node\"}".to_vec(),
+            labels: Rc::new(EncodedLabels {
+                series_hash: stable_hash::stable_hash([(b"host".as_slice(), b"node".as_slice())])
+                    as i64,
+                metric_name: b"work".to_vec(),
+                canonical: b"host\xffnode\xff".to_vec(),
+                json: b"{\"host\":\"node\"}".to_vec(),
+            }),
         }
     }
 

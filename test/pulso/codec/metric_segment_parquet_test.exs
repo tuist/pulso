@@ -70,6 +70,140 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert finite.labels == %{"__name__" => "safe"}
   end
 
+  test "consecutive label reuse compares canonical bytes rather than caller series IDs" do
+    labels = [%{}, %{"svc" => "api"}, %{"svc" => "api"}, %{"svc" => "web"}, %{"svc" => "web"}, %{}, %{"svc" => "api"}]
+
+    samples =
+      labels
+      |> Enum.with_index(1)
+      |> Enum.map(fn {set, ts} -> %{sample(ts, ts * 1.0, set) | series_id: 42} end)
+
+    {payload, _, _, _} = encode!(samples)
+    assert decode!(payload) == samples
+
+    for {op, value} <- [{:eq, "api"}, {:neq, "api"}, {:re, "api|web"}, {:nre, "api|web"}, {:eq, ""}] do
+      expected =
+        Enum.filter(samples, fn s ->
+          actual = Map.get(s.labels, "svc", "")
+
+          case op do
+            :eq -> actual == value
+            :neq -> actual != value
+            :re -> Regex.match?(~r/^(api|web)$/, actual)
+            :nre -> not Regex.match?(~r/^(api|web)$/, actual)
+          end
+        end)
+
+      assert decode!(payload, matchers: [{"svc", op, value}]) == expected
+    end
+
+    assert {:error, :query_sample_limit} =
+             NIF.decode_metric_segment_parquet_bounded(payload, nil, nil, [], 3)
+  end
+
+  test "repeated labels are shared in the decoded Erlang heap" do
+    labels = %{"__name__" => "counter", "instance" => String.duplicate("x", 100)}
+    {payload, _, _, _} = encode!(for ts <- 1..100, do: sample(ts, ts * 1.0, labels))
+    [first, second | _] = decoded = decode!(payload)
+    assert :erts_debug.same(first.labels, second.labels)
+    assert Enum.all?(decoded, &(&1.labels == labels))
+  end
+
+  test "writer metadata reuse preserves varying IDs, Unicode labels, and invalid input rejection" do
+    labels = %{"__name__" => "counter", "instance" => "é😀\"\\\n"}
+
+    samples = [
+      sample(1, 1, labels),
+      %{sample(2, 2, labels) | series_id: 42},
+      sample(3, 3, %{}),
+      sample(4, 4, labels)
+    ]
+
+    {payload, _, _, _} = encode!(samples)
+    decoded = decode!(payload) |> Enum.sort_by(& &1.timestamp_ns)
+    assert Enum.map(decoded, & &1.labels) == Enum.map(samples, & &1.labels)
+    assert Enum.at(decoded, 1).series_id == 42
+    assert hd(decoded).series_id == List.last(decoded).series_id
+
+    for invalid <- [%{labels | "instance" => :invalid}, %{bad: "value"}, nil] do
+      assert :fallback = NIF.encode_metric_segment_parquet([hd(samples), %{hd(samples) | labels: invalid}])
+    end
+  end
+
+  test "record key sharing preserves duplicates, changing labels, and equal-time conflicting values" do
+    labels = %{"__name__" => "counter"}
+
+    samples = [
+      %{sample(1, 1.0, labels) | series_id: 1},
+      %{sample(1, 1.0, labels) | series_id: 1},
+      %{sample(1, 2.0, labels) | series_id: 1},
+      %{sample(1, 2.0, %{}) | series_id: 1},
+      %{sample(2, 3.0, labels) | series_id: 2}
+    ]
+
+    {payload, _, _, _} = encode!(samples)
+    decoded = decode!(payload)
+    assert decoded == samples
+    assert :erts_debug.same(hd(decoded), Enum.at(decoded, 1))
+  end
+
+  test "repeated long labels retain dictionary bytes rather than an expanded sample column" do
+    long = String.duplicate("annotation", 100)
+    labels = %{"__name__" => "counter", "annotation" => long}
+    {payload, _, _, _} = encode!(for ts <- 1..2000, do: sample(ts, ts * 1.0, labels))
+    [selected] = decode!(payload, start_ts: 1999, end_ts: 1999)
+    assert selected.labels == labels
+    assert :binary.referenced_byte_size(selected.labels["annotation"]) < 2 * byte_size(long)
+  end
+
+  test "batches sharing a label dictionary retain a single Erlang arena" do
+    supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.ArenaSupervisor})
+    long = String.duplicate("annotation", 100)
+    labels = %{"__name__" => "counter", "annotation" => long}
+    {payload, _, _, _} = encode!(for ts <- 1..2000, do: sample(ts, ts * 1.0, labels))
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        decoded = decode!(payload)
+        :erlang.garbage_collect()
+        size = :binary.referenced_byte_size(hd(decoded).labels["annotation"])
+        {:binary, binaries} = Process.info(self(), :binary)
+        count = binaries |> Enum.uniq_by(&elem(&1, 0)) |> Enum.count(&(elem(&1, 1) == size))
+        {count, length(decoded)}
+      end)
+
+    assert Task.await(task) == {1, 2000}
+  end
+
+  test "dictionary-preserving reads support high-cardinality plain fallback pages" do
+    samples =
+      for ts <- 1..2000 do
+        %{sample(ts, ts / 3, %{"instance" => "node-#{ts}", "annotation" => String.duplicate("é😀", 200)}) | series_id: 1}
+      end
+
+    {payload, _, _, _} = encode!(samples)
+    assert decode!(payload) == samples
+    assert decode!(payload, start_ts: 1000, end_ts: 1100) == Enum.slice(samples, 999, 101)
+  end
+
+  test "dictionary reuse preserves changing labels across adaptive row groups" do
+    samples =
+      for series <- 1..2, ts <- 1..9_000 do
+        labels = %{"__name__" => "counter", "instance" => String.duplicate("node-#{series}", 100)}
+        %{sample(ts, ts * 1.0, labels) | series_id: series}
+      end
+
+    {payload, 1, 9_000, 18_000} = encode!(samples)
+    assert decode!(payload) == samples
+
+    matchers = [{"instance", :eq, String.duplicate("node-2", 100)}]
+    expected = Enum.filter(samples, &(&1.series_id == 2 and &1.timestamp_ns >= 8_999))
+    assert decode!(payload, start_ts: 8_999, matchers: matchers) == expected
+
+    assert {:error, :query_sample_limit} =
+             NIF.decode_metric_segment_parquet_bounded(payload, nil, nil, matchers, 8_999)
+  end
+
   test "same label set hashes to the same series_id across samples" do
     labels = %{"__name__" => "cpu", "instance" => "node-1"}
     a = sample(10, 0.1, labels)
