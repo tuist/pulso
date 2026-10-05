@@ -3,8 +3,9 @@ name: Release App
 # Releases the Pulso Phoenix app image. On every push to `main`,
 # git-cliff decides whether the accumulated conventional commits earn a
 # version bump. If they do, the workflow builds and pushes the release
-# image to ghcr.io/tuist/pulso and creates a GitHub Release tagged
-# v<version>.
+# image to ghcr.io/tuist/pulso, pushes the Helm chart at the same version
+# to oci://ghcr.io/tuist/charts/pulso, and creates a GitHub Release
+# tagged v<version> with the packaged chart attached.
 #
 # The tag this workflow creates is dispatched to the NIF release
 # workflow (release.yml) explicitly, because GitHub does not fire the
@@ -144,7 +145,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Bump mix.exs version and push to main
+      - name: Bump versions and push to main
         id: bump
         # Both Pulso.Codec.NIF and Pulso.ObjectStore.NIF compute their
         # rustler_precompiled base_url from Mix.Project.config()[:version]
@@ -153,27 +154,30 @@ jobs:
         # a later Pulso tag would still request NIF artifacts from the
         # first release's URL and fail. Bump mix.exs to match the next
         # tag, commit it back to main, and use that commit as the tag
-        # target so the tagged tree has the right version.
+        # target so the tagged tree has the right version. The Helm
+        # chart's version and appVersion move in the same commit so the
+        # tagged chart installs the image published by this run.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           number="${{ needs.check.outputs.next-version-number }}"
 
-          # Idempotent: skip when mix.exs already matches (manual dispatch,
-          # or the workflow rerun of a release that already landed).
-          current=$(sed -nE 's/^[[:space:]]*version:[[:space:]]*"([^"]+)".*/\1/p' mix.exs | head -n1)
-          if [ "$current" = "$number" ]; then
-            echo "mix.exs already at ${number}; skipping bump commit"
+          sed -i -E "s/^([[:space:]]*version:[[:space:]]*)\"[^\"]+\"/\1\"${number}\"/" mix.exs
+          sed -i -E "s/^version:.*/version: ${number}/; s/^appVersion:.*/appVersion: \"${number}\"/" charts/pulso/Chart.yaml
+
+          # Idempotent: skip when both files already match (manual
+          # dispatch, or the workflow rerun of a release that already
+          # landed).
+          if git diff --quiet -- mix.exs charts/pulso/Chart.yaml; then
+            echo "mix.exs and Chart.yaml already at ${number}; skipping bump commit"
             echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          sed -i -E "s/^([[:space:]]*version:[[:space:]]*)\"[^\"]+\"/\1\"${number}\"/" mix.exs
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add mix.exs
+          git add mix.exs charts/pulso/Chart.yaml
           # `chore(release):` is skipped by cliff.toml, so this commit
           # cannot itself become the driver of the next release bump.
           # And GITHUB_TOKEN pushes do not re-trigger workflows, so this
@@ -212,6 +216,28 @@ jobs:
             org.opencontainers.image.revision=${{ steps.bump.outputs.sha }}
             org.opencontainers.image.version=${{ needs.check.outputs.next-version-number }}
 
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Package and push Helm chart
+        # Published next to the image as oci://ghcr.io/tuist/charts/pulso
+        # at the same version. Pushed after the image so the chart never
+        # references a tag that does not exist yet.
+        id: chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ needs.check.outputs.next-version-number }}"
+          echo "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm lint charts/pulso \
+            --set storage.bucket=lint --set storage.region=lint --set existingSecret=lint
+          helm package charts/pulso --version "${number}" --app-version "${number}" --destination "${RUNNER_TEMP}/chart"
+          helm push "${RUNNER_TEMP}/chart/pulso-${number}.tgz" oci://ghcr.io/tuist/charts
+          echo "path=${RUNNER_TEMP}/chart/pulso-${number}.tgz" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         # softprops creates the v* tag if it does not exist, and this
         # is the tag the NIF release workflow will build against. Point
@@ -223,8 +249,10 @@ jobs:
           target_commitish: ${{ steps.bump.outputs.sha }}
           name: ${{ needs.check.outputs.next-version-number }}
           tag_name: ${{ needs.check.outputs.next-version }}
+          files: ${{ steps.chart.outputs.path }}
           body: |
             Docker image: `ghcr.io/tuist/pulso:${{ needs.check.outputs.next-version-number }}`
+            Helm chart: `oci://ghcr.io/tuist/charts/pulso --version ${{ needs.check.outputs.next-version-number }}`
 
             ${{ steps.release-notes.outputs.RELEASE_NOTES }}
 
