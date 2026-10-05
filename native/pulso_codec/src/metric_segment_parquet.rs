@@ -360,9 +360,14 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut series_id = Int64Builder::with_capacity(rows.len());
     let mut ts = Int64Builder::with_capacity(rows.len());
     let mut value = Float64Builder::with_capacity(rows.len());
-    let mut metric_name = StringBuilder::with_capacity(rows.len(), 0);
-    let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), 0);
-    let mut labels_json = StringBuilder::with_capacity(rows.len(), 0);
+    // The encoded label bytes already exist; reserve their total column
+    // size once rather than repeatedly reallocating and copying buffers.
+    let name_bytes = rows.iter().map(|row| row.labels.metric_name.len()).sum();
+    let canonical_bytes = rows.iter().map(|row| row.labels.canonical.len()).sum();
+    let json_bytes = rows.iter().map(|row| row.labels.json.len()).sum();
+    let mut metric_name = StringBuilder::with_capacity(rows.len(), name_bytes);
+    let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), canonical_bytes);
+    let mut labels_json = StringBuilder::with_capacity(rows.len(), json_bytes);
 
     for row in rows {
         series_id.append_value(row.series_id);
