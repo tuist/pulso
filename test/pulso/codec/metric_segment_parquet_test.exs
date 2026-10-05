@@ -136,6 +136,26 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert :erts_debug.same(hd(decoded), Enum.at(decoded, 1))
   end
 
+  test "repeated long labels retain dictionary bytes rather than an expanded sample column" do
+    long = String.duplicate("annotation", 100)
+    labels = %{"__name__" => "counter", "annotation" => long}
+    {payload, _, _, _} = encode!(for ts <- 1..2000, do: sample(ts, ts * 1.0, labels))
+    [selected] = decode!(payload, start_ts: 1999, end_ts: 1999)
+    assert selected.labels == labels
+    assert :binary.referenced_byte_size(selected.labels["annotation"]) < 2 * byte_size(long)
+  end
+
+  test "dictionary-preserving reads support high-cardinality plain fallback pages" do
+    samples =
+      for ts <- 1..2000 do
+        %{sample(ts, ts / 3, %{"instance" => "node-#{ts}", "annotation" => String.duplicate("é😀", 200)}) | series_id: 1}
+      end
+
+    {payload, _, _, _} = encode!(samples)
+    assert decode!(payload) == samples
+    assert decode!(payload, start_ts: 1000, end_ts: 1100) == Enum.slice(samples, 999, 101)
+  end
+
   test "same label set hashes to the same series_id across samples" do
     labels = %{"__name__" => "cpu", "instance" => "node-1"}
     a = sample(10, 0.1, labels)

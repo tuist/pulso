@@ -34,12 +34,12 @@
 use crate::stable_hash;
 
 use arrow::array::{
-    Array, BinaryArray, BinaryBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
+    Array, BinaryArray, BinaryBuilder, DictionaryArray, Float64Array, Float64Builder, Int64Array, Int64Builder,
     RecordBatch, StringBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::RowGroupMetaData;
@@ -492,8 +492,25 @@ pub fn decode<'a>(
     let regex_cache = compile_regexes(&filter.matchers)?;
     let bytes = Bytes::copy_from_slice(blob.as_slice());
 
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| DecodeError::Reader)?;
+    // Preserve the label dictionary instead of expanding identical bytes
+    // for every sample. Plain/fallback pages remain supported: parquet-rs
+    // builds an Arrow dictionary for them. Keep all other inferred fields
+    // and metadata unchanged, including legacy fixture schemas.
+    let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
+        .map_err(|_| DecodeError::Reader)?;
+    let mut fields = metadata.schema().fields().to_vec();
+    let labels_field = fields.get(4).ok_or(DecodeError::Reader)?;
+    if labels_field.data_type() != &DataType::Binary {
+        return Err(DecodeError::Reader);
+    }
+    fields[4] = Arc::new(labels_field.as_ref().clone().with_data_type(
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+    ));
+    let read_schema = Arc::new(Schema::new_with_metadata(fields, metadata.schema().metadata().clone()));
+    let read_metadata = ArrowReaderMetadata::try_new(
+        Arc::clone(metadata.metadata()), ArrowReaderOptions::new().with_schema(read_schema),
+    ).map_err(|_| DecodeError::Reader)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, read_metadata);
 
     // Column projection: only the four columns the decoder actually
     // reads. `metric_name` and `labels_json` stay in the file but are
@@ -567,7 +584,9 @@ pub fn decode<'a>(
         // the raw `name<0xff>value<0xff>...` bytes we hashed into
         // `series_id`, so every label slice is returned as a sub-binary
         // of the arena without a per-row JSON parse.
-        let labels_arr = col::<BinaryArray>(&batch, 3)?;
+        let labels_dict = col::<DictionaryArray<Int32Type>>(&batch, 3)?;
+        let labels_arr = labels_dict.values().as_any().downcast_ref::<BinaryArray>()
+            .ok_or(DecodeError::Reader)?;
         let labels_arena = BinaryArena::from(env, labels_arr);
         // The whole-column byte view — the per-row canonical slices we
         // scan during the row loop point into this slice.
@@ -607,7 +626,8 @@ pub fn decode<'a>(
                 }
             }
 
-            let (row_start, row_end) = labels_arena.row_bounds(row);
+            let label_index = labels_dict.key(row).ok_or(DecodeError::Reader)?;
+            let (row_start, row_end) = labels_arena.row_bounds(label_index);
 
             let row_bytes = &labels_bytes[row_start..row_end];
             if previous_labels != Some(row_bytes) {
