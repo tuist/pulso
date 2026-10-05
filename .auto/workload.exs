@@ -120,4 +120,4 @@ defmodule CapacityBench do
     IO.puts("METRIC capacity_index=#{geometric.(Enum.map(results, &elem(&1, 2)))}")
   end
 end
-CapacityBench.run()
+unless System.get_env("CAPACITY_BENCH_SKIP") == "1", do: CapacityBench.run()
