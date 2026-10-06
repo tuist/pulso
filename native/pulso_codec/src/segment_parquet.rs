@@ -20,14 +20,14 @@
 //!   * Row-group `timestamp_ns` min/max stats prune whole row groups
 //!     before any column pages are read, so a segment outside the query
 //!     range decodes to `[]` with no column-buffer allocations at all.
+//!   * The input blob reaches the Parquet reader without a copy (see
+//!     `erlang_bytes`).
 //!
 //! Follow-ups worth doing when the query path is on the hot list:
-//!   * Wrap the input Erlang binary in a `Bytes` without copying (needs
-//!     ref-counted access, so either `rustler_sys` or a wrapper crate).
-//!     Would remove one full-blob memcpy per read.
 //!   * Arena the JSON blobs on encode too so the sort is by indices,
 //!     not by owned strings.
 
+use crate::erlang_bytes;
 use crate::json_read::{Fallback, Parser, Res, Stacks};
 use crate::query_filter::{find_label, line_bytes_for_match, LineFilter, Matcher};
 use crate::term_json::{Enc, EncodeError, InternedKeys, JsonEncoder, TermBuilder};
@@ -37,7 +37,6 @@ use arrow::array::{
     StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -384,9 +383,7 @@ fn writer_properties() -> WriterProperties {
 // -- decode --------------------------------------------------------------
 
 pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<Term<'a>>> {
-    // One copy from the Erlang heap into a Rust-owned `Bytes` so the
-    // Parquet reader owns something with `'static` lifetime.
-    let bytes = Bytes::copy_from_slice(blob.as_slice());
+    let bytes = erlang_bytes::from_binary(*blob);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| Fallback)?;
     let metadata = builder.metadata().clone();
 
@@ -872,6 +869,7 @@ fn parse_json_sub<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn long_utf8_statistics_are_conservative_and_timestamp_bounds_stay_exact() {

@@ -31,6 +31,7 @@
 //! Elixir side maps `:fallback` to `{:error, {:decode_failed, _}}`),
 //! same policy as the log Parquet codec.
 
+use crate::erlang_bytes;
 use crate::stable_hash;
 
 use arrow::array::{
@@ -38,7 +39,6 @@ use arrow::array::{
     Int64Builder, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -512,7 +512,7 @@ pub fn decode<'a>(
     filter: &Filter<'_>,
 ) -> Result<Term<'a>, DecodeError> {
     let regex_cache = compile_regexes(&filter.matchers)?;
-    let bytes = Bytes::copy_from_slice(blob.as_slice());
+    let bytes = erlang_bytes::from_binary(*blob);
 
     // Preserve the label dictionary instead of expanding identical bytes
     // for every sample. Plain/fallback pages remain supported: parquet-rs
@@ -949,6 +949,7 @@ fn labels_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn row(series_id: i64, timestamp_ns: i64) -> Row {
         Row {

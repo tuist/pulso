@@ -8,17 +8,16 @@
 // The Elixir side (`Pulso.ObjectStore.NIF`) always passes an explicit
 // `StoreConfig` map; nothing in this crate reads process environment.
 
-use bytes::Bytes;
+mod erlang_bytes;
+
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
-    Error as ObjectStoreError, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
-    UpdateVersion,
+    Error as ObjectStoreError, GetOptions, ObjectStore, PutMode, PutOptions, UpdateVersion,
 };
 use once_cell::sync::Lazy;
-use rustler::env::SavedTerm;
-use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult, OwnedEnv};
+use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -106,49 +105,6 @@ fn build_store(config: &StoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
     Ok(store)
 }
 
-// Hand the Erlang binary to `object_store` without copying it. The
-// binary is saved into a process-independent environment, which holds a
-// reference to it (a refcount, not a copy, for off-heap binaries), and
-// the resulting `Bytes` owns that environment. reqwest may clone the body
-// for retries and keep clones past the NIF call; every clone shares the
-// owner, so the Erlang binary stays alive until the last one is dropped.
-// That is what makes this sound where a lifetime-extended slice was not.
-struct ErlangBinary {
-    _saved: SavedTerm,
-    _env: OwnedEnv,
-    ptr: *const u8,
-    len: usize,
-}
-
-// The bytes are immutable and kept alive by `_env`, which is itself
-// `Send`; freeing a process-independent environment is allowed from any
-// thread.
-unsafe impl Send for ErlangBinary {}
-
-impl AsRef<[u8]> for ErlangBinary {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: `ptr`/`len` describe the binary saved in `_env`, which
-        // lives as long as `self` and never mutates or moves the data.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-fn payload_from_binary(data: Binary) -> PutPayload {
-    let env = OwnedEnv::new();
-    let saved = env.save(data);
-    let (ptr, len) = env.run(|e| {
-        let b: Binary = saved.load(e).decode().expect("saved term is a binary");
-        (b.as_slice().as_ptr(), b.len())
-    });
-    Bytes::from_owner(ErlangBinary {
-        _saved: saved,
-        _env: env,
-        ptr,
-        len,
-    })
-    .into()
-}
-
 // The `object_store` crate returns `PutResult { e_tag, version }`. S3
 // always supplies an ETag; treat its absence as a hard error rather than
 // silently returning an empty string — a CAS caller that trusts a bogus
@@ -161,7 +117,7 @@ fn etag_or_error(e_tag: Option<String>) -> Result<String, Error> {
 fn put(config: StoreConfig, key: String, data: Binary) -> NifResult<(Atom, String)> {
     let store = build_store(&config)?;
     let path = Path::from(key);
-    let payload = payload_from_binary(data);
+    let payload = erlang_bytes::from_binary(data).into();
 
     let result = RUNTIME
         .block_on(store.put(&path, payload))
@@ -178,7 +134,7 @@ fn put(config: StoreConfig, key: String, data: Binary) -> NifResult<(Atom, Strin
 fn put_if_none_match(config: StoreConfig, key: String, data: Binary) -> NifResult<(Atom, String)> {
     let store = build_store(&config)?;
     let path = Path::from(key);
-    let payload = payload_from_binary(data);
+    let payload = erlang_bytes::from_binary(data).into();
     let opts = PutOptions {
         mode: PutMode::Create,
         ..PutOptions::default()
@@ -204,7 +160,7 @@ fn put_if_match(
 ) -> NifResult<(Atom, String)> {
     let store = build_store(&config)?;
     let path = Path::from(key);
-    let payload = payload_from_binary(data);
+    let payload = erlang_bytes::from_binary(data).into();
     let opts = PutOptions {
         mode: PutMode::Update(UpdateVersion {
             e_tag: Some(etag),

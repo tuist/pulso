@@ -15,6 +15,7 @@
 // Callers that keep decoded data past a request should `:binary.copy/1`
 // the fields they keep.
 
+mod erlang_bytes;
 mod ingest_limits;
 mod json_read;
 mod json_write;
