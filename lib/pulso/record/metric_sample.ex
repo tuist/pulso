@@ -13,6 +13,11 @@ defmodule Pulso.Record.MetricSample do
   Readers should treat `series_id` as a pruning accelerator only — identity
   is the canonical labels, not the hash.
 
+  Values unsupported by BEAM floats use the closed atoms `:stale`, `:nan`,
+  `:infinity`, and `:negative_infinity`. The native codec preserves the stale
+  NaN payload exactly through Parquet and compaction. Ordinary NaN payloads
+  normalize to `:nan`; they are arithmetic values, not staleness markers.
+
   `timestamp_ns` is nanoseconds since the Unix epoch. The wire protocols
   (Prometheus remote_write v1 and OTLP metrics) express timestamps in
   milliseconds and nanoseconds respectively; conversion happens at the
@@ -24,7 +29,7 @@ defmodule Pulso.Record.MetricSample do
   @type t :: %__MODULE__{
           series_id: non_neg_integer() | nil,
           timestamp_ns: integer() | nil,
-          value: float() | nil,
+          value: number() | :stale | :nan | :infinity | :negative_infinity | nil,
           labels: %{optional(String.t()) => String.t()}
         }
 end

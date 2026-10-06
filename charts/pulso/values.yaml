@@ -156,7 +156,11 @@ resources:
     memory: 2Gi
 
 # Pulso is supported as a single node today. Rolling updates briefly run two
-# nodes, which object-storage conditional writes keep safe.
+# nodes, which object-storage conditional writes keep safe for compatible
+# versions. When upgrading from a version that rejected stale/non-finite samples,
+# use type: Recreate and rollingUpdate: null so old readers never overlap new
+# writers. Existing buckets cannot be rolled back to the old reader after those
+# values are stored. See docs/deployment.md's stale-sample compatibility section.
 strategy:
   type: RollingUpdate
   rollingUpdate:

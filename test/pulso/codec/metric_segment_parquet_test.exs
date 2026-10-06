@@ -53,17 +53,38 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     assert decode!(payload, start_ts: 21) == []
   end
 
+  test "stale, NaN, and infinities survive randomized Parquet round trips" do
+    :rand.seed(:exsss, {51, 7, 29})
+    values = [:stale, :nan, :infinity, :negative_infinity, 0.0, -1.0, 17.25]
+
+    for _ <- 1..20 do
+      samples =
+        for ts <- 1..100, do: sample(ts, Enum.at(values, :rand.uniform(length(values)) - 1), %{"__name__" => "special"})
+
+      {payload, _, _, _} = encode!(samples)
+      decoded = decode!(payload)
+      assert Enum.map(decoded, &Map.delete(&1, :series_id)) == Enum.map(samples, &Map.delete(&1, :series_id))
+      assert Enum.all?(decoded, &is_integer(&1.series_id))
+      {again, _, _, _} = encode!(decoded)
+      assert decode!(again) == decoded
+    end
+  end
+
   test "does not encode an unsupported value beside a finite sample" do
     labels = %{"__name__" => "up"}
     assert :fallback = NIF.encode_metric_segment_parquet([sample(1, 1.0, labels), sample(2, nil, labels)])
   end
 
-  test "legacy stale values fail explicitly while filtered finite rows remain readable" do
+  test "legacy stale markers remain bit-exact across decode and re-encode" do
     blob = File.read!(Path.expand("../../fixtures/metrics/non_finite.parquet", __DIR__))
 
-    assert {:error, :non_finite_sample_value} = NIF.decode_metric_segment_parquet(blob, nil, nil, [])
-    assert {:error, :non_finite_sample_value} = NIF.decode_metric_segment_parquet_bounded(blob, nil, nil, [], 10)
-    assert {:error, :non_finite_sample_value} = S3.decode_segment(:metrics, blob, nil, nil, [])
+    assert {:ok, [finite, stale] = samples} = NIF.decode_metric_segment_parquet(blob, nil, nil, [])
+    assert finite.value == 1.0
+    assert stale.value == :stale
+    assert {:ok, ^samples} = NIF.decode_metric_segment_parquet_bounded(blob, nil, nil, [], 10)
+    assert {:ok, ^samples} = S3.decode_segment(:metrics, blob, nil, nil, [])
+    {encoded, _, _, _} = encode!(samples)
+    assert decode!(encoded) == samples
 
     assert {:ok, [finite]} = NIF.decode_metric_segment_parquet(blob, nil, nil, [{"__name__", :eq, "safe"}])
     assert finite.value == 1.0

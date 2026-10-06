@@ -21,7 +21,9 @@ mod json_write;
 mod labels;
 mod loki;
 mod metric_json;
+mod metric_regex;
 mod metric_segment_parquet;
+mod metric_value;
 mod out;
 mod query_filter;
 mod remote_write;
@@ -54,7 +56,6 @@ mod atoms {
         fallback,
         too_big,
         query_sample_limit,
-        non_finite_sample_value,
         storage,
         lines,
         eq,
@@ -552,9 +553,6 @@ fn decode_metrics<'a>(
         Err(metric_segment_parquet::DecodeError::TooManySamples) => {
             (atoms::error(), atoms::query_sample_limit()).encode(env)
         }
-        Err(metric_segment_parquet::DecodeError::NonFiniteValue) => {
-            (atoms::error(), atoms::non_finite_sample_value()).encode(env)
-        }
         Err(_) => atoms::fallback().encode(env),
     }
 }
@@ -656,7 +654,13 @@ fn decode_remote_write_inner<'a>(
         let samples: Vec<Term<'a>> = series
             .samples
             .iter()
-            .map(|s| (s.timestamp_ms, s.value).encode(env))
+            .map(|s| {
+                (
+                    s.timestamp_ms.encode(env),
+                    metric_value::encode(env, s.value),
+                )
+                    .encode(env)
+            })
             .collect();
         let sorted_pairs: Vec<(&[u8], &[u8])> =
             series.labels.iter().map(|(n, v)| (*n, *v)).collect();

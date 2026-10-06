@@ -6,13 +6,13 @@
 //! ```proto
 //! message WriteRequest {
 //!   repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
-//!   // metadata, histograms, etc. are optional and ignored here
+//!   // metadata is optional and ignored here
 //! }
 //!
 //! message TimeSeries {
 //!   repeated Label   labels    = 1 [(gogoproto.nullable) = false];
 //!   repeated Sample  samples   = 2 [(gogoproto.nullable) = false];
-//!   // exemplars (3), histograms (4) ignored on v1
+//!   // exemplars (3), native histograms (4) explicitly counted as rejected
 //! }
 //!
 //! message Label  { string name = 1; string value = 2; }
@@ -93,11 +93,13 @@ fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
             Some((2, Value::Bytes(bytes))) => {
                 total_samples = total_samples.saturating_add(1);
                 let sample = decode_sample(bytes).ok_or(total_samples)?;
-                if sample.value.is_finite() {
-                    samples.push(sample);
-                } else {
-                    rejected = rejected.saturating_add(1);
-                }
+                samples.push(sample);
+            }
+            Some((3 | 4, Value::Bytes(_))) => {
+                // Exemplars and native histograms have no storage model yet.
+                // Count them explicitly instead of silently acknowledging loss.
+                total_samples = total_samples.saturating_add(1);
+                rejected = rejected.saturating_add(1);
             }
             _ => {}
         }

@@ -107,7 +107,7 @@ impl Limits {
                 fields(series, |field, value| {
                     match (field, value) {
                         (1, Value::Bytes(pair)) => self.wire_pair(pair, &mut count, &mut bytes)?,
-                        (2, Value::Bytes(_)) => increment(&mut records, self.records)?,
+                        (2..=4, Value::Bytes(_)) => increment(&mut records, self.records)?,
                         _ => {}
                     }
                     Ok(())
