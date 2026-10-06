@@ -150,12 +150,48 @@ before they reach Pulso.
   `terminationGracePeriodSeconds` (30 by default) to finish in-flight requests.
   Pulso only acknowledges a batch after it is durable in the bucket, so
   collectors retry anything cut off mid-request.
-- **Upgrades** roll out one new pod before stopping the old one. Read the release
-  notes before upgrading, and do not run versions side by side for long once
-  metrics compaction is enabled.
+- **Compatible upgrades** roll out one new pod before stopping the old one.
+  Read release notes first. Crossing the stale-sample compatibility boundary
+  below requires a non-overlapping upgrade, not the default rolling strategy.
+  Do not mix incompatible readers, writers, or compactors.
 
 The pod runs as an unprivileged user with a read-only root filesystem. The only
 writable path is an `emptyDir` at `/tmp` for runtime scratch files.
+
+### Stale-sample storage compatibility
+
+When upgrading from a release that rejected stale markers, NaN, and infinities,
+**do not use the default rolling update**. New writers persist those values
+immediately, while old readers and compactors cannot decode them. Collectors
+send stale markers automatically when series disappear, so asking collectors
+not to send them is not a safe rollout strategy.
+
+For the chart's supported single-node deployment, use `Recreate` for this upgrade:
+
+```yaml
+strategy:
+  type: Recreate
+  rollingUpdate: null # Removes the chart's default rolling-update settings.
+```
+
+Render the chart first and verify that `strategy` has only `type: Recreate`.
+Then upgrade to the new image/chart. The old pod must finish termination before
+the new pod starts. If other processes write, read, or compact the same bucket,
+stop them too before starting any new-version writer. Keep collector queues and
+the reference destination running; ingestion is unavailable during the upgrade,
+and collectors must retry unacknowledged requests within their retry horizon.
+Verify readiness, finite and stale-sample queries, and independent monitoring
+before expanding traffic. Compatible subsequent upgrades can restore the rolling
+strategy.
+
+**Rollback is not a simple image rollback after the first non-finite write.**
+Retain a compatible Pulso version to read the existing bucket, and roll forward
+with a fix or route collection/query traffic back to the reference destination.
+Do not delete live objects or restore an older manifest to hide incompatible
+records: that can lose acknowledged data. Returning the bucket to an older data
+contract requires a separately validated data migration or a pre-upgrade backup
+with an explicitly accepted loss/backfill procedure. Record this boundary in the
+release's upgrade notes.
 
 ## Sending telemetry
 

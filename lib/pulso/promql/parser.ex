@@ -9,10 +9,21 @@ defmodule Pulso.PromQL.Parser do
   import NimbleParsec
 
   alias Pulso.Codec.NIF
+  alias Pulso.PromQL.FloatParser
 
   comment = string("#") |> repeat(utf8_char(not: ?\n))
   ws = ignore(repeat(choice([ascii_char([?\s, ?\t, ?\r, ?\n]), comment])))
   defcombinatorp(:ws, ws)
+
+  keyword = fn text ->
+    text
+    |> String.to_charlist()
+    |> Enum.reduce(empty(), fn char, acc ->
+      next = if char in ?a..?z, do: ascii_char([char, char - 32]), else: string(<<char>>)
+      concat(acc, next)
+    end)
+    |> replace(text)
+  end
 
   identifier =
     ascii_char([?a..?z, ?A..?Z, ?_, ?:])
@@ -93,7 +104,7 @@ defmodule Pulso.PromQL.Parser do
 
   offset =
     parsec(:ws)
-    |> ignore(string("offset"))
+    |> ignore(keyword.("offset"))
     |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
     |> parsec(:ws)
     |> concat(duration)
@@ -123,7 +134,7 @@ defmodule Pulso.PromQL.Parser do
     |> reduce({__MODULE__, :function, []})
 
   grouping =
-    choice([string("by") |> replace(:by), string("without") |> replace(:without)])
+    choice([keyword.("by") |> replace(:by), keyword.("without") |> replace(:without)])
     |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
     |> parsec(:ws)
     |> ignore(string("("))
@@ -139,7 +150,7 @@ defmodule Pulso.PromQL.Parser do
 
   aggregate =
     choice(
-      Enum.map(~w(sum avg min max count), fn op ->
+      Enum.map(~w(sum avg min max count group), fn op ->
         op
         |> String.to_charlist()
         |> Enum.reduce(empty(), fn char, acc -> concat(acc, ascii_char([char, char - 32])) end)
@@ -156,18 +167,152 @@ defmodule Pulso.PromQL.Parser do
     |> optional(parsec(:ws) |> concat(grouping))
     |> reduce({__MODULE__, :aggregate, []})
 
-  expression =
+  digits = ascii_string([?0..?9], 1) |> optional(ascii_string([?0..?9, ?_], min: 1))
+  hex_digits = ascii_string([?0..?9, ?a..?f, ?A..?F, ?_], min: 1)
+  exponent = optional(choice([string("+"), string("-")])) |> concat(digits)
+
+  decimal_number =
+    choice([
+      digits |> optional(string(".") |> optional(digits)),
+      string(".") |> concat(digits)
+    ])
+    |> optional(choice([string("e"), string("E")]) |> concat(exponent))
+
+  hex_number = choice([string("0x"), string("0X")]) |> concat(hex_digits)
+
+  number = choice([hex_number, decimal_number]) |> reduce({__MODULE__, :number, []})
+
+  aggregation_prefix =
+    choice(
+      Enum.map(~w(sum avg min max count group topk bottomk), fn op ->
+        keyword.(op) |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
+      end)
+    )
+
+  generic_function =
+    lookahead_not(aggregation_prefix)
+    |> concat(identifier)
+    |> parsec(:ws)
+    |> ignore(string("("))
+    |> parsec(:ws)
+    |> optional(parsec(:argument) |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:argument)))
+    |> parsec(:ws)
+    |> ignore(string(")"))
+    |> reduce({__MODULE__, :call, []})
+
+  parameter_aggregate =
+    choice([keyword.("topk"), keyword.("bottomk")])
+    |> parsec(:ws)
+    |> optional(grouping |> parsec(:ws))
+    |> ignore(string("("))
+    |> parsec(:expression)
+    |> ignore(string(","))
+    |> parsec(:expression)
+    |> ignore(string(")"))
+    |> optional(parsec(:ws) |> concat(grouping))
+    |> reduce({__MODULE__, :parameter_aggregate, []})
+
+  special_number =
+    choice([keyword.("nan") |> replace(:nan), keyword.("inf") |> replace(:infinity)])
+    |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
+    |> reduce({__MODULE__, :special_number, []})
+
+  primary =
     parsec(:ws)
     |> choice([
+      parameter_aggregate,
       aggregate,
       function,
-      ignore(string("(")) |> parsec(:expression) |> parsec(:ws) |> ignore(string(")")),
+      generic_function,
+      special_number,
+      ignore(string("(")) |> parsec(:expression) |> ignore(string(")")),
+      number,
       instant
     ])
     |> parsec(:ws)
 
-  defcombinatorp(:expression, expression)
-  defparsecp(:do_parse, expression |> eos())
+  defcombinatorp(:primary, primary)
+
+  defcombinatorp(
+    :argument,
+    parsec(:ws) |> choice([quoted |> reduce({__MODULE__, :string_argument, []}), parsec(:expression)]) |> parsec(:ws)
+  )
+
+  # Power is right-associative; unary signs bind less tightly than power.
+  defcombinatorp(
+    :power,
+    parsec(:primary)
+    |> optional(string("^") |> parsec(:modifiers) |> parsec(:unary))
+    |> reduce({__MODULE__, :power, []})
+  )
+
+  defcombinatorp(
+    :unary,
+    parsec(:ws)
+    |> choice([
+      choice([string("+"), string("-")]) |> parsec(:ws) |> parsec(:unary) |> reduce({__MODULE__, :unary, []}),
+      parsec(:power)
+    ])
+  )
+
+  label_list =
+    ignore(string("("))
+    |> parsec(:ws)
+    |> optional(identifier |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:ws) |> concat(identifier)))
+    |> parsec(:ws)
+    |> ignore(string(")"))
+    |> wrap()
+
+  matching =
+    choice([keyword.("on"), keyword.("ignoring")])
+    |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
+    |> parsec(:ws)
+    |> concat(label_list)
+    |> wrap()
+
+  cardinality =
+    choice([keyword.("group_left"), keyword.("group_right")])
+    |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
+    |> parsec(:ws)
+    |> optional(label_list)
+    |> wrap()
+
+  modifiers =
+    parsec(:ws)
+    |> optional(keyword.("bool") |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:])) |> parsec(:ws))
+    |> optional(matching |> parsec(:ws))
+    |> optional(cardinality |> parsec(:ws))
+    |> wrap()
+
+  defcombinatorp(:modifiers, modifiers)
+
+  for {name, operand, operators} <- [
+        {:product, :unary, ["*", "/", "%"]},
+        {:addition, :product, ["+", "-"]},
+        {:comparison, :addition, ["==", "!=", ">=", "<=", ">", "<"]},
+        {:intersection, :comparison, ["and", "unless"]},
+        {:expression, :intersection, ["or"]}
+      ] do
+    operator =
+      case operators do
+        [op] -> keyword.(op)
+        _ -> choice(Enum.map(operators, keyword))
+      end
+
+    operator =
+      if name in [:intersection, :expression],
+        do: operator |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:])),
+        else: operator
+
+    defcombinatorp(
+      name,
+      parsec(operand)
+      |> repeat(operator |> concat(modifiers) |> parsec(operand) |> wrap())
+      |> reduce({__MODULE__, :binary, []})
+    )
+  end
+
+  defparsecp(:do_parse, parsec(:expression) |> eos())
   defparsecp(:do_parse_duration, duration |> eos())
 
   # These atoms are an explicit, closed operation set, never derived from input.
@@ -185,7 +330,8 @@ defmodule Pulso.PromQL.Parser do
     :avg,
     :min,
     :max,
-    :count
+    :count,
+    :group
   ]
   @factors %{
     "ms" => 1_000_000,
@@ -199,7 +345,7 @@ defmodule Pulso.PromQL.Parser do
 
   def parse(input) when is_binary(input) and byte_size(input) <= 16_384 do
     case do_parse(input) do
-      {:ok, [expr], "", _, _, _} -> validate(expr)
+      {:ok, [expr], "", _, _, _} -> if bounded?(expr), do: validate(expr), else: {:error, :query_expression_limit}
       _ -> {:error, :invalid_or_unsupported_query}
     end
   rescue
@@ -273,6 +419,116 @@ defmodule Pulso.PromQL.Parser do
   def aggregate([op, inner]), do: {:aggregate, op, nil, inner}
   def aggregate(_), do: raise(ArgumentError)
 
+  @doc false
+  def number(parts) do
+    text = IO.iodata_to_binary(parts)
+
+    case FloatParser.parse(text, :literal) do
+      {:ok, value} -> {:scalar, value}
+      :error -> raise ArgumentError
+    end
+  end
+
+  @doc false
+  def special_number([value]), do: {:scalar, value}
+  @doc false
+  def string_argument([text]), do: {:string, text}
+  @doc false
+  def call([name | args]), do: {:call, name, args}
+  @doc false
+  def parameter_aggregate([op, {:grouping, _, _} = group, parameter, inner]),
+    do: {:parameter_aggregate, op, group, parameter, inner}
+
+  def parameter_aggregate([op, parameter, inner, {:grouping, _, _} = group]),
+    do: {:parameter_aggregate, op, group, parameter, inner}
+
+  def parameter_aggregate([op, parameter, inner]), do: {:parameter_aggregate, op, nil, parameter, inner}
+  def parameter_aggregate(_), do: raise(ArgumentError)
+  @doc false
+  def power([inner]), do: inner
+  def power([left, "^", modifiers, right]), do: {:binary, "^", modifiers, left, right}
+  @doc false
+  def unary([op, inner]), do: {:unary, op, inner}
+  @doc false
+  def binary([left | rest]),
+    do: Enum.reduce(rest, left, fn [op, modifiers, right], left -> {:binary, op, modifiers, left, right} end)
+
+  @doc false
+  def type({:scalar, _}), do: :scalar
+  def type({:string, _}), do: :string
+  def type({:unary, _, inner}), do: type(inner)
+  def type({:call, name, _}) when name in ["time", "scalar"], do: :scalar
+
+  def type({:binary, _, _, left, right}),
+    do: if(type(left) == :scalar and type(right) == :scalar, do: :scalar, else: :vector)
+
+  def type(_), do: :vector
+
+  defp bounded?(expr), do: ast_size(expr, 0) <= 256
+  defp ast_size(_expr, depth) when depth > 64, do: 257
+  defp ast_size({:binary, _, _, left, right}, depth), do: 1 + ast_size(left, depth + 1) + ast_size(right, depth + 1)
+  defp ast_size({:aggregate, _, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
+  defp ast_size({:unary, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
+
+  defp ast_size({:parameter_aggregate, _, _, parameter, inner}, depth),
+    do: 1 + ast_size(parameter, depth + 1) + ast_size(inner, depth + 1)
+
+  defp ast_size({:call, _, args}, depth), do: 1 + Enum.sum(Enum.map(args, &ast_size(&1, depth + 1)))
+  defp ast_size(_, _), do: 1
+
+  defp validate({:scalar, _} = expr), do: {:ok, expr}
+
+  defp validate({:unary, _, inner} = expr) do
+    with {:ok, _} <- validate(inner),
+         true <- type(inner) in [:scalar, :vector],
+         do: {:ok, expr},
+         else: (_ -> {:error, :invalid_operand})
+  end
+
+  defp validate({:call, name, args} = expr) do
+    signatures = %{
+      "histogram_quantile" => [:scalar, :vector],
+      "clamp_min" => [:vector, :scalar],
+      "clamp_max" => [:vector, :scalar],
+      "vector" => [:scalar],
+      "scalar" => [:vector],
+      "time" => [],
+      "label_replace" => [:vector, :string, :string, :string, :string],
+      "sort_desc" => [:vector],
+      "sort" => [:vector],
+      "round" => [:vector],
+      "abs" => [:vector]
+    }
+
+    expected = if name == "round" and length(args) == 2, do: [:vector, :scalar], else: Map.get(signatures, name)
+
+    valid =
+      Enum.all?(args, fn
+        {:string, _} -> true
+        arg -> match?({:ok, _}, validate(arg))
+      end)
+
+    if valid and expected == Enum.map(args, &type/1),
+      do: validate_call(expr),
+      else: {:error, :invalid_function_arguments}
+  end
+
+  defp validate({:parameter_aggregate, _, group, parameter, inner} = expr) do
+    with {:ok, _} <- validate(parameter),
+         true <- type(parameter) == :scalar,
+         {:ok, _} <- validate({:aggregate, :sum, group, inner}),
+         do: {:ok, expr},
+         else: (_ -> {:error, :invalid_aggregation})
+  end
+
+  defp validate({:binary, op, modifiers, left, right} = expr) do
+    with {:ok, _} <- validate(left),
+         {:ok, _} <- validate(right),
+         true <- valid_binary?(op, modifiers, type(left), type(right)),
+         do: {:ok, expr},
+         else: (_ -> {:error, :invalid_binary_expression})
+  end
+
   defp validate({:aggregate, _, group, inner} = expr) do
     names =
       case group do
@@ -282,6 +538,7 @@ defmodule Pulso.PromQL.Parser do
 
     with true <- names == Enum.uniq(names) and Enum.all?(names, &label_name?/1),
          {:ok, _} <- validate(inner),
+         true <- type(inner) == :vector,
          do: {:ok, expr},
          else: (_ -> {:error, :invalid_grouping})
   end
@@ -295,6 +552,51 @@ defmodule Pulso.PromQL.Parser do
   end
 
   defp validate(_), do: {:error, :invalid_range}
+
+  defp validate_call({:call, "label_replace", [_, {:string, dst}, _, _, {:string, regex}]} = expr) do
+    if label_name?(dst) and valid_regex?(regex), do: {:ok, expr}, else: {:error, :invalid_label_replace}
+  end
+
+  defp validate_call(expr), do: {:ok, expr}
+
+  defp valid_binary?(op, modifiers, left, right) do
+    boolean = "bool" in modifiers
+    matching = Enum.find(modifiers, &match?([mode, _] when mode in ["on", "ignoring"], &1))
+    grouping = Enum.find(modifiers, &match?([mode | _] when mode in ["group_left", "group_right"], &1))
+    names = for [_mode, names] <- modifiers, name <- names, do: name
+
+    valid_names =
+      Enum.all?(names, &label_name?/1) and
+        Enum.all?(modifiers, fn
+          [_, names] -> names == Enum.uniq(names)
+          _ -> true
+        end)
+
+    comparisons = op in ["==", "!=", ">", "<", ">=", "<="]
+    sets = op in ["and", "or", "unless"]
+
+    valid_names and valid_operator_types?(comparisons, sets, boolean, left, right) and
+      valid_matching?(sets, matching, grouping, left, right)
+  end
+
+  defp valid_operator_types?(comparison?, set?, boolean?, left, right) do
+    boolean_valid? = not boolean? or comparison?
+    scalar_valid? = valid_scalar_comparison?(comparison?, boolean?, left, right)
+    set_valid? = not set? or (left == :vector and right == :vector and not boolean?)
+    boolean_valid? and scalar_valid? and set_valid?
+  end
+
+  defp valid_scalar_comparison?(true, false, :scalar, :scalar), do: false
+  defp valid_scalar_comparison?(_, _, _, _), do: true
+
+  defp valid_matching?(set?, matching, grouping, left, right) do
+    vector_valid? = (is_nil(matching) and is_nil(grouping)) or (left == :vector and right == :vector)
+    group_valid? = not set? or is_nil(grouping)
+    vector_valid? and group_valid? and not overlapping_labels?(matching, grouping)
+  end
+
+  defp overlapping_labels?(["on", names], [_, include]), do: Enum.any?(include, &(&1 in names))
+  defp overlapping_labels?(_, _), do: false
 
   defp validate_matchers(matchers) do
     valid =

@@ -29,6 +29,29 @@ defmodule Pulso.MCP.ToolsTest do
     assert length(Pulso.JSON.decode!(text)) == 10
   end
 
+  test "raw metric tools serialize non-finite storage values and PromQL tools use wire numbers" do
+    values = [:stale, :nan, :infinity, :negative_infinity]
+
+    samples =
+      values
+      |> Enum.with_index(1)
+      |> Enum.map(fn {value, ts} ->
+        %MetricSample{timestamp_ns: ts, value: value, labels: %{"__name__" => "special"}}
+      end)
+
+    :ok = Storage.append(:metrics, "acme", samples)
+    assert {:ok, [%{"text" => raw}]} = Tools.call("query_metrics", %{"tenant" => "acme"})
+
+    assert raw |> Pulso.JSON.decode!() |> Enum.map(& &1["value"]) |> Enum.sort() ==
+             ["infinity", "nan", "negative_infinity", "stale"]
+
+    assert {:ok, [%{"text" => evaluated}]} =
+             Tools.call("query_promql", %{"tenant" => "acme", "query" => "vector(1 / 0)"})
+
+    assert [entry] = Pulso.JSON.decode!(evaluated)["data"]["result"]
+    assert Enum.at(entry["value"], 1) == "+Inf"
+  end
+
   test "lists all four query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])

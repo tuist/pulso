@@ -103,15 +103,15 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
              [1_700_000_000_000_000_000, 1_700_000_015_000_000_000]
   end
 
-  test "stale and non-finite samples are rejected without losing finite samples", %{conn: conn} do
-    unsupported = [
+  test "stale and non-finite samples are preserved without constructing BEAM floats", %{conn: conn} do
+    values = [
       {:stale, 0x7FF0000000000002},
-      {:other_nan, 0x7FF8000000000001},
-      {:positive_infinity, 0x7FF0000000000000},
+      {:nan, 0x7FF8000000000001},
+      {:infinity, 0x7FF0000000000000},
       {:negative_infinity, 0xFFF0000000000000}
     ]
 
-    for {_name, bits} <- unsupported do
+    for {value, bits} <- values do
       Memory.reset()
 
       request =
@@ -122,12 +122,25 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
 
       response = post_write(conn, request)
       assert response.status == 204
-      assert get_resp_header(response, "x-pulso-rejected-records") == ["2"]
+      assert get_resp_header(response, "x-pulso-rejected-records") == []
       assert {:ok, stored} = Storage.query(:metrics, "default")
 
       assert Enum.sort_by(stored, & &1.timestamp_ns) |> Enum.map(&{&1.timestamp_ns, &1.value}) ==
-               [{1_000_000, 1.0}, {3_000_000, 2.0}]
+               [{1_000_000, 1.0}, {2_000_000, value}, {3_000_000, 2.0}, {4_000_000, value}]
     end
+  end
+
+  test "unsupported histograms and exemplars are explicitly counted without losing float samples", %{conn: conn} do
+    series = encode_series([{"__name__", "mixed"}], [{1.0, 1}]) <> length_delim(3, <<>>) <> length_delim(4, <<>>)
+    response = post_write(conn, snappy(length_delim(1, series)))
+    assert response.status == 204
+    assert get_resp_header(response, "x-pulso-rejected-records") == ["2"]
+    assert {:ok, [%MetricSample{value: 1.0}]} = Storage.query(:metrics, "default")
+    original = Application.get_env(:pulso, Pulso.IngestLimits, [])
+    Application.put_env(:pulso, Pulso.IngestLimits, max_records: 2)
+    on_exit(fn -> Application.put_env(:pulso, Pulso.IngestLimits, original) end)
+    response = post_write(build_conn(), snappy(length_delim(1, series)))
+    assert response.status == 413
   end
 
   test "falls back to the default tenant when X-Scope-OrgID is absent", %{conn: conn} do

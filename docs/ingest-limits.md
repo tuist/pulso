@@ -79,15 +79,25 @@ failures keep their existing transport behavior (`payload_too_large` for
 protobuf, parser errors for JSON). Existing in-budget
 malformed-record rejection and partial-success behavior is unchanged.
 
-Prometheus remote write rejects individual non-finite samples and counts them
-in `X-Pulso-Rejected-Records`. This includes the Prometheus stale marker,
-other not-a-number values, and positive or negative infinity. Finite samples in the
-same series or request are stored, and the receiver returns **204**.
-An all-rejected series contributes its rejected sample count and produces no
-stored series. The segment encoder refuses absent values; a segment containing
-a non-finite value fails decoding instead of crashing a query. Full
-stale-series semantics remain future work, so pilot metric completeness and
-staleness must be evaluated against a reference destination.
+Prometheus remote write preserves stale markers, other not-a-number values,
+and positive or negative infinity alongside finite samples, returning **204**.
+Parquet and metrics compaction preserve those values. Instant selectors stop
+at stale markers; range functions ignore them. The segment encoder still
+refuses absent values.
+
+Native histogram samples and exemplars are not supported. Each is counted in
+`X-Pulso-Rejected-Records`, including in mixed batches where float samples are
+stored. They also count against the supplied-record budget. Invalid series
+contribute their supplied sample count and produce no stored series.
+
+**This is a storage compatibility boundary for upgrades from releases that
+rejected non-finite samples.** Collectors send stale markers automatically, so
+operators cannot delay the first incompatible write after a new writer starts.
+Older readers and compactors fail on segments containing these values, even
+though the Parquet schema has not changed. Use a non-overlapping upgrade and
+read the [upgrade and rollback procedure](deployment.md#stale-sample-storage-compatibility).
+Compare actual collector deliveries and staleness with the reference destination
+during rollout.
 
 Tenant validation and authentication precede these semantic checks. Snappy
 protobuf preflight runs after one bounded decompression, before allocating

@@ -203,7 +203,35 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert evaluated_after == evaluated_before
   end
 
-  test "a legacy non-finite segment reports a permanent data error", ctx do
+  test "compaction preserves staleness and IEEE values and leaves query results unchanged", ctx do
+    previous = Application.get_env(:pulso, Pulso.Storage)
+    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
+    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(0, 1.0), sample(10_000_000_000, :stale)])
+
+    assert :ok =
+             S3.append(:metrics, ctx.tenant, [
+               sample(20_000_000_000, 2.0),
+               sample(30_000_000_000, :nan),
+               sample(40_000_000_000, :infinity),
+               sample(50_000_000_000, :negative_infinity)
+             ])
+
+    times = [0, 10, 20, 30, 40, 50]
+    before = for time <- times, do: Evaluator.query("requests", ctx.tenant, %{end_ts_ns: time * 1_000_000_000})
+    assert Enum.all?(before, &match?({:ok, _}, &1))
+    assert {:ok, stored} = S3.query(:metrics, ctx.tenant, [])
+    assert {:ok, %{merged: 2}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+
+    after_compaction =
+      for time <- times, do: Evaluator.query("requests", ctx.tenant, %{end_ts_ns: time * 1_000_000_000})
+
+    assert after_compaction == before
+    assert {:ok, after_rows} = S3.query(:metrics, ctx.tenant, [])
+    assert Enum.sort_by(after_rows, & &1.timestamp_ns) == Enum.sort_by(stored, & &1.timestamp_ns)
+  end
+
+  test "a legacy stale marker suppresses instant results instead of corrupting the query", ctx do
     previous = Application.get_env(:pulso, Pulso.Storage)
     Application.put_env(:pulso, Pulso.Storage, adapter: S3)
     on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
@@ -218,8 +246,10 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     fixture = File.read!(Path.expand("../../../fixtures/metrics/non_finite.parquet", __DIR__))
     assert {:ok, _} = ObjectStore.put(ctx.config, key, fixture)
 
-    assert {:error, :non_finite_sample_value} = S3.query(:metrics, ctx.tenant, [])
-    assert {:error, :invalid_stored_sample} = Evaluator.query("unsafe", ctx.tenant, %{end_ts_ns: 2})
+    assert {:ok, stored} = S3.query(:metrics, ctx.tenant, [])
+    assert Enum.any?(stored, &(&1.value == :stale))
+    assert {:ok, result} = Evaluator.query("unsafe", ctx.tenant, %{end_ts_ns: 2})
+    assert result["data"]["result"] == []
     assert {:ok, [finite]} = S3.query(:metrics, ctx.tenant, matchers: [{"__name__", :eq, "safe"}])
     assert finite.value == 1.0
   end

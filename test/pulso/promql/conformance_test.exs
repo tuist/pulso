@@ -13,7 +13,27 @@ defmodule Pulso.PromQL.ConformanceTest do
       {"counter", %{"job" => "api"}, [100, 110, 120, 5, 15, 25, 35]},
       {"gauge", %{"job" => "api"}, [1, 5, 3, 7, 2, 9, 4]},
       {"gauge", %{"job" => "web"}, [2, 4, 6, 8, 10, 12, 14]},
-      {"missing", %{}, [1, 2, 3, 4, 5, 6, 7]}
+      {"missing", %{}, [1, 2, 3, 4, 5, 6, 7]},
+      {"staleness", %{}, [1, 2, :stale, :stale, 5, 6, :stale]},
+      {"special", %{}, [1, :nan, :infinity, :negative_infinity, 5, 6, 7]},
+      {"latency_bucket", %{"le" => "0.1", "job" => "api"}, [1, 2, 3, 4, 5, 6, 7]},
+      {"latency_bucket", %{"le" => "1", "job" => "api"}, [2, 4, 6, 8, 10, 12, 14]},
+      {"latency_bucket", %{"le" => "+Inf", "job" => "api"}, [3, 6, 9, 12, 15, 18, 21]},
+      {"kahan", %{"i" => "1"}, List.duplicate(1.0e100, 7)},
+      {"kahan", %{"i" => "2"}, List.duplicate(1.0, 7)},
+      {"kahan", %{"i" => "3"}, List.duplicate(-1.0e100, 7)},
+      {"cancel", %{}, [1.0e100, 1.0, -1.0e100]},
+      {"huge", %{}, [1.0e308, 1.0e308, 1.0e308]},
+      {"noncanonical_bucket", %{"le" => ".5"}, List.duplicate(5, 7)},
+      {"noncanonical_bucket", %{"le" => "0x1p1"}, List.duplicate(8, 7)},
+      {"noncanonical_bucket", %{"le" => "infinity"}, List.duplicate(10, 7)},
+      {"nan_bucket", %{"le" => "1"}, List.duplicate(:nan, 7)},
+      {"nan_bucket", %{"le" => "2"}, List.duplicate(5, 7)},
+      {"nan_bucket", %{"le" => "+Inf"}, List.duplicate(10, 7)},
+      {"nan_last_bucket", %{"le" => "1"}, List.duplicate(5, 7)},
+      {"nan_last_bucket", %{"le" => "+Inf"}, List.duplicate(:nan, 7)},
+      {"inf_last_bucket", %{"le" => "1"}, List.duplicate(3, 7)},
+      {"inf_last_bucket", %{"le" => "+Inf"}, List.duplicate(:infinity, 7)}
     ]
 
     records =
@@ -21,7 +41,7 @@ defmodule Pulso.PromQL.ConformanceTest do
           {value, index} <- Enum.with_index(values),
           do: %MetricSample{
             timestamp_ns: index * 10_000_000_000,
-            value: value * 1.0,
+            value: if(is_number(value), do: value * 1.0, else: value),
             labels: Map.put(labels, "__name__", name)
           }
 
@@ -41,6 +61,86 @@ defmodule Pulso.PromQL.ConformanceTest do
         "count(gauge)",
         "min(gauge)",
         "max(gauge)",
+        "gauge + 2 * gauge",
+        "gauge / gauge",
+        "gauge - 1",
+        "gauge % 3",
+        "gauge ^ 2",
+        "-gauge",
+        "+gauge",
+        "vector(Inf ^ 2)",
+        "vector((-Inf) ^ 3)",
+        "vector(Inf ^ -2)",
+        "vector((-2) ^ 0.5)",
+        "vector(1e308 * 10)",
+        "vector(1. + .5)",
+        "gauge > 3",
+        "gauge > on(job) group_left counter",
+        "gauge == on(__name__,job) gauge",
+        "gauge ^ on(job) counter",
+        "SUM BY(job)(gauge)",
+        "TOPK(1,gauge)",
+        "gauge AND ON(job) counter",
+        "vector(0x10)",
+        "vector(1_000)",
+        "vector(1e1_0)",
+        "vector(inf)",
+        "vector(nan)",
+        "sum(kahan)",
+        "avg(kahan)",
+        "sum_over_time(cancel[1m])",
+        "avg_over_time(cancel[1m])",
+        "avg_over_time(huge[1m])",
+        "sum_over_time(huge[1m])",
+        "histogram_quantile(0.3,noncanonical_bucket)",
+        "histogram_quantile(0.3,nan_bucket)",
+        "histogram_quantile(0.3,nan_last_bucket)",
+        "histogram_quantile(0.3,inf_last_bucket)",
+        "gauge > ignoring(job) sum(gauge)",
+        "gauge < ignoring(job) max(gauge)",
+        "gauge > bool 3",
+        "3 < gauge",
+        "gauge == bool gauge",
+        "gauge + on(job) counter",
+        "gauge / ignoring(job) group_left() sum(counter)",
+        "counter / on(job) group_right() gauge",
+        "gauge and on(job) counter",
+        "gauge unless on(job) counter",
+        "gauge or counter",
+        "gauge or on(job) counter",
+        "histogram_quantile(0.5, latency_bucket)",
+        "histogram_quantile(0.99, latency_bucket)",
+        "histogram_quantile(0.5, sum by(le)(rate(latency_bucket[30s])))",
+        "clamp_min(gauge, 4)",
+        "clamp_max(gauge, 4)",
+        "round(gauge / 3)",
+        "round(gauge / 3, 0.1)",
+        "topk(1, gauge)",
+        "bottomk(1, gauge)",
+        "topk by(job)(1, gauge)",
+        "sort_desc(gauge)",
+        "sort(gauge)",
+        "group by(job)(gauge)",
+        "abs(-gauge)",
+        ~s|label_replace(gauge, "service", "$1", "job", "(.*)")|,
+        "vector(time())",
+        "scalar(sum(gauge))",
+        "time() - 10",
+        "2 ^ 3 ^ 2",
+        "-2 ^ 2",
+        "vector(1 / 0)",
+        "vector(0 / 0)",
+        "vector(-1 / 0)",
+        "staleness",
+        "count_over_time(staleness[30s])",
+        "rate(staleness[30s])",
+        "special",
+        "sum(special)",
+        "avg(special)",
+        "min(special)",
+        "special != 1",
+        "sum_over_time(special[30s])",
+        "rate(special[30s])",
         ~s(missing{job=~".*"}),
         ~s(missing{job!~".*"})
       ] ++
@@ -50,12 +150,27 @@ defmodule Pulso.PromQL.ConformanceTest do
       for expression <- expressions, time <- [0, 10, 20, 30, 45, 60, 330] do
         assert {:ok, result} = Evaluator.query(expression, "reference", %{end_ts_ns: time * 1_000_000_000})
 
-        reference_case(expression, time, result["data"]["result"])
+        entries =
+          if result["data"]["resultType"] == "scalar",
+            do: [%{"metric" => %{}, "value" => result["data"]["result"]}],
+            else: result["data"]["result"]
+
+        reference_case(expression, time, entries)
       end
 
     range_cases =
       Enum.flat_map(
-        ["gauge", "rate(counter[30s])", "sum(gauge)", "gauge offset 10s", ~s(missing{job!~".*"})],
+        [
+          "gauge",
+          "rate(counter[30s])",
+          "sum(gauge)",
+          "gauge offset 10s",
+          ~s(missing{job!~".*"}),
+          "gauge + on(job) counter",
+          "topk(1,gauge)",
+          "histogram_quantile(0.5,latency_bucket)",
+          "staleness"
+        ],
         fn expression ->
           assert {:ok, result} =
                    Evaluator.query(expression, "reference", %{
@@ -78,7 +193,7 @@ defmodule Pulso.PromQL.ConformanceTest do
 
     inputs =
       Enum.map_join(series, "", fn {name, fields, values} ->
-        "      - series: #{quote_yaml(name <> labels(fields))}\n        values: #{quote_yaml(Enum.join(values, " "))}\n"
+        "      - series: #{quote_yaml(name <> labels(fields))}\n        values: #{quote_yaml(Enum.map_join(values, " ", &input_value/1))}\n"
       end)
 
     directory = Path.join(System.tmp_dir!(), "pulso-prometheus-#{System.unique_integer([:positive])}")
@@ -86,9 +201,12 @@ defmodule Pulso.PromQL.ConformanceTest do
     on_exit(fn -> File.rm_rf!(directory) end)
     path = Path.join(directory, "reference.yml")
 
+    # Go math.Pow and the platform libm can differ by one significand bit.
+    # promtool's fuzzy mode permits only that ULP-level tolerance, not broad
+    # numerical differences such as uncompensated summation or missing series.
     File.write!(
       path,
-      "evaluation_interval: 10s\ntests:\n  - interval: 10s\n    input_series:\n#{inputs}    promql_expr_test:\n#{Enum.join(cases ++ range_cases)}"
+      "evaluation_interval: 10s\nfuzzy_compare: true\ntests:\n  - interval: 10s\n    input_series:\n#{inputs}    promql_expr_test:\n#{Enum.join(cases ++ range_cases)}"
     )
 
     {output, status} = System.cmd(System.fetch_env!("PULSO_PROMTOOL"), ["test", "rules", path], stderr_to_stdout: true)
@@ -96,13 +214,40 @@ defmodule Pulso.PromQL.ConformanceTest do
   end
 
   defp reference_case(expression, time, entries) do
+    # promtool's expected-value comparator treats NaN as unequal to itself.
+    # Compare the PromQL self-inequality mask instead at NaN evaluation times.
+    {expression, entries} =
+      if Enum.any?(entries, &(Enum.at(&1["value"], 1) == "NaN")) do
+        masked =
+          Enum.map(entries, fn entry ->
+            %{
+              "metric" => Map.delete(entry["metric"], "__name__"),
+              "value" => [time, if(Enum.at(entry["value"], 1) == "NaN", do: "1", else: "0")]
+            }
+          end)
+
+        {"(#{expression}) != bool (#{expression})", masked}
+      else
+        {expression, entries}
+      end
+
     samples =
       Enum.map_join(entries, ", ", fn sample ->
-        "{labels: #{quote_yaml(labels(sample["metric"]))}, value: #{Enum.at(sample["value"], 1)}}"
+        "{labels: #{quote_yaml(labels(sample["metric"]))}, value: #{yaml_value(Enum.at(sample["value"], 1))}}"
       end)
 
     "      - expr: #{quote_yaml(expression)}\n        eval_time: #{time}s\n        exp_samples: [#{samples}]\n"
   end
+
+  defp input_value(:stale), do: "stale"
+  defp input_value(:nan), do: "NaN"
+  defp input_value(:infinity), do: "+Inf"
+  defp input_value(:negative_infinity), do: "-Inf"
+  defp input_value(value), do: to_string(value)
+  defp yaml_value("NaN"), do: ".nan"
+  defp yaml_value("+Inf"), do: ".inf"
+  defp yaml_value("-Inf"), do: "-.inf"
+  defp yaml_value(value), do: value
 
   defp labels(fields) do
     "{" <>

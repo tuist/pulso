@@ -121,7 +121,6 @@ pub enum DecodeError {
     Reader,
     InvalidRegex,
     TooManySamples,
-    NonFiniteValue,
 }
 
 pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), EncodeError> {
@@ -226,13 +225,7 @@ fn extract_row<'a>(
     let value_term = sample
         .map_get(atoms::value().encode(env))
         .map_err(|_| EncodeError::BadInput)?;
-    let value: f64 = value_term
-        .decode::<f64>()
-        .or_else(|_| value_term.decode::<i64>().map(|i| i as f64))
-        .map_err(|_| EncodeError::BadInput)?;
-    if !value.is_finite() {
-        return Err(EncodeError::BadInput);
-    }
+    let value = crate::metric_value::decode(value_term).map_err(|_| EncodeError::BadInput)?;
 
     bounds.count += 1;
     let ts = i128::from(timestamp_ns);
@@ -712,9 +705,6 @@ pub fn decode<'a>(
             }
             let series_id = series_id_arr.value(row);
             let value = value_arr.value(row);
-            if !value.is_finite() {
-                return Err(DecodeError::NonFiniteValue);
-            }
 
             // Rebuild label terms as sub-binaries of the arena. The
             // slice pointer arithmetic recovers each slice's absolute
@@ -743,7 +733,7 @@ pub fn decode<'a>(
                 struct_name,
                 series_id.encode(env),
                 ts_arr.value(row).encode(env),
-                value.encode(env),
+                crate::metric_value::encode(env, value),
                 labels_term,
             ];
             let record = match previous_record {

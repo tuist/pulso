@@ -11,6 +11,8 @@ defmodule Pulso.PromQL.Evaluator do
   This first evaluator folds selected samples in Elixir. Columnar aggregation
   in Rust is a future optimization; unsupported expression types fail in parsing.
   """
+  alias Pulso.PromQL.Number
+  alias Pulso.PromQL.Operations
   alias Pulso.PromQL.Parser
   alias Pulso.QueryRunner
   alias Pulso.Storage
@@ -39,13 +41,42 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp run_query(expr, tenant, steps, kind) do
+    Process.put(:promql_budget, %{samples: 0, work: 0, points: 0})
+
     with {:ok, series, warnings} <- evaluate(expr, tenant, steps) do
-      result = envelope(kind, series)
+      points = Enum.reduce(series, 0, fn {_, values}, total -> total + length(values) end)
+      if points > limits().points, do: throw({:promql_error, :query_result_limit})
+
+      if length(Enum.uniq_by(series, &elem(&1, 0))) != length(series),
+        do: throw({:promql_error, :duplicate_result_label_sets})
+
+      result = envelope(kind, series, Parser.type(expr), ordered?(expr))
       {:ok, if(warnings == [], do: result, else: Map.put(result, "warnings", Enum.uniq(warnings)))}
     end
   rescue
     ArithmeticError -> {:error, :nonfinite_result}
+  catch
+    {:promql_error, reason} -> {:error, reason}
   end
+
+  @doc false
+  def charge(key, count) do
+    budget = Process.get(:promql_budget)
+    used = Map.fetch!(budget, key) + count
+    if used > Map.fetch!(limits(), key), do: throw({:promql_error, budget_error(key)})
+
+    if System.monotonic_time(:millisecond) >= Process.get(:promql_deadline_ms),
+      do: throw({:promql_error, :query_timeout})
+
+    Process.put(:promql_budget, Map.put(budget, key, used))
+  end
+
+  defp budget_error(:samples), do: :query_sample_limit
+  defp budget_error(:work), do: :query_work_limit
+  defp budget_error(:points), do: :query_result_limit
+  defp ordered?({:call, name, _}), do: name in ["sort", "sort_desc"]
+  defp ordered?({:parameter_aggregate, _, _, _, _}), do: true
+  defp ordered?(_), do: false
 
   defp limits do
     config = Application.get_env(:pulso, __MODULE__, [])
@@ -96,9 +127,44 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp range_steps(_, _, _), do: {:error, :invalid_range_or_too_many_steps}
 
+  defp evaluate({:scalar, value}, _tenant, steps), do: {:ok, [{%{}, Enum.map(steps, &{&1, value})}], []}
+  defp evaluate({:string, _} = string, _tenant, _steps), do: {:ok, string, []}
+
+  defp evaluate({:unary, op, inner}, tenant, steps) do
+    with {:ok, series, warnings} <- evaluate(inner, tenant, steps) do
+      result =
+        Enum.map(series, fn {labels, samples} ->
+          {if(op == "-", do: Map.delete(labels, "__name__"), else: labels),
+           Enum.map(samples, fn {ts, value} -> {ts, if(op == "-", do: Number.negate(value), else: value)} end)}
+        end)
+
+      {:ok, result, warnings}
+    end
+  end
+
+  defp evaluate({:binary, op, modifiers, left, right}, tenant, steps) do
+    with {:ok, lhs, lw} <- evaluate(left, tenant, steps), {:ok, rhs, rw} <- evaluate(right, tenant, steps) do
+      {:ok, Operations.binary(op, modifiers, lhs, rhs, Parser.type(left), Parser.type(right), steps), lw ++ rw}
+    end
+  end
+
+  defp evaluate({:call, name, args}, tenant, steps) do
+    with {:ok, values, warnings} <- evaluate_args(args, tenant, steps) do
+      {:ok, Operations.call(name, values, steps), warnings}
+    end
+  end
+
+  defp evaluate({:parameter_aggregate, op, grouping, parameter, inner}, tenant, steps) do
+    with {:ok, k, kw} <- evaluate(parameter, tenant, steps),
+         {:ok, vector, warnings} <- evaluate(inner, tenant, steps) do
+      {:ok, Operations.topk(op, grouping, k, vector, steps), kw ++ warnings}
+    end
+  end
+
   defp evaluate({:aggregate, op, grouping, inner}, tenant, steps) do
     with {:ok, series, warnings} <- evaluate(inner, tenant, steps) do
       grouped = for {labels, samples} <- series, {ts, value} <- samples, do: {{group_key(labels, grouping), ts}, value}
+      charge(:work, length(grouped))
 
       result =
         grouped
@@ -117,6 +183,15 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp evaluate({:function, op, {:range, matchers, window, offset}}, tenant, steps) do
     select(tenant, matchers, offset, window, steps, op)
+  end
+
+  defp evaluate_args(args, tenant, steps) do
+    Enum.reduce_while(args, {:ok, [], []}, fn arg, {:ok, acc, warnings} ->
+      case evaluate(arg, tenant, steps) do
+        {:ok, value, extra} -> {:cont, {:ok, acc ++ [value], warnings ++ extra}}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp select(tenant, matchers, offset, window, steps, op) do
@@ -144,10 +219,18 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp query_samples(tenant, opts) do
     case Storage.query(:metrics, tenant, opts) do
-      {:ok, samples} -> {:ok, samples}
-      {:error, reason} when reason in [:query_sample_limit, :query_scan_limit, :query_timeout] -> {:error, reason}
-      {:error, :non_finite_sample_value} -> {:error, :invalid_stored_sample}
-      {:error, reason} -> {:error, {:storage_error, reason}}
+      {:ok, samples} ->
+        charge(:samples, length(samples))
+        {:ok, samples}
+
+      {:error, reason} when reason in [:query_sample_limit, :query_scan_limit, :query_timeout] ->
+        {:error, reason}
+
+      {:error, :non_finite_sample_value} ->
+        {:error, :invalid_stored_sample}
+
+      {:error, reason} ->
+        {:error, {:storage_error, reason}}
     end
   end
 
@@ -156,8 +239,12 @@ defmodule Pulso.PromQL.Evaluator do
       evaluate_group(group, acc, steps, offset, window, op, limits)
     end)
     |> case do
-      {:ok, result, _, _} -> {:ok, result}
-      error -> error
+      {:ok, result, work, _} ->
+        charge(:work, work)
+        {:ok, result}
+
+      error ->
+        error
     end
   end
 
@@ -217,12 +304,15 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp bucket_value(:latest, bucket, _, _) do
     case :queue.peek_r(bucket) do
+      {:value, %{value: :stale}} -> nil
       {:value, sample} -> sample.value
       :empty -> nil
     end
   end
 
-  defp bucket_value(op, bucket, start, finish), do: value(op, :queue.to_list(bucket), start, finish)
+  defp bucket_value(op, bucket, start, finish) do
+    value(op, Enum.reject(:queue.to_list(bucket), &(&1.value == :stale)), start, finish)
+  end
 
   # Both storage adapters use unanchored matching; Prometheus selectors anchor
   # the entire label and let dot match newline. Push the wrapped pattern down.
@@ -234,19 +324,33 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp prepare_group({labels, group}, {:ok, acc, warnings}) do
-    if Enum.any?(group, &(not is_integer(&1.timestamp_ns) or not is_number(&1.value))) do
+    if Enum.any?(group, &(not is_integer(&1.timestamp_ns) or not Number.valid?(&1.value))) do
       {:halt, {:error, :unsupported_sample_value}}
     else
-      ordered = group |> Enum.sort_by(&{&1.timestamp_ns, -&1.value}) |> Enum.uniq_by(& &1.timestamp_ns)
+      ordered =
+        group
+        |> Enum.sort(fn a, b ->
+          if a.timestamp_ns == b.timestamp_ns,
+            do: sample_priority(a.value, b.value),
+            else: a.timestamp_ns < b.timestamp_ns
+        end)
+        |> Enum.uniq_by(& &1.timestamp_ns)
+
       conflicts = length(Enum.uniq_by(group, &{&1.timestamp_ns, &1.value})) != length(ordered)
 
       warnings =
         if conflicts,
-          do: ["Conflicting samples at the same timestamp were resolved using the maximum value." | warnings],
+          do: [conflict_warning(group) | warnings],
           else: warnings
 
       {:cont, {:ok, [{labels, ordered} | acc], warnings}}
     end
+  end
+
+  defp conflict_warning(group) do
+    if Enum.any?(group, &(&1.value == :stale)),
+      do: "Conflicting samples at the same timestamp were resolved using staleness first, then the maximum value.",
+      else: "Conflicting samples at the same timestamp were resolved using the maximum value."
   end
 
   defp value(_, [], _, _), do: nil
@@ -258,8 +362,12 @@ defmodule Pulso.PromQL.Evaluator do
   defp value(:irate, samples, _, _) do
     case Enum.take(samples, -2) do
       [first, last] ->
-        change = if last.value < first.value, do: last.value, else: last.value - first.value
-        change / ((last.timestamp_ns - first.timestamp_ns) / 1_000_000_000)
+        change =
+          if Number.compare("<", last.value, first.value),
+            do: last.value,
+            else: Number.binary("-", last.value, first.value)
+
+        Number.divide(change, (last.timestamp_ns - first.timestamp_ns) / 1_000_000_000)
 
       _ ->
         nil
@@ -275,12 +383,12 @@ defmodule Pulso.PromQL.Evaluator do
   defp extrapolated_change(op, samples, start, finish) do
     first = hd(samples)
     last = List.last(samples)
-    change = last.value - first.value
+    change = Number.binary("-", last.value, first.value)
 
     {change, _} =
       Enum.reduce(tl(samples), {change, first.value}, fn sample, {delta, previous} ->
-        reset = if op != :delta and sample.value < previous, do: previous, else: 0
-        {delta + reset, sample.value}
+        reset = if op != :delta and Number.compare("<", sample.value, previous), do: previous, else: 0
+        {Number.add(delta, reset), sample.value}
       end)
 
     interval = (last.timestamp_ns - first.timestamp_ns) / 1_000_000_000
@@ -289,27 +397,36 @@ defmodule Pulso.PromQL.Evaluator do
     right = boundary_duration((finish - last.timestamp_ns) / 1_000_000_000, average)
 
     left =
-      if op != :delta and change > 0 and first.value >= 0, do: min(left, interval * first.value / change), else: left
+      if op != :delta and is_number(change) and change > 0 and is_number(first.value) and first.value >= 0,
+        do: min(left, interval * first.value / change),
+        else: left
 
     factor = (interval + left + right) / interval
     factor = if op == :rate, do: factor / ((finish - start) / 1_000_000_000), else: factor
-    change * factor
+    Number.multiply(change, factor)
   end
 
   defp boundary_duration(distance, average) do
     if distance >= average * 1.1, do: average / 2, else: distance
   end
 
-  defp aggregate(:sum, values), do: Enum.sum(values) * 1.0
-  defp aggregate(:avg, values), do: Enum.sum(values) / length(values)
-  defp aggregate(:min, values), do: Enum.min(values)
-  defp aggregate(:max, values), do: Enum.max(values)
+  defp sample_priority(:stale, _), do: true
+  defp sample_priority(_, :stale), do: false
+  defp sample_priority(:nan, _), do: false
+  defp sample_priority(_, :nan), do: true
+  defp sample_priority(a, b), do: not Number.less?(a, b)
+  defp aggregate(:sum, values), do: Number.sum(values)
+  defp aggregate(:avg, values), do: Number.average(values)
+  defp aggregate(:min, values), do: Enum.reduce(values, :nan, &Number.min/2)
+  defp aggregate(:max, values), do: Enum.reduce(values, :nan, &Number.max/2)
   defp aggregate(:count, values), do: length(values) * 1.0
+  defp aggregate(:group, _values), do: 1.0
   defp group_key(_, nil), do: %{}
   defp group_key(labels, {:grouping, :by, names}), do: Map.take(labels, names)
   defp group_key(labels, {:grouping, :without, names}), do: Map.drop(labels, ["__name__" | names])
 
   # Match Prometheus's shortest-decimal wire formatting and exponent cutoffs.
+  defp format_value(value) when is_atom(value), do: Number.format(value)
   defp format_value(value) when is_integer(value), do: Integer.to_string(value)
 
   defp format_value(value) do
@@ -347,10 +464,18 @@ defmodule Pulso.PromQL.Evaluator do
     sign <> trimmed
   end
 
-  defp envelope(kind, series) do
+  defp envelope(:vector, [{_, [{ts, value}]}], :scalar, _ordered) do
+    %{
+      "status" => "success",
+      "data" => %{"resultType" => "scalar", "result" => [ts / 1_000_000_000, format_value(value)]}
+    }
+  end
+
+  defp envelope(kind, series, _type, ordered) do
+    series = if kind == :vector and ordered, do: series, else: Enum.sort_by(series, &elem(&1, 0))
+
     result =
       series
-      |> Enum.sort_by(&elem(&1, 0))
       |> Enum.map(fn {labels, samples} ->
         values = Enum.map(samples, fn {ts, value} -> [ts / 1_000_000_000, format_value(value)] end)
         field = if kind == :vector, do: "value", else: "values"

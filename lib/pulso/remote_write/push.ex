@@ -15,9 +15,10 @@ defmodule Pulso.RemoteWrite.Push do
 
   Semantic errors inside a series (invalid labels, out-of-range
   timestamp) are counted in `rejected` rather than failing the whole
-  request — the same contract as `Pulso.Loki.Push`. This includes
-  non-finite values such as Prometheus stale markers, which cannot be
-  represented as Erlang floats. A wire-level
+  request — the same contract as `Pulso.Loki.Push`. Native histogram samples
+  and exemplars are counted as rejected until their storage models exist.
+  Stale markers and IEEE-754 non-finite values are preserved using a closed
+  atom vocabulary rather than unsupported Erlang floats. A wire-level
   corruption fails the whole request with a typed error.
   """
 

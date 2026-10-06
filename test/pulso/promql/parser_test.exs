@@ -9,6 +9,30 @@ defmodule Pulso.PromQL.ParserTest do
     assert {:error, _} = Parser.parse(~s(m{job=~"#{String.duplicate("a", 1025)}"}))
   end
 
+  test "unclosed nested aggregations cannot backtrack exponentially" do
+    supervisor = start_supervised!({Task.Supervisor, []})
+
+    for prefix <- ["sum(", "topk(1,"], depth <- [20, 30, 100] do
+      task = Task.Supervisor.async_nolink(supervisor, fn -> Parser.parse(String.duplicate(prefix, depth) <> "x") end)
+      assert {:ok, {:error, _}} = Task.yield(task, 1000)
+    end
+  end
+
+  test "Prometheus keywords are case insensitive while label identifiers retain case" do
+    for {upper, lower} <- [
+          {"SUM BY(job)(a)", "sum by(job)(a)"},
+          {"TOPK(1,a)", "topk(1,a)"},
+          {"a AND ON(job) b", "a and on(job) b"},
+          {"a > BOOL 1", "a > bool 1"},
+          {"a OFFSET 1m", "a offset 1m"},
+          {"a / ON(job) GROUP_LEFT(region) b", "a / on(job) group_left(region) b"}
+        ] do
+      assert Parser.parse(upper) == Parser.parse(lower)
+    end
+
+    assert {:ok, {:selector, [_, {"Job", :eq, "API"}], 0}} = Parser.parse(~s|a{Job="API"}|)
+  end
+
   test "mutated untrusted input always returns a parse result" do
     :rand.seed(:exsss, {11, 37, 91})
     seeds = [~s|sum by(job) (rate(m{job=~"api.*"}[5m]))|, "m offset 1h", "# comment\nm"]
@@ -52,9 +76,7 @@ defmodule Pulso.PromQL.ParserTest do
           "rate(x[1m1h])",
           "rate(x[1.5h])",
           "sum by (a) (x) without (b)",
-          "x + y",
           "x[5m]",
-          "histogram_quantile(0.9,x)",
           "rate(x[5m]) trailing",
           "x offset -1m",
           "rate(x[5m:1m])",

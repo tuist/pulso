@@ -34,6 +34,17 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, :query_execution_failed} ->
         error(conn, :internal_server_error, "execution", "Metric query execution failed.")
 
+      {:error, reason} when reason in [:many_to_many_matching, :duplicate_result_label_sets] ->
+        error(conn, :unprocessable_entity, "execution", "Vector matching produced ambiguous or duplicate series.")
+
+      {:error, :invalid_aggregation_parameter} ->
+        error(
+          conn,
+          :unprocessable_entity,
+          "execution",
+          "Ranking requires a scalar other than NaN and below the signed int64 maximum."
+        )
+
       {:error, :query_overloaded} ->
         error(conn, :too_many_requests, "execution", "Query capacity is busy; retry later.")
 
