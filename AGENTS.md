@@ -113,6 +113,7 @@ User-facing documentation lives in `docs/`, with [`docs/README.md`](./docs/READM
 
 ## Development workflow
 
+- **Pull request titles must follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)**: `type(scope): summary` or `type: summary`. Use an appropriate type (`feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `build`, `ci`, or `style`) and a concise imperative summary. For example: `docs(alerting): plan stateless alerting and change history`. Conventional commit messages do not replace this requirement: validate the PR title itself before creating or updating a pull request.
 - `mix setup` — fetch deps
 - `mix compile --warnings-as-errors` — must be clean before merge
 - `mix test` or `mix test test/path/to_test.exs`
