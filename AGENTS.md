@@ -15,7 +15,7 @@ Early scaffolding. In place:
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
 - `Pulso.Loki` — read-only Loki HTTP client wrapping `query_range`
 - `Pulso.MCP` — stateless MCP `2026-07-28` dispatcher (`server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`); no `initialize` handshake, sessions, or `ping`
-- `Pulso.MCP.Tools` — tool registry; read-only tools `query_logs`, `query_metrics`, `query_logql`, and `query_promql`
+- `Pulso.MCP.Tools` — read-only query tools plus capability-scoped alert management/state/history tools under `Pulso.Alerting.Tools`; infrastructure remediation is never part of this registry
 - `PulsoWeb.MCPController` at `POST /mcp` — Streamable HTTP transport: one message per POST (no batches), `202` for notifications, mirrored-header validation (`PulsoWeb.MCPHeaders`), `405` for GET/DELETE; `PulsoWeb.MCPRequestGate` rejects disallowed `Origin` headers (`403`) and non-JSON POST bodies (`415`) before body parsing
 - `PulsoWeb.OTLPController` at `POST /v1/logs` — OTLP/HTTP JSON logs ingest
 - `PulsoWeb.LokiController` at `POST /loki/api/v1/push` — Loki push ingest, JSON and Snappy-compressed protobuf (decoded in Rust by `Pulso.Codec.NIF`)
@@ -29,7 +29,9 @@ Early scaffolding. In place:
 - `Pulso.Storage.S3.CompactionWorker` and `MetricsCompactor` provide opt-in metrics compaction, rendezvous ownership among live eligible workers, durable manifest-based tenant discovery, and restart-safe retirement cleanup. See the metrics compaction section in `docs/architecture.md`.
 - `Pulso.Storage.S3.AppendBuffer` provides opt-in bounded node-local coalescing of unkeyed appends before segment upload. Keyed requests and overflow remain direct; every acknowledgment still waits for segment PUT and manifest CAS. `PULSO_INGEST_FLUSH_INTERVAL_MS` defaults to `0` (disabled). This is not rendezvous-owned ingest forwarding or node-wide admission.
 
-Not yet built: alerting, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, ingest forwarding and ownership. Follow-up priority: label posting indexes, OpenTelemetry metrics ingestion, then alert evaluation.
+- `Pulso.Alerting` — experimental object-backed rule management, immutable revision audit history, per-rule event replay, and opt-in native Prometheus threshold evaluation. Grafana wrappers preserve complete original definitions but remain disabled; native Slack outboxes and request-scoped live resource subscriptions are experimental; Grafana notification-policy parity is not implemented. See `docs/alerting.md` for current semantics and limits.
+
+Not yet built: full Grafana alert/notification compatibility, Mimir/Tempo clients, sidecar indexes (bloom filters, posting lists, stats — label postings are the first follow-up on the metrics path), traces signal, OTLP/HTTP metrics (`/v1/metrics`), remediation surface, HITL wiring, ingest forwarding and ownership. Follow-up priority: label posting indexes, OpenTelemetry metrics ingestion, then alert evaluation.
 
 ## Design bet
 
@@ -76,7 +78,7 @@ lib/
     loki.ex               # Read-only Loki HTTP client
     mcp.ex                # JSON-RPC dispatcher (public MCP entry point)
     mcp/
-      tools.ex            # Tool registry — read-only tools only
+      tools.ex            # Query and capability-scoped alert tool registry
   pulso_web/
     controllers/
       mcp_controller.ex   # POST /mcp — thin JSON-RPC transport
@@ -97,7 +99,7 @@ Storage backend URLs are read from `config :pulso, Pulso.Loki, base_url: ...` an
 - **Rust fast paths** must be semantically identical to an Elixir reference implementation: when the Rust side cannot guarantee the same result it returns `:fallback` and the Elixir code runs. Tests compare the two on randomized input and assert the Rust path actually answered. The one exception is the Parquet log-segment codec (`Pulso.Codec.NIF.{encode,decode}_log_segment_parquet`): Parquet is not a fast path for a pre-existing Elixir behaviour, so there is no reference implementation and no Elixir fallback — a `:fallback` there is a hard error (`{:error, {:encode_failed | :decode_failed, _}}`), mirroring `Pulso.ObjectStore.NIF`, which has no Elixir S3 client to fall back to. Round-trip tests fuzz `encode → decode → encode → decode` and assert idempotency from the first decode onwards.
 - **New backends** go under `Pulso.<Backend>` (e.g. `Pulso.Mimir`, `Pulso.Tempo`), with the same read-only-first shape as `Pulso.Loki`. Every read function must accept a `:base_url` override in opts.
 - **MCP tools** live in `Pulso.MCP.Tools`. Each tool has an `inputSchema`, and its `call/2` clause returns `{:ok, [content_block]}` or `{:error, reason}`. Content blocks follow the MCP shape: `%{"type" => "text", "text" => "..."}`.
-- **Alerting** (when added): each rule is its own supervised process with a rendezvous-hashed evaluator. Rules and immutable fire records live in object storage; conditional creation arbitrates competing evaluators.
+- **Alerting**: current native evaluation runs in bounded supervised work with rendezvous ownership and object-store conditional head publication. Full revisions are their audit records; stale candidates never become fires. Preserve the distinction between the implemented native slice and unimplemented Grafana/delivery semantics. Configuration changes currently reset native lifecycle; imported Grafana rules cannot be enabled.
 - **Ingestion** (when added): pull-based via Broadway/GenStage. No unbounded process mailboxes.
 - **Naming**: predicate functions end in `?`, not `is_` (see Elixir guidelines below).
 - **Rust NIF distribution**: the NIF crates under `native/` (`pulso_object_store`, `pulso_codec`) ship via `rustler_precompiled`. Every `v*` tag triggers `.github/workflows/release.yml`, which builds artifacts for each crate and the target triples in its `lib/pulso/*/nif.ex` module and attaches them to the matching GitHub Release. Downstream consumers install without a Cargo toolchain. Local dev keeps compiling from source (`PULSO_NIF_FORCE_BUILD=true` is the default); unset it to opt into the precompiled path.

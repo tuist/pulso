@@ -8,13 +8,15 @@ defmodule PulsoWeb.MCPControllerTest do
   alias Pulso.Storage.Memory
   alias Pulso.Test.MCPMessages
 
-  test "tool discovery exposes read-only annotations", %{conn: conn} do
+  test "tool discovery separates query and alert mutation annotations", %{conn: conn} do
     response = request(conn, "tools/list", %{})
-    assert length(response["result"]["tools"]) == 4
-
-    for tool <- response["result"]["tools"] do
-      assert tool["annotations"]["readOnlyHint"] == true
-    end
+    tools = response["result"]["tools"]
+    queries = Enum.filter(tools, &String.starts_with?(&1["name"], "query_"))
+    assert length(queries) == 4
+    assert Enum.all?(queries, &(&1["annotations"]["readOnlyHint"] == true))
+    create = Enum.find(tools, &(&1["name"] == "create_alert_rule"))
+    assert create["annotations"]["readOnlyHint"] == false
+    assert create["annotations"]["openWorldHint"] == true
   end
 
   test "malformed arguments return an explicit error without failing the request", %{conn: conn} do

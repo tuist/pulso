@@ -75,6 +75,16 @@ spec:
               value: {{ .Values.storage.allowHttp | quote }}
             - name: PULSO_METRICS_COMPACTION_ENABLED
               value: {{ .Values.metricsCompaction.enabled | quote }}
+            - name: PULSO_ALERTING_EVALUATION_ENABLED
+              value: {{ .Values.alerting.evaluationEnabled | quote }}
+            - name: PULSO_ALERTING_NOTIFICATIONS_ENABLED
+              value: {{ .Values.alerting.notificationsEnabled | quote }}
+            - name: PULSO_ALERTING_NOTIFICATION_TARGETS_JSON
+              value: {{ .Values.alerting.notificationTargets | toJson | quote }}
+            - name: PULSO_ALERTING_POLL_INTERVAL_MS
+              value: {{ .Values.alerting.pollIntervalMs | quote }}
+            - name: PULSO_ALERTING_PRINCIPALS_JSON
+              value: {{ .Values.alerting.principals | toJson | quote }}
             - name: PULSO_INGEST_FLUSH_INTERVAL_MS
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
             {{- with .Values.mcp.allowedOrigins }}

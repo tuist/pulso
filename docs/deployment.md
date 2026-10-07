@@ -76,6 +76,11 @@ The ones you are most likely to change:
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
+| `alerting.principals` | Dedicated alert principal identities, hashed credentials and capabilities; see [alerting](alerting.md). |
+| `alerting.evaluationEnabled` | Opt-in experimental native evaluation, default `false`. Grafana execution remains unsupported; native delivery has a separate opt-in. |
+| `alerting.notificationsEnabled` | Opt-in native Slack delivery, default `false`; not Grafana routing/template parity. |
+| `alerting.notificationTargets` | Public target descriptors; reference webhook environment secrets supplied through `extraEnv`, never inline URLs. |
+| `alerting.pollIntervalMs` | Durable rule discovery interval (`1000..60000` ms), default `5000`; benchmark read cost before lowering it. |
 | `resources` | CPU and memory. The defaults are starting points, not measured capacity. |
 
 ### Using an existing secret

@@ -22,7 +22,7 @@ defmodule Pulso.QueryRunner do
             })
 
             with :ok <- acquire({tenant}, config(:max_per_tenant, 2)),
-                 :ok <- acquire({:class, :interactive}, config(:max_interactive, 3)),
+                 :ok <- acquire_interactive(class),
                  :ok <- acquire({:class, class}, class_limit(class)) do
               fun.(deadline)
             end
@@ -93,12 +93,15 @@ defmodule Pulso.QueryRunner do
 
   defp config(key, default), do: Keyword.get(Application.get_env(:pulso, __MODULE__, []), key, default)
 
+  defp acquire_interactive(:alerting), do: :ok
+  defp acquire_interactive(_class), do: acquire({:class, :interactive}, config(:max_interactive, 3))
+
   defp class_limit(class) do
-    default = if class in [:raw, :discovery], do: 1, else: 3
+    default = if class in [:raw, :discovery, :alerting], do: 1, else: 3
     Map.get(config(:class_limits, %{}), class, default)
   end
 
-  defp heap_words(:promql) do
+  defp heap_words(class) when class in [:promql, :alerting] do
     Keyword.get(Application.get_env(:pulso, Evaluator, []), :max_heap_words, config(:max_heap_words, 16_000_000))
   end
 

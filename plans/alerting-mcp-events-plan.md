@@ -1,6 +1,6 @@
 # MCP alert events and proactive consumers
 
-Status: implementation design reviewed with Claude, including adversarial correctness/simplicity passes ([decisions](alerting/adversarial-review.md)), not available yet. Complements [S3-backed alerting](alerting-implementation-plan.md); all 115 rule entries remain in that plan's scope. Alert subscriptions and replay are a first-class implementation milestone, not a Slack-only follow-up.
+Status: implementation design reviewed with Claude, including adversarial correctness/simplicity passes ([decisions](alerting/adversarial-review.md)), per-rule replay tools, frontier/state resources and real request-scoped live subscription streams are implemented for the native slice; the complete classified tenant-feed and proactive-policy surface remains planned. Complements [S3-backed alerting](alerting-implementation-plan.md); all 115 rule entries remain in that plan's scope. Alert subscriptions and replay are a first-class implementation milestone, not a Slack-only follow-up.
 
 ## Verified protocol, not a custom event RPC
 

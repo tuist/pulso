@@ -22,6 +22,22 @@ defmodule PulsoWeb.Router do
   scope "/", PulsoWeb do
     pipe_through :api
 
+    post "/api/v1/alerting/import/preview", AlertingController, :import_preview
+    get "/api/v1/alerting/rules", AlertingController, :index
+    get "/api/v1/alerting/rules/:id", AlertingController, :show
+    post "/api/v1/alerting/rules/:id", AlertingController, :create
+    put "/api/v1/alerting/rules/:id", AlertingController, :update
+    delete "/api/v1/alerting/rules/:id", AlertingController, :delete
+    get "/api/v1/alerting/rules/:id/changes", AlertingController, :changes
+    post "/api/v1/alerting/rules/:id/changes", AlertingController, :changes
+    get "/api/v1/alerting/rules/:id/revisions/:revision", AlertingController, :revision
+    post "/api/v1/alerting/rules/:id/revisions/:revision", AlertingController, :revision
+    post "/api/v1/alerting/rules/:id/restore", AlertingController, :restore
+    get "/api/v1/alerting/rules/:id/state", AlertingController, :state
+    post "/api/v1/alerting/rules/:id/events", AlertingController, :events
+    post "/api/v1/alerting/rules/:id/preview", AlertingController, :preview
+    post "/api/v1/alerting/rules/:id/evaluate", AlertingController, :evaluate
+
     post "/v1/logs", OTLPController, :logs
     post "/loki/api/v1/push", LokiController, :push
     post "/api/v1/write", RemoteWriteController, :write

@@ -16,6 +16,7 @@ defmodule PulsoWeb.MCPController do
 
   use PulsoWeb, :controller
 
+  alias Pulso.Alerting.Subscriptions
   alias Pulso.MCP
   alias PulsoWeb.MCPHeaders
 
@@ -63,6 +64,92 @@ defmodule PulsoWeb.MCPController do
     |> send_resp(200, body)
   end
 
+  defp respond(conn, {:subscription, subscription}) do
+    case Subscriptions.acquire(subscription.descriptor) do
+      {:ok, keys} ->
+        try do
+          Process.flag(:max_heap_size, %{
+            size: 8_000_000,
+            kill: true,
+            error_logger: false,
+            include_shared_binaries: true
+          })
+
+          conn =
+            conn
+            |> put_resp_content_type("text/event-stream")
+            |> put_resp_header("cache-control", "no-cache")
+            |> put_resp_header("x-accel-buffering", "no")
+            |> send_chunked(200)
+
+          case send_message(conn, subscription.acknowledgement) do
+            {:ok, conn} -> stream(conn, subscription.descriptor, subscription.completion)
+            {:error, _} -> conn
+          end
+        after
+          Subscriptions.release(keys)
+        end
+
+      {:error, _} ->
+        respond(
+          conn,
+          {:reply, MCP.error_response(subscription.completion["id"], -32_000, "Subscription capacity exceeded")}
+        )
+    end
+  end
+
+  defp stream(conn, descriptor, completion) do
+    receive do
+      :pulso_subscription_shutdown -> finish(conn, completion)
+    after
+      Subscriptions.interval() -> poll_stream(conn, descriptor, completion)
+    end
+  end
+
+  defp poll_stream(conn, descriptor, completion) do
+    case Subscriptions.poll(descriptor) do
+      {:ok, uris, next} ->
+        messages =
+          Enum.map(uris, fn uri ->
+            %{
+              "jsonrpc" => "2.0",
+              "method" => "notifications/resources/updated",
+              "params" => %{"uri" => uri, "_meta" => completion["result"]["_meta"]}
+            }
+          end)
+
+        case send_updates(conn, messages) do
+          {:ok, conn} -> stream(conn, next, completion)
+          {:error, _} -> conn
+        end
+
+      :complete ->
+        finish(conn, completion)
+    end
+  end
+
+  defp send_updates(conn, []), do: chunk(conn, ": heartbeat\n\n")
+  defp send_updates(conn, messages), do: Enum.reduce_while(messages, {:ok, conn}, &send_update/2)
+
+  defp send_update(message, {:ok, conn}) do
+    case send_message(conn, message) do
+      {:ok, conn} -> {:cont, {:ok, conn}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp send_message(conn, message), do: chunk(conn, "data: #{Pulso.JSON.encode!(message)}\n\n")
+
+  defp finish(conn, completion) do
+    case send_message(conn, completion) do
+      {:ok, conn} -> conn
+      {:error, _} -> conn
+    end
+  end
+
+  defp status(%{"error" => %{"code" => -32_001}}), do: 401
+  defp status(%{"error" => %{"code" => -32_003}}), do: 403
+  defp status(%{"error" => %{"code" => -32_000}}), do: 503
   defp status(%{"error" => %{"code" => -32_601}}), do: 404
   defp status(%{"error" => %{"code" => -32_603}}), do: 500
   defp status(%{"error" => _}), do: 400

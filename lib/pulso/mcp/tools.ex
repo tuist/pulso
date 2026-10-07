@@ -1,16 +1,17 @@
 defmodule Pulso.MCP.Tools do
   @moduledoc """
-  Registry of read-only MCP tools Pulso exposes.
+  Registry of query and capability-scoped alert-management MCP tools.
 
-  Every tool in this module is read-only against `Pulso.Storage`. Write and
-  remediation tools live in separate surfaces by design — see
-  `docs/architecture.md`.
+  Query tools are read-only against `Pulso.Storage`. Alert management uses
+  separately configured principals/capabilities; infrastructure remediation
+  remains outside Pulso by design — see `docs/architecture.md`.
   Calls validate the schema vocabulary used by this registry before execution.
   Unknown properties remain allowed; optional null properties retain omitted-field defaults.
   Read-only annotations describe tool behavior and do not replace tenant
   authorization, which every tool enforces before querying storage.
   """
 
+  alias Pulso.Alerting.Tools
   alias Pulso.Auth
   alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
@@ -149,13 +150,13 @@ defmodule Pulso.MCP.Tools do
   ]
 
   @spec list() :: [map()]
-  def list, do: @tools
+  def list, do: @tools ++ Tools.list()
 
   @tool_names Enum.map(@tools, & &1["name"])
 
   @doc "Whether `name` is a registered tool."
   @spec known?(term()) :: boolean()
-  def known?(name), do: name in @tool_names
+  def known?(name), do: name in @tool_names or Tools.known?(name)
 
   @spec call(String.t(), term(), Pulso.MCP.context()) :: {:ok, [map()]} | {:error, term()}
   def call(name, args, context \\ %{})
@@ -169,6 +170,14 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp do_call(name, args, context) do
+    if Tools.known?(name) do
+      Tools.call(name, args, context)
+    else
+      do_query_call(name, args, context)
+    end
+  end
+
+  defp do_query_call(name, args, context) do
     case Enum.find(@tools, &(&1["name"] == name)) do
       nil ->
         {:error, {:unknown_tool, name}}

@@ -6,8 +6,9 @@ S3-compatible bucket, and serves queries through the Model Context Protocol and
 Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
 
 > [!WARNING]
-> Pulso is early software. Logs and metrics work end to end; traces, alerting,
-> and data retention are not implemented yet. Expect breaking changes between
+> Pulso is early software. Logs and metrics work end to end. Native alert
+> evaluation, Slack delivery, live resource hints and rule history are experimental.
+> Grafana migration compatibility, traces, and data retention are not implemented yet. Expect breaking changes between
 > releases and read the release notes before upgrading.
 
 ## Running Pulso
@@ -18,6 +19,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
   tokens, object storage requirements, and metrics compaction.
 - [Querying](querying.md): the Model Context Protocol tools, the Prometheus and
   Loki query APIs, the supported query subset, and query limits.
+- [Alerting](alerting.md): experimental native evaluation, dedicated credentials,
+  rule management and modification history, with explicit compatibility limits.
 - [Ingest limits](ingest-limits.md): per-request budgets for records,
   attributes, and payload sizes, and how to tune them.
 - [Self-monitoring](self-monitoring.md): the `/metrics` endpoint, what each

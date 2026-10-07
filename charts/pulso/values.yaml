@@ -65,6 +65,22 @@ ingestBatching:
   # Overflow uses the original direct path. Keyed requests always remain direct.
   flushIntervalMs: 0
 
+alerting:
+  # Experimental native Prometheus thresholds and Slack delivery. Grafana
+  # execution/policy parity is not implemented; do not transfer production paging.
+  evaluationEnabled: false
+  # Separate explicit opt-in for native Slack outbox delivery.
+  notificationsEnabled: false
+  # Public bindings: tenant/id/type=slack_webhook/secret_env. Supply the HTTPS
+  # webhook via a Secret-backed extraEnv entry named by secret_env, never here.
+  notificationTargets: []
+  # Poll durable rule heads every 1000..60000 ms. Queries have separate admission.
+  pollIntervalMs: 5000
+  # Dedicated principals, not tenant-shared credentials. Each item has tenant,
+  # id, type (human/agent/service), token_hash (64 lowercase SHA-256 hex chars),
+  # and capabilities. See docs/alerting.md. Never put plaintext bearer tokens here.
+  principals: []
+
 mcp:
   # Browser origins allowed to call POST /mcp. Requests without an Origin
   # header (most agents and servers) are always accepted.

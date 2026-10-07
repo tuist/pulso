@@ -28,6 +28,11 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_S3_ENDPOINT` | Amazon S3 | URL of an S3-compatible endpoint, for example `https://<account>.r2.cloudflarestorage.com`. |
 | `PULSO_S3_ALLOW_HTTP` | `false` | Allow a plain-HTTP storage endpoint. Use only for storage on a private network. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
+| `PULSO_ALERTING_PRINCIPALS_JSON` | `[]` | Dedicated alerting principal array with `tenant`, `id`, `type`, `token_hash` and `capabilities`; at most 256 entries. See [alerting credentials](alerting.md#configure-credentials-and-evaluation). |
+| `PULSO_ALERTING_EVALUATION_ENABLED` | `false` | Enable experimental native threshold evaluation. Grafana execution remains unsupported; native Slack delivery has a separate opt-in. |
+| `PULSO_ALERTING_NOTIFICATIONS_ENABLED` | `false` | Enable native Slack delivery from committed bounded outboxes. See [delivery semantics](alerting.md#native-slack-delivery). |
+| `PULSO_ALERTING_NOTIFICATION_TARGETS_JSON` | `[]` | Operator-provisioned target descriptors (`tenant`, `id`, `type: slack_webhook`, `secret_env`), at most 256. Webhook URLs must live in the referenced environment secrets, not in descriptors. |
+| `PULSO_ALERTING_POLL_INTERVAL_MS` | `5000` | Native evaluator discovery interval, integer `1000..60000`; measure object-store read cost before reducing it. |
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request record and attribute budgets for ingestion. |
@@ -57,7 +62,11 @@ Give the plaintext token to the collectors and agents for that tenant and put
 the digest in `PULSO_TENANT_TOKENS`. A tenant that is not listed is rejected,
 and so is a malformed digest, so a blank value cannot switch authentication off.
 
-Each tenant has exactly one token. To rotate it, update the collectors and the
+These ingest/query credentials give each tenant exactly one token. Alerting uses
+separately configured per-principal credentials; a tenant-shared token does not
+automatically grant alert administration. See [alerting](alerting.md).
+
+Each tenant has exactly one ingest/query token. To rotate it, update the collectors and the
 digest together, or briefly route the collectors through a second tenant name
 while they roll over. Changing the variable requires a restart.
 

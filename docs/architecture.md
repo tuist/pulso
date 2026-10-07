@@ -214,9 +214,27 @@ ingest. It adds no cluster state or admission policy.
 
 ## Alerting
 
-Alerting is **designed but not implemented**. The implementation and compatibility
-plan is [S3-backed alerting](../plans/alerting-implementation-plan.md). The rules
-below constrain that implementation; they do not describe available endpoints.
+Alerting has an **experimental implemented native slice**: object-backed rule
+management, immutable revision audit chains, bounded per-rule transition replay,
+and opt-in native Prometheus threshold evaluation. See [alerting](alerting.md)
+for the available endpoints, credentials, semantics and limits. Conditional head
+writes publish configuration/audit and evaluation state; every completed tick is
+fenced, including unchanged normal results. Audit snapshots are retained without
+GC in this slice; replay floors do not authorize deleting them. Tombstones and a
+single bounded history page list retain older generations' reachable data.
+
+Native Slack delivery uses bounded per-target outboxes in the same rule authority;
+lease claims and acknowledgements are conditional head writes. Queue references
+outlive replay pruning. Delivery is at-least-once, without remote-order guarantees.
+Native resource subscriptions are request-scoped HTTP streams polling committed
+heads, with bounded admission and authorization refresh; hints are not replay.
+
+Grafana routing/silences, recording publication and graph execution are **not
+implemented yet**. Original Grafana
+rules are losslessly representable but remain disabled. The full implementation
+and compatibility plan is [S3-backed alerting](../plans/alerting-implementation-plan.md).
+The remaining sections constrain that planned functionality; they do not imply
+that every described endpoint or coordination mechanism exists.
 
 ### Rules and durable state
 
