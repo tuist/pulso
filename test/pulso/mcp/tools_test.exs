@@ -73,7 +73,7 @@ defmodule Pulso.MCP.ToolsTest do
   describe "tool contracts" do
     test "discovery declares every query read-only" do
       {:reply, response} = Pulso.MCP.dispatch(MCPMessages.request(1, "tools/list"))
-      tools = response["result"]["tools"]
+      tools = Enum.filter(response["result"]["tools"], &String.starts_with?(&1["name"], "query_"))
       assert length(tools) == 4
 
       for tool <- tools do
@@ -86,8 +86,8 @@ defmodule Pulso.MCP.ToolsTest do
       end
     end
 
-    test "all tools reject malformed arguments and out-of-range timestamps" do
-      for tool <- Tools.list() do
+    test "query tools reject malformed arguments and out-of-range timestamps" do
+      for tool <- query_tools() do
         name = tool["name"]
         valid = %{"tenant" => "acme", "query" => expression(name)}
 
@@ -215,7 +215,7 @@ defmodule Pulso.MCP.ToolsTest do
     end
 
     test "optional nulls preserve defaults while required nulls are rejected" do
-      for tool <- Tools.list() do
+      for tool <- query_tools() do
         args = %{"tenant" => "acme", "query" => expression(tool["name"])}
         required = tool["inputSchema"]["required"]
 
@@ -323,7 +323,7 @@ defmodule Pulso.MCP.ToolsTest do
         assert {:ok, [_]} = NIF.decode_log_segment_parquet(log_blob, max(ts - 1, minimum), ts, nil, [], [])
         assert {:ok, [_]} = NIF.decode_metric_segment_parquet(metric_blob, max(ts - 1, minimum), ts, [])
 
-        for tool <- Tools.list() do
+        for tool <- query_tools() do
           assert {:ok, _} =
                    Tools.call(tool["name"], %{
                      "tenant" => "acme",
@@ -393,9 +393,9 @@ defmodule Pulso.MCP.ToolsTest do
       {"query_promql", %{"tenant" => "acme", "query" => "up"}}
     ]
 
-    test "all advertised tools declare read-only behavior" do
-      assert length(Tools.list()) == 4
-      assert Enum.all?(Tools.list(), &(&1["annotations"]["readOnlyHint"] == true))
+    test "all advertised query tools declare read-only behavior" do
+      assert length(query_tools()) == 4
+      assert Enum.all?(query_tools(), &(&1["annotations"]["readOnlyHint"] == true))
     end
 
     test "rejects non-object arguments and invalid tenants across all tools" do
@@ -534,7 +534,8 @@ defmodule Pulso.MCP.ToolsTest do
       assert {:reply, %{"result" => %{"tools" => tools}}} =
                Pulso.MCP.dispatch(MCPMessages.request(1, "tools/list"))
 
-      assert Enum.all?(tools, &(&1["annotations"]["readOnlyHint"] == true))
+      queries = Enum.filter(tools, &String.starts_with?(&1["name"], "query_"))
+      assert Enum.all?(queries, &(&1["annotations"]["readOnlyHint"] == true))
 
       for {name, args} <- @queries do
         assert {:reply, %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}}} =
@@ -752,4 +753,6 @@ defmodule Pulso.MCP.ToolsTest do
       assert [%{"body" => "ok"}] = JSON.decode!(text)
     end
   end
+
+  defp query_tools, do: Enum.filter(Tools.list(), &String.starts_with?(&1["name"], "query_"))
 end

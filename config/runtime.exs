@@ -16,8 +16,77 @@ import Config
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
+alias Pulso.Alerting.Principal
+alias Pulso.Alerting.Targets
 alias Pulso.Auth.SharedSecret
 alias Pulso.Storage.S3
+
+# Alerting uses separate principal credentials; tenant-shared tokens never grant writes.
+alerting_principals =
+  case JSON.decode(System.get_env("PULSO_ALERTING_PRINCIPALS_JSON", "[]")) do
+    {:ok, values} when is_list(values) and length(values) <= 256 ->
+      Enum.map(values, fn
+        %{"tenant" => tenant, "id" => id, "type" => type, "token_hash" => hash, "capabilities" => caps} = value ->
+          if Map.keys(value) -- ~w(tenant id type token_hash capabilities) == [] and
+               Principal.valid_id?(tenant) and Principal.valid_id?(id) and
+               type in ["human", "agent", "service"] and is_binary(hash) and
+               Regex.match?(~r/\A[0-9a-f]{64}\z/, hash) and is_list(caps) and
+               Enum.all?(
+                 caps,
+                 &(&1 in ~w(alert:read alert:rules:write alert:audit:read alert:preview alert:evaluate alert:import))
+               ) do
+            %{tenant: tenant, id: id, type: type, token_hash: hash, capabilities: caps}
+          else
+            raise "PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal"
+          end
+
+        _ ->
+          raise "PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal"
+      end)
+
+    _ ->
+      raise "PULSO_ALERTING_PRINCIPALS_JSON must be a JSON array of at most 256 principals"
+  end
+
+for field <- [:id, :token_hash] do
+  keys =
+    Enum.map(alerting_principals, fn principal ->
+      if field == :id, do: {principal.tenant, principal.id}, else: principal.token_hash
+    end)
+
+  if length(Enum.uniq(keys)) != length(keys),
+    do: raise("PULSO_ALERTING_PRINCIPALS_JSON has duplicate identities or credentials")
+end
+
+alerting_poll_interval_ms =
+  case Integer.parse(System.get_env("PULSO_ALERTING_POLL_INTERVAL_MS", "5000")) do
+    {value, ""} when value in 1000..60_000 -> value
+    _ -> raise "PULSO_ALERTING_POLL_INTERVAL_MS must be an integer in 1000..60000"
+  end
+
+alerting_targets =
+  case JSON.decode(System.get_env("PULSO_ALERTING_NOTIFICATION_TARGETS_JSON", "[]")) do
+    {:ok, values} when is_list(values) and length(values) <= 256 ->
+      Enum.map(values, fn value ->
+        case Targets.validate(value) do
+          {:ok, target} -> target
+          _ -> raise "PULSO_ALERTING_NOTIFICATION_TARGETS_JSON contains an invalid target"
+        end
+      end)
+
+    _ ->
+      raise "PULSO_ALERTING_NOTIFICATION_TARGETS_JSON must be an array of at most 256 targets"
+  end
+
+identities = Enum.map(alerting_targets, &{&1["tenant"], &1["id"]})
+if length(Enum.uniq(identities)) != length(identities), do: raise("Duplicate alert notification target IDs")
+
+config :pulso, Pulso.Alerting,
+  principals: alerting_principals,
+  notification_targets: alerting_targets,
+  notifications_enabled: System.get_env("PULSO_ALERTING_NOTIFICATIONS_ENABLED", "false") in ["1", "true", "yes"],
+  evaluation_enabled: System.get_env("PULSO_ALERTING_EVALUATION_ENABLED", "false") in ["1", "true", "yes"],
+  poll_interval_ms: alerting_poll_interval_ms
 
 if System.get_env("PHX_SERVER") do
   config :pulso, PulsoWeb.Endpoint, server: true

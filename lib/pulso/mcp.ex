@@ -9,14 +9,15 @@ defmodule Pulso.MCP do
   The legacy `initialize` handshake and `ping` were removed by this revision
   and return method-not-found.
 
-  Only read-only tools are exposed from this module by design; write and
-  remediation tools live in separate, narrowly-scoped surfaces (see
-  `docs/architecture.md`).
+  Query tools are read-only; alert-management tools require separately configured
+  capability-scoped principals. Infrastructure remediation lives in a separate
+  server, not this registry (see `docs/architecture.md`).
 
   This module is transport-agnostic. HTTP concerns (status codes, mirrored
   request headers, and origin checks) live in `PulsoWeb.MCPController`.
   """
 
+  alias Pulso.Alerting.{Resources, Subscriptions}
   alias Pulso.MCP.Tools
 
   @protocol_version "2026-07-28"
@@ -93,6 +94,7 @@ defmodule Pulso.MCP do
           {:reply, %{"jsonrpc" => "2.0", "id" => id, "result" => complete(result)}}
         else
           {:stream, messages} -> {:stream, messages}
+          {:subscription, subscription} -> {:subscription, subscription}
           {:error, code, message, data} -> {:reply, error_response(id, code, message, data)}
         end
     end
@@ -174,22 +176,20 @@ defmodule Pulso.MCP do
 
   defp handle("tools/call", _params, _id, _context), do: invalid_params("params.name must be a string")
 
-  defp handle("subscriptions/listen", params, id, _context) do
+  defp handle("resources/list", params, _id, %{conn: conn}), do: resource_result(Resources.list(conn, params))
+  defp handle("resources/read", %{"uri" => uri}, _id, %{conn: conn}), do: resource_result(Resources.read(conn, uri))
+
+  defp handle("resources/templates/list", _params, _id, _context),
+    do: {:ok, %{"resourceTemplates" => Resources.templates(), "ttlMs" => @list_ttl_ms, "cacheScope" => @cache_scope}}
+
+  defp handle(method, _params, _id, _context) when method in ["resources/list", "resources/read"],
+    do: invalid_params("Resource requests need a valid URI and authenticated HTTP context")
+
+  defp handle("subscriptions/listen", params, id, context) do
     with :ok <- validate_subscription_filter(params["notifications"]) do
-      # Pulso supports no change notifications (`listChanged: false`), so it
-      # acknowledges an empty filter and ends the subscription gracefully.
-      # Nothing outlives the request.
-      meta = Map.put(server_meta(), @meta_subscription_id, id)
-
-      acknowledgement = %{
-        "jsonrpc" => "2.0",
-        "method" => "notifications/subscriptions/acknowledged",
-        "params" => %{"_meta" => meta, "notifications" => %{}}
-      }
-
-      completion = %{"jsonrpc" => "2.0", "id" => id, "result" => %{"resultType" => "complete", "_meta" => meta}}
-
-      {:stream, [acknowledgement, completion]}
+      requested = Map.get(params["notifications"], "resourceSubscriptions", [])
+      resources = Enum.filter(requested, &match?({:ok, _, _, _}, Resources.parse(&1)))
+      subscription(resources, id, context)
     end
   end
 
@@ -200,13 +200,54 @@ defmodule Pulso.MCP do
 
   defp handle(method, _params, _id, _context), do: {:error, @method_not_found, "Method not found: #{method}", nil}
 
+  defp subscription([], id, _context) do
+    {ack, completion} = subscription_messages(id, %{})
+    {:stream, [ack, completion]}
+  end
+
+  defp subscription(resources, id, %{conn: conn}) do
+    case Subscriptions.prepare(conn, resources) do
+      {:ok, descriptor} ->
+        {ack, completion} = subscription_messages(id, %{"resourceSubscriptions" => descriptor.uris})
+        {:subscription, %{descriptor: descriptor, acknowledgement: ack, completion: completion}}
+
+      error ->
+        resource_result(error)
+    end
+  end
+
+  defp subscription(_, _, _), do: resource_result({:error, :unauthorized})
+
+  defp subscription_messages(id, filter) do
+    meta = Map.put(server_meta(), @meta_subscription_id, id)
+
+    ack = %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/subscriptions/acknowledged",
+      "params" => %{"_meta" => meta, "notifications" => filter}
+    }
+
+    completion = %{"jsonrpc" => "2.0", "id" => id, "result" => %{"resultType" => "complete", "_meta" => meta}}
+    {ack, completion}
+  end
+
+  defp resource_result({:ok, result}), do: {:ok, result}
+  defp resource_result({:error, :unauthorized}), do: {:error, -32_001, "Unauthorized", nil}
+  defp resource_result({:error, :forbidden}), do: {:error, -32_003, "Forbidden", nil}
+
+  defp resource_result({:error, reason})
+       when reason in [:invalid_uri, :not_found, :reset_required, :invalid_subscription],
+       do: invalid_params("Resource is unavailable or continuation requires reset")
+
+  defp resource_result({:error, _}), do: {:error, -32_000, "Alert resource unavailable", nil}
+
   defp validate_subscription_filter(filter) when is_map(filter) do
     Enum.reduce_while(filter, :ok, fn
       {key, value}, :ok when key in @subscription_flags and not is_boolean(value) ->
         {:halt, invalid_params("params.notifications.#{key} must be a boolean")}
 
       {"resourceSubscriptions", value}, :ok ->
-        if is_list(value) and Enum.all?(value, &is_binary/1),
+        if is_list(value) and length(value) <= 32 and Enum.all?(value, &(is_binary(&1) and byte_size(&1) <= 512)),
           do: {:cont, :ok},
           else: {:halt, invalid_params("params.notifications.resourceSubscriptions must be an array of strings")}
 
@@ -217,7 +258,8 @@ defmodule Pulso.MCP do
 
   defp validate_subscription_filter(_filter), do: invalid_params("params.notifications must be an object")
 
-  defp capabilities, do: %{"tools" => %{"listChanged" => false}}
+  defp capabilities,
+    do: %{"tools" => %{"listChanged" => false}, "resources" => %{"listChanged" => false, "subscribe" => true}}
 
   defp complete(result) do
     result

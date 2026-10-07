@@ -25,7 +25,12 @@ defmodule PulsoWeb.MCPTransportTest do
         conn |> post_mcp(MCPMessages.request("d", "server/discover")) |> json_response(200) |> Map.fetch!("result")
 
       assert result["supportedVersions"] == [@version]
-      assert result["capabilities"] == %{"tools" => %{"listChanged" => false}}
+
+      assert result["capabilities"] == %{
+               "tools" => %{"listChanged" => false},
+               "resources" => %{"listChanged" => false, "subscribe" => true}
+             }
+
       assert result["resultType"] == "complete"
       assert is_integer(result["ttlMs"]) and result["ttlMs"] >= 0
       assert result["cacheScope"] == "private"
@@ -211,7 +216,7 @@ defmodule PulsoWeb.MCPTransportTest do
 
   describe "methods" do
     test "removed and unknown methods are not found", %{conn: conn} do
-      for method <- ["ping", "initialize", "resources/list", "logging/setLevel"] do
+      for method <- ["ping", "initialize", "logging/setLevel"] do
         response = build_conn() |> post_mcp(MCPMessages.request(1, method)) |> json_response(404)
         assert response["error"]["code"] == -32_601
       end

@@ -27,7 +27,7 @@ defmodule Pulso.PromQL.Evaluator do
   defp do_query(query, tenant, opts) do
     QueryRunner.run(
       tenant,
-      :promql,
+      Map.get(opts, :query_class, :promql),
       fn deadline ->
         Process.put(:promql_deadline_ms, deadline)
 

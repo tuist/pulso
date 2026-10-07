@@ -214,23 +214,127 @@ ingest. It adds no cluster state or admission policy.
 
 ## Alerting
 
-### Rule storage
+Alerting has an **experimental implemented native slice**: object-backed rule
+management, immutable revision audit chains, bounded per-rule transition replay,
+and opt-in native Prometheus threshold evaluation. See [alerting](alerting.md)
+for the available endpoints, credentials, semantics and limits. Conditional head
+writes publish configuration/audit and evaluation state; every completed tick is
+fenced, including unchanged normal results. Audit snapshots are retained without
+GC in this slice; replay floors do not authorize deleting them. Tombstones and a
+single bounded history page list retain older generations' reachable data.
 
-Alert rules are JSON objects in S3 (`s3://<bucket>/tenant=X/alerts/rule=Y.json`). Rule updates use S3 CAS the same way manifests do.
+Native Slack delivery uses bounded per-target outboxes in the same rule authority;
+lease claims and acknowledgements are conditional head writes. Queue references
+outlive replay pruning. Delivery is at-least-once, without remote-order guarantees.
+Native resource subscriptions are request-scoped HTTP streams polling committed
+heads, with bounded admission and authorization refresh; hints are not replay.
+
+Grafana routing/silences, recording publication and graph execution are **not
+implemented yet**. Original Grafana
+rules are losslessly representable but remain disabled. The full implementation
+and compatibility plan is [S3-backed alerting](../plans/alerting-implementation-plan.md).
+The remaining sections constrain that planned functionality; they do not imply
+that every described endpoint or coordination mechanism exists.
+
+### Rules and durable state
+
+Tenant-scoped rule revisions, routing, silences and lifecycle state live in a
+separate `tenants/<tenant>/alerting/v1/` object namespace. IDs and tenant paths
+must be validated and encoded. Rule heads use conditional writes and are the
+single publication authority for configuration revision, enabled/paused state,
+completed evaluation timestamp, pending/firing/keep-firing state, committed
+bounded inline event tail, bounded sealed-page reference list/replay floor and per-target
+notification progress. Fresh nonces scope revisions/events/cursors; retained old
+generation roots and detached drain heads preserve recovery through re-creation.
+Edits and disable/delete tombstones contend on the same head, fencing stale
+evaluators. Durable paginated discovery must recover idle tenants and rules after
+every node restarts.
+
+Each immutable full configuration revision IS its audit record: parent reference,
+change sequence, operation/request identity, principal, reason, publication time
+and classified impact. The same head CAS publishes configuration and audit; no
+second audit journal/index or duplicate change event. Compute authorized diffs on
+read. Audit pagination follows parents from a frozen committed tip, independently
+of forward lifecycle replay. Budget exhaustion continues, not a fabricated gap.
+Historical snapshots survive their explicit audit horizon, including deleted
+generations; publish retention floors before GC. Lifecycle-registry removal does
+not authorize deleting audit snapshots: GC is per object class and protects the
+cross-generation parent chain until its audit floor expires. Restore creates a
+new authorized revision, never rewinds history or silently re-enables a rule. API/MCP share
+history, revision and diff reads; change subscriptions are opt-in, not firing
+triggers. Secret values are excluded. Snapshot and change-metadata sensitivity
+remain historical even after a source is removed.
+
+Write/audit APIs require operator-configured per-principal hashed credentials and
+capabilities, not just existing tenant-shared auth. A service credential identifies
+the service, not an independently verified end user. Delegated identities are
+deferred; no accounts database or S3 credential registry is introduced.
 
 ### Rule evaluators
 
-Each rule has a rendezvous-hashed evaluator among the current live nodes. The evaluator is a supervised Elixir process that queries the same S3 data any other query would touch and evaluates the rule expression on the returned series.
+Each rule has an expected rendezvous-hashed evaluator among live eligible
+workers, reusing `Pulso.Rendezvous`. Supervised, resource-bounded tasks use the
+same query/storage path as interactive requests, with reserved background
+admission and explicit freshness requirements. Ownership only reduces duplicate
+work: nodes can disagree, and conditional object publication enforces correctness.
+Pending and keep-firing timers survive restart; query failure, unavailable
+freshness and skipped admission must not become a successful empty result.
 
-### Firing
+Rules can contain source queries and a bounded expression graph. Explicit,
+operator-created, capability-scoped read-only external source bindings may remain
+necessary during migration. An existing SQL source is never an alert-state store
+or coordinator. HTTP and stateless MCP share validation, authorization, preview
+and management semantics; preview does not emit transitions or notifications.
+Infrastructure remediation remains outside Pulso.
 
-Fires are recorded as an immutable, append-only WAL per rule (`s3://<bucket>/tenant=X/alerts/rule=Y/fires/<seq>.json`). Firing = CAS-PUT with `If-None-Match: *` on the next sequence.
+### Transition publication
 
-This gives exactly-once firing without Raft, without Horde-with-guardrails, without any of the coordination primitives I earlier considered. Two evaluators racing: only one CAS wins. The loser reads back the winner's fire record and knows the fire is handled.
+Prepare content-addressed candidate transitions and sealed history pages, then
+publish their bounded page-reference/range list, tail, replay floor and lifecycle
+in the rule-head CAS with a monotonic evaluation timestamp. Logical IDs live
+inside candidate objects, not in keys competing writers can reserve with different
+bytes. References carry digest/size and readers validate them. Flat bounded pages
+provide forward progress within the committed floor without a copy-on-write tree.
+Retention is count or time, whichever limit is reached first; it is not a promised
+time window under arbitrary churn. Floor advancement precedes GC.
+Unreferenced losing candidates are not fires and cannot trigger delivery.
+Request-bound operation identities and content digests resolve lost responses.
+Exact retries reuse an identity; changed payload/precondition requires a new one.
+A bounded ancestry search without a match is ambiguous, not proof of failure. Read-back is
+required after any conditional failure, including conflicts: automatic client
+retries can report a conflict after the first attempt already committed. Never
+blindly increment a sequence or assume a failed response means no write occurred.
 
-### Notification routing
+This deduplicates **logical committed transitions**, not external notifications.
+Live outbox/payload references must remain recoverable throughout the retry
+horizon; retention and orphan cleanup cannot erase outstanding work. Exact
+committed history is distinct from coalescing notification snapshots and has an
+explicit replay floor. Disconnected event consumers do not pin retention.
 
-A separate process subscribes to the per-tenant fires log (via S3 polling or event notifications where available) and dispatches to configured channels (webhook, Slack, PagerDuty, email). Notification-side dedup is trivial because fires are already exactly-once.
+### Notification routing and delivery
+
+Separate supervised workers materialize groups and channel intents from committed
+outboxes. Consumption watermarks advance in the same CAS as the resulting group
+or channel state, and source entries are pruned only after every target has
+consumed, resynchronized an explicit gap, or durably retired them. Target-specific
+backpressure must not freeze lifecycle evaluation or other channels. Group/channel
+heads coalesce the latest membership snapshot, while source history preserves
+committed transitions. Grouping/timing, fan-out, silences, resolved messages and
+retry progress are durable in S3, never in a local broker or database.
+
+Start with Slack and compatible webhooks; preserve incident integrations before
+transferring paging responsibility. Destinations reference deployment secrets;
+API/MCP responses and diagnostics do not disclose credentials. Notification
+configuration, paging-affecting silences and explicit test sends require distinct
+capabilities beyond diagnosis. V1 agents cannot create or alter silences; humans
+need a separate audited silence capability. Defer approval-attestation protocols until a trusted agent
+suppression workflow is explicitly designed.
+
+Delivery is **at least once** unless a provider's idempotency contract gives a
+stronger guarantee. A crash after an accepted remote send but before recording
+its receipt can produce a duplicate on retry. Ownership and expiring delivery
+claims fence S3 commits, not remote HTTP effects. Document this limitation and
+use verified receiver deduplication rather than claiming exactly-once delivery.
 
 ## MCP interface
 
@@ -255,6 +359,27 @@ the percent-decoded path the router matches. Requests without an `Origin` header
 accepted. Legacy initialize-based clients, including Atlas's proxy at
 the time of writing, need a client-side migration rather than a compatibility shim.
 
+Planned alert subscriptions use standard `subscriptions/listen` resource watches,
+`notifications/resources/updated`, and authorized `resources/list`/`resources/read`.
+The specification requires acknowledgement-first ordering and request-scoped
+stream cancellation. Notifications are hints: consumers read durable committed
+alert-event pages with encrypted application cursors in tool request/response
+bodies, never resource URIs/headers, and deduplicate event IDs. Keys survive the
+advertised cursor lifetime; undecodable or scope-changed cursors require explicit
+replay restart from retained authorized floors, with continuity uncertainty and
+possible duplicates, not jumping to a current-state checkpoint. Restart dedup
+uses durable event IDs, not a sequence high-water mark that would skip newly
+authorized older events. Reconnection
+works through any node without sessions; this revision explicitly does not support
+`Last-Event-ID` stream resumption. Bound watchers, replay work and stream lifetimes,
+reauthorize long-lived streams, and propagate source capabilities into event and
+stored-state reads. Event classification is immutable per event, and notifier
+lease changes have separate classified history from evaluator truth. The
+[MCP alert events plan](../plans/alerting-mcp-events-plan.md)
+defines replay/retention gaps and the external proactive-agent flow. These resource
+methods and live subscriptions are not implemented yet. Agent-triggered
+infrastructure remediation remains in a separate server with runtime policy/HITL.
+
 All four query tools advertise read-only, non-destructive, idempotent, closed-world
 annotations as defined by the [Model Context Protocol tool schema](https://modelcontextprotocol.io/specification/2026-07-28/schema#tool).
 Calls validate the schema vocabulary used by the registry before evaluation:
@@ -278,7 +403,7 @@ replace authorization.
 | Tier | Where it lives | Blast radius |
 |---|---|---|
 | Read-only diagnosis | This repo (`Pulso.MCP.Tools`) | None; queries are read-only against S3 |
-| Write within Pulso | This repo (silence/ack alerts, add annotations) | Contained; no external side effects |
+| Write within Pulso | This repo (alert configuration, silence/ack alerts, add annotations) | Configuration/state; notification settings and silences affect external paging and require separate permissions |
 | Infrastructure remediation | **Separate MCP server, not this repo** | Unbounded without policy |
 
 **Do not add remediation tools to `Pulso.MCP.Tools`.** They live in a separate, narrowly-scoped MCP server that policy-gates each action. This is a design invariant, not a preference.

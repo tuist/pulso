@@ -5,6 +5,7 @@ defmodule Pulso.Application do
 
   use Application
 
+  alias Pulso.Alerting.Subscriptions
   alias Pulso.Health.StorageMonitor
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
@@ -24,9 +25,10 @@ defmodule Pulso.Application do
          name: TaskSupervisor,
          max_children: Keyword.get(Application.get_env(:pulso, Pulso.QueryRunner, []), :max_global, 4)},
         {Registry, keys: :unique, name: QuerySlots},
+        Subscriptions,
         {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Pulso.PubSub}
-      ] ++ storage_children() ++ [PulsoWeb.Endpoint]
+      ] ++ storage_children() ++ Pulso.Alerting.Supervisor.children() ++ [PulsoWeb.Endpoint]
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
