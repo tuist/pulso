@@ -118,7 +118,7 @@ def render(rules):
         "`record` means no alert notification. Blank no-data/error settings belong to recording entries, not default alert policies.",
         "",
         "| UID | Rule | Observed sources (residency unverified) | Expression nodes | Cadence / for / keep-firing | Paused | No-data / error | Receiver |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |", 
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     names = {"grafanacloud-prom": "main metrics", "grafanacloud-logs": "main logs", "grafanacloud-usage": "usage", "dexgs9hv7rjswd": "SQL"}
     for rule in sorted(rules, key=lambda r: (r["folderUID"], r["ruleGroup"], r["title"])):
