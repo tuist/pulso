@@ -80,6 +80,46 @@ mod tests {
     }
 
     #[test]
+    fn string_writer_matches_bytewise_oracle() {
+        fn oracle(input: &[u8]) -> Vec<u8> {
+            let mut out = vec![b'"'];
+            for &byte in input {
+                match byte {
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0c => out.extend_from_slice(b"\\f"),
+                    b if b < 0x20 => out.extend_from_slice(format!("\\u{b:04X}").as_bytes()),
+                    b => out.push(b),
+                }
+            }
+            out.push(b'"');
+            out
+        }
+
+        let mut state = 0xdead_beef_cafe_f00du64;
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 127, 1024]
+            .into_iter()
+            .chain((0..2000).map(|i| i % 128))
+        {
+            let input: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 56) as u8
+                })
+                .collect();
+            let mut out = Vec::new();
+            write_str(&mut out, &input);
+            assert_eq!(out, oracle(&input));
+        }
+    }
+
+    #[test]
     fn numbers() {
         let mut out = Vec::new();
         write_i64(&mut out, -42);

@@ -32,6 +32,8 @@ jobs:
             command: mix format --check-formatted
           - name: Credo
             command: mix credo
+          - name: Dependency audit
+            command: mix hex.audit
           # The ingest decoder parses untrusted bytes in native code; its
           # unit tests include a deterministic mutation-fuzzing loop.
           - name: Rust

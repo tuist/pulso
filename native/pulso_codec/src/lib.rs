@@ -762,10 +762,8 @@ fn decode_line_filter_op(atom: rustler::Atom) -> Result<LineFilterOp, ()> {
 
 /// JSON-encode `[%Pulso.Record.MetricSample{}]` for the MCP
 /// `query_metrics` response. Returns `{:ok, binary}` on success or
-/// `:fallback` on any input the Rust encoder cannot guarantee to emit
-/// identically — the Elixir caller downgrades to `JSON.encode!`.
-///
-/// Fast-path numbers (10 000 samples × 4 labels): see commit body.
+/// `:fallback` on any input the Rust encoder cannot guarantee to encode
+/// with the same JSON values. The Elixir caller uses `JSON.encode!` then.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
     match metric_json::encode(env, samples) {

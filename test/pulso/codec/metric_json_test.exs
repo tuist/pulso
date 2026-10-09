@@ -36,6 +36,24 @@ defmodule Pulso.Codec.MetricJSONTest do
     assert {:ok, "[]"} = NIF.encode_metric_samples([])
   end
 
+  test "invalid UTF-8 label keys and values fall back instead of emitting malformed JSON" do
+    valid = %MetricSample{series_id: 1, timestamp_ns: 1, value: 1.0, labels: %{"key" => "valid"}}
+
+    # Invalid leading bytes, overlong encodings, surrogate code points,
+    # truncated sequences, and code points above the Unicode limit.
+    for bytes <- [<<255>>, <<192, 175>>, <<237, 160, 128>>, <<226, 130>>, <<244, 144, 128, 128>>],
+        labels <- [%{bytes => "value"}, %{"key" => bytes}] do
+      invalid = %{valid | labels: labels}
+      assert :fallback = NIF.encode_metric_samples([valid, valid, invalid])
+      assert_raise ErlangError, fn -> JSON.encode!(Enum.map([invalid], &fields/1)) end
+    end
+  end
+
+  test "improper sample lists fall back without returning a partial response" do
+    sample = %MetricSample{series_id: 1, timestamp_ns: 1, value: 1.0, labels: %{}}
+    assert :fallback = NIF.encode_metric_samples([sample | :invalid])
+  end
+
   test "unsupported fields still fall back after a run of valid labels" do
     valid = %MetricSample{series_id: 1, timestamp_ns: 1, value: 1.0, labels: %{}}
 
