@@ -1,5 +1,5 @@
 defmodule Pulso.Storage.S3.ManifestTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment

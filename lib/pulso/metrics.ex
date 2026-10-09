@@ -5,13 +5,16 @@ defmodule Pulso.Metrics do
   Telemetry handlers update ETS synchronously, with a finite label vocabulary and
   no reporting mailbox. Counters reset when this supervised process restarts.
   """
-  use GenServer
+  use Pulso.Runtime.GenServer
 
   alias Pulso.PromQL.QuerySlots
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.ManifestRegistry
 
   @table __MODULE__
+  defp table, do: Pulso.Runtime.table(@table)
   @handler {__MODULE__, :metrics}
   @event [:pulso, :operation, :stop]
   @timeout_event [:pulso, :compaction, :timeout]
@@ -86,14 +89,20 @@ defmodule Pulso.Metrics do
 
   @impl true
   def init(_opts) do
-    :ets.new(@table, [:named_table, :public, :set, write_concurrency: true])
-    :telemetry.detach(@handler)
-    :ok = :telemetry.attach_many(@handler, @events, &__MODULE__.handle_event/4, nil)
+    :ets.new(table(), [:named_table, :public, :set, write_concurrency: true])
+
+    case :telemetry.attach_many(@handler, @events, &__MODULE__.handle_event/4, nil) do
+      :ok -> :ok
+      {:error, :already_exists} -> :ok
+    end
+
     {:ok, nil}
   end
 
   @impl true
-  def terminate(_reason, _state), do: :telemetry.detach(@handler)
+  def terminate(_reason, _state) do
+    if Pulso.Runtime.name(__MODULE__) == __MODULE__, do: :telemetry.detach(@handler), else: :ok
+  end
 
   @doc "Measure an operation without changing its result or exception semantics."
   def measure(kind, operation, fun, measurements \\ fn _ -> %{} end, purpose \\ "none") do
@@ -258,7 +267,7 @@ defmodule Pulso.Metrics do
 
   # A metrics process restart must never fail the operation being observed.
   defp increment(key, amount) do
-    :ets.update_counter(@table, key, {2, amount}, {key, 0})
+    :ets.update_counter(table(), key, {2, amount}, {key, 0})
     :ok
   rescue
     ArgumentError -> :ok
@@ -279,7 +288,7 @@ defmodule Pulso.Metrics do
   end
 
   defp snapshot do
-    :ets.tab2list(@table)
+    :ets.tab2list(table())
   rescue
     ArgumentError -> []
   end
@@ -349,7 +358,7 @@ defmodule Pulso.Metrics do
   defp manifest_queues do
     registry = ManifestRegistry
 
-    if Process.whereis(registry) do
+    if Pulso.Runtime.whereis(registry) do
       registry
       |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [{{:"$2", :"$3"}}]}])
       |> Enum.reduce({0, 0, 0}, &add_manifest_queue/2)
@@ -372,7 +381,7 @@ defmodule Pulso.Metrics do
   end
 
   defp occupied_queries do
-    if Process.whereis(QuerySlots) do
+    if Pulso.Runtime.whereis(QuerySlots) do
       QuerySlots
       |> Registry.select([{{:_, :"$1", :_}, [], [:"$1"]}])
       |> Enum.uniq()

@@ -17,6 +17,7 @@ defmodule Pulso.Storage do
 
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
   alias Pulso.Storage.Memory
 
   @type tenant :: String.t()
@@ -80,5 +81,5 @@ defmodule Pulso.Storage do
   end
 
   @spec adapter() :: module()
-  def adapter, do: Application.get_env(:pulso, __MODULE__)[:adapter] || Memory
+  def adapter, do: Runtime.get_env(:pulso, __MODULE__)[:adapter] || Memory
 end

@@ -113,6 +113,13 @@ User-facing documentation lives in `docs/`, with [`docs/README.md`](./docs/READM
 - Leave out internal details that do not help an operator: module names, implementation history, review notes, and anything specific to a particular organization's deployment, rollout, or companion services. Contributor-facing design belongs in `docs/architecture.md`; rollout planning belongs in `plans/`.
 - The Helm chart in `charts/pulso` ships with every release alongside the container image, at the same version. Keep `charts/pulso/values.yaml` comments, `docs/deployment.md`, and `docs/configuration.md` in sync with `config/runtime.exs`.
 
+## Test isolation
+
+- Tests must be `async: true` and own their state. Do not use `Application.put_env/3`, `Application.delete_env/2`, OS environment mutation, or resetting shared named processes/ETS tables to configure a test, even with an `on_exit` restore.
+- Inject configuration, adapters, clocks, and process/table references through explicit options or an owned test-local dependency context. Concurrent tests must not observe or overwrite one another's configuration, caches, admission budgets, storage, metrics, or worker membership.
+- Start test-owned processes with `start_supervised!/1`; propagate the test's dependencies explicitly to supervised children and tasks. Scope fixtures and external object prefixes to the test. Cleanup must affect only resources the test owns.
+- If a component cannot be tested concurrently, refactor its dependency boundary rather than switching the test to `async: false`.
+
 ## Development workflow
 
 - **Pull request titles must follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)**: `type(scope): summary` or `type: summary`. Use an appropriate type (`feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `build`, `ci`, or `style`) and a concise imperative summary. For example: `docs(alerting): plan stateless alerting and change history`. Conventional commit messages do not replace this requirement: validate the PR title itself before creating or updating a pull request.

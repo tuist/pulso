@@ -1,5 +1,5 @@
 defmodule Pulso.OTLP.LogsTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.OTLP.Logs
   alias Pulso.Record.Log

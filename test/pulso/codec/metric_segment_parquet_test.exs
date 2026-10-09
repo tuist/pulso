@@ -3,10 +3,11 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
   # test/pulso/storage/s3_codec_test.exs on the logs side. Hits the
   # Rust NIF directly rather than going through Pulso.Storage, since
   # we're guarding the codec contract — not the storage adapter.
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
 
   defp sample(ts, value, labels) when is_integer(ts) and is_map(labels) do

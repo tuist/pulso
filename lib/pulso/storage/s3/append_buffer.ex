@@ -7,8 +7,10 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   unbuffered path; this is not ingest rate admission. Acknowledgments wait for the
   combined segment PUT and manifest CAS. Keyed requests never enter this process.
   """
-  use GenServer
+  use Pulso.Runtime.GenServer
 
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.AppendRegistry
   alias Pulso.Storage.S3.AppendSupervisor
@@ -20,7 +22,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   @doc "Read node-local buffer reservations without messaging owners or doing storage I/O."
   def stats do
-    if Process.whereis(AppendRegistry) do
+    if Pulso.Runtime.whereis(AppendRegistry) do
       AppendRegistry
       |> Registry.select([{{:_, :_, :"$1"}, [], [:"$1"]}])
       |> Enum.reduce({0, 0, 0, 0}, fn table, totals -> add_stats(table, totals) end)
@@ -99,7 +101,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
         opts = [key: key, signal: signal, tenant: tenant, config: config]
         spec = %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :transient}
 
-        case DynamicSupervisor.start_child(AppendSupervisor, spec) do
+        case DynamicSupervisor.start_child(Pulso.Runtime.name(AppendSupervisor), Pulso.Runtime.child_spec(spec)) do
           {:ok, _pid} -> lookup(key)
           {:error, {:already_started, _pid}} -> lookup(key)
           {:error, _} -> {:error, :owner_overloaded}

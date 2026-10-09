@@ -14,12 +14,13 @@ defmodule Pulso.Auth do
       header that matches a per-tenant token from application env. Default
       for prod.
 
-  The active implementation is read from `Application.get_env(:pulso,
+  The active implementation is read from `Runtime.get_env(:pulso,
   Pulso.Auth)[:module]` at call time so tests can swap it without
   recompiling.
   """
 
   alias Plug.Conn
+  alias Pulso.Runtime
 
   @type reason :: :missing_token | :invalid_token | :unknown_tenant | term()
 
@@ -32,7 +33,7 @@ defmodule Pulso.Auth do
 
   @spec module() :: module()
   def module do
-    case Application.get_env(:pulso, __MODULE__) do
+    case Runtime.get_env(:pulso, __MODULE__) do
       nil ->
         raise """
         Pulso.Auth is not configured. This should never happen — config/config.exs

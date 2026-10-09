@@ -1,5 +1,6 @@
 defmodule Pulso.Test.CompactionPeer do
   @moduledoc false
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.CompactionOwnership
   alias Pulso.Storage.S3.CompactionTasks
@@ -44,12 +45,12 @@ defmodule Pulso.Test.CompactionPeer do
   end
 
   def await_members(config, expected) do
-    {ref, _} = :pg.monitor(CompactionOwnership.scope(), CompactionOwnership.group(config))
+    {ref, _} = :pg.monitor(Pulso.Runtime.name(CompactionOwnership.scope()), CompactionOwnership.group(config))
 
     try do
       await_view(config, Enum.sort(expected), ref, System.monotonic_time(:millisecond) + 5_000)
     after
-      :pg.demonitor(CompactionOwnership.scope(), ref)
+      :pg.demonitor(Pulso.Runtime.name(CompactionOwnership.scope()), ref)
     end
   end
 

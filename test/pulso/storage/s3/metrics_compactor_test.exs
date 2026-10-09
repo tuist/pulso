@@ -1,10 +1,15 @@
 defmodule Pulso.Storage.S3.MetricsCompactorTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.ObjectStore
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
+  alias Pulso.Runtime.ProcessGroup
+  alias Pulso.Runtime.Registry
+  alias Pulso.Runtime.Supervision, as: Supervisor
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.CompactionDiscovery
   alias Pulso.Storage.S3.CompactionOwnership
@@ -55,12 +60,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       refresh_stale_ms: 0
     }
 
-    previous = Application.get_env(:pulso, S3)
-    Application.put_env(:pulso, S3, config)
-
-    on_exit(fn ->
-      if previous, do: Application.put_env(:pulso, S3, previous), else: Application.delete_env(:pulso, S3)
-    end)
+    Runtime.put_env(:pulso, S3, config)
 
     start_supervised!(ManifestSupervision)
     start_supervised!(%{id: CompactionOwnership, start: {:pg, :start_link, [CompactionOwnership.scope()]}})
@@ -181,9 +181,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   end
 
   test "an absent value is rejected while finite samples survive compaction and evaluation", ctx do
-    previous = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
 
     assert {:error, {:encode_failed, _}} =
              S3.append(:metrics, ctx.tenant, [sample(1, 1.0), sample(2, nil)])
@@ -204,9 +202,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   end
 
   test "compaction preserves staleness and IEEE values and leaves query results unchanged", ctx do
-    previous = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
     assert :ok = S3.append(:metrics, ctx.tenant, [sample(0, 1.0), sample(10_000_000_000, :stale)])
 
     assert :ok =
@@ -232,9 +228,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   end
 
   test "a legacy stale marker suppresses instant results instead of corrupting the query", ctx do
-    previous = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
 
     records = [
       %MetricSample{timestamp_ns: 1, value: 1.0, labels: %{"__name__" => "safe"}},
@@ -294,7 +288,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:ok, 0} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
     ManifestCache.put(ctx.tenant, "metrics", snapshot, "stale")
     # Deliberately serve a fresh-looking obsolete snapshot; missing files restart the scan.
-    Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
+    Runtime.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
     assert S3.query(:metrics, ctx.tenant, []) == hd(before)
   end
 
@@ -306,10 +300,12 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
 
     pid =
       start_supervised!(
-        {Task,
-         fn ->
+        # `Task` is Pulso.Runtime.Task here; supervise a standard task running a
+        # closure that carries this test's runtime explicitly.
+        {Elixir.Task,
+         Runtime.capture(fn ->
            send(parent, {:append_finished, S3.append(:metrics, ctx.tenant, [sample(1, 1.0)])})
-         end}
+         end)}
       )
 
     ref = Process.monitor(pid)
@@ -335,7 +331,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     key = {"pulso_compaction_timeouts_total", [{"operation", "merge"}]}
 
     before_count =
-      case :ets.lookup(Pulso.Metrics, key) do
+      case :ets.lookup(Pulso.Runtime.table(Pulso.Metrics), key) do
         [{_, count}] -> count
         [] -> 0
       end
@@ -345,7 +341,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     send(worker, :compact)
     assert_receive {:storage_barrier, storage, "GET", ^source}, 1_000
     _ = :sys.get_state(worker)
-    assert [{^key, count}] = :ets.lookup(Pulso.Metrics, key)
+    assert [{^key, count}] = :ets.lookup(Pulso.Runtime.table(Pulso.Metrics), key)
     assert count == before_count + 1
     assert [task] = Task.Supervisor.children(CompactionTasks)
     ref = Process.monitor(task)
@@ -354,13 +350,16 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert Agent.get(ctx.agent, &Map.has_key?(&1.barriers, {"GET", source}))
     send(storage, {:release_storage, source})
     assert_receive {:DOWN, ^ref, :process, ^task, :normal}, 1_000
-    assert [{^key, count}] = :ets.lookup(Pulso.Metrics, key)
+    assert [{^key, count}] = :ets.lookup(Pulso.Runtime.table(Pulso.Metrics), key)
     assert count == before_count + 1
   end
 
   test "self-monitoring counts completed merges and cleanup without storing monitoring records", ctx do
     count = fn operation ->
-      case :ets.lookup(Pulso.Metrics, {"pulso_compaction_segments_total", [{"operation", operation}]}) do
+      case :ets.lookup(
+             Pulso.Runtime.table(Pulso.Metrics),
+             {"pulso_compaction_segments_total", [{"operation", operation}]}
+           ) do
         [{_, value}] -> value
         [] -> 0
       end
@@ -418,7 +417,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     end
 
     ManifestCache.put(ctx.tenant, "metrics", snapshot, "obsolete")
-    Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
+    Runtime.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
     reads(ctx.agent)
     assert S3.query(:metrics, ctx.tenant, matchers: [{"__name__", :eq, "requests"}], max_scan_segments: 3) == expected
     assert reads(ctx.agent) == 2
@@ -442,9 +441,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   end
 
   test "public metric evaluation preserves counter resets and grouped range results after compaction", ctx do
-    previous = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: S3)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, previous) end)
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
 
     for scrape <- 1..30 do
       ts = scrape * 15_000_000_000
@@ -852,7 +849,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:ok, %{merged: 3}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
     assert {:ok, 3} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
     ManifestCache.put(ctx.tenant, "metrics", snapshot, "obsolete")
-    Application.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
+    Runtime.put_env(:pulso, S3, Map.put(ctx.config, :refresh_stale_ms, 60_000))
     key = Manifest.manifest_key(ctx.tenant, "metrics")
     owner = self()
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", key} => owner}})
@@ -914,7 +911,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
 
     assert log =~ "discovery raised tenant="
     :sys.replace_state(worker, fn _ -> ctx.config end)
-    :pg.join(CompactionOwnership.scope(), CompactionOwnership.group(ctx.config), worker)
+    ProcessGroup.join(CompactionOwnership.scope(), CompactionOwnership.group(ctx.config), worker)
     send(worker, :compact)
     _ = :sys.get_state(worker)
     assert length(load(ctx).segments) == 1
@@ -939,7 +936,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   end
 
   test "an unconfigured object-storage adapter still fails with a clear configuration error" do
-    Application.delete_env(:pulso, S3)
+    Runtime.delete_env(:pulso, S3)
     assert_raise RuntimeError, ~r/is not configured/, fn -> S3.query(:metrics, "unconfigured", []) end
   end
 
@@ -1202,12 +1199,12 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     stop_supervised!(CompactionOwnership)
     stop_supervised!(CompactionTasks)
     supervisor = start_supervised!({CompactionSupervision, ctx.config})
-    old_worker = Process.whereis(CompactionWorker)
+    old_worker = Pulso.Runtime.whereis(CompactionWorker)
     ref = Process.monitor(old_worker)
-    Process.exit(Process.whereis(CompactionOwnership.scope()), :kill)
+    Process.exit(Pulso.Runtime.whereis(CompactionOwnership.scope()), :kill)
     assert_receive {:DOWN, ^ref, :process, ^old_worker, :shutdown}
     _ = :sys.get_state(supervisor)
-    assert Process.whereis(CompactionWorker) != old_worker
+    assert Pulso.Runtime.whereis(CompactionWorker) != old_worker
     assert CompactionOwnership.members(ctx.config) == [node()]
   end
 
@@ -1351,7 +1348,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert CompactionOwnership.members(ctx.config) == []
     send(task, :finish)
     assert_receive {:DOWN, ^ref, :process, ^task, :normal}
-    _ = :sys.get_state(CompactionTasks)
+    _ = :sys.get_state(Pulso.Runtime.name(CompactionTasks))
     send(worker, :compact)
     _ = :sys.get_state(worker)
     assert CompactionOwnership.members(ctx.config) == [node()]

@@ -1,5 +1,5 @@
 defmodule PulsoWeb.PrometheusQueryControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Auth
   alias Pulso.Auth.SharedSecret
@@ -89,29 +89,21 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
 
   test "scan limits and timeouts are execution errors rather than storage failures", %{conn: conn} do
     adapter = BlockingMetricStorage
-    original = Application.get_env(:pulso, Storage)
-    Application.put_env(:pulso, Storage, adapter: adapter)
-
-    on_exit(fn ->
-      Application.put_env(:pulso, Storage, original)
-      Application.delete_env(:pulso, adapter)
-    end)
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: adapter)
 
     for reason <- [:query_scan_limit, :query_timeout] do
-      Application.put_env(:pulso, adapter, {:error, reason})
+      Pulso.Runtime.put_env(:pulso, adapter, {:error, reason})
       assert %{"errorType" => "execution"} = conn |> get("/api/v1/query", %{query: "m"}) |> json_response(422)
     end
 
-    Application.put_env(:pulso, adapter, self())
+    Pulso.Runtime.put_env(:pulso, adapter, self())
 
     assert %{"errorType" => "execution"} =
              conn |> get("/api/v1/query", %{query: "m", timeout: "5ms"}) |> json_response(422)
   end
 
   test "sample budgets return an execution error", %{conn: conn} do
-    original = Application.get_env(:pulso, Evaluator, [])
-    Application.put_env(:pulso, Evaluator, max_samples: 1)
-    on_exit(fn -> Application.put_env(:pulso, Evaluator, original) end)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 1)
 
     assert %{"errorType" => "execution"} =
              conn
@@ -121,15 +113,13 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
   end
 
   test "a valid token for another tenant cannot read acme", %{conn: conn} do
-    original = Application.fetch_env!(:pulso, Auth)
     token = fn value -> "sha256$" <> Base.encode16(:crypto.hash(:sha256, value), case: :lower) end
 
-    Application.put_env(:pulso, Auth,
+    Pulso.Runtime.put_env(:pulso, Auth,
       module: SharedSecret,
       tokens: %{"acme" => token.("acme-key"), "beta" => token.("beta-key")}
     )
 
-    on_exit(fn -> Application.put_env(:pulso, Auth, original) end)
     conn = conn |> put_req_header("x-scope-orgid", "acme") |> put_req_header("authorization", "Bearer beta-key")
 
     for path <- ["/api/v1/query", "/api/v1/query_range"] do
@@ -138,9 +128,7 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
   end
 
   test "reads require tenant authorization", %{conn: conn} do
-    original = Application.fetch_env!(:pulso, Auth)
-    Application.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
-    on_exit(fn -> Application.put_env(:pulso, Auth, original) end)
+    Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
     assert %{"errorType" => "unauthorized"} =
              conn |> get("/api/v1/query", %{query: "requests_total"}) |> json_response(401)

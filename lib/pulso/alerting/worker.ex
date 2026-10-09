@@ -1,18 +1,21 @@
 defmodule Pulso.Alerting.Worker do
   @moduledoc "Opt-in disposable native evaluator. Membership reduces work; rule-head CAS enforces correctness."
-  use GenServer
+  use Pulso.Runtime.GenServer
 
   alias Pulso.Alerting.{Canonical, Evaluator, Repository}
   alias Pulso.Alerting.Membership
   alias Pulso.Alerting.Notifier
   alias Pulso.Alerting.Tasks
+  alias Pulso.Runtime
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @impl true
   def init(opts) do
-    config = Keyword.get(opts, :store_config, Application.get_env(:pulso, S3, [])) |> Map.new()
+    config = Keyword.get(opts, :store_config, Runtime.get_env(:pulso, S3, [])) |> Map.new()
     group = {:alerting, Canonical.hash(Enum.map([:bucket, :endpoint, :region], &Map.get(config, &1)))}
     :ok = :pg.join(Membership, group, self())
     send(self(), :tick)
@@ -47,7 +50,7 @@ defmodule Pulso.Alerting.Worker do
 
   def run_once(opts, nodes) do
     store = Keyword.get(opts, :object_store, Pulso.ObjectStore)
-    config = Keyword.get(opts, :store_config, Application.get_env(:pulso, S3, [])) |> Map.new()
+    config = Keyword.get(opts, :store_config, Runtime.get_env(:pulso, S3, [])) |> Map.new()
 
     repo_opts = [
       store: store,

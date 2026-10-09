@@ -3,7 +3,7 @@ defmodule Pulso.Storage.S3UnitTest do
   # construction. Anything that actually talks to an S3 endpoint lives in
   # s3_test.exs behind the `:integration` tag.
 
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Storage.S3

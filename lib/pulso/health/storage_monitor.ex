@@ -24,29 +24,31 @@ defmodule Pulso.Health.StorageMonitor do
     * `:probe` — `(config -> :ok | {:error, term})` override, for tests.
   """
 
-  use GenServer
+  use Pulso.Runtime.GenServer
 
   alias Pulso.ObjectStore
+  alias Pulso.Runtime
+  alias Pulso.Runtime.GenServer
 
   @probe_prefix ".pulso/"
   @default_interval_ms 15_000
   @default_timeout_ms 5_000
 
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: Elixir.GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "The result of the most recent probe."
-  @spec status(GenServer.server()) :: :ok | {:error, term()}
+  @spec status(Elixir.GenServer.server()) :: :ok | {:error, term()}
   def status(server \\ __MODULE__) do
     GenServer.call(server, :status)
   catch
     :exit, _ -> {:error, :monitor_not_running}
   end
 
-  @impl GenServer
+  @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
-    env = Application.get_env(:pulso, Pulso.Health, [])
+    env = Runtime.get_env(:pulso, Pulso.Health, [])
 
     state = %{
       config: Keyword.fetch!(opts, :config),
@@ -60,13 +62,13 @@ defmodule Pulso.Health.StorageMonitor do
     {:ok, state, {:continue, :probe}}
   end
 
-  @impl GenServer
+  @impl true
   def handle_continue(:probe, state), do: {:noreply, start_probe(state)}
 
-  @impl GenServer
+  @impl true
   def handle_call(:status, _from, state), do: {:reply, state.status, state}
 
-  @impl GenServer
+  @impl true
   def handle_info(:probe, %{task: nil} = state), do: {:noreply, start_probe(state)}
   def handle_info(:probe, state), do: {:noreply, state}
 
@@ -87,7 +89,7 @@ defmodule Pulso.Health.StorageMonitor do
   # A link alone does not stop the probe on a normal shutdown (a `:normal`
   # exit signal is ignored), so end it explicitly. Abrupt monitor death is
   # covered by the link.
-  @impl GenServer
+  @impl true
   def terminate(_reason, %{task: %{pid: pid}}), do: Process.exit(pid, :kill)
   def terminate(_reason, _state), do: :ok
 
@@ -96,7 +98,8 @@ defmodule Pulso.Health.StorageMonitor do
     tag = make_ref()
     config = state.config
     probe = state.probe
-    pid = spawn_link(fn -> send(parent, {:probe_result, tag, probe.(config)}) end)
+    # The probe records object-store metrics; run it in this monitor's runtime.
+    pid = spawn_link(Runtime.capture(fn -> send(parent, {:probe_result, tag, probe.(config)}) end))
     timer = Process.send_after(self(), {:probe_timeout, tag}, state.timeout_ms)
     %{state | task: %{pid: pid, tag: tag, timer: timer}}
   end

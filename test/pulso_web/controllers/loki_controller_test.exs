@@ -1,7 +1,6 @@
 defmodule PulsoWeb.LokiControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
-  alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
   alias Pulso.Loki.PushProto
   alias Pulso.Record.Log
@@ -339,14 +338,10 @@ defmodule PulsoWeb.LokiControllerTest do
     setup do
       hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
 
-      Application.put_env(:pulso, Pulso.Auth,
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth,
         module: SharedSecret,
         tokens: %{"acme" => "sha256$#{hex}"}
       )
-
-      on_exit(fn ->
-        Application.put_env(:pulso, Pulso.Auth, module: Open)
-      end)
 
       :ok
     end

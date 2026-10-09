@@ -1,5 +1,5 @@
 defmodule PulsoWeb.CompressedBodyReaderTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Plug.Parsers.RequestTooLargeError
   alias PulsoWeb.CompressedBodyReader
@@ -74,14 +74,7 @@ defmodule PulsoWeb.CompressedBodyReaderTest do
 
   describe "decompressed size limit" do
     setup do
-      original = Application.get_env(:pulso, CompressedBodyReader)
-      Application.put_env(:pulso, CompressedBodyReader, max_decompressed_bytes: 1_000)
-
-      on_exit(fn ->
-        if original,
-          do: Application.put_env(:pulso, CompressedBodyReader, original),
-          else: Application.delete_env(:pulso, CompressedBodyReader)
-      end)
+      Pulso.Runtime.put_env(:pulso, CompressedBodyReader, max_decompressed_bytes: 1_000)
     end
 
     test "inflates a body exactly at the limit" do

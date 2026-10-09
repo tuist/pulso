@@ -15,31 +15,35 @@ defmodule Pulso.Storage.Memory do
 
   @behaviour Pulso.Storage
 
-  use GenServer
+  use Pulso.Runtime.GenServer
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime.GenServer
   alias Pulso.Storage.SortOrder
 
   @table __MODULE__
 
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: Elixir.GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
+
+  # Every table operation goes through the current runtime's instance name.
+  defp table, do: Pulso.Runtime.table(@table)
 
   @impl Pulso.Storage
   def append(signal, tenant, records, _opts \\ []) when is_atom(signal) and is_binary(tenant) and is_list(records) do
     key = {tenant, signal}
 
     existing =
-      case :ets.lookup(@table, key) do
+      case :ets.lookup(table(), key) do
         [{^key, list}] -> list
         [] -> []
       end
 
-    :ets.insert(@table, {key, existing ++ records})
+    :ets.insert(table(), {key, existing ++ records})
     :ok
   end
 
@@ -48,7 +52,7 @@ defmodule Pulso.Storage.Memory do
     key = {tenant, signal}
 
     records =
-      case :ets.lookup(@table, key) do
+      case :ets.lookup(table(), key) do
         [{^key, list}] -> list
         [] -> []
       end
@@ -71,16 +75,16 @@ defmodule Pulso.Storage.Memory do
   @doc false
   @spec reset() :: :ok
   def reset do
-    if :ets.info(@table) != :undefined do
-      :ets.delete_all_objects(@table)
+    if :ets.info(table()) != :undefined do
+      :ets.delete_all_objects(table())
     end
 
     :ok
   end
 
-  @impl GenServer
+  @impl true
   def init(_opts) do
-    :ets.new(@table, [:named_table, :set, :public, read_concurrency: true, write_concurrency: true])
+    :ets.new(table(), [:named_table, :set, :public, read_concurrency: true, write_concurrency: true])
     {:ok, %{}}
   end
 

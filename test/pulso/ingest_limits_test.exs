@@ -1,18 +1,10 @@
 defmodule Pulso.IngestLimitsTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.IngestLimits
 
   setup do
-    previous = Application.get_env(:pulso, IngestLimits)
-    Application.delete_env(:pulso, IngestLimits)
-
-    on_exit(fn ->
-      if previous,
-        do: Application.put_env(:pulso, IngestLimits, previous),
-        else: Application.delete_env(:pulso, IngestLimits)
-    end)
-
+    Pulso.Runtime.delete_env(:pulso, IngestLimits)
     :ok
   end
 
@@ -24,29 +16,29 @@ defmodule Pulso.IngestLimitsTest do
 
   test "non-positive and non-integer configuration cannot disable a budget" do
     for value <- [0, -1, nil, :infinity, 1.5, 2_147_483_648] do
-      Application.put_env(:pulso, IngestLimits, max_records: value)
+      Pulso.Runtime.put_env(:pulso, IngestLimits, max_records: value)
       assert_raise ArgumentError, fn -> IngestLimits.config() end
     end
   end
 
   test "runtime environment overrides are validated at startup" do
+    # runtime.exs reads variables through the test-owned runtime environment,
+    # so this never touches the OS environment of the shared test VM.
     name = "PULSO_INGEST_MAX_RECORDS"
-    previous = System.get_env(name)
-    on_exit(fn -> if previous, do: System.put_env(name, previous), else: System.delete_env(name) end)
     path = Path.expand("../../config/runtime.exs", __DIR__)
 
-    System.put_env(name, "12")
+    Pulso.Runtime.put_env(name, "12")
     config = Config.Reader.read!(path, env: :test, target: :host)
     assert config[:pulso][IngestLimits][:max_records] == 12
 
     for value <- ["0", "-1", "12junk", "", "2147483648"] do
-      System.put_env(name, value)
+      Pulso.Runtime.put_env(name, value)
       assert_raise RuntimeError, fn -> Config.Reader.read!(path, env: :test, target: :host) end
     end
   end
 
   test "nested Loki metadata has exact depth and node boundaries" do
-    Application.put_env(:pulso, IngestLimits, max_depth: 2, max_nodes: 3)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_depth: 2, max_nodes: 3)
     payload = loki(%{"a" => %{"b" => "v"}})
     assert IngestLimits.validate(:loki, payload) == :ok
     assert IngestLimits.validate(:loki, loki(%{"a" => %{"b" => ["v"]}})) == {:error, :attributes_too_large}
@@ -54,18 +46,18 @@ defmodule Pulso.IngestLimitsTest do
   end
 
   test "OTLP key and value limits are independent" do
-    Application.put_env(:pulso, IngestLimits, max_key_bytes: 4, max_value_bytes: 1)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_key_bytes: 4, max_value_bytes: 1)
     record = %{"attributes" => [%{"key" => "aaaa", "value" => %{"stringValue" => "v"}}]}
     assert IngestLimits.validate(:otlp, request(record)) == :ok
   end
 
   test "a one-record OTLP budget still allows its resource and scope groups" do
-    Application.put_env(:pulso, IngestLimits, max_records: 1)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_records: 1)
     assert IngestLimits.validate(:otlp, request(%{})) == :ok
   end
 
   test "OTLP arrays and nested key-value lists are bounded before AnyValue conversion" do
-    Application.put_env(:pulso, IngestLimits, max_depth: 2, max_nodes: 4, max_attributes: 2)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_depth: 2, max_nodes: 4, max_attributes: 2)
     value = %{"arrayValue" => %{"values" => [%{"stringValue" => "v"}]}}
     assert IngestLimits.validate(:otlp, otlp(value)) == :ok
     nested = %{"arrayValue" => %{"values" => [value]}}
@@ -73,7 +65,7 @@ defmodule Pulso.IngestLimitsTest do
     wide = %{"arrayValue" => %{"values" => List.duplicate(%{"stringValue" => "v"}, 2)}}
     assert IngestLimits.validate(:otlp, otlp(wide)) == {:error, :attributes_too_large}
 
-    Application.put_env(:pulso, IngestLimits, max_attributes: 2)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_attributes: 2)
     pairs = List.duplicate(%{"key" => "a", "value" => %{"stringValue" => "v"}}, 3)
 
     assert IngestLimits.validate(:otlp, otlp(%{"kvlistValue" => %{"values" => pairs}})) ==
@@ -82,7 +74,7 @@ defmodule Pulso.IngestLimitsTest do
 
   test "structured OTLP bodies are bounded but ordinary messages are not attribute values" do
     value = %{"arrayValue" => %{"values" => [%{"stringValue" => "v"}]}}
-    Application.put_env(:pulso, IngestLimits, max_depth: 1)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_depth: 1)
     assert IngestLimits.validate(:otlp, body(value)) == :ok
 
     assert IngestLimits.validate(:otlp, body(%{"arrayValue" => %{"values" => [value]}})) ==
@@ -92,7 +84,7 @@ defmodule Pulso.IngestLimitsTest do
   end
 
   test "deep malformed AnyValue keys and values still consume budgets" do
-    Application.put_env(:pulso, IngestLimits, max_depth: 2)
+    Pulso.Runtime.put_env(:pulso, IngestLimits, max_depth: 2)
 
     assert IngestLimits.validate(:otlp, otlp(%{"unknown" => %{"a" => %{"b" => "v"}}})) ==
              {:error, :attributes_too_large}

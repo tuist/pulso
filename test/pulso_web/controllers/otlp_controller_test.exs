@@ -1,7 +1,6 @@
 defmodule PulsoWeb.OTLPControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
-  alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
   alias Pulso.Record.Log
   alias Pulso.Storage
@@ -129,14 +128,10 @@ defmodule PulsoWeb.OTLPControllerTest do
     setup do
       hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
 
-      Application.put_env(:pulso, Pulso.Auth,
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth,
         module: SharedSecret,
         tokens: %{"acme" => "sha256$#{hex}"}
       )
-
-      on_exit(fn ->
-        Application.put_env(:pulso, Pulso.Auth, module: Open)
-      end)
 
       :ok
     end

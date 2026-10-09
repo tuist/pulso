@@ -21,6 +21,7 @@ defmodule Pulso.Auth.SharedSecret do
   @behaviour Pulso.Auth
 
   alias Plug.Conn
+  alias Pulso.Runtime
 
   @impl Pulso.Auth
   def verify(conn, tenant) when is_binary(tenant) do
@@ -40,7 +41,7 @@ defmodule Pulso.Auth.SharedSecret do
 
   defp fetch_stored_hash(tenant) do
     tokens =
-      case Application.get_env(:pulso, Pulso.Auth) do
+      case Runtime.get_env(:pulso, Pulso.Auth) do
         nil -> %{}
         env -> Keyword.get(env, :tokens, %{})
       end

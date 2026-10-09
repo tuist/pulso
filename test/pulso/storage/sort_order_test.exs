@@ -3,7 +3,7 @@ defmodule Pulso.Storage.SortOrderTest do
   # that swaps adapters must never see the order change when timestamps are
   # equal, so this coverage runs against the pure sort — no adapter needed.
 
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Storage.SortOrder

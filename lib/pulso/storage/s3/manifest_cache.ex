@@ -20,11 +20,13 @@ defmodule Pulso.Storage.S3.ManifestCache do
   owner to decide whether a refresh is due).
   """
 
-  use GenServer
+  use Pulso.Runtime.GenServer
 
+  alias Pulso.Runtime.GenServer
   alias Pulso.Storage.S3.Manifest
 
   @table __MODULE__
+  defp table, do: Pulso.Runtime.table(@table)
 
   @type entry :: %{
           manifest: Manifest.t(),
@@ -47,7 +49,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
   """
   @spec get(String.t(), String.t()) :: entry() | nil
   def get(tenant, signal) when is_binary(tenant) and is_binary(signal) do
-    case :ets.lookup(@table, {tenant, signal}) do
+    case :ets.lookup(table(), {tenant, signal}) do
       [{_, entry}] -> entry
       [] -> nil
     end
@@ -65,33 +67,33 @@ defmodule Pulso.Storage.S3.ManifestCache do
       refreshed_at_mono: System.monotonic_time(:millisecond)
     }
 
-    :ets.insert(@table, {{tenant, signal}, entry})
+    :ets.insert(table(), {{tenant, signal}, entry})
     :ok
   end
 
   @doc "Tenants observed locally through ingest or queries, without listing segment objects."
   def tenants(signal) when is_binary(signal) do
-    :ets.select(@table, [{{{:"$1", signal}, :_}, [], [:"$1"]}]) |> Enum.sort()
+    :ets.select(table(), [{{{:"$1", signal}, :_}, [], [:"$1"]}]) |> Enum.sort()
   end
 
   @doc "Drop a cached entry — used on tenant deletion or forced cache flush."
   @spec drop(String.t(), String.t()) :: :ok
   def drop(tenant, signal) when is_binary(tenant) and is_binary(signal) do
-    :ets.delete(@table, {tenant, signal})
+    :ets.delete(table(), {tenant, signal})
     :ok
   end
 
   @doc false
   @spec reset() :: :ok
   def reset do
-    if :ets.info(@table) != :undefined do
-      :ets.delete_all_objects(@table)
+    if :ets.info(table()) != :undefined do
+      :ets.delete_all_objects(table())
     end
 
     :ok
   end
 
-  @impl GenServer
+  @impl true
   def init(_opts) do
     ensure_table()
     {:ok, %{}}
@@ -99,9 +101,9 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
   @doc false
   def ensure_table do
-    case :ets.info(@table) do
+    case :ets.info(table()) do
       :undefined ->
-        :ets.new(@table, [
+        :ets.new(table(), [
           :named_table,
           :set,
           :public,
@@ -109,7 +111,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
         ])
 
       _ ->
-        @table
+        table()
     end
   end
 end

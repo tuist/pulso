@@ -1,5 +1,5 @@
 defmodule PulsoWeb.LokiQueryControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Storage

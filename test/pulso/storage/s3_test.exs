@@ -3,10 +3,11 @@ defmodule Pulso.Storage.S3Test do
   # docker-compose). Only runs with PULSO_INTEGRATION=1; plain `mix test`
   # skips it. See test/test_helper.exs.
 
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
+  alias Pulso.Runtime
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
@@ -27,7 +28,7 @@ defmodule Pulso.Storage.S3Test do
       allow_http: true
     }
 
-    Application.put_env(:pulso, S3, config)
+    Runtime.put_env(:pulso, S3, config)
 
     # The application boots ManifestSupervision only when the S3 adapter
     # is configured as the active storage. Tests set the adapter config
@@ -36,14 +37,15 @@ defmodule Pulso.Storage.S3Test do
 
     tenant = "test-#{System.unique_integer([:positive])}"
 
-    on_exit(fn ->
-      # The adapter writes objects under `tenants/<tenant>/v4/signal=logs/`; clean up
-      # both the segment objects and the manifest so a re-run starts empty.
-      case ObjectStore.list(config, "tenants/#{tenant}/v4/signal=logs/") do
-        {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
-        _ -> :ok
-      end
-    end)
+    on_exit(
+      Runtime.capture(fn ->
+        # Delete only the prefix this test owns, with its own metrics instance.
+        case ObjectStore.list(config, "tenants/#{tenant}/v4/signal=logs/") do
+          {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
+          _ -> :ok
+        end
+      end)
+    )
 
     {:ok, config: config, tenant: tenant}
   end
@@ -84,12 +86,14 @@ defmodule Pulso.Storage.S3Test do
   test "records for one tenant are invisible to another", %{tenant: tenant, config: config} do
     other = "test-other-#{System.unique_integer([:positive])}"
 
-    on_exit(fn ->
-      case ObjectStore.list(config, "tenants/#{other}/v4/signal=logs/") do
-        {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
-        _ -> :ok
-      end
-    end)
+    on_exit(
+      Runtime.capture(fn ->
+        case ObjectStore.list(config, "tenants/#{other}/v4/signal=logs/") do
+          {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
+          _ -> :ok
+        end
+      end)
+    )
 
     assert :ok = S3.append(:logs, tenant, [record(1)])
     assert :ok = S3.append(:logs, other, [record(2)])
@@ -350,9 +354,9 @@ defmodule Pulso.Storage.S3Test do
       # it as stale.
       Process.sleep(120)
 
-      Application.put_env(:pulso, S3, short_config)
+      Runtime.put_env(:pulso, S3, short_config)
       assert {:ok, records} = S3.query(:logs, tenant, [])
-      Application.put_env(:pulso, S3, config)
+      Runtime.put_env(:pulso, S3, config)
 
       timestamps = Enum.map(records, & &1.timestamp_ns) |> Enum.sort()
       assert 42 in timestamps
@@ -376,12 +380,12 @@ defmodule Pulso.Storage.S3Test do
       assert :ok = S3.append(:logs, tenant, [record(1)])
 
       capped_config = Map.put(config, :max_mailbox, 0)
-      Application.put_env(:pulso, S3, capped_config)
+      Runtime.put_env(:pulso, S3, capped_config)
 
       try do
         assert {:error, :owner_overloaded} = S3.append(:logs, tenant, [record(2)])
       after
-        Application.put_env(:pulso, S3, config)
+        Runtime.put_env(:pulso, S3, config)
       end
 
       # And once the cap is lifted, subsequent appends succeed

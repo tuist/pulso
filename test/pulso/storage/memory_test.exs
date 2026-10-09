@@ -1,5 +1,5 @@
 defmodule Pulso.Storage.MemoryTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Storage

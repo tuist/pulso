@@ -17,20 +17,22 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
   Wired into `Pulso.Application` only when the S3 adapter is active.
   """
 
-  use Supervisor
+  use Pulso.Runtime.Supervision
 
+  alias Pulso.Runtime.Registry
+  alias Pulso.Runtime.Supervision, as: Supervisor
   alias Pulso.Storage.S3.AppendRegistry
   alias Pulso.Storage.S3.AppendSupervisor
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervisor
 
-  @spec start_link(keyword()) :: Supervisor.on_start()
+  @spec start_link(keyword()) :: Elixir.Supervisor.on_start()
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @impl Supervisor
+  @impl true
   def init(_opts) do
     children = [
       {Registry, keys: :unique, name: ManifestRegistry},

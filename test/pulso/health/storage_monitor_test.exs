@@ -1,5 +1,5 @@
 defmodule Pulso.Health.StorageMonitorTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Health.StorageMonitor
 
@@ -134,7 +134,7 @@ defmodule Pulso.Health.StorageMonitorTest do
   test "a crashing probe is reported and does not kill the monitor" do
     name = start_monitor(fn _ -> exit(:boom) end)
     assert {:error, {:probe_crashed, _}} = wait_for_error(name)
-    assert Process.alive?(Process.whereis(name))
+    assert Process.alive?(Pulso.Runtime.whereis(name))
   end
 
   test "status is an error when the monitor is not running" do

@@ -77,6 +77,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
@@ -104,7 +105,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   def append(signal, tenant, records, opts) when is_atom(signal) and is_binary(tenant) and is_list(records) do
-    config = Map.new(Application.get_env(:pulso, __MODULE__) || %{})
+    config = Map.new(Runtime.get_env(:pulso, __MODULE__) || %{})
     keyed? = opts[:idempotency_key] not in [nil, ""]
 
     if not keyed? and Map.get(config, :ingest_flush_interval_ms, 0) > 0 do
@@ -627,7 +628,7 @@ defmodule Pulso.Storage.S3 do
   defp take_limit(records, limit) when is_integer(limit) and limit > 0, do: Enum.take(records, limit)
 
   defp config! do
-    case Application.get_env(:pulso, __MODULE__) do
+    case Runtime.get_env(:pulso, __MODULE__) do
       nil ->
         raise "Pulso.Storage.S3 is not configured. Set `config :pulso, Pulso.Storage.S3, bucket: ..., endpoint: ..., region: ..., access_key_id: ..., secret_access_key: ..., allow_http: ...`"
 

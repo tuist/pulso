@@ -54,9 +54,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   callers — not unbounded as the earlier design allowed.
   """
 
-  use GenServer, restart: :transient
+  use Pulso.Runtime.GenServer, restart: :transient
 
   alias Pulso.ObjectStore
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
@@ -266,7 +268,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         opts = [tenant: tenant, signal: signal, config: config]
         spec = %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :transient}
 
-        case DynamicSupervisor.start_child(ManifestSupervisor, spec) do
+        case DynamicSupervisor.start_child(Pulso.Runtime.name(ManifestSupervisor), Pulso.Runtime.child_spec(spec)) do
           {:ok, pid} -> {:ok, pid}
           {:error, {:already_started, pid}} -> {:ok, pid}
           {:error, _} = err -> err
@@ -274,7 +276,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  @spec start_link(opts()) :: GenServer.on_start()
+  @spec start_link(opts()) :: Elixir.GenServer.on_start()
   def start_link(opts) do
     tenant = Keyword.fetch!(opts, :tenant)
     signal = Keyword.fetch!(opts, :signal)
@@ -284,7 +286,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   # ---- GenServer callbacks --------------------------------------------------
 
-  @impl GenServer
+  @impl true
   def init(opts) do
     state = %{
       tenant: Keyword.fetch!(opts, :tenant),
@@ -305,7 +307,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     {:ok, state, @idle_hibernate_ms}
   end
 
-  @impl GenServer
+  @impl true
   def handle_call(:ensure_loaded, _from, state) do
     # A cache miss must not turn an old owner snapshot into a fresh query
     # snapshot after another node has published compaction or new ingest.
@@ -347,7 +349,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  @impl GenServer
+  @impl true
   def handle_info(:flush, state) do
     do_flush(state)
   end

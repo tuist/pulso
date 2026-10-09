@@ -1,5 +1,5 @@
 defmodule Pulso.Storage.S3.MetricLabelSummaryTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.MetricSample
   alias Pulso.Storage.S3

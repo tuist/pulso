@@ -9,8 +9,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   and `:compaction_cleanup_options` to tune limits. Scheduling has up to 10% jitter.
   Each tenant is isolated from errors and exceptions in the rest of the pass.
   """
-  use GenServer
+  use Pulso.Runtime.GenServer
 
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.ProcessGroup
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3.CompactionDiscovery
   alias Pulso.Storage.S3.CompactionOwnership
   alias Pulso.Storage.S3.CompactionSupervision
@@ -129,7 +132,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         # a dirty native call can signal termination before native work ends,
         # hiding it from admission checks. Late publication remains conditional.
         Process.demonitor(task.ref, [:flush])
-        :pg.leave(CompactionOwnership.scope(), CompactionOwnership.group(config), self())
+        ProcessGroup.leave(CompactionOwnership.scope(), CompactionOwnership.group(config), self())
         :telemetry.execute([:pulso, :compaction, :timeout], %{}, %{operation: name})
         report_failure(tenant, name, :timeout)
     end

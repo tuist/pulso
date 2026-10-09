@@ -1,5 +1,5 @@
 defmodule Pulso.PromQL.TimeTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.Time
 

@@ -9,6 +9,7 @@ defmodule Pulso.Storage.S3.CompactionOwnership do
   """
 
   alias Pulso.Rendezvous
+  alias Pulso.Runtime.ProcessGroup
 
   @scope __MODULE__
 
@@ -18,15 +19,15 @@ defmodule Pulso.Storage.S3.CompactionOwnership do
     {__MODULE__, Map.get(config, :endpoint), Map.get(config, :region), Map.get(config, :bucket)}
   end
 
-  def join(config), do: :pg.join(@scope, group(config), self())
+  def join(config), do: ProcessGroup.join(@scope, group(config), self())
 
   def join_once(config) do
-    if self() in :pg.get_local_members(@scope, group(config)), do: :ok, else: join(config)
+    if self() in ProcessGroup.get_local_members(@scope, group(config)), do: :ok, else: join(config)
   end
 
   def members(config) do
     @scope
-    |> :pg.get_members(group(config))
+    |> ProcessGroup.get_members(group(config))
     |> Enum.map(&node/1)
     |> Enum.uniq()
   end

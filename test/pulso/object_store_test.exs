@@ -4,9 +4,10 @@ defmodule Pulso.ObjectStoreTest do
   # opts in with PULSO_INTEGRATION=1 (see test/test_helper.exs), so plain
   # `mix test` on a machine without docker-compose still passes.
 
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.ObjectStore
+  alias Pulso.Runtime.Task
 
   @moduletag :integration
 
@@ -22,7 +23,8 @@ defmodule Pulso.ObjectStoreTest do
 
     key = "pulso-object-store-test/#{System.unique_integer([:positive])}.bin"
 
-    on_exit(fn -> ObjectStore.delete(config, key) end)
+    runtime = Pulso.Runtime.current()
+    on_exit(fn -> Pulso.Runtime.with(runtime, fn -> ObjectStore.delete(config, key) end) end)
 
     {:ok, config: config, key: key}
   end
@@ -51,11 +53,13 @@ defmodule Pulso.ObjectStoreTest do
       parent = self()
 
       {pid, ref} =
-        spawn_monitor(fn ->
-          payload = :crypto.strong_rand_bytes(3 * 1024 * 1024)
-          send(parent, {:hash, :crypto.hash(:sha256, payload)})
-          {:ok, _} = ObjectStore.put(config, key, payload)
-        end)
+        spawn_monitor(
+          Pulso.Runtime.capture(fn ->
+            payload = :crypto.strong_rand_bytes(3 * 1024 * 1024)
+            send(parent, {:hash, :crypto.hash(:sha256, payload)})
+            {:ok, _} = ObjectStore.put(config, key, payload)
+          end)
+        )
 
       assert_receive {:hash, hash}
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 30_000
@@ -66,7 +70,8 @@ defmodule Pulso.ObjectStoreTest do
 
     test "concurrent puts through the shared client", %{config: config} do
       keys = for i <- 1..16, do: "pulso-object-store-test/concurrent-#{System.unique_integer([:positive])}-#{i}.bin"
-      on_exit(fn -> Enum.each(keys, &ObjectStore.delete(config, &1)) end)
+      runtime = Pulso.Runtime.current()
+      on_exit(fn -> Pulso.Runtime.with(runtime, fn -> Enum.each(keys, &ObjectStore.delete(config, &1)) end) end)
 
       payloads =
         keys
@@ -90,9 +95,13 @@ defmodule Pulso.ObjectStoreTest do
     key_a = "#{prefix}/a.txt"
     key_b = "#{prefix}/b.txt"
 
+    runtime = Pulso.Runtime.current()
+
     on_exit(fn ->
-      ObjectStore.delete(config, key_a)
-      ObjectStore.delete(config, key_b)
+      Pulso.Runtime.with(runtime, fn ->
+        ObjectStore.delete(config, key_a)
+        ObjectStore.delete(config, key_b)
+      end)
     end)
 
     assert {:ok, _} = ObjectStore.put(config, key_a, "one")

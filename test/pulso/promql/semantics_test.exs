@@ -1,5 +1,5 @@
 defmodule Pulso.PromQL.SemanticsTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Parser
@@ -238,13 +238,11 @@ defmodule Pulso.PromQL.SemanticsTest do
   end
 
   test "sample and work budgets apply across selectors in a binary expression" do
-    original = Application.get_env(:pulso, Evaluator, [])
-    on_exit(fn -> Application.put_env(:pulso, Evaluator, original) end)
     append("a", %{}, [{30, 1.0}])
     append("b", %{}, [{30, 2.0}])
-    Application.put_env(:pulso, Evaluator, max_samples: 1)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 1)
     assert {:error, :query_sample_limit} = query("a + b")
-    Application.put_env(:pulso, Evaluator, max_work: 3)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_work: 3)
     assert {:error, :query_work_limit} = query("a + b")
   end
 

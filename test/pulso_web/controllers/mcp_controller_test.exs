@@ -1,5 +1,5 @@
 defmodule PulsoWeb.MCPControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Auth
   alias Pulso.Auth.SharedSecret
@@ -38,9 +38,7 @@ defmodule PulsoWeb.MCPControllerTest do
   end
 
   test "every query tool fails closed without tenant credentials", %{conn: conn} do
-    original = Application.fetch_env!(:pulso, Auth)
-    Application.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
-    on_exit(fn -> Application.put_env(:pulso, Auth, original) end)
+    Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
     for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
       response =
@@ -86,9 +84,7 @@ defmodule PulsoWeb.MCPControllerTest do
   end
 
   test "tenant authorization precedes query argument validation", %{conn: conn} do
-    original = Application.fetch_env!(:pulso, Auth)
-    Application.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
-    on_exit(fn -> Application.put_env(:pulso, Auth, original) end)
+    Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
     for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
       response =

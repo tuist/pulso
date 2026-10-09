@@ -1,6 +1,7 @@
 defmodule Pulso.Alerting.Targets do
   @moduledoc "Operator-provisioned notification bindings; only secret references enter object storage."
   alias Pulso.Alerting.{Canonical, Principal}
+  alias Pulso.Runtime
 
   def validate(target) when is_map(target) do
     allowed = ~w(tenant id type secret_env)
@@ -30,7 +31,7 @@ defmodule Pulso.Alerting.Targets do
 
     with {:ok, current} <- find(descriptor["tenant"], descriptor["id"]),
          true <- current == descriptor and Canonical.hash(current) == version,
-         url when is_binary(url) <- System.get_env(current["secret_env"]),
+         url when is_binary(url) <- Runtime.env(current["secret_env"]),
          true <- secure_url?(url) do
       {:ok, url}
     else
@@ -46,7 +47,7 @@ defmodule Pulso.Alerting.Targets do
   end
 
   defp find(tenant, id) do
-    env = Application.get_env(:pulso, Pulso.Alerting, [])
+    env = Runtime.get_env(:pulso, Pulso.Alerting, [])
 
     case Enum.find(Keyword.get(env, :notification_targets, []), &(&1["tenant"] == tenant and &1["id"] == id)) do
       nil -> {:error, :invalid_target}

@@ -1,8 +1,9 @@
 defmodule Pulso.Alerting.RepositoryTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Alerting
   alias Pulso.Alerting.{Canonical, Evaluator, Importer, Repository}
+  alias Pulso.Runtime.Task
   alias Pulso.Test.CompactionStore
 
   setup do
@@ -277,7 +278,9 @@ defmodule Pulso.Alerting.RepositoryTest do
         Evaluator.evaluate(ctx.actor, "backup", ctx.opts ++ [timestamp_ns: 1_000_000_000, query: query])
       end)
 
-    assert_receive {:query_started, pid}
+    # The evaluation reads its rule head from storage before querying; allow for a
+    # loaded async suite without changing the ordering under test.
+    assert_receive {:query_started, pid}, 5_000
 
     assert {:ok, _} =
              Alerting.update(
