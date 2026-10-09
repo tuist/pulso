@@ -252,6 +252,11 @@ fn encode_labels<'a>(labels_term: Term<'a>) -> Result<EncodedLabels, EncodeError
     for (k, v) in iter {
         let kb: Binary<'a> = k.decode().map_err(|_| EncodeError::BadInput)?;
         let vb: Binary<'a> = v.decode().map_err(|_| EncodeError::BadInput)?;
+        // Canonical fields use 0xff as a separator, which cannot occur
+        // in valid UTF-8. Reject invalid labels before writing a segment
+        // that would be unreadable or decode into fabricated labels.
+        simdutf8::basic::from_utf8(kb.as_slice()).map_err(|_| EncodeError::BadInput)?;
+        simdutf8::basic::from_utf8(vb.as_slice()).map_err(|_| EncodeError::BadInput)?;
         pairs.push((kb.as_slice(), vb.as_slice()));
     }
     pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -496,7 +501,6 @@ impl<'a> BinaryArena<'a> {
             Some(a) => a
                 .make_subbinary(start, len)
                 .map_err(|_| DecodeError::Reader),
-            None if len == 0 => Err(DecodeError::Reader),
             None => Err(DecodeError::Reader),
         }
     }
