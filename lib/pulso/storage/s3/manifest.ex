@@ -35,6 +35,7 @@ defmodule Pulso.Storage.S3.Manifest do
 
   alias Pulso.Storage.S3.Manifest.Retirement
   alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.PagedManifest
 
   @schema_version 1
   @name_dictionary_bytes 65_536
@@ -42,13 +43,14 @@ defmodule Pulso.Storage.S3.Manifest do
   # `tenant` and `signal` are not serialized — they are derivable from
   # the manifest object's own key. Keeping them off the wire keeps the
   # payload smaller and forecloses a class of tenant-mixing bugs.
-  defstruct version: @schema_version, segments: [], retired: %{}, cleanup_cursor: nil
+  defstruct version: @schema_version, segments: [], retired: %{}, cleanup_cursor: nil, paging: nil
 
   @type t :: %__MODULE__{
           version: non_neg_integer(),
           segments: [Segment.t()],
           retired: %{String.t() => Retirement.t()},
-          cleanup_cursor: String.t() | nil
+          cleanup_cursor: String.t() | nil,
+          paging: map() | nil
         }
 
   @doc "Path of the manifest object for one `(tenant, signal)`."
@@ -69,7 +71,7 @@ defmodule Pulso.Storage.S3.Manifest do
   per-segment binary allocations.
   """
   @spec encode(t()) :: iodata()
-  def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor}) do
+  def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor} = manifest) do
     {wire_segments, names, labels} = encode_segments(segments)
 
     wire = %{
@@ -79,9 +81,18 @@ defmodule Pulso.Storage.S3.Manifest do
       "cleanup_cursor" => cursor
     }
 
+    wire = if version == 3, do: Map.put(wire, "p", manifest.paging), else: wire
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
     wire = if labels == [], do: wire, else: Map.put(wire, "labels", labels)
-    Pulso.JSON.encode_to_iodata!(wire)
+    json = Pulso.JSON.encode_to_iodata!(wire)
+
+    if version == 3 do
+      # Verify exact payload bytes, independent of OTP term encoding or JSON
+      # map iteration order across reader/writer upgrades.
+      ["{\"root_sha\":\"", root_digest(json), "\",\"payload\":", json, "}"]
+    else
+      json
+    end
   end
 
   @doc """
@@ -94,18 +105,23 @@ defmodule Pulso.Storage.S3.Manifest do
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
   def decode(binary) when is_binary(binary) do
-    with {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(binary),
+    with {:ok, payload, protected?} <- unwrap_root(binary),
+         {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(payload),
          :ok <- validate_version(version),
          :ok <- validate_fields(version, wire),
          {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"]), name_dictionary(wire["labels"])),
          {:ok, retired} <- decode_retired(Map.get(wire, "retired", %{})),
-         {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")) do
+         {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")),
+         :ok <- validate_paging(version, wire["p"]),
+         :ok <- validate_root_bounds(version, parsed, byte_size(binary)),
+         :ok <- validate_root_digest(version, protected?) do
       {:ok,
        %__MODULE__{
          version: version,
          segments: sort_by_max_ts_desc(parsed),
          retired: retired,
-         cleanup_cursor: cursor
+         cleanup_cursor: cursor,
+         paging: wire["p"]
        }}
     else
       {:ok, _malformed} -> {:error, :invalid_manifest}
@@ -115,12 +131,44 @@ defmodule Pulso.Storage.S3.Manifest do
 
   # Tombstones remain after deletion: a delayed idempotent ingest retry must
   # never reintroduce records that already live in a replacement segment.
-  defp validate_version(version) when version in [1, 2], do: :ok
+  defp validate_version(version) when version in [1, 2, 3], do: :ok
   defp validate_version(_), do: {:error, :unsupported_manifest_version}
+
+  defp validate_paging(3, paging), do: PagedManifest.validate(paging)
+  defp validate_paging(_, nil), do: :ok
+  defp validate_paging(_, _), do: {:error, :invalid_manifest}
 
   defp validate_fields(1, _wire), do: :ok
   defp validate_fields(2, %{"retired" => _}), do: :ok
+  defp validate_fields(3, %{"retired" => retired, "p" => _}) when is_map(retired) and map_size(retired) == 0, do: :ok
   defp validate_fields(_, _wire), do: {:error, :invalid_manifest}
+
+  defp root_digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+  defp unwrap_root(<<"{\"root_sha\":\"", sha::binary-size(64), "\",\"payload\":", rest::binary>>) do
+    if byte_size(rest) > 0 and :binary.last(rest) == ?} do
+      payload = binary_part(rest, 0, byte_size(rest) - 1)
+      if root_digest(payload) == sha, do: {:ok, payload, true}, else: {:error, :invalid_manifest}
+    else
+      {:error, :invalid_manifest}
+    end
+  end
+
+  defp unwrap_root(bytes), do: {:ok, bytes, false}
+  defp validate_root_digest(3, true), do: :ok
+  defp validate_root_digest(3, _), do: {:error, :invalid_manifest}
+  defp validate_root_digest(_, false), do: :ok
+  defp validate_root_digest(_, _), do: {:error, :invalid_manifest}
+
+  defp validate_root_bounds(3, segments, bytes) do
+    tail_bytes = segments |> Enum.map(&Segment.to_wire/1) |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_length()
+
+    if bytes <= 524_288 and length(segments) <= 256 and tail_bytes <= 65_536,
+      do: :ok,
+      else: {:error, :retention_capacity}
+  end
+
+  defp validate_root_bounds(_, _, _), do: :ok
 
   defp decode_cursor(cursor) when is_nil(cursor) or is_binary(cursor), do: {:ok, cursor}
   defp decode_cursor(_), do: {:error, :invalid_manifest}

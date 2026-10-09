@@ -11,10 +11,10 @@ defmodule Pulso.Metrics do
   alias Pulso.Runtime.GenServer
   alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.AppendBuffer
+  alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
 
   @table __MODULE__
-  defp table, do: Pulso.Runtime.table(@table)
   @handler {__MODULE__, :metrics}
   @event [:pulso, :operation, :stop]
   @timeout_event [:pulso, :compaction, :timeout]
@@ -41,7 +41,8 @@ defmodule Pulso.Metrics do
       "unknown_tool"
     ],
     object: ["put", "put_if_match", "put_if_none_match", "get", "get_if_none_match", "delete", "list", "list_prefixes"],
-    compaction: ["compact", "cleanup"]
+    compaction: ["compact", "cleanup"],
+    retention: ["advance", "cleanup", "cleanup_retired", "sweep"]
   }
   @http_routes %{
     {"POST", ["v1", "logs"]} => {:ingest, "otlp"},
@@ -69,7 +70,7 @@ defmodule Pulso.Metrics do
     {"pulso_compaction_timeouts_total", "counter",
      "Background worker deadlines exceeded, including still-running native work."}
   ]
-  @purposes ["none", "segment", "manifest", "other"]
+  @purposes ["none", "segment", "manifest", "metadata_page", "other"]
   @outcomes ["ok", "error", "exception", "conflict", "not_modified", "not_found", "rejected"]
   @gauge_help %{
     "pulso_manifest_mailbox_messages" => "Messages in node-local manifest-owner mailboxes.",
@@ -81,16 +82,24 @@ defmodule Pulso.Metrics do
       "Estimated external-term bytes reserved in unkeyed ingest buffers, not heap size.",
     "pulso_ingest_buffer_rows" => "Queued and executing rows reserved in unkeyed ingest buffers.",
     "pulso_query_occupied_slots" => "Registered node-local PromQL tenant query slots.",
+    "pulso_retention_root_capacity_ratio" =>
+      "Worst metadata capacity ratio among locally cached managed scopes, without tenant labels.",
+    "pulso_retention_pending_buckets" => "Expired buckets awaiting reclamation in locally cached managed scopes.",
+    "pulso_retention_managed_scopes" => "Retention-managed tenant/signal scopes cached on this node.",
     "pulso_vm_memory_bytes" => "Total BEAM-reported memory in bytes.",
     "pulso_vm_run_queue" => "BEAM scheduler run-queue length."
   }
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  # Every table operation goes through the current runtime's instance name.
+  defp table, do: Pulso.Runtime.table(@table)
+
   @impl true
   def init(_opts) do
     :ets.new(table(), [:named_table, :public, :set, write_concurrency: true])
-
+    # Handlers are node-global and route each event to the emitting process's
+    # runtime instance, so attach once and never re-attach under concurrent events.
     case :telemetry.attach_many(@handler, @events, &__MODULE__.handle_event/4, nil) do
       :ok -> :ok
       {:error, :already_exists} -> :ok
@@ -99,6 +108,7 @@ defmodule Pulso.Metrics do
     {:ok, nil}
   end
 
+  # Owned (scoped) instances must not detach the handlers other instances share.
   @impl true
   def terminate(_reason, _state) do
     if Pulso.Runtime.name(__MODULE__) == __MODULE__, do: :telemetry.detach(@handler), else: :ok
@@ -340,6 +350,9 @@ defmodule Pulso.Metrics do
   defp render_gauges do
     {mailbox, pending, waiters} = manifest_queues()
     {buffers, reserved_calls, input_bytes, input_rows} = AppendBuffer.stats()
+    retention = ManifestCache.retention_statistics()
+    capacity = Enum.map(retention, & &1.capacity_ratio) |> Enum.max(fn -> 0.0 end)
+    expired = Enum.reduce(retention, 0, &(&1.pending_buckets + &2))
 
     [
       gauge("pulso_manifest_mailbox_messages", mailbox),
@@ -350,6 +363,9 @@ defmodule Pulso.Metrics do
       gauge("pulso_ingest_buffer_input_bytes", input_bytes),
       gauge("pulso_ingest_buffer_rows", input_rows),
       gauge("pulso_query_occupied_slots", occupied_queries()),
+      gauge("pulso_retention_root_capacity_ratio", capacity),
+      gauge("pulso_retention_pending_buckets", expired),
+      gauge("pulso_retention_managed_scopes", length(retention)),
       gauge("pulso_vm_memory_bytes", :erlang.memory(:total)),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue))
     ]
@@ -394,7 +410,13 @@ defmodule Pulso.Metrics do
   end
 
   defp gauge(name, value),
-    do: [metric_header(name, "gauge", Map.fetch!(@gauge_help, name)), name, " ", Integer.to_string(value), "\n"]
+    do: [
+      metric_header(name, "gauge", Map.fetch!(@gauge_help, name)),
+      name,
+      " ",
+      if(is_float(value), do: Float.to_string(value), else: Integer.to_string(value)),
+      "\n"
+    ]
 
   defp metric_header(name, type, help) do
     name = exported_name(name)

@@ -10,6 +10,7 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.FailingStorage
 
   setup do
     Memory.reset()
@@ -74,6 +75,26 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     merged
     |> Enum.reduce(conn, fn {h, v}, c -> put_req_header(c, h, v) end)
     |> post(~p"/api/v1/write", body)
+  end
+
+  test "retention timestamp failures are permanent and capacity/migration failures are retryable" do
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: FailingStorage)
+
+    encoded = body([%{labels: [{"__name__", "requests_total"}], samples: [{1.0, 1_700_000_000_000}]}])
+
+    for reason <- [
+          :retention_expired,
+          :timestamp_too_new,
+          :retention_capacity,
+          :retention_migration_required,
+          :managed_manifest_missing,
+          :manifest_page_missing,
+          :cas_retries_exhausted
+        ] do
+      Pulso.Runtime.put_env(:pulso, FailingStorage, {:error, reason})
+      response = post_write(build_conn(), encoded)
+      assert response.status == if(reason in [:retention_expired, :timestamp_too_new], do: 400, else: 503)
+    end
   end
 
   # ------- happy path -------------------------------------------------------

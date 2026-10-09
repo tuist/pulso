@@ -13,7 +13,7 @@ Pulso ships no UI. It exists to be talked to by humans through their own dashboa
 Four bets shape everything below. Deviating from any of them is a redesign, not a refactor.
 
 1. **Headless nodes, shared-nothing at the write path.** No shared database, no leader election, no consensus service, no cluster-visible mutable state. Nodes coordinate only through object storage. Kill a node, launch another; nothing is lost.
-2. **Object storage is the source of truth.** S3 (or any S3-compatible: R2, GCS, Azure Blob, MinIO) holds every acknowledged record, forever. Local disk is a warm cache and nothing more.
+2. **Object storage is the source of truth.** S3 (or any S3-compatible: R2, GCS, Azure Blob, MinIO) holds every acknowledged record until an explicitly configured retention policy expires it (indefinitely by default). Local disk is a warm cache and nothing more.
 3. **BEAM for orchestration, Rust for bytes.** Elixir/OTP owns concurrency, supervision, per-tenant isolation, backpressure, and the MCP surface. Rust owns Parquet encode/decode, DataFusion query execution, and the S3 object store client, called via Rustler NIFs. Nothing crosses the boundary that doesn't need to.
 4. **MCP is first-class, not bolted on.** The primary read surface is MCP tools. HTTP APIs exist for compatibility with agents (Alloy, OTel collectors, Prometheus remote_write clients) that expect them, not as the recommended read path.
 
@@ -31,9 +31,9 @@ For each signal Pulso stores:
 
 - **Segment files** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`): immutable Parquet objects containing the records themselves. The zero-padded 20-digit `[min_ts, max_ts]` tail is what the query path prunes against at LIST time; the `date=`/`hour=` partitions are derived from `min_ts` as UTC and let Athena-style callers prune without opening the manifest.
 - **Sidecar index files** (`.bloom`, `.postings`, `.stats`), written alongside the segment at flush time, immutable, live in S3. **Not yet implemented**; the first signal to need them is metrics (label→series posting list).
-- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it.
+- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it. Formats 1 and 2 are flat lists. Format 3, written only when retention is enforced, is a bounded root over immutable time-bucket pages; see [Retention implementation](#retention-implementation).
 
-The manifest is the only file for a tenant that ever gets rewritten. Segments and sidecar indexes are write-once.
+The manifest root is the only file for a tenant that ever gets rewritten. Segments, sidecar indexes and format-3 metadata pages are write-once.
 
 ### Segment lifecycle
 
@@ -89,7 +89,8 @@ Initial ingest into a prefix without a manifest reconstructs legacy segments by
 listing, then publishes the rebuilt entries and new segment metadata in one
 conditional creation. There is no intermediate bootstrap manifest PUT. The
 unpublished snapshot does not enter the query cache. Read-first legacy migration
-still publishes its reconstruction before returning, and compacted prefixes
+still publishes its reconstruction before returning. Prefixes carrying the
+retention `.managed` marker never rebuild by listing, and compacted prefixes
 without a manifest still fail closed.
 
 Under normal operation there is exactly one writer per manifest (the current rendezvous owner), so CAS conflicts do not happen. During failover or a cluster resize, two nodes may briefly race; the loser retries with the new etag. This is the failover mechanism — no explicit election.
@@ -514,7 +515,7 @@ native decoder filters.
 - Compactor role: dedicated compactor nodes, or ingesters run compaction in the background?
 - Multi-region: single region only in v1; multi-region S3 replication and query routing is a separate design.
 - Tenant tiering: are hot tenants sharded to dedicated nodes, or homogeneous?
-- Retention: TTL enforcement is a background job that rewrites manifests and deletes segments past the retention window; specifics TBD.
+- Retention: an experimental event-time implementation exists (see [Retention implementation](#retention-implementation)). Per-tenant policies, provider validation at production scale and finite-time reclamation of arbitrarily late uploads remain open.
 
 ## When this document must be updated
 
@@ -608,7 +609,8 @@ keys, and persists progress through conditional writes. The cursor rotates past
 permanent failures. Completed objects are not repeatedly deleted. A delayed
 ingest retry increments the retired key's revision and schedules its re-upload
 for deletion, preventing overlapping cleanup from incorrectly marking it done.
-Tombstones remain permanently to prevent duplicate ingest. Bounding their
+In flat manifests, tombstones remain permanently to prevent duplicate ingest. Format-3
+manifests drop them with their expired time bucket (see below). Bounding flat-manifest
 metadata requires an explicit ingest retry horizon in a later version. An ingest
 retry that crashes between re-upload and manifest registration can leave an
 unreferenced retired object; reclaiming abandoned uploads remains a follow-up.
@@ -619,13 +621,216 @@ If a manifest is missing and compacted objects exist, reads and ingest return
 `:compacted_manifest_missing` rather than reconstructing incomplete or duplicate
 data. Recovery requires restoring the manifest from object-store version history
 or a backup. Legacy prefixes without compaction retain their listing-based
-migration path.
+migration path unless they carry the retention `.managed` marker.
 
-Queries that lose a segment to cleanup restart their entire scan once against a
-fresh manifest. A second missing object returns an error rather than silently
-omitting samples. The retry uses its own snapshot without overwriting the shared
+Queries that lose a segment or format-3 metadata page to cleanup restart their
+entire scan once against a fresh manifest. This applies to logs as well as
+metrics; logs no longer skip missing objects silently. A second missing object
+returns an error rather than silently omitting records. The retry uses its own snapshot without overwriting the shared
 cache, so it cannot hide a later acknowledged append. This protects stale readers
 even after extended refresh failures; the grace period alone cannot bound every
 snapshot's lifetime.
 
 The next metrics work is label posting indexes, followed by OpenTelemetry metrics ingestion and then alert evaluation.
+
+## Retention implementation
+
+Event-time retention is experimental and opt-in. Operator procedures live in
+[retention](retention.md); this section records the design constraints.
+
+### Format 3 manifests
+
+A retention-managed (tenant, signal) keeps `manifest.json` as its only
+conditional publication authority. Format 3 replaces the flat segment list with a
+bounded root: the irreversible `floor_ns`, the recorded duration in days, a fixed
+bucket width, a fresh nonce on every mutating write, an inline tail of recent
+entries (at most 256 entries / 64 KiB) and bucket descriptors (hard ceiling
+2,048). The encoded root is capped at 512 KiB, independently of the descriptor
+count. A format-3 root is stored in a fixed JSON envelope,
+`{"root_sha":"<sha256 hex>","payload":<raw JSON>}`. The digest covers the exact
+stored payload bytes, so verification depends neither on Erlang term encoding
+nor on JSON key order across releases. Readers check the fixed header, strip the
+outer brace, verify the raw payload slice, and only then decode it; a format-3
+payload without a valid envelope is rejected. Formats 1 and 2 stay plain JSON. A
+checked-in fixture pins the envelope. Old releases reject format 3 instead of
+erasing its fields.
+
+Each segment belongs to exactly one fixed time bucket, chosen by the maximum
+timestamp encoded in its canonical key. Query pruning uses each bucket's actual
+aggregate time bounds, because a segment can contain records far older than its
+bucket start. Older entries live in immutable pages under
+`tenants/<t>/v4/signal=<s>/index/<bucket-start>/<bucket-id>/`: leaves of at most
+256 entries / 64 KiB, and a bucket index of at most 1,024 page references /
+512 KiB. Pages are uploaded before the root CAS that references them; a page PUT
+alone never acknowledges data. References are scoped to the bucket's prefix,
+carry size and SHA-256, and are verified on the first read. Each node keeps an
+immutable metadata cache of at most 512 pages. Its 16 MiB limit counts the ETS
+table's allocated memory (decoded maps, lists, inline binaries and overhead)
+plus each page's encoded size and its reference strings, which stand in for
+reference-counted binaries that ETS accounting omits; least recently used pages
+are evicted first. Reference strings are copied before insertion so a cached
+entry never pins the 512 KiB root it was decoded from. Because pages are
+content-addressed, a verified cached page stays valid even if the stored object
+later changes or disappears. Each bucket also has a cap on total metadata bytes
+written, and one root write may touch at most four buckets. Exceeding a budget is
+an explicit `:retention_capacity` error.
+
+The width is chosen once, at activation, as `ceil(window / 508)` whole hours,
+where the window is the duration plus the effective grace (the larger of the
+retention and configured compaction grace) plus the future skew. Expired
+buckets keep their descriptors until their grace ends, so the window, not the
+duration alone, must fit 512 descriptors with four of headroom; this keeps the
+root within its byte budget even with long tenant names. Defaults give 2 hours
+for 30 days, 18 for 365 and 173 for 3,650. The width is persisted. Every pass
+and `apply_policy/5` call rechecks the current window against it, so a grace or
+skew change that no longer fits stops advancement with `:retention_capacity`
+(ingest is not gated on it; registration stays floor-fenced); changing the width in place is unsupported. A managed
+compaction call cannot use a grace above the effective configured grace. Normal appends still cost one segment
+PUT plus one root write; spilling the inline tail adds leaf and index page writes.
+
+### Activation, policy and fences
+
+Only `enforce` mode with a positive duration converts a manifest, either from a
+maintenance pass; an append converts only a prefix with no data yet, and appends
+to a non-empty legacy prefix return the retryable `:retention_migration_required`
+until the worker converts it. Conversion first creates the permanent `.managed`
+marker with a conditional create; the marker holds an immutable random seed from
+which bucket generations and migration retirement identities are derived, and
+pages are content-addressed and written with conditional creates, so retries and
+restarts reuse identical pages. It then publishes the converted root
+conditionally against the legacy manifest's ETag, under its own deadline
+(`retention_migration_timeout_ms`, ten minutes by default). Ordinary queries,
+appends and owner loads read flat manifests without a size limit in every mode,
+so enforcement never makes a large legacy prefix unreadable; such a prefix
+returns `:retention_migration_required` to appends until it is converted. A root
+of unknown format (a cold cache or a fresh owner) is first read with the 512 KiB
+format-3 cap; only a `:response_too_large` answer falls back to one unbounded
+read, which the decoder still rejects if the body is an oversized format-3 root.
+A root already known to be format 3 is never read unbounded.
+Automatic conversion, policy inspection and maintenance read the legacy manifest
+with a 16 MiB bound and refuse larger ones. `Retention.convert_offline/4` converts a quiesced prefix with an
+explicit byte limit (up to 256 MiB), a heap cap and a timeout; a timed-out
+conversion is not killed and may still complete. Canonical buckets that are
+already wholly closed go into closed cleanup work buckets of at most 262,144
+keys, keeping per-key deletion references and the grace period without creating
+a descriptor for every historical hour.
+Every bootstrap path checks the marker before rebuilding by listing or creating a
+manifest; a marked prefix with a missing root returns `:managed_manifest_missing`.
+
+The root's recorded duration is authoritative. A worker whose configuration
+disagrees refuses to advance (`:retention_policy_mismatch`); changes go through an
+explicit conditional `Pulso.Storage.S3.Retention.apply_policy/5` with the
+expected current duration. A floor never moves backwards, and lengthening the
+window cannot restore deleted data.
+
+Registration is fenced by the latest root on every attempt: a segment is
+eligible only if its minimum timestamp is at or above the floor and its maximum is
+no further ahead of the node clock than the configured future skew. Missing
+timestamps count as zero. `ManifestOwner` evaluates eligibility per caller, so
+an expired registration does not fail unrelated callers in the same flush.
+Normal tail spills perform page I/O for at most four buckets per publication,
+and the owner partitions waiters per caller (at most four buckets and 256
+segments each) instead of rejecting a whole batch. The final spill of an
+expiring bucket is exempt from its mutation quota and uses a reserved leaf,
+reference and index allowance, so an exhausted bucket cannot trap the floor.
+Expiring buckets reject all mutations, including compaction. Compaction sources
+must share a bucket and be at or above the floor; a paged compaction rewrites
+the source leaves and then writes the index once, and its bucket cursor rotates
+past buckets with nothing to merge. After an ambiguous conditional
+write, the writer rereads the root and treats its own nonce as proof of commit.
+
+Queries clamp their lower bound to the snapshot's floor and read only live
+buckets, fetching one index per overlapping bucket plus matching leaves. A
+query may read 128 metadata pages plus two per bucket in the root, and 8 MiB,
+within one deadline shared with its retry; maintenance operations keep 128
+pages and 8 MiB. Exceeding either is `:metadata_scan_limit`, never a partial
+result. A metadata budget exhausted after the caller's own deadline is
+reported as `:query_timeout`. A failed refresh of a cached format-3 root is an
+error, never a stale success, because cleanup may already have reclaimed what
+the stale snapshot references. A cached flat root keeps serving its last
+snapshot on a failed refresh, as before retention existed, after a marker probe:
+a present marker turns the refresh failure into an error; a failed probe is
+treated as "not managed" unless this node enforces retention for that signal.
+
+### Expiry, cleanup and sweeps
+
+A pass advances the floor to `max(previous, now - days)` and, in the same root
+write, marks every live bucket ending at or before the floor as expiring, with a
+deletion deadline of now plus the grace period. After the deadline, teardown runs
+in stages recorded in the root: first it deletes every segment the bucket's
+pages reference (checking tenant/signal scope and that each key's maximum
+timestamp is below the floor), then it deletes the bucket's metadata prefix with
+paginated listing, and finally it removes the descriptor. Teardown never reads
+pages that the metadata stage may already have deleted. Failed objects are
+retried on later passes without blocking other buckets. Compaction retirements
+inside live buckets are deleted after their own deadlines. All per-key fences of
+an expired bucket disappear with it: the floor already makes those records
+unregistrable, so metadata stays proportional to the retained window instead of
+the bucket's lifetime.
+
+Uploads never published by any root (lost responses, crashes, completions after
+expiry) are reclaimed by bounded sweeps. A grace-aged watermark advances only to
+the earlier of a floor committed at least one grace period ago and the oldest
+remaining bucket. Sweeps walk one UTC date partition at a time with the native
+paginated `list_page` (lexical start-after), within a configurable horizon below
+the watermark, deleting canonical segment keys whose maximum timestamp is below
+it, plus the metadata prefixes of buckets below it. The native `get_bounded`
+call rejects manifests and pages above their size cap before allocating them.
+
+Uploads outside the normal horizon are handled by an explicit, durable catch-up
+job (`Retention.start_catchup/4`) stored in the root. It covers a range from an
+operator-chosen start up to the committed watermark and, while active, replaces
+the scope's normal sweep. Each pass lists at most 128 keys from one date
+partition and 128 from one expired metadata slot. A failed or unadmitted delete
+marks the cycle dirty: healthy ranges keep advancing, a dirty cycle is followed
+by a complete new cycle, and the job clears only after a failure-free cycle.
+
+Deletion admission is node-wide: at most `retention_delete_limit` attempts per
+`retention_interval_ms`, shared by retention and managed-prefix compaction
+cleanup, and four concurrent DELETEs enforced by an atomic guard in the native
+`delete_bounded` call. A slot is released only when the provider request
+actually returns, so a killed BEAM caller cannot free a slot while its I/O is
+still running. The worker discovers tenants with a bounded lexical walk (native
+`discover_tenants`, 16 tenants per round, skipping each tenant's subtree) plus a
+key-only continuation over locally cached scopes, without listing every
+tenant or registry entry. It reserves half of its 64-scope queue for durable
+discovery, never drops a scope it has already passed, and processes at most
+eight scopes per pass. Native
+`list_page` resumes with server-side start-after keys rather than opaque
+continuation tokens. The grace period reduces, but does not eliminate, readers
+losing objects: a missing object restarts the scan once, then errors.
+
+These native calls (`get_bounded`, `list_page`, `discover_tenants`,
+`delete_bounded`) are reached by every S3 deployment, not only retention-enabled
+ones: the `.managed` marker probe uses `get_bounded`. The object-store NIF
+therefore exports a retention API version, and application start fails with an
+actionable error when the S3 backend is configured and a stale precompiled
+artifact lacks it, rather than raising `:nif_not_loaded` on the first append.
+Release tags build matching artifacts automatically; the version is not bumped
+by hand.
+
+Every maintenance step is a root transition that can be retried after a crash,
+and overlapping workers are fenced by the root CAS. Pausing, an unmoving floor,
+insufficient cleanup throughput, persistent provider failures, or uploads that
+complete outside the sweep horizon void the physical bounds; this is not a
+compliance-erasure feature. Receivers answer expired and future records with
+permanent `400` responses (OTLP status code 3) and capacity, metadata-limit,
+policy-mismatch, pending-migration and storage failures with retryable `503`
+(OTLP code 14; Loki keeps `500` for unclassified storage errors). Append
+preflight loads the root (and applies eligibility, capacity and the legacy
+migration gate) only when the cached root is format 3 or the node enforces
+retention for the signal; `observe` and `paused` nodes add no root read to
+ingest for legacy prefixes. Otherwise a node with no cached root checks the
+`.managed` marker at most once per second per scope, through the bounded
+metadata cache. That probe is advisory: if it fails the append proceeds to its
+segment upload, and the owner's own marker check before creating a manifest and
+the root CAS (which rereads the root and re-evaluates eligibility against a
+format-3 root) still refuse to publish into a managed prefix, at the cost of a
+possible unpublished upload, as with any failed append. A foreground first append converts only a prefix whose
+freshly loaded legacy root is empty; anything else returns
+`:retention_migration_required` and is left to the worker. Mixing format-3 writers with older releases is unsupported.
+
+Self-monitoring adds fixed-cardinality `kind=retention` operations (`advance`,
+`cleanup`, `cleanup_retired`, `sweep`), the `metadata_page` object purpose, and
+three node-local gauges without tenant labels: the worst capacity ratio among
+cached managed scopes, the sum of their pending buckets, and their count.

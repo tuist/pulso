@@ -73,6 +73,7 @@ The ones you are most likely to change:
 | `ingress.*` | Expose ingestion and queries outside the cluster. |
 | `serviceMonitor.enabled` | Create a Prometheus Operator `ServiceMonitor` for self-monitoring. |
 | `metricsCompaction.enabled` | Merge small metrics segments. Read [the prerequisites](configuration.md#metrics-compaction) first. |
+| `retention.*` | Experimental event-time retention: `enabled` (keep the worker running with zero durations), `logsDays`, `metricsDays`, `mode` (`observe`, `enforce`, `paused`), grace, cadence, deletion limit, timeout, migration timeout, future skew and sweep horizon. Defaults keep data indefinitely. Read [retention](retention.md) first; enforcing is irreversible. |
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
@@ -159,6 +160,15 @@ before they reach Pulso.
   Read release notes first. Crossing the stale-sample compatibility boundary
   below requires a non-overlapping upgrade, not the default rolling strategy.
   Do not mix incompatible readers, writers, or compactors.
+- **Retention worker shutdown**: when the worker runs (`retention.enabled` or a
+  positive duration), the chart raises the
+  effective termination grace to at least the pre-stop delay plus
+  `retention.timeoutMs` plus 15 seconds, so a maintenance operation can finish.
+  In `enforce` mode with a positive duration it uses
+  `retention.migrationTimeoutMs` instead when that is longer (ten minutes by
+  default), so a manifest conversion is not cut short.
+  Stopping a node does not cancel storage calls already in flight; retention
+  work resumes from the manifest on the next pass.
 
 The pod runs as an unprivileged user with a read-only root filesystem. The only
 writable path is an `emptyDir` at `/tmp` for runtime scratch files.
@@ -197,6 +207,35 @@ records: that can lose acknowledged data. Returning the bucket to an older data
 contract requires a separately validated data migration or a pre-upgrade backup
 with an explicitly accepted loss/backfill procedure. Record this boundary in the
 release's upgrade notes.
+
+### Retention format boundary
+
+Enforcing [retention](retention.md) converts each tenant/signal manifest to a
+paged format that releases without retention cannot read. Before setting
+`retention.mode: enforce`:
+
+1. Upgrade to a release with retention while `retention.mode` is `observe` (the
+   chart default), and let the rollout finish so no older pod remains. Stop or
+   fence any other process that reads, writes or compacts the bucket with an
+   older release.
+2. Then change only `retention.mode` (and the durations) in a separate upgrade.
+   Pods of the same release can overlap during that rolling update.
+
+A release containing retention support does not by itself make it safe to
+overlap older and newer versions once a prefix has been converted. After
+conversion, rolling back to a release without retention is not supported; fix
+forward instead.
+
+### Native library compatibility
+
+Pulso's object-storage client is a native library that must come from the same
+release as the rest of the application. The container image compiles it from
+source, so this only matters if you build Pulso yourself with precompiled
+native artifacts: each release publishes artifacts built from its own source.
+With the S3 backend, a node whose native library predates the storage
+operations this release needs refuses to start and names the mismatch, instead
+of failing ingest later. Rebuild with `PULSO_NIF_FORCE_BUILD=1` or install the
+artifacts that match the release.
 
 ## Sending telemetry
 

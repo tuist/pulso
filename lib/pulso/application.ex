@@ -13,6 +13,7 @@ defmodule Pulso.Application do
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.CompactionWorker
   alias Pulso.Storage.S3.ManifestSupervision
+  alias Pulso.Storage.S3.RetentionWorker
 
   @impl true
   def start(_type, _args) do
@@ -65,8 +66,12 @@ defmodule Pulso.Application do
         [Memory]
 
       S3 ->
+        :ok = Pulso.ObjectStore.ensure_retention_api!()
         config = :pulso |> Application.fetch_env!(S3) |> Map.new()
-        [ManifestSupervision, {StorageMonitor, config: config} | CompactionWorker.children(config)]
+
+        [ManifestSupervision, {StorageMonitor, config: config}] ++
+          CompactionWorker.children(config) ++
+          RetentionWorker.children(config)
 
       _ ->
         []

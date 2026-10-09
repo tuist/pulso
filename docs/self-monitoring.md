@@ -109,6 +109,9 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_ingest_buffer_input_bytes` | Gauge | None | Estimated external-term bytes reserved in unkeyed buffers, not actual heap memory |
 | `pulso_ingest_buffer_rows` | Gauge | None | Queued and executing rows reserved in unkeyed buffers |
 | `pulso_query_occupied_slots` | Gauge | None | Registered PromQL tenant slots, including admitted native work that outlives the response deadline |
+| `pulso_retention_root_capacity_ratio` | Gauge | None | Highest metadata capacity ratio among the retention-managed scopes cached on this node; `0` when none are cached |
+| `pulso_retention_pending_buckets` | Gauge | None | Expired time buckets still awaiting cleanup, summed over cached retention-managed scopes |
+| `pulso_retention_managed_scopes` | Gauge | None | Retention-managed tenant/signal scopes cached on this node |
 | `pulso_vm_memory_bytes` | Gauge | None | Total BEAM-reported memory |
 | `pulso_vm_run_queue` | Gauge | None | BEAM scheduler run-queue length |
 
@@ -126,12 +129,21 @@ Detailed operation labels:
 - `kind=object`: the same eight object operations as the canonical view.
   Outcomes distinguish `ok`, `error`, `exception`, `conflict`, `not_found`, and
   `not_modified`. `purpose=manifest` identifies `/manifest.json` keys, `segment`
-  identifies `.parquet` keys, and `other` covers listings/other objects. Other
+  identifies `.parquet` keys, `metadata_page` identifies retention manifest pages
+  (`.json` objects under `index/`), and `other` covers listings, markers, and other
+  objects. Retention reads, paginated listings, tenant discovery, and admitted
+  deletes reuse the `get_if_none_match`, `list`, `list_prefixes`, and `delete`
+  operations. Other
   operation kinds use `purpose=none`. Only meaningful byte directions are emitted.
 - `kind=compaction`: `compact`, `cleanup`, including explicit and background
   calls. No-op passes count operations but add no segments. The separate timeout
   counter increments when the worker stops waiting; a late success also increments
   the eventual operation-success counter. These are different events.
+- `kind=retention`: `advance`, `cleanup`, `cleanup_retired`, `sweep`, including
+  background passes and explicit calls such as `convert_offline`. `advance` also
+  covers manifest conversion; `sweep` also covers an active catch-up job. A pass
+  with nothing to do counts as `ok`. Retention has no canonical-view layer; use
+  this detailed family and the retention gauges.
 
 ## Counting boundaries and limitations
 
@@ -158,6 +170,13 @@ still show those attempts, but successful-cleanup progress excludes that pass.
 Untrappable process termination cannot record completion. Durations end when the
 underlying operation completes, while worker wait metrics and deadline counters
 report timeouts immediately.
+
+Retention gauges cover only managed scopes whose root this node has loaded
+recently, through ingest, queries, or its own maintenance. A scope that no node
+has touched lately is absent, so the gauges are not a cluster inventory. Take the
+maximum ratio and the sum of pending buckets across nodes, and use
+`Retention.inspect_policy/4` (see [retention](retention.md#operating-retention))
+for an authoritative view of one tenant/signal.
 
 Queue gauges are instantaneous snapshots, not admission guarantees. Mailbox
 messages and publication batches are different stages; inspect both. Registry
@@ -201,8 +220,19 @@ sum by (instance) (rate(pulso_detailed_operations_total{kind="object",outcome="c
 
 # Worker deadlines exceeded even while native work is still running.
 sum by (instance, operation) (rate(pulso_compaction_timeouts_total[5m]))
+
+# Retention: failing maintenance passes, closest scope to a metadata limit, and
+# cleanup backlog across nodes.
+sum by (instance, operation) (rate(pulso_detailed_operations_total{kind="retention",outcome!="ok"}[15m]))
+max(pulso_retention_root_capacity_ratio)
+sum(pulso_retention_pending_buckets)
+
+# Retention manifest-page reads and their bytes.
+sum by (instance, operation) (rate(pulso_detailed_operations_total{kind="object",purpose="metadata_page"}[5m]))
+sum by (instance) (rate(pulso_object_bytes_total{purpose="metadata_page",direction="read"}[5m]))
 ```
 
 Alert on scrape failure (`up == 0`) through the independent monitor. Choose
-latency, queue, rejection-rate, and compaction thresholds from your measured
-load. Instrumentation alone establishes neither safe capacity nor readiness.
+latency, queue, rejection-rate, compaction, and retention thresholds from your
+measured load. For retention, alert well before the capacity ratio reaches `1.0`
+and when pending buckets keep growing over several retention intervals. Instrumentation alone establishes neither safe capacity nor readiness.

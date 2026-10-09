@@ -87,7 +87,8 @@ defmodule PulsoWeb.MetricsControllerTest do
     rejected = records(:rejected)
     errors = operations(:ingest, :otlp, :error)
     conn = conn |> put_req_header("content-type", "application/json") |> post("/v1/logs", payload())
-    assert conn.status == 500
+    # OTLP/HTTP clients only retry 429/502/503/504, so storage failures are retryable 503s.
+    assert %{"code" => 14} = json_response(conn, 503)
     assert records(:accepted) == accepted
     assert records(:failed) == failed + 1
     assert records(:rejected) == rejected + 1

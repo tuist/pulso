@@ -64,10 +64,26 @@ defmodule PulsoWeb.OTLPController do
         |> put_status(:bad_request)
         |> json(%{error: "attribute_key_collision"})
 
+      {:error, reason} when reason in [:retention_expired, :timestamp_too_new] ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{code: 3, message: to_string(reason)})
+
+      {:error, reason}
+      when reason in [
+             :retention_capacity,
+             :metadata_scan_limit,
+             :retention_policy_mismatch,
+             :retention_migration_required
+           ] ->
+        conn
+        |> put_status(:service_unavailable)
+        |> json(%{code: 14, message: to_string(reason)})
+
       {:error, reason} ->
         conn
-        |> put_status(:internal_server_error)
-        |> json(%{error: inspect(reason)})
+        |> put_status(:service_unavailable)
+        |> json(%{code: 14, message: inspect(reason)})
     end
   end
 

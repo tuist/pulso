@@ -109,6 +109,25 @@ defmodule PulsoWeb.LokiController do
         |> put_status(:bad_request)
         |> json(%{error: "attribute_key_collision"})
 
+      {:error, reason} when reason in [:retention_expired, :timestamp_too_new] ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{error: to_string(reason)})
+
+      {:error, reason}
+      when reason in [
+             :retention_capacity,
+             :metadata_scan_limit,
+             :retention_policy_mismatch,
+             :retention_migration_required,
+             :managed_manifest_missing,
+             :manifest_page_missing,
+             :cas_retries_exhausted
+           ] ->
+        conn
+        |> put_status(:service_unavailable)
+        |> json(%{error: to_string(reason)})
+
       {:error, reason} ->
         conn
         |> put_status(:internal_server_error)

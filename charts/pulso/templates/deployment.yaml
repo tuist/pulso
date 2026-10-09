@@ -36,7 +36,7 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "pulso.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ include "pulso.terminationGracePeriodSeconds" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -87,6 +87,30 @@ spec:
               value: {{ .Values.alerting.principals | toJson | quote }}
             - name: PULSO_INGEST_FLUSH_INTERVAL_MS
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
+            - name: PULSO_RETENTION_ENABLED
+              value: {{ .Values.retention.enabled | quote }}
+            - name: PULSO_LOGS_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.logsDays" .Values.retention.logsDays 0 3650) | quote }}
+            - name: PULSO_METRICS_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.metricsDays" .Values.retention.metricsDays 0 3650) | quote }}
+            - name: PULSO_RETENTION_MODE
+              value: {{ .Values.retention.mode | quote }}
+            - name: PULSO_RETENTION_DELETE_GRACE_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.deleteGraceMs" .Values.retention.deleteGraceMs 60000 2592000000) | quote }}
+            - name: PULSO_RETENTION_INTERVAL_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.intervalMs" .Values.retention.intervalMs 1000 3600000) | quote }}
+            - name: PULSO_RETENTION_DELETE_LIMIT
+              value: {{ include "pulso.boundedInteger" (list "retention.deleteLimit" .Values.retention.deleteLimit 1 512) | quote }}
+            - name: PULSO_RETENTION_TIMEOUT_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.timeoutMs" .Values.retention.timeoutMs 1000 600000) | quote }}
+            - name: PULSO_RETENTION_MIGRATION_TIMEOUT_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.migrationTimeoutMs" .Values.retention.migrationTimeoutMs 30000 3600000) | quote }}
+            - name: PULSO_RETENTION_FUTURE_SKEW_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.futureSkewMs" .Values.retention.futureSkewMs 0 86400000) | quote }}
+            {{- if ne (toString .Values.retention.sweepHorizonDays) "" }}
+            - name: PULSO_RETENTION_SWEEP_HORIZON_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.sweepHorizonDays" .Values.retention.sweepHorizonDays 1 7302) | quote }}
+            {{- end }}
             {{- with .Values.mcp.allowedOrigins }}
             - name: PULSO_MCP_ALLOWED_ORIGINS
               value: {{ join "," . | quote }}

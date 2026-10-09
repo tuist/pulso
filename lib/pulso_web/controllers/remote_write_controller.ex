@@ -104,6 +104,9 @@ defmodule PulsoWeb.RemoteWriteController do
       {:error, {:decode_failed, _}} ->
         conn |> put_status(:bad_request) |> json(%{error: "decode_failed"})
 
+      {:error, reason} when reason in [:retention_expired, :timestamp_too_new] ->
+        conn |> put_status(:bad_request) |> json(%{error: to_string(reason)})
+
       {:error, reason} ->
         conn |> put_status(:service_unavailable) |> json(%{error: inspect(reason)})
     end

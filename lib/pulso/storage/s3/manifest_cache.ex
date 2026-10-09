@@ -24,9 +24,9 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
   alias Pulso.Runtime.GenServer
   alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Retention
 
   @table __MODULE__
-  defp table, do: Pulso.Runtime.table(@table)
 
   @type entry :: %{
           manifest: Manifest.t(),
@@ -38,6 +38,9 @@ defmodule Pulso.Storage.S3.ManifestCache do
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
+
+  # Every table operation goes through the current runtime's instance name.
+  defp table, do: Pulso.Runtime.table(@table)
 
   @doc """
   Look up the cached manifest for one `(tenant, signal)`. Returns
@@ -67,13 +70,56 @@ defmodule Pulso.Storage.S3.ManifestCache do
       refreshed_at_mono: System.monotonic_time(:millisecond)
     }
 
+    entry =
+      if manifest.version == 3 do
+        previous = :ets.select(table(), [{{{tenant, signal}, %{etag: etag, statistics: :"$1"}}, [], [:"$1"]}])
+
+        statistics =
+          case previous do
+            [statistics] -> statistics
+            [] -> Retention.metadata_stats(manifest)
+          end
+
+        Map.put(entry, :statistics, statistics)
+      else
+        entry
+      end
+
     :ets.insert(table(), {{tenant, signal}, entry})
     :ok
+  end
+
+  @doc "Small node-local summaries for fixed-cardinality retention gauges, without storage I/O."
+  def retention_statistics do
+    :ets.select(table(), [{{:_, %{statistics: :"$1"}}, [], [:"$1"]}])
+  rescue
+    ArgumentError -> []
   end
 
   @doc "Tenants observed locally through ingest or queries, without listing segment objects."
   def tenants(signal) when is_binary(signal) do
     :ets.select(table(), [{{{:"$1", signal}, :_}, [], [:"$1"]}]) |> Enum.sort()
+  end
+
+  @doc "Bounded local scope discovery; the opaque ETS continuation contains no root values."
+  def scopes_page(cursor, limit) when limit in 1..16 do
+    scope_scan(cursor, limit, [])
+  rescue
+    ArgumentError -> {[], nil}
+  end
+
+  defp scope_scan(cursor, 0, acc), do: {Enum.reverse(acc), cursor}
+
+  defp scope_scan(cursor, remaining, acc) do
+    # The continuation embeds its chunk size. Keep it at one so callers may
+    # shrink their queue allowance without receiving an oversized next chunk.
+    result = if cursor == nil, do: :ets.select(table(), [{{:"$1", :_}, [], [:"$1"]}], 1), else: :ets.select(cursor)
+
+    case result do
+      :"$end_of_table" -> {Enum.reverse(acc), nil}
+      {scopes, :"$end_of_table"} -> {Enum.reverse(scopes ++ acc), nil}
+      {[scope], next} -> scope_scan(next, remaining - 1, [scope | acc])
+    end
   end
 
   @doc "Drop a cached entry — used on tenant deletion or forced cache flush."

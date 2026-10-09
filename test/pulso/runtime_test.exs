@@ -28,4 +28,8 @@ defmodule Pulso.RuntimeTest do
     refute :sys.get_status(server) |> inspect() =~ "must-not-appear"
   end
 
+  test "native object-store capability matches the bounded retention API" do
+    assert :ok = Pulso.ObjectStore.ensure_retention_api!()
+    assert NIF.retention_api_version() == 1
+  end
 end

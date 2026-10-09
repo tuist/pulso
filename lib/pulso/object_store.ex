@@ -27,6 +27,22 @@ defmodule Pulso.ObjectStore do
 
   @type etag :: String.t()
 
+  @doc false
+  def ensure_retention_api! do
+    version =
+      try do
+        NIF.retention_api_version()
+      rescue
+        ErlangError -> :unavailable
+      end
+
+    if version != 1 do
+      raise "object-store native artifact is incompatible with this Pulso release; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
+    end
+
+    :ok
+  end
+
   @spec put(config(), String.t(), binary()) :: {:ok, etag()} | {:error, term()}
   def put(config, key, data) when is_map(config) and is_binary(key) and is_binary(data) do
     observe("put", key, byte_size(data), fn -> normalize(NIF.put(normalize_config(config), key, data)) end)
@@ -85,6 +101,36 @@ defmodule Pulso.ObjectStore do
     end)
   end
 
+  @doc "Conditional metadata GET with a native, pre-allocation body limit."
+  def get_bounded(config, key, etag, limit) when is_integer(limit) and limit > 0 do
+    observe("get_if_none_match", key, 0, fn ->
+      normalize(NIF.get_bounded(normalize_config(config), key, etag || "", limit))
+    end)
+  end
+
+  @doc "Bounded lexical listing; the returned start-after cursor survives deletion of earlier keys."
+  def list_page(config, prefix, after_key \\ nil, limit \\ 512) when is_integer(limit) and limit in 1..1000 do
+    if after_key != nil and not String.starts_with?(after_key, prefix) do
+      {:error, :invalid_list_cursor}
+    else
+      observe("list", prefix, 0, fn ->
+        normalize(NIF.list_page(normalize_config(config), prefix, after_key || "", limit))
+      end)
+    end
+  end
+
+  @doc "Bounded tenant discovery that jumps over each ASCII managed subtree."
+  def discover_tenants(config, after_tenant \\ nil, limit \\ 16) when limit in 1..64 do
+    observe("list_prefixes", "tenants/", 0, fn ->
+      normalize(NIF.discover_tenants(normalize_config(config), after_tenant || "", limit))
+    end)
+  end
+
+  @doc "Retention DELETE with four native in-flight slots that survive BEAM caller termination."
+  def delete_bounded(config, key) do
+    observe("delete", key, 0, fn -> normalize(NIF.delete_bounded(normalize_config(config), key)) end)
+  end
+
   @spec delete(config(), String.t()) :: :ok | {:error, term()}
   def delete(config, key) when is_map(config) and is_binary(key) do
     observe("delete", key, 0, fn -> normalize(NIF.delete(normalize_config(config), key)) end)
@@ -110,6 +156,7 @@ defmodule Pulso.ObjectStore do
     purpose =
       cond do
         String.ends_with?(key, "/manifest.json") -> "manifest"
+        String.contains?(key, "/index/") and String.ends_with?(key, ".json") -> "metadata_page"
         String.ends_with?(key, ".parquet") -> "segment"
         true -> "other"
       end

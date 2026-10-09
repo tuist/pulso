@@ -6,10 +6,32 @@ defmodule PulsoWeb.LokiControllerTest do
   alias Pulso.Record.Log
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.FailingStorage
 
   setup do
     Memory.reset()
     :ok
+  end
+
+  test "retention timestamp failures are permanent and metadata failures are retryable" do
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: FailingStorage)
+
+    for reason <- [
+          :retention_expired,
+          :timestamp_too_new,
+          :retention_capacity,
+          :retention_migration_required,
+          :managed_manifest_missing,
+          :manifest_page_missing,
+          :cas_retries_exhausted
+        ] do
+      Pulso.Runtime.put_env(:pulso, FailingStorage, {:error, reason})
+
+      response =
+        build_conn() |> put_req_header("content-type", "application/json") |> post(~p"/loki/api/v1/push", payload())
+
+      assert response.status == if(reason in [:retention_expired, :timestamp_too_new], do: 400, else: 503)
+    end
   end
 
   defp payload(ts \\ "1700000000000000000", body \\ "hello") do

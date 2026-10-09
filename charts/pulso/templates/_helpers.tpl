@@ -61,6 +61,7 @@ crash on boot.
 {{- end }}
 {{- $_ := include "pulso.ingestLimitValue" (list $key $value) }}
 {{- end }}
+{{- include "pulso.validateRetention" . }}
 {{- if .Values.ingress.enabled }}
 {{- if not .Values.ingress.paths }}
 {{- fail "ingress.paths needs at least one path when ingress.enabled is true" }}
@@ -117,6 +118,87 @@ Takes (list key value).
 {{- fail (printf "ingestLimits.%s must be an integer between 1 and 2147483647, got %v" $key $value) }}
 {{- end }}
 {{- printf "%d" (int64 $n) }}
+{{- end }}
+
+{{/*
+Renders an integer setting as a decimal string, failing unless it is a whole
+number within the inclusive range config/runtime.exs accepts. Fractions are
+rejected rather than truncated. Takes (list name value min max).
+*/}}
+{{- define "pulso.boundedInteger" -}}
+{{- $name := index . 0 }}
+{{- $value := index . 1 }}
+{{- $min := int64 (index . 2) }}
+{{- $max := int64 (index . 3) }}
+{{- $n := -1 }}
+{{- $valid := false }}
+{{- if kindIs "string" $value }}
+{{- if regexMatch "^[0-9]{1,10}$" $value }}
+{{- $n = atoi $value }}
+{{- $valid = true }}
+{{- end }}
+{{- else if kindIs "float64" $value }}
+{{- if eq (float64 (int64 $value)) $value }}
+{{- $n = int64 $value }}
+{{- $valid = true }}
+{{- end }}
+{{- else if or (kindIs "int" $value) (kindIs "int64" $value) }}
+{{- $n = int64 $value }}
+{{- $valid = true }}
+{{- end }}
+{{- if or (not $valid) (lt (int64 $n) $min) (gt (int64 $n) $max) }}
+{{- fail (printf "%s must be an integer between %d and %d, got %v" $name $min $max $value) }}
+{{- end }}
+{{- printf "%d" (int64 $n) }}
+{{- end }}
+
+{{/*
+Validates retention values. Called from pulso.validate so rendering fails
+before the release would crash on boot.
+*/}}
+{{- define "pulso.validateRetention" -}}
+{{- $r := .Values.retention }}
+{{- if not (kindIs "bool" $r.enabled) }}
+{{- fail "retention.enabled must be true or false" }}
+{{- end }}
+{{- if not (has (toString $r.mode) (list "observe" "enforce" "paused")) }}
+{{- fail (printf "retention.mode must be observe, enforce, or paused, got %v" $r.mode) }}
+{{- end }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.deleteGraceMs" $r.deleteGraceMs 60000 2592000000) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.intervalMs" $r.intervalMs 1000 3600000) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.deleteLimit" $r.deleteLimit 1 512) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.timeoutMs" $r.timeoutMs 1000 600000) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.migrationTimeoutMs" $r.migrationTimeoutMs 30000 3600000) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.futureSkewMs" $r.futureSkewMs 0 86400000) }}
+{{- if ne (toString $r.sweepHorizonDays) "" }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.sweepHorizonDays" $r.sweepHorizonDays 1 7302) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Pod termination grace. When the retention worker runs (enabled, or either
+duration positive) it is raised to cover the pre-stop delay, one full
+maintenance operation (or, in enforce mode with a positive duration, one
+manifest conversion), and a 15-second drain margin, because stopping a node does not cancel in-flight storage calls.
+*/}}
+{{- define "pulso.terminationGracePeriodSeconds" -}}
+{{- $configured := int64 .Values.terminationGracePeriodSeconds }}
+{{- $r := .Values.retention }}
+{{- if or $r.enabled (gt (int64 (include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650))) 0) (gt (int64 (include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650))) 0) }}
+{{- $logsDays := int64 (include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650)) }}
+{{- $metricsDays := int64 (include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650)) }}
+{{- $operationMs := int64 (include "pulso.boundedInteger" (list "retention.timeoutMs" $r.timeoutMs 1000 600000)) }}
+{{- if and (eq (toString $r.mode) "enforce") (or (gt $logsDays 0) (gt $metricsDays 0)) }}
+{{- $operationMs = max $operationMs (int64 (include "pulso.boundedInteger" (list "retention.migrationTimeoutMs" $r.migrationTimeoutMs 30000 3600000))) }}
+{{- end }}
+{{- $timeoutSeconds := div (add $operationMs 999) 1000 }}
+{{- $required := add $timeoutSeconds (int64 .Values.preStopSleepSeconds) 15 }}
+{{- max $configured $required }}
+{{- else }}
+{{- $configured }}
+{{- end }}
 {{- end }}
 
 {{/*
