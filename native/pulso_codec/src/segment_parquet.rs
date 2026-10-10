@@ -167,7 +167,7 @@ fn extract_row<'a>(
     let body_term = record
         .map_get(atoms::body().encode(env))
         .map_err(|_| EncodeError::Fallback)?;
-    let body = if enc.is_nil_or_false(body_term) {
+    let body = if body_term == atom::nil().encode(env) {
         None
     } else {
         scratch.clear();
@@ -412,16 +412,14 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
         return Ok(Vec::new());
     }
 
-    let total_rows: usize = surviving
-        .iter()
-        .map(|&i| metadata.row_group(i).num_rows() as usize)
-        .sum();
     let reader = builder
         .with_row_groups(surviving)
         .build()
         .map_err(|_| Fallback)?;
 
-    let mut out = Vec::with_capacity(total_rows);
+    // Footer row counts are untrusted. Grow only as rows are decoded,
+    // rather than allowing a corrupt footer to request a huge allocation.
+    let mut out = Vec::new();
     for batch in reader {
         let batch = batch.map_err(|_| Fallback)?;
         materialize(env, &batch, filter, &mut out)?;

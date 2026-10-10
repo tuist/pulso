@@ -50,7 +50,8 @@ limits; these are node-wide settings, not per-tenant quotas.
 - **Attributes:** each OTLP resource, scope, record attribute list, and nested
   key-value list; each Loki stream label set and entry metadata set; each
   remote-write series label set. The count is per set, not per request. Supplied
-  duplicate entries count before last-wins normalization in OTLP and protobuf.
+  duplicate entries count before normalization. OTLP and Loki use last-wins
+  normalization; remote write rejects series with duplicate label names.
   JSON object duplicate keys have already been collapsed by the JSON parser.
   Loki `trace_id`/`span_id` metadata counts even though decoding promotes it to
   dedicated fields. Remote-write `__name__` counts as a label.
@@ -68,6 +69,9 @@ limits; these are node-wide settings, not per-tenant quotas.
   structured bodies have the same structure limits; ordinary log messages do
   not receive the smaller attribute-value or aggregate-attribute byte caps.
   Protobuf labels and metadata are flat, so depth/node limits do not apply.
+  Increasing request depth limits cannot bypass the native log codec's
+  256-level JSON ceiling: deeper values fail encoding rather than being
+  acknowledged into an unreadable segment.
 
 ## Rejection and authentication
 
@@ -88,7 +92,18 @@ refuses absent values.
 Native histogram samples and exemplars are not supported. Each is counted in
 `X-Pulso-Rejected-Records`, including in mixed batches where float samples are
 stored. They also count against the supplied-record budget. Invalid series
-contribute their supplied sample count and produce no stored series.
+contribute their supplied sample count and produce no stored series. Remote-write
+label names and values must be valid UTF-8, and label names must be unique within
+a series. Violations reject every sample in that series and count them in
+`X-Pulso-Rejected-Records`; valid series in the same request are still stored.
+
+Earlier releases could persist invalid UTF-8 metric labels. This validation does
+not repair existing objects: such labels can still fail queries, and compaction
+now refuses to rewrite them. A failing group can delay compaction for later
+hours in that tenant. If affected, keep the original objects and a backup of the
+manifest, then use a separately validated repair or re-ingestion procedure.
+Do not delete segments directly from a live manifest or expect upgrading alone
+to recover corrupted label identities.
 
 **This is a storage compatibility boundary for upgrades from releases that
 rejected non-finite samples.** Collectors send stale markers automatically, so

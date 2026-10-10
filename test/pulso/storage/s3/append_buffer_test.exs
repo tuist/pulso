@@ -2,6 +2,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
   use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
+  alias Pulso.Record.MetricSample
   alias Pulso.Runtime
   alias Pulso.Runtime.Registry
   alias Pulso.Runtime.Task
@@ -13,7 +14,9 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Test.CompactionStore
 
-  setup do
+  setup context do
+    signal = Map.get(context, :signal, :logs)
+
     agent =
       start_supervised!(
         {Agent,
@@ -32,7 +35,13 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: agent}, port: 0})
+    # Cached native clients leave keep-alive sockets open. All publications
+    # are awaited below; do not spend 15s draining each idle socket at teardown.
+    server =
+      start_supervised!(
+        {Bandit, plug: {CompactionStore, agent: agent}, port: 0, thousand_island_options: [shutdown_timeout: 100]}
+      )
+
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
     config = %{
@@ -45,7 +54,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
       secret_access_key: "test",
       allow_http: true,
       refresh_stale_ms: 0,
-      ingest_flush_interval_ms: 1000
+      ingest_flush_interval_ms: Map.get(context, :flush_interval_ms, 1000)
     }
 
     Runtime.put_env(:pulso, S3, config)
@@ -53,11 +62,11 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     start_supervised!(ManifestSupervision)
     tasks = start_supervised!(Task.Supervisor)
     tenant = "buffer-#{System.unique_integer([:positive])}"
-    key = {:crypto.hash(:sha256, :erlang.term_to_binary(config, [:deterministic])), tenant, :logs}
-    buffer = start_supervised!({AppendBuffer, key: key, signal: :logs, tenant: tenant, config: config})
+    key = {:crypto.hash(:sha256, :erlang.term_to_binary(config, [:deterministic])), tenant, signal}
+    buffer = start_supervised!({AppendBuffer, key: key, signal: signal, tenant: tenant, config: config})
     :erlang.trace(buffer, true, [:receive])
     [{^buffer, admission}] = Registry.lookup(AppendRegistry, key)
-    %{agent: agent, config: config, tasks: tasks, tenant: tenant, buffer: buffer, admission: admission}
+    %{agent: agent, config: config, tasks: tasks, tenant: tenant, signal: signal, buffer: buffer, admission: admission}
   end
 
   defp enqueue(ctx, batches) do
@@ -67,7 +76,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
 
     tasks =
       Enum.map(batches, fn records ->
-        Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(:logs, ctx.tenant, records) end)
+        Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(ctx.signal, ctx.tenant, records) end)
       end)
 
     buffer = ctx.buffer
@@ -188,6 +197,111 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert segment_puts(ctx.agent) == 1
     assert {:ok, [^valid]} = S3.query(:logs, ctx.tenant, [])
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+  end
+
+  defp heterogeneous_batches(signal, producers) do
+    for producer <- 1..producers do
+      for row <- 1..Enum.at([1, 17, 131, 509], rem(producer - 1, 4)) do
+        id = producer * 1000 + row
+
+        producer_record(signal, producer, id)
+      end
+    end
+  end
+
+  defp producer_record(:logs, producer, id) do
+    %Log{
+      timestamp_ns: id,
+      service: "worker-#{rem(producer, 3)}",
+      body: "request-#{id}",
+      resource: %{"instance" => "host-#{producer}"}
+    }
+  end
+
+  defp producer_record(:metrics, producer, id) do
+    %MetricSample{
+      timestamp_ns: id,
+      value: id / 13,
+      labels: %{"__name__" => "work", "job" => "worker-#{rem(producer, 3)}", "instance" => "host-#{producer}"}
+    }
+  end
+
+  defp producer_label(:logs, record), do: record.service
+  defp producer_label(:metrics, record), do: record.labels["job"]
+
+  defp normalized(signal, records) do
+    assert {:ok, blob, _, _} = S3.encode_segment(signal, records)
+    assert {:ok, decoded} = S3.decode_segment(signal, blob, nil, nil, [])
+    Enum.sort(decoded)
+  end
+
+  for signal <- [:logs, :metrics], producers <- [8, 32] do
+    @tag signal: signal
+    test "#{signal}: #{producers} heterogeneous producers preserve every row", ctx do
+      batches = heterogeneous_batches(ctx.signal, unquote(producers))
+      tasks = enqueue(ctx, batches)
+      assert Enum.all?(tasks, &(Task.await(&1, 30_000) == :ok))
+      assert segment_puts(ctx.agent) == 1
+      assert {:ok, actual} = S3.query(ctx.signal, ctx.tenant, [])
+      expected = normalized(ctx.signal, List.flatten(batches))
+      assert Enum.sort(actual) == expected
+      label = if ctx.signal == :logs, do: "service", else: "job"
+      assert {:ok, selected} = S3.query(ctx.signal, ctx.tenant, matchers: [{label, :eq, "worker-1"}])
+      matching = Enum.filter(expected, &(producer_label(ctx.signal, &1) == "worker-1"))
+      assert Enum.sort(selected) == matching
+      _ = :sys.get_state(ctx.buffer)
+      assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    end
+
+    @tag signal: signal, flush_interval_ms: 0
+    test "#{signal}: disabled coalescing publishes one segment per each of #{producers} producers", ctx do
+      # As in the original holdout, publish a keyed bootstrap before the
+      # burst so this checks direct appends, not first-write reconstruction.
+      bootstrap = producer_record(ctx.signal, 99, 99_000)
+      assert :ok = S3.append(ctx.signal, ctx.tenant, [bootstrap], idempotency_key: "bootstrap")
+      puts_before = segment_puts(ctx.agent)
+      batches = heterogeneous_batches(ctx.signal, unquote(producers))
+
+      tasks =
+        Enum.map(batches, fn records ->
+          Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(ctx.signal, ctx.tenant, records) end)
+        end)
+
+      assert Enum.all?(tasks, &(Task.await(&1, 30_000) == :ok))
+      assert segment_puts(ctx.agent) - puts_before == unquote(producers)
+      assert {:ok, actual} = S3.query(ctx.signal, ctx.tenant, [])
+      assert Enum.sort(actual) == normalized(ctx.signal, [bootstrap | List.flatten(batches)])
+      assert :sys.get_state(ctx.buffer).pending == []
+      assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    end
+
+    @tag signal: signal
+    test "#{signal}: one invalid request cannot poison #{producers - 1} valid producers", ctx do
+      [first | rest] = heterogeneous_batches(ctx.signal, unquote(producers))
+      [record | tail] = first
+      field = if ctx.signal == :logs, do: :body, else: :value
+      invalid = Map.put(record, field, make_ref())
+      [bad | good] = enqueue(ctx, [[invalid | tail] | rest])
+      assert {:error, {:encode_failed, _}} = Task.await(bad, 30_000)
+      assert Enum.all?(good, &(Task.await(&1, 30_000) == :ok))
+      assert segment_puts(ctx.agent) == unquote(producers) - 1
+      assert {:ok, actual} = S3.query(ctx.signal, ctx.tenant, [])
+      assert Enum.sort(actual) == normalized(ctx.signal, List.flatten(rest))
+      _ = :sys.get_state(ctx.buffer)
+      assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    end
+
+    @tag signal: signal
+    test "#{signal}: publication failure does not retry #{producers} producers separately", ctx do
+      key = Manifest.manifest_key(ctx.tenant, Atom.to_string(ctx.signal))
+      Agent.update(ctx.agent, &%{&1 | faults: %{{"PUT", key} => {400, :before, 1}}})
+      tasks = enqueue(ctx, heterogeneous_batches(ctx.signal, unquote(producers)))
+      for task <- tasks, do: assert({:error, _} = Task.await(task, 30_000))
+      assert segment_puts(ctx.agent) == 1
+      refute Agent.get(ctx.agent, &Map.has_key?(&1.objects, key))
+      _ = :sys.get_state(ctx.buffer)
+      assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    end
   end
 
   test "storage errors fan out without retrying individual inputs after an ambiguous publication", ctx do

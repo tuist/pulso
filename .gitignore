@@ -40,3 +40,6 @@ native/*/target/
 # top-level fallback is tracked here as a safety net for setups where the
 # git-scoped path is unwritable.
 /.pulso-dev-instance
+
+# Local autoresearch sessions, including logs and machine-specific outputs.
+/.auto/

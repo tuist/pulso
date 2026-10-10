@@ -18,7 +18,9 @@ use rustler::types::map::MapIterator;
 use rustler::{Binary, Encoder, Env, ListIterator, NewBinary, Term, TermType};
 use std::borrow::Cow;
 
-const MAX_DEPTH: usize = 512;
+// Storage uses this encoder too: never write JSON deeper than our parser
+// can read back. General-purpose JSON calls fall back to Elixir at this bound.
+const MAX_DEPTH: usize = crate::json_read::MAX_DEPTH;
 
 /// Strings at or below this size are copied into small heap binaries;
 /// larger ones become sub-binaries of the input.

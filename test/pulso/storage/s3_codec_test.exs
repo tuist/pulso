@@ -94,6 +94,34 @@ defmodule Pulso.Storage.S3CodecTest do
       assert {:error, {:encode_failed, _}} = S3.encode_segment(:logs, records)
     end
 
+    test "false JSON bodies survive encoding without becoming nil" do
+      records = [%Log{timestamp_ns: 1, body: false}, %Log{timestamp_ns: 2, body: nil}]
+      assert {:ok, payload, 1, 2} = S3.encode_segment(:logs, records)
+      assert {:ok, ^records} = S3.decode_segment(:logs, payload, nil, nil, [])
+    end
+
+    test "JSON fields cannot be written deeper than the segment decoder can read" do
+      readable = Enum.reduce(1..200, "value", fn _, value -> [value] end)
+
+      record = %Log{
+        timestamp_ns: 1,
+        body: readable,
+        attributes: %{"nested" => readable},
+        resource: %{"nested" => readable}
+      }
+
+      assert {:ok, payload, 1, 1} = S3.encode_segment(:logs, [record])
+      assert {:ok, [^record]} = S3.decode_segment(:logs, payload, nil, nil, [])
+
+      too_deep = Enum.reduce(1..300, "value", fn _, value -> [value] end)
+
+      for field <- [:body, :attributes, :resource] do
+        value = if field == :body, do: too_deep, else: %{"nested" => too_deep}
+        invalid = Map.put(%Log{timestamp_ns: 1}, field, value)
+        assert {:error, {:encode_failed, _}} = S3.encode_segment(:logs, [invalid])
+      end
+    end
+
     test "an out-of-range integer timestamp surfaces as a Parquet encoder error" do
       # Parquet's timestamp column is Int64; anything past 2^63 - 1 must
       # not be silently truncated.
@@ -103,6 +131,13 @@ defmodule Pulso.Storage.S3CodecTest do
   end
 
   describe "decode_segment/4" do
+    test "a corrupt footer cannot preallocate output from an enormous claimed row count" do
+      # One physical row, but the footer claims 2^36 rows (512 GiB of term
+      # slots). The fixture generator verifies that metadata is readable.
+      payload = File.read!(Path.expand("../../fixtures/logs/corrupt_footer.parquet", __DIR__))
+      assert {:error, {:decode_failed, _}} = S3.decode_segment(:logs, payload, nil, nil, [])
+    end
+
     test "reads back everything a segment holds when no filter is set" do
       records = for i <- 1..30, do: %Log{timestamp_ns: i * 1000, service: "svc#{rem(i, 3)}"}
       {:ok, payload, _, _} = S3.encode_segment(:logs, records)

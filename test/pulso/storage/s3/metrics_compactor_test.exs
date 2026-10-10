@@ -54,7 +54,8 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       bucket: "pulso",
       endpoint: "http://localhost:#{port}",
       region: "us-east-1",
-      access_key_id: "test",
+      # Isolate native connection caches even if the OS reuses a test port.
+      access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
       allow_http: true,
       refresh_stale_ms: 0

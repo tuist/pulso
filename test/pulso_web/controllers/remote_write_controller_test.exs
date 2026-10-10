@@ -10,6 +10,7 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Storage.S3
   alias Pulso.Test.FailingStorage
 
   setup do
@@ -239,6 +240,37 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     assert conn.status == 204
     assert get_resp_header(conn, "x-pulso-rejected-records") == ["1"]
     assert {:ok, [%MetricSample{}]} = Storage.query(:metrics, "default")
+  end
+
+  test "invalid UTF-8 and duplicate label names reject a complete series without poisoning valid samples" do
+    invalid_labels =
+      for bytes <- [<<255>>, "a" <> <<255>> <> "injected" <> <<255>> <> "x", <<192, 175>>, <<237, 160, 128>>],
+          labels <- [[{bytes, "value"}], [{"job", bytes}]],
+          do: [{"__name__", "invalid"} | labels]
+
+    duplicates = [
+      [{"__name__", "invalid"}, {"job", "a"}, {"job", "b"}],
+      [{"__name__", "invalid"}, {"job", "a"}, {"job", "a"}]
+    ]
+
+    for labels <- invalid_labels ++ duplicates do
+      Memory.reset()
+
+      request =
+        body([
+          %{labels: labels, samples: [{1.0, 1}, {2.0, 2}, {3.0, 3}]},
+          %{labels: [{"__name__", "safe"}, {"job", "é😀"}], samples: [{4.0, 4}]}
+        ])
+
+      response = post_write(build_conn(), request)
+      assert response.status == 204
+      assert get_resp_header(response, "x-pulso-rejected-records") == ["3"]
+      assert {:ok, [stored]} = Storage.query(:metrics, "default")
+      assert stored.labels == %{"__name__" => "safe", "job" => "é😀"}
+      assert stored.value == 4.0
+      assert {:ok, blob, _, _} = S3.encode_segment(:metrics, [stored])
+      assert {:ok, [^stored]} = S3.decode_segment(:metrics, blob, nil, nil, [])
+    end
   end
 
   test "counts every sample in a structurally rejected series", %{conn: conn} do

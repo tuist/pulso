@@ -112,7 +112,18 @@ fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
         return Err(total_samples.max(1));
     }
 
+    // Validate after reading the whole series so rejected counts include
+    // every supplied sample. UTF-8 validation also excludes the 0xff byte
+    // used as the canonical label separator in storage.
+    if labels.iter().any(|(name, value)| {
+        simdutf8::basic::from_utf8(name).is_err() || simdutf8::basic::from_utf8(value).is_err()
+    }) {
+        return Err(total_samples.max(1));
+    }
     labels.sort_by(|a, b| a.0.cmp(b.0));
+    if labels.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(total_samples.max(1));
+    }
     Ok((Series { labels, samples }, rejected))
 }
 
@@ -217,4 +228,54 @@ fn read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All test fields are shorter than 128 bytes, so lengths fit one varint byte.
+    fn bytes_field(tag: u8, bytes: &[u8]) -> Vec<u8> {
+        assert!(bytes.len() < 128);
+        [vec![tag, bytes.len() as u8], bytes.to_vec()].concat()
+    }
+
+    fn series(labels: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, value) in labels {
+            let label = [bytes_field(0x0a, name), bytes_field(0x12, value)].concat();
+            out.extend(bytes_field(0x0a, &label));
+        }
+        for timestamp in 1..=3 {
+            let sample = [
+                vec![0x09],
+                1.0f64.to_le_bytes().to_vec(),
+                vec![0x10, timestamp],
+            ]
+            .concat();
+            out.extend(bytes_field(0x12, &sample));
+        }
+        out
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_and_duplicates_before_materializing_labels() {
+        let invalid: &[&[(&[u8], &[u8])]] = &[
+            &[(b"job", b"a\xffb")],
+            &[(b"job", b"a\xffinjected\xffx")],
+            &[(b"\xc0\xaf", b"value")],
+            &[(b"job", b"\xed\xa0\x80")],
+            &[(b"job", b"a"), (b"job", b"b")],
+            &[(b"job", b"a"), (b"job", b"a")],
+        ];
+        let good = series(&[(b"__name__", b"safe"), (b"job", "é😀".as_bytes())]);
+        for labels in invalid {
+            let request = [bytes_field(0x0a, &series(labels)), bytes_field(0x0a, &good)].concat();
+            let decoded = decode(&request).expect("valid protobuf");
+            assert_eq!(decoded.rejected, 3);
+            assert_eq!(decoded.series.len(), 1);
+            assert_eq!(decoded.series[0].labels[1].1, "é😀".as_bytes());
+            assert_eq!(decoded.series[0].samples.len(), 3);
+        }
+    }
 }

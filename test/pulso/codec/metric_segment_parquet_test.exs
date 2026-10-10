@@ -152,6 +152,17 @@ defmodule Pulso.Codec.MetricSegmentParquetTest do
     end
   end
 
+  test "invalid label bytes cannot create unreadable segments or inject canonical labels" do
+    valid = sample(1, 1.0, %{"__name__" => "safe"})
+
+    for bytes <- [<<255>>, "a" <> <<255>> <> "injected" <> <<255>> <> "x", <<192, 175>>, <<237, 160, 128>>],
+        labels <- [%{bytes => "value"}, %{"job" => bytes}] do
+      invalid = %{valid | labels: labels}
+      assert :fallback = NIF.encode_metric_segment_parquet([valid, valid, invalid])
+      assert {:error, {:encode_failed, _}} = S3.encode_segment(:metrics, [invalid])
+    end
+  end
+
   test "record key sharing preserves duplicates, changing labels, and equal-time conflicting values" do
     labels = %{"__name__" => "counter"}
 
