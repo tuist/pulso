@@ -1,6 +1,8 @@
 defmodule Pulso.Alerting.Principal do
   @moduledoc "Capability-scoped alerting identities from operator configuration, not caller assertions."
 
+  alias Pulso.Runtime
+
   def authenticate(conn, tenant) do
     with true <- valid_id?(tenant),
          [header] <- Plug.Conn.get_req_header(conn, "authorization"),
@@ -10,7 +12,7 @@ defmodule Pulso.Alerting.Principal do
       hash = :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)
 
       principal =
-        Application.get_env(:pulso, Pulso.Alerting, [])
+        Runtime.get_env(:pulso, Pulso.Alerting, [])
         |> Keyword.get(:principals, [])
         |> Enum.find(fn principal ->
           stored = Map.get(principal, :token_hash, "")

@@ -1,7 +1,6 @@
 defmodule Pulso.MCP.ToolsTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
-  alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
   alias Pulso.Codec.NIF
   alias Pulso.MCP.Tools
@@ -310,14 +309,7 @@ defmodule Pulso.MCP.ToolsTest do
 
       {:ok, log_blob, _, _, _} = NIF.encode_log_segment_parquet(records)
       {:ok, metric_blob, _, _, _} = NIF.encode_metric_segment_parquet(samples)
-      original = Application.get_env(:pulso, Storage)
-      Application.put_env(:pulso, Storage, adapter: NativeQueryStorage)
-
-      on_exit(fn ->
-        if original == nil,
-          do: Application.delete_env(:pulso, Storage),
-          else: Application.put_env(:pulso, Storage, original)
-      end)
+      Pulso.Runtime.put_env(:pulso, Storage, adapter: NativeQueryStorage)
 
       for ts <- [minimum, -1, maximum] do
         assert {:ok, [_]} = NIF.decode_log_segment_parquet(log_blob, max(ts - 1, minimum), ts, nil, [], [])
@@ -516,9 +508,7 @@ defmodule Pulso.MCP.ToolsTest do
     end
 
     test "valid arguments still require tenant authorization across all tools" do
-      original = Application.fetch_env!(:pulso, Pulso.Auth)
-      Application.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
-      on_exit(fn -> Application.put_env(:pulso, Pulso.Auth, original) end)
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
 
       for {name, args} <- @queries do
         assert {:error, {:unauthorized, :missing_token}} = Tools.call(name, args)
@@ -576,9 +566,7 @@ defmodule Pulso.MCP.ToolsTest do
     end
 
     test "requires tenant authorization before parsing or reading" do
-      original = Application.fetch_env!(:pulso, Pulso.Auth)
-      Application.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
-      on_exit(fn -> Application.put_env(:pulso, Pulso.Auth, original) end)
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth, module: SharedSecret, tokens: %{})
       assert {:error, {:unauthorized, _}} = Tools.call("query_promql", %{"tenant" => "acme", "query" => "gauge"})
     end
   end
@@ -702,14 +690,10 @@ defmodule Pulso.MCP.ToolsTest do
     setup do
       hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
 
-      Application.put_env(:pulso, Pulso.Auth,
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth,
         module: SharedSecret,
         tokens: %{"acme" => "sha256$#{hex}"}
       )
-
-      on_exit(fn ->
-        Application.put_env(:pulso, Pulso.Auth, module: Open)
-      end)
 
       :ok
     end

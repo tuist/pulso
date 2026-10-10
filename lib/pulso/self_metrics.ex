@@ -4,8 +4,10 @@ defmodule Pulso.SelfMetrics do
   process mailbox. Dimensions are fixed enums, not tenants, keys, or expressions.
   Scraping never queries signal storage or waits for manifest owners.
   """
-  use GenServer
+  use Pulso.Runtime.GenServer
 
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.ManifestRegistry
 
   @table __MODULE__
@@ -27,9 +29,12 @@ defmodule Pulso.SelfMetrics do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  # Every table operation goes through the current runtime's instance name.
+  defp table, do: Pulso.Runtime.table(@table)
+
   @impl true
   def init(_opts) do
-    :ets.new(@table, [:named_table, :public, :set, write_concurrency: true, read_concurrency: true])
+    :ets.new(table(), [:named_table, :public, :set, write_concurrency: true, read_concurrency: true])
 
     for {kind, dimensions} <- @operations, dimension <- dimensions, outcome <- [:success, :error, :exception] do
       labels = operation_labels(kind, dimension, outcome)
@@ -48,21 +53,26 @@ defmodule Pulso.SelfMetrics do
     compaction(:compact, {:ok, %{merged: 0}})
     compaction(:cleanup, {:ok, 0})
 
-    :telemetry.detach(__MODULE__)
-
-    :ok =
-      :telemetry.attach_many(
-        __MODULE__,
-        [[:phoenix, :endpoint, :start], [:phoenix, :endpoint, :stop], [:phoenix, :error_rendered]],
-        &PulsoWeb.SelfMetrics.handle_event/4,
-        nil
-      )
+    # Handlers are node-global and route each event to the emitting process's
+    # runtime instance, so attach once and never re-attach under concurrent events.
+    case :telemetry.attach_many(
+           __MODULE__,
+           [[:phoenix, :endpoint, :start], [:phoenix, :endpoint, :stop], [:phoenix, :error_rendered]],
+           &PulsoWeb.SelfMetrics.handle_event/4,
+           nil
+         ) do
+      :ok -> :ok
+      {:error, :already_exists} -> :ok
+    end
 
     {:ok, nil}
   end
 
+  # Owned (scoped) instances must not detach the handlers other instances share.
   @impl true
-  def terminate(_reason, _state), do: :telemetry.detach(__MODULE__)
+  def terminate(_reason, _state) do
+    if Pulso.Runtime.name(__MODULE__) == __MODULE__, do: :telemetry.detach(__MODULE__), else: :ok
+  end
 
   @doc "Measure a completed operation without changing its return value or exception."
   def track(kind, dimension, fun) when is_function(fun, 0) do
@@ -122,7 +132,7 @@ defmodule Pulso.SelfMetrics do
   def compaction(_operation, _result), do: :ok
 
   defp increment(name, labels, value) do
-    :ets.update_counter(@table, {name, labels}, {2, value}, {{name, labels}, 0})
+    :ets.update_counter(table(), {name, labels}, {2, value}, {{name, labels}, 0})
     :ok
   rescue
     # Supervision can briefly remove the table. Monitoring must not fail work.
@@ -163,13 +173,13 @@ defmodule Pulso.SelfMetrics do
   end
 
   defp snapshot do
-    :ets.tab2list(@table)
+    :ets.tab2list(table())
   rescue
     ArgumentError -> []
   end
 
   defp manifest_queue_depth do
-    if Process.whereis(ManifestRegistry) do
+    if Pulso.Runtime.whereis(ManifestRegistry) do
       Registry.select(ManifestRegistry, [{{:"$1", :"$2", :"$3"}, [], [{{:"$2", :"$3"}}]}])
       |> Enum.reduce(0, fn owner, total -> total + owner_queue_depth(owner) end)
     else

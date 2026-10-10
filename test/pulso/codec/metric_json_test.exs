@@ -1,5 +1,5 @@
 defmodule Pulso.Codec.MetricJSONTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   import Bitwise
 

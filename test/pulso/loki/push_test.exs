@@ -1,5 +1,5 @@
 defmodule Pulso.Loki.PushTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Loki.Push
   alias Pulso.Loki.PushProto

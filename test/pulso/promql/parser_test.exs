@@ -1,7 +1,8 @@
 defmodule Pulso.PromQL.ParserTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.Parser
+  alias Pulso.Runtime.Task
 
   test "matcher counts and pattern sizes are bounded before native compilation" do
     matchers = Enum.map_join(1..65, ",", &~s(a#{&1}="x"))

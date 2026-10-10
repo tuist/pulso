@@ -1,5 +1,5 @@
 defmodule Pulso.LogQL.MetricEvalTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.LogQL.AST.NumberLit
   alias Pulso.LogQL.Evaluator

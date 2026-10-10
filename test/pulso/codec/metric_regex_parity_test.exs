@@ -1,5 +1,5 @@
 defmodule Pulso.Codec.MetricRegexParityTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.MetricSample

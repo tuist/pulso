@@ -22,6 +22,9 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestOwner
+  alias Pulso.Storage.S3.PagedManifest
+  alias Pulso.Storage.S3.Retention
 
   def compact(tenant, config, opts \\ []) do
     monitor(:compact, fn -> do_compact(tenant, config, opts) end)
@@ -30,13 +33,21 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   defp do_compact(tenant, config, opts) do
     with :ok <- S3.validate_tenant(tenant),
          :ok <- validate_options(opts),
-         {:ok, manifest, _etag} <- load(tenant, config) do
-      case select(manifest, opts) do
-        [] -> {:ok, %{segments_before: length(manifest.segments), merged: 0}}
-        sources -> merge_and_publish(tenant, config, manifest, sources, opts)
-      end
+         {:ok, manifest, _etag} <- load(tenant, config),
+         :ok <- migration_gate(manifest, config),
+         :ok <- validate_retained_grace(manifest, config, opts),
+         {:ok, candidates} <- compaction_candidates(manifest, tenant, config) do
+      compact_selected(select(candidates, opts), candidates, manifest, tenant, config, opts)
     end
   end
+
+  defp compact_selected([], candidates, manifest, tenant, config, _opts) do
+    with :ok <- advance_empty_cursor(manifest, candidates, tenant, config),
+         do: {:ok, %{segments_before: length(manifest.segments), merged: 0}}
+  end
+
+  defp compact_selected(sources, _candidates, manifest, tenant, config, opts),
+    do: merge_and_publish(tenant, config, manifest, sources, opts)
 
   @doc false
   def select(manifest, opts) do
@@ -50,7 +61,9 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
       is_integer(s.byte_size) and s.byte_size > 0 and s.byte_size <= small_bytes and
         is_integer(s.row_count) and s.row_count > 0
     end)
-    |> Enum.group_by(&Path.dirname(&1.key))
+    |> Enum.group_by(fn s ->
+      if manifest.version == 3, do: PagedManifest.bucket_start(manifest.paging, s.max_ts), else: Path.dirname(s.key)
+    end)
     |> Enum.sort_by(fn {hour, _} -> hour end)
     |> Enum.find_value([], fn {_hour, segments} ->
       segments
@@ -158,14 +171,16 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   defp publish(tenant, config, sources, replacement, _grace, 0) do
     # The last conditional response can also have been lost after success.
     # Resolve it before declaring exhaustion or reclaiming this unique upload.
-    with {:ok, current, _etag} <- load(tenant, config) do
-      if published?(current, sources, replacement.key), do: :ok, else: {:error, :cas_retries_exhausted}
+    with {:ok, current, _etag} <- load(tenant, config),
+         {:ok, published} <- published?(current, sources, replacement.key, tenant, config) do
+      if published, do: :ok, else: {:error, :cas_retries_exhausted}
     end
   end
 
   defp publish(tenant, config, sources, replacement, grace, attempts) do
-    with {:ok, current, etag} <- load(tenant, config) do
-      if published?(current, sources, replacement.key) do
+    with {:ok, current, etag} <- load(tenant, config),
+         {:ok, published} <- published?(current, sources, replacement.key, tenant, config) do
+      if published do
         :ok
       else
         publish_current(current, etag, tenant, config, sources, replacement, grace, attempts)
@@ -173,12 +188,83 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
     end
   end
 
-  defp published?(manifest, _sources, key) do
-    Enum.any?(manifest.segments, &(&1.key == key)) or Map.has_key?(manifest.retired, key)
+  defp validate_retained_grace(%{version: 3}, config, opts) do
+    if opts[:grace_ms] <= Retention.effective_grace(config), do: :ok, else: {:error, :unsupported_compaction_grace}
   end
 
+  defp validate_retained_grace(_manifest, _config, _opts), do: :ok
+
+  defp migration_gate(%{version: 3}, _config), do: :ok
+
+  defp migration_gate(_root, config) do
+    if config[:retention_mode] == "enforce" and Retention.days(config, "metrics") > 0,
+      do: {:error, :retention_migration_required},
+      else: :ok
+  end
+
+  defp advance_empty_cursor(%{version: 3}, candidates, tenant, config),
+    do: rotate_cursor(candidates.paging["compaction_candidate"], tenant, config)
+
+  defp advance_empty_cursor(_root, _candidates, _tenant, _config), do: :ok
+
+  defp rotate_cursor(nil, _tenant, _config), do: :ok
+
+  defp rotate_cursor(start, tenant, config) do
+    case Retention.transact(
+           tenant,
+           "metrics",
+           config,
+           &{%{&1 | paging: Map.put(&1.paging, "compaction_bucket", start)}, :ok}
+         ) do
+      {:ok, :ok} -> :ok
+      error -> error
+    end
+  end
+
+  defp compaction_candidates(%{version: 3} = root, tenant, config),
+    do: PagedManifest.candidates(root, tenant, "metrics", config)
+
+  defp compaction_candidates(root, _tenant, _config), do: {:ok, root}
+
+  defp published?(%{version: 3} = root, _sources, key, tenant, config) do
+    result =
+      PagedManifest.with_budget(config, fn ->
+        {:ok, s} = ManifestOwner.segment_from_key(key)
+        # After a bucket is fenced, even an unpublished replacement is an
+        # expiration-owned orphan. Never delete a possibly published key early.
+        s.max_ts < PagedManifest.floor(root) or PagedManifest.lookup(root, s, tenant, "metrics", config) != :absent
+      end)
+
+    if result == {:error, :retention_expired}, do: {:ok, false}, else: result
+  end
+
+  defp published?(manifest, _sources, key, _tenant, _config) do
+    {:ok, Enum.any?(manifest.segments, &(&1.key == key)) or Map.has_key?(manifest.retired, key)}
+  end
+
+  defp prepare_replacement(%{version: 3} = root, sources, replacement, grace, tenant, config) do
+    segments =
+      Enum.map(sources, fn key ->
+        {:ok, s} = ManifestOwner.segment_from_key(key)
+        s
+      end)
+
+    PagedManifest.replace(
+      root,
+      segments,
+      replacement,
+      System.system_time(:millisecond) + grace,
+      tenant,
+      "metrics",
+      config
+    )
+  end
+
+  defp prepare_replacement(root, sources, replacement, grace, _tenant, _config),
+    do: Manifest.replace(root, sources, replacement, System.system_time(:millisecond) + grace)
+
   defp publish_current(current, etag, tenant, config, sources, replacement, grace, attempts) do
-    with {:ok, updated} <- Manifest.replace(current, sources, replacement, System.system_time(:millisecond) + grace) do
+    with {:ok, updated} <- prepare_replacement(current, sources, replacement, grace, tenant, config) do
       payload = updated |> Manifest.encode() |> IO.iodata_to_binary()
 
       case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, "metrics"), payload, etag) do
@@ -224,10 +310,13 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
 
     with :ok <- S3.validate_tenant(tenant),
          :ok <- validate_cleanup_limit(maximum),
-         {:ok, manifest, _etag} <- load(tenant, config) do
-      manifest
-      |> deletion_candidates(tenant, maximum)
-      |> delete_candidates(tenant, config)
+         {:ok, manifest, _etag} <- load(tenant, config),
+         :ok <- migration_gate(manifest, config) do
+      if manifest.version == 3 do
+        Retention.cleanup_retired(tenant, "metrics", config, opts)
+      else
+        manifest |> deletion_candidates(tenant, maximum) |> delete_candidates(tenant, config)
+      end
     end
   end
 
@@ -296,10 +385,7 @@ defmodule Pulso.Storage.S3.MetricsCompactor do
   end
 
   defp load(tenant, config) do
-    with {:ok, etag, body} <- ObjectStore.get_if_none_match(config, Manifest.manifest_key(tenant, "metrics"), nil),
-         {:ok, manifest} <- Manifest.decode(body) do
-      {:ok, manifest, etag}
-    end
+    Retention.load(tenant, "metrics", config)
   end
 
   defp validate_options(opts) do

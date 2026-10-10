@@ -8,7 +8,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
 > [!WARNING]
 > Pulso is early software. Logs and metrics work end to end. Native alert
 > evaluation, Slack delivery, live resource hints and rule history are experimental.
-> Grafana migration compatibility, traces, and data retention are not implemented yet. Expect breaking changes between
+> Event-time retention is experimental and off by default. Grafana migration
+> compatibility and traces are not implemented yet. Expect breaking changes between
 > releases and read the release notes before upgrading.
 
 ## Running Pulso
@@ -21,6 +22,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
   Loki query APIs, the supported query subset, and query limits.
 - [Alerting](alerting.md): experimental native evaluation, dedicated credentials,
   rule management and modification history, with explicit compatibility limits.
+- [Retention](retention.md): experimental event-time retention for logs and
+  metrics, its irreversible rollout, policy changes, limits, and recovery.
 - [Ingest limits](ingest-limits.md): per-request budgets for records,
   attributes, and payload sizes, and how to tune them.
 - [Self-monitoring](self-monitoring.md): the `/metrics` endpoint, what each

@@ -1,6 +1,7 @@
 defmodule Pulso.Alerting.Repository do
   @moduledoc "S3 rule authority, immutable revision audit chain, and bounded committed transition history."
   alias Pulso.Alerting.{Canonical, Principal, Rule, Targets}
+  alias Pulso.Runtime
   alias Pulso.Storage.S3
 
   @tail_limit 64
@@ -588,9 +589,9 @@ defmodule Pulso.Alerting.Repository do
   end
 
   defp backend(opts) do
-    env = Application.get_env(:pulso, Pulso.Alerting, [])
+    env = Runtime.get_env(:pulso, Pulso.Alerting, [])
     store = Keyword.get(opts, :store, Keyword.get(env, :object_store, Pulso.ObjectStore))
-    config = Keyword.get(opts, :store_config, Keyword.get(env, :store_config, Application.get_env(:pulso, S3)))
+    config = Keyword.get(opts, :store_config, Keyword.get(env, :store_config, Runtime.get_env(:pulso, S3)))
     if is_nil(config), do: {:error, :not_configured}, else: {:ok, store, Map.new(config)}
   end
 

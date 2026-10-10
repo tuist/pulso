@@ -36,6 +36,17 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request record and attribute budgets for ingestion. |
+| `PULSO_RETENTION_ENABLED` | `false` | Run the experimental retention and cleanup worker even with both durations at `0`; it also runs whenever a duration is positive. See [retention](retention.md). |
+| `PULSO_LOGS_RETENTION_DAYS` | `0` | Log event-time retention in whole days, `0..3650`. `0` stops advancing the floor; without earlier enforcement, logs are kept indefinitely. |
+| `PULSO_METRICS_RETENTION_DAYS` | `0` | Metric event-time retention in whole days, `0..3650`. `0` stops advancing the floor; without earlier enforcement, metrics are kept indefinitely. |
+| `PULSO_RETENTION_MODE` | `observe` | `observe` previews, `enforce` converts manifests and expires data (irreversible), `paused` stops all retention work. |
+| `PULSO_RETENTION_DELETE_GRACE_MS` | `3600000` | Grace between committed expiry and deletion, `60000..2592000000`. |
+| `PULSO_RETENTION_INTERVAL_MS` | `30000` | Retention maintenance cadence, `1000..3600000`. |
+| `PULSO_RETENTION_DELETE_LIMIT` | `512` | Maximum DELETE attempts per node per `PULSO_RETENTION_INTERVAL_MS`, `1..512`, shared by retention and compaction cleanup of retention-managed prefixes. At most four run at once. |
+| `PULSO_RETENTION_TIMEOUT_MS` | `30000` | Deadline for one retention operation, `1000..600000`. |
+| `PULSO_RETENTION_MIGRATION_TIMEOUT_MS` | `600000` | Deadline for converting one existing manifest during enforcement, `30000..3600000`. Normal maintenance keeps `PULSO_RETENTION_TIMEOUT_MS`. |
+| `PULSO_RETENTION_FUTURE_SKEW_MS` | `600000` | Maximum record time ahead of the node clock on retention-managed prefixes, `0..86400000`. |
+| `PULSO_RETENTION_SWEEP_HORIZON_DAYS` | twice the recorded days plus two | Days of expired partitions revisited by orphan sweeps, `1..7302`. |
 | `PHX_HOST` | `example.com` | Host name used when Pulso generates absolute URLs. Pulso does not currently emit any, so this can stay unset. |
 
 Boolean variables accept `true`, `1`, or `yes`; anything else is false.
@@ -86,7 +97,8 @@ The credentials need these permissions on the bucket and its objects:
 - `s3:ListBucket`
 - `s3:GetObject`
 - `s3:PutObject`
-- `s3:DeleteObject`, used by metrics compaction to remove merged segments
+- `s3:DeleteObject`, used by metrics compaction to remove merged segments and by
+  retention to remove expired data
 
 An Amazon S3 policy for a bucket named `pulso-telemetry`:
 
@@ -111,8 +123,8 @@ An Amazon S3 policy for a bucket named `pulso-telemetry`:
 Use a dedicated bucket. Pulso writes under `tenants/` and expects nothing else to
 modify that prefix. Its readiness check lists the `.pulso/` prefix. Do not configure
 bucket lifecycle rules that expire objects under `tenants/`: Pulso tracks live
-objects in per-tenant manifests and does not yet implement retention, so an
-object that disappears underneath it makes queries fail.
+objects in per-tenant manifests, so an object that disappears underneath it makes
+queries fail. Use Pulso's own [retention](retention.md) to expire data instead.
 
 ## Ingest coalescing
 
@@ -162,6 +174,15 @@ Before enabling it:
   previous manifest version.
 - **Keep node clocks synchronized.** The deletion grace period assumes clocks
   agree to well within an hour.
+
+## Retention
+
+By default Pulso keeps data indefinitely. Experimental event-time retention
+expires logs and metrics after a configured number of days and deletes their
+objects itself. Enforcing it converts manifests to a paged format that older
+Pulso releases cannot read, and expired data cannot be restored. Read
+[retention](retention.md) for the rollout procedure, modes, policy changes,
+capacity limits and recovery before setting any `PULSO_RETENTION_*` variable.
 
 ## Fixed limits
 

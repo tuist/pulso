@@ -1,5 +1,5 @@
 defmodule Pulso.PromQL.FloatParserTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.FloatParser
 

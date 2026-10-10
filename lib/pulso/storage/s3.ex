@@ -77,10 +77,15 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestOwner
+  alias Pulso.Storage.S3.MetadataCache
+  alias Pulso.Storage.S3.PagedManifest
+  alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.SortOrder
 
   @tenant_regex ~r/\A[A-Za-z0-9_.\-]{1,128}\z/
@@ -104,7 +109,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   def append(signal, tenant, records, opts) when is_atom(signal) and is_binary(tenant) and is_list(records) do
-    config = Map.new(Application.get_env(:pulso, __MODULE__) || %{})
+    config = Map.new(Runtime.get_env(:pulso, __MODULE__) || %{})
     keyed? = opts[:idempotency_key] not in [nil, ""]
 
     if not keyed? and Map.get(config, :ingest_flush_interval_ms, 0) > 0 do
@@ -115,7 +120,8 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp append_buffered(signal, tenant, records, opts, config) do
-    with :ok <- validate_tenant(tenant) do
+    with :ok <- validate_tenant(tenant),
+         :ok <- check_retention(signal, tenant, records, config) do
       case AppendBuffer.append(signal, tenant, records, config) do
         :unbuffered -> append_unbuffered(signal, tenant, records, opts, config)
         result -> result
@@ -141,7 +147,8 @@ defmodule Pulso.Storage.S3 do
           idempotency_key
         )
 
-      with {:ok, _etag} <- ObjectStore.put(config, key, payload) do
+      with :ok <- check_retention(signal, tenant, records, config),
+           {:ok, _etag} <- ObjectStore.put(config, key, payload) do
         segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
         segment = summarize_segment(signal, segment, records)
         ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
@@ -151,22 +158,56 @@ defmodule Pulso.Storage.S3 do
 
   @impl Pulso.Storage
   def query(signal, tenant, opts) when is_atom(signal) and is_binary(tenant) and is_list(opts) do
+    # An already expired deadline is a timeout, not a metadata budget overrun.
+    with :ok <- validate_tenant(tenant),
+         :ok <- check_deadline(opts[:deadline_ms]) do
+      config = config!()
+
+      timeout =
+        if opts[:deadline_ms],
+          do: max(0, opts[:deadline_ms] - System.monotonic_time(:millisecond)),
+          else: Map.get(config, :retention_timeout_ms, 30_000)
+
+      budget = Map.put(config, :retention_timeout_ms, timeout)
+
+      budget
+      |> PagedManifest.with_budget(fn -> do_query(signal, tenant, opts, config) end)
+      |> budget_result(opts)
+    end
+  end
+
+  # The metadata budget shares the caller's deadline, so exhausting it after
+  # that deadline is a timeout rather than an oversized query.
+  defp budget_result({:ok, {:error, :metadata_scan_limit}}, opts), do: metadata_limit(opts)
+  defp budget_result({:ok, result}, _opts), do: result
+  defp budget_result({:error, :metadata_scan_limit}, opts), do: metadata_limit(opts)
+  defp budget_result(error, _opts), do: error
+
+  defp metadata_limit(opts) do
+    with :ok <- check_deadline(opts[:deadline_ms]), do: {:error, :query_scan_limit}
+  end
+
+  defp do_query(signal, tenant, opts, config) do
     start_ts = Keyword.get(opts, :start_ts)
     end_ts = Keyword.get(opts, :end_ts)
     limit = Keyword.get(opts, :limit)
 
-    with :ok <- validate_tenant(tenant),
-         config = config!(),
-         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config) do
-      segments = query_segments(entry.manifest, signal, start_ts, end_ts, opts)
+    with :ok <- check_deadline(opts[:deadline_ms]),
+         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config),
+         :ok <- check_deadline(opts[:deadline_ms]) do
+      start_ts = retained_start(entry.manifest, start_ts)
 
-      with :ok <- check_scan_budget(segments, opts) do
+      with {:ok, segments} <- query_segments(entry.manifest, signal, start_ts, end_ts, opts, tenant, config),
+           :ok <- check_scan_budget(segments, opts) do
         scan_segments(signal, config, segments, start_ts, end_ts, opts, limit)
       end
       |> case do
         {:ok, records} ->
           sorted = records |> SortOrder.sort(signal) |> take_limit(limit)
           {:ok, sorted}
+
+        {:error, :manifest_page_missing} ->
+          retry_scan(signal, tenant, config, start_ts, end_ts, opts, limit)
 
         {:error, {:segment_missing, consumed}} ->
           # Cleanup can overtake a cached snapshot or an in-flight query.
@@ -179,13 +220,107 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp query_segments(manifest, signal, start_ts, end_ts, opts) do
+  @doc false
+  def check_retention(signal, tenant, records, config) do
+    name = signal_string(signal)
+
+    cached = ManifestCache.get(tenant, name)
+
+    cond do
+      # Managed roots check eligibility and capacity; enforcing nodes also gate
+      # legacy roots behind conversion.
+      (cached != nil and cached.manifest.version == 3) or Retention.enforcing?(config, name) ->
+        do_check_retention(signal, tenant, records, config)
+
+      cached != nil ->
+        :ok
+
+      # A cold scope probes the marker so a managed prefix is checked before
+      # the segment upload. The probe is advisory: on error the append
+      # proceeds, and the owner's marker check and root CAS still refuse to
+      # publish into a managed prefix it has not loaded.
+      true ->
+        case cached_marker(config, tenant, name) do
+          {:ok, true} -> do_check_retention(signal, tenant, records, config)
+          _ -> :ok
+        end
+    end
+  end
+
+  defp cached_marker(config, tenant, signal) do
+    ref = %{"k" => "marker-cache:" <> PagedManifest.scope(tenant, signal), "b" => 1}
+    now = System.monotonic_time(:millisecond)
+
+    case MetadataCache.get(ref) do
+      {:ok, {checked, exists}} when now - checked < 1000 ->
+        {:ok, exists}
+
+      _ ->
+        case PagedManifest.managed?(config, tenant, signal) do
+          {:ok, exists} = result ->
+            MetadataCache.put(ref, {now, exists})
+            result
+
+          error ->
+            error
+        end
+    end
+  end
+
+  defp do_check_retention(signal, tenant, records, config) do
+    name = signal_string(signal)
+
+    with {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, name, config),
+         {:ok, root} <- ensure_policy(entry.manifest, tenant, name, config),
+         do: check_admission(root, records, config)
+  end
+
+  defp check_admission(%Manifest{version: 3} = root, records, config) do
+    timestamps = Enum.map(records, &(&1.timestamp_ns || 0))
+    segment = Segment.build("", Enum.min(timestamps), Enum.max(timestamps), length(records))
+
+    with :ok <- PagedManifest.eligible(root, segment, System.system_time(:nanosecond), config),
+         {:ok, :ok} <- PagedManifest.check_capacity(root, segment, config),
+         do: :ok
+  end
+
+  defp check_admission(_root, _records, _config), do: :ok
+
+  defp ensure_policy(%Manifest{version: 3} = root, _tenant, _signal, _config), do: {:ok, root}
+
+  defp ensure_policy(root, tenant, signal, config) do
+    cond do
+      not Retention.enforcing?(config, signal) -> {:ok, root}
+      root.segments == [] and map_size(root.retired) == 0 -> convert_empty(tenant, signal, config)
+      true -> {:error, :retention_migration_required}
+    end
+  end
+
+  defp convert_empty(tenant, signal, config) do
+    with {:ok, _} <- Retention.advance(tenant, signal, Map.put(config, :retention_empty_conversion_only, true)),
+         {:ok, managed, _} <- Retention.load(tenant, signal, config),
+         do: {:ok, managed}
+  end
+
+  defp retained_start(%Manifest{version: 3} = root, nil), do: PagedManifest.floor(root)
+  defp retained_start(%Manifest{version: 3} = root, start), do: max(start, PagedManifest.floor(root))
+  defp retained_start(_root, start), do: start
+
+  defp query_segments(%Manifest{version: 3} = root, signal, start_ts, end_ts, opts, tenant, config) do
+    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts)
+    PagedManifest.query(root, tenant, signal_string(signal), opts, config)
+  end
+
+  defp query_segments(manifest, signal, start_ts, end_ts, opts, _tenant, _config) do
     segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
 
-    case signal do
-      :metrics -> Enum.filter(segments, &Segment.matches_metrics?(&1, Keyword.get(opts, :matchers, [])))
-      :logs -> Enum.filter(segments, &Segment.matches_log_service?(&1, opts))
-    end
+    filtered =
+      case signal do
+        :metrics -> Enum.filter(segments, &Segment.matches_metrics?(&1, Keyword.get(opts, :matchers, [])))
+        :logs -> Enum.filter(segments, &Segment.matches_log_service?(&1, opts))
+      end
+
+    {:ok, filtered}
   end
 
   defp remaining_budget(opts, consumed) do
@@ -199,10 +334,9 @@ defmodule Pulso.Storage.S3 do
 
   defp retry_scan(signal, tenant, config, start_ts, end_ts, opts, limit) do
     with :ok <- check_deadline(opts[:deadline_ms]),
-         {:ok, _etag, body} <-
-           ObjectStore.get_if_none_match(config, Manifest.manifest_key(tenant, signal_string(signal)), nil),
-         {:ok, manifest} <- Manifest.decode(body),
-         segments = query_segments(manifest, signal, start_ts, end_ts, opts),
+         {:ok, manifest, _etag} <- Retention.load(tenant, signal_string(signal), config),
+         start_ts = retained_start(manifest, start_ts),
+         {:ok, segments} <- query_segments(manifest, signal, start_ts, end_ts, opts, tenant, config),
          :ok <- check_deadline(opts[:deadline_ms]),
          :ok <- check_scan_budget(segments, opts),
          {:ok, records} <- scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
@@ -396,9 +530,6 @@ defmodule Pulso.Storage.S3 do
         do: {:halt, {:error, :query_scan_limit}},
         else: continue_or_halt(%{state | bytes: bytes}, blob, index, ctx)
     else
-      {:error, :not_found} when ctx.signal == :logs ->
-        {:cont, {:ok, state}}
-
       {:error, :not_found} ->
         consumed = %{
           max_scan_bytes: state.bytes,
@@ -627,7 +758,7 @@ defmodule Pulso.Storage.S3 do
   defp take_limit(records, limit) when is_integer(limit) and limit > 0, do: Enum.take(records, limit)
 
   defp config! do
-    case Application.get_env(:pulso, __MODULE__) do
+    case Runtime.get_env(:pulso, __MODULE__) do
       nil ->
         raise "Pulso.Storage.S3 is not configured. Set `config :pulso, Pulso.Storage.S3, bucket: ..., endpoint: ..., region: ..., access_key_id: ..., secret_access_key: ..., allow_http: ...`"
 

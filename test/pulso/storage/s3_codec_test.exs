@@ -9,7 +9,7 @@ defmodule Pulso.Storage.S3CodecTest do
   #
   # The `(:plain, :array)` NDJSON encoder is left in place for
   # `Pulso.MCP.Tools` — its test lives at the bottom.
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.Log

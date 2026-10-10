@@ -3,7 +3,7 @@ defmodule Pulso.JSONTest do
   # errors. These tests compare the two on random and edge-case input, and
   # also assert the Rust path actually answered (so equivalence is not
   # just the fallback agreeing with itself).
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   import Bitwise
 

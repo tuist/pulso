@@ -3,7 +3,7 @@ defmodule Pulso.Codec.MetricsBenchTest do
   # test run — `mix test --only bench` opts in. Each test prints the
   # measured numbers so a Rust refactor can compare before/after without
   # a heavier dependency like `benchee`.
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   import Bitwise
 

@@ -1,6 +1,6 @@
 defmodule PulsoWeb.MCPTransportTest do
   # Conformance with the MCP 2026-07-28 Streamable HTTP transport.
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Test.MCPMessages
 
@@ -386,14 +386,7 @@ defmodule PulsoWeb.MCPTransportTest do
 
   describe "origin" do
     setup do
-      original = Application.get_env(:pulso, PulsoWeb.MCPController)
-      Application.put_env(:pulso, PulsoWeb.MCPController, allowed_origins: ["https://Atlas.example.com:443"])
-
-      on_exit(fn ->
-        if original,
-          do: Application.put_env(:pulso, PulsoWeb.MCPController, original),
-          else: Application.delete_env(:pulso, PulsoWeb.MCPController)
-      end)
+      Pulso.Runtime.put_env(:pulso, PulsoWeb.MCPController, allowed_origins: ["https://Atlas.example.com:443"])
     end
 
     test "absent and allowed origins pass", %{conn: conn} do
@@ -448,7 +441,7 @@ defmodule PulsoWeb.MCPTransportTest do
     end
 
     test "IPv6 hosts and ports cannot collide", %{conn: conn} do
-      Application.put_env(:pulso, PulsoWeb.MCPController, allowed_origins: ["https://[::1]:8443"])
+      Pulso.Runtime.put_env(:pulso, PulsoWeb.MCPController, allowed_origins: ["https://[::1]:8443"])
 
       for origin <- ["https://[::1:8443]", "https://[::1]", "https://[::1]:443"] do
         conn =

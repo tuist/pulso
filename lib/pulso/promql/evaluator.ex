@@ -15,6 +15,7 @@ defmodule Pulso.PromQL.Evaluator do
   alias Pulso.PromQL.Operations
   alias Pulso.PromQL.Parser
   alias Pulso.QueryRunner
+  alias Pulso.Runtime
   alias Pulso.Storage
 
   @lookback_ns 300_000_000_000
@@ -79,7 +80,7 @@ defmodule Pulso.PromQL.Evaluator do
   defp ordered?(_), do: false
 
   defp limits do
-    config = Application.get_env(:pulso, __MODULE__, [])
+    config = Runtime.get_env(:pulso, __MODULE__, [])
 
     %{
       samples: Keyword.get(config, :max_samples, 100_000),

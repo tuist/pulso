@@ -1,10 +1,11 @@
 defmodule Pulso.PromQL.EvaluatorTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime.Task
   alias Pulso.Storage
   alias Pulso.Storage.Memory
   alias Pulso.Test.BlockingMetricStorage
@@ -35,23 +36,15 @@ defmodule Pulso.PromQL.EvaluatorTest do
   defp values(result), do: Enum.map(result["data"]["result"], & &1["value"])
 
   test "the operator heap ceiling is configurable" do
-    original = Application.get_env(:pulso, Evaluator, [])
-    Application.put_env(:pulso, Evaluator, max_heap_words: 1000)
-    on_exit(fn -> Application.put_env(:pulso, Evaluator, original) end)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_heap_words: 1000)
     append("memory", Enum.map(1..1000, &{&1, &1}))
     assert {:error, :query_resource_limit} = instant("memory", 1000)
   end
 
   test "real blocked queries enforce tenant admission and release their slots" do
     adapter = BlockingMetricStorage
-    original = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: adapter)
-    Application.put_env(:pulso, adapter, self())
-
-    on_exit(fn ->
-      Application.put_env(:pulso, Pulso.Storage, original)
-      Application.delete_env(:pulso, adapter)
-    end)
+    Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: adapter)
+    Pulso.Runtime.put_env(:pulso, adapter, self())
 
     callers = start_supervised!({Task.Supervisor, name: __MODULE__.CallerSupervisor})
     owner = self()
@@ -61,7 +54,7 @@ defmodule Pulso.PromQL.EvaluatorTest do
         {:ok, _} =
           Task.Supervisor.start_child(callers, fn -> send(owner, {:finished_metric_query, instant("m", 1, "acme")}) end)
 
-        assert_receive {:blocked_metric_query, worker, "acme"}
+        assert_receive {:blocked_metric_query, worker, "acme"}, 5_000
         worker
       end
 
@@ -70,43 +63,42 @@ defmodule Pulso.PromQL.EvaluatorTest do
     {:ok, _} =
       Task.Supervisor.start_child(callers, fn -> send(owner, {:finished_metric_query, instant("m", 1, "beta")}) end)
 
-    assert_receive {:blocked_metric_query, beta, "beta"}
+    assert_receive {:blocked_metric_query, beta, "beta"}, 5_000
     refs = Enum.map([beta | workers], &Process.monitor/1)
     Enum.each([beta | workers], &send(&1, {:release, {:ok, []}}))
-    for _ <- 1..3, do: assert_receive({:finished_metric_query, {:ok, _}})
+    for _ <- 1..3, do: assert_receive({:finished_metric_query, {:ok, _}}, 5_000)
     # A result reaches the caller before its worker necessarily exits.
     # Observe worker termination before asserting that slots are released.
-    for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal})
-    _ = :sys.get_state(QuerySlots)
-    assert Registry.lookup(QuerySlots, {"acme", 0}) == []
-    assert Registry.lookup(QuerySlots, {"acme", 1}) == []
+    for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal}, 5_000)
+    slots = Pulso.Runtime.name(QuerySlots)
+    _ = :sys.get_state(slots)
+    assert Registry.lookup(slots, {"acme", 0}) == []
+    assert Registry.lookup(slots, {"acme", 1}) == []
   end
 
   test "one tenant cannot occupy every node slot" do
     owner = self()
+    slots = Pulso.Runtime.name(QuerySlots)
 
-    children =
-      for slot <- 0..1 do
-        {:ok, pid} =
-          Task.Supervisor.start_child(TaskSupervisor, fn ->
-            {:ok, _} = Registry.register(QuerySlots, {"acme", slot}, nil)
-            send(owner, {:tenant_slot, self()})
-            receive do: (:release -> :ok)
-          end)
+    for slot <- 0..1 do
+      {:ok, pid} =
+        Task.Supervisor.start_child(TaskSupervisor, fn ->
+          {:ok, _} = Registry.register(slots, {"acme", slot}, nil)
+          send(owner, {:tenant_slot, self()})
+          receive do: (:release -> :ok)
+        end)
 
-        assert_receive {:tenant_slot, ^pid}
-        pid
-      end
+      assert_receive {:tenant_slot, ^pid}, 5_000
+    end
 
-    on_exit(fn -> Enum.each(children, &Task.Supervisor.terminate_child(TaskSupervisor, &1)) end)
+    # The query task supervisor and slot registry are owned by this test and
+    # stop with it, so the blocked children need no explicit cleanup.
     assert {:error, :query_overloaded} = instant("m", 1, "acme")
     assert {:ok, _} = instant("m", 1, "beta")
   end
 
   test "unexpected task crashes are execution failures" do
-    original = Application.get_env(:pulso, Pulso.Storage)
-    Application.put_env(:pulso, Pulso.Storage, adapter: Pulso.MissingAdapter)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.Storage, original) end)
+    Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: Pulso.MissingAdapter)
 
     ExUnit.CaptureLog.capture_log(fn ->
       assert {:error, :query_execution_failed} = instant("m", 1)
@@ -128,7 +120,6 @@ defmodule Pulso.PromQL.EvaluatorTest do
         pid
       end
 
-    on_exit(fn -> Enum.each(children, &Task.Supervisor.terminate_child(TaskSupervisor, &1)) end)
     assert {:error, :query_overloaded} = instant("m", 1)
 
     Enum.each(children, fn pid ->
@@ -279,14 +270,12 @@ defmodule Pulso.PromQL.EvaluatorTest do
   end
 
   test "sample, work, and result limits return errors instead of partial aggregates" do
-    original = Application.get_env(:pulso, Evaluator)
-    on_exit(fn -> Application.put_env(:pulso, Evaluator, original || []) end)
     append("gauge", [{10, 1}, {20, 2}, {30, 3}])
-    Application.put_env(:pulso, Evaluator, max_samples: 2)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 2)
     assert {:error, :query_sample_limit} = instant("sum(gauge)", 30)
-    Application.put_env(:pulso, Evaluator, max_work: 1)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_work: 1)
     assert {:error, :query_work_limit} = instant("sum_over_time(gauge[30s])", 30)
-    Application.put_env(:pulso, Evaluator, max_result_points: 1)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 1)
 
     assert {:error, :query_result_limit} =
              Evaluator.query("gauge", "acme", %{

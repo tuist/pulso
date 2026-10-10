@@ -7,6 +7,9 @@ defmodule Pulso.QueryRunner do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
+  alias Pulso.Runtime
+  alias Pulso.Runtime.Registry
+  alias Pulso.Runtime.Task
 
   def run(tenant, class, fun, opts \\ %{}) when is_binary(tenant) and is_function(fun, 1) do
     with {:ok, timeout} <- timeout(opts) do
@@ -91,7 +94,7 @@ defmodule Pulso.QueryRunner do
     end
   end
 
-  defp config(key, default), do: Keyword.get(Application.get_env(:pulso, __MODULE__, []), key, default)
+  defp config(key, default), do: Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), key, default)
 
   defp acquire_interactive(:alerting), do: :ok
   defp acquire_interactive(_class), do: acquire({:class, :interactive}, config(:max_interactive, 3))
@@ -102,7 +105,7 @@ defmodule Pulso.QueryRunner do
   end
 
   defp heap_words(class) when class in [:promql, :alerting] do
-    Keyword.get(Application.get_env(:pulso, Evaluator, []), :max_heap_words, config(:max_heap_words, 16_000_000))
+    Keyword.get(Runtime.get_env(:pulso, Evaluator, []), :max_heap_words, config(:max_heap_words, 16_000_000))
   end
 
   defp heap_words(_class), do: config(:max_heap_words, 16_000_000)

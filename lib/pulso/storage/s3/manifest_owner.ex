@@ -54,14 +54,18 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   callers — not unbounded as the earlier design allowed.
   """
 
-  use GenServer, restart: :transient
+  use Pulso.Runtime.GenServer, restart: :transient
 
   alias Pulso.ObjectStore
+  alias Pulso.Runtime.GenServer
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.ManifestSupervisor
+  alias Pulso.Storage.S3.PagedManifest
+  alias Pulso.Storage.S3.Retention
 
   require Logger
 
@@ -181,7 +185,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   def ensure_loaded(tenant, signal, config) when is_binary(tenant) and is_binary(signal) and is_map(config) do
     case ManifestCache.get(tenant, signal) do
       %{} = entry ->
-        {:ok, maybe_refresh(entry, tenant, signal, config)}
+        case maybe_refresh(entry, tenant, signal, config) do
+          {:error, _} = error -> error
+          refreshed -> {:ok, refreshed}
+        end
 
       nil ->
         with {:ok, pid} <- ensure_started(tenant, signal, config) do
@@ -212,9 +219,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp refresh(entry, tenant, signal, config) do
-    key = Manifest.manifest_key(tenant, signal)
-
-    case Pulso.ObjectStore.get_if_none_match(config, key, entry.etag) do
+    case Retention.fetch_root(tenant, signal, config, entry.etag, entry.manifest.version) do
       :not_modified ->
         # No new writes; just touch the freshness timestamp so we don't
         # keep issuing 304s on every query.
@@ -223,7 +228,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         touched
 
       {:ok, new_etag, body} ->
-        case Manifest.decode(body) do
+        case decode_manifest(body, tenant, signal) do
           {:ok, manifest} ->
             ManifestCache.put(tenant, signal, manifest, new_etag)
 
@@ -233,18 +238,35 @@ defmodule Pulso.Storage.S3.ManifestOwner do
               refreshed_at_mono: System.monotonic_time(:millisecond)
             }
 
-          {:error, _} ->
-            # Decoded manifest is garbage — the safe move is to serve
-            # the stale entry we already trust rather than start
-            # returning empty results because a manifest was corrupted
-            # server-side.
-            entry
+          {:error, _} = error ->
+            stale_or_error(entry, error, tenant, signal, config)
         end
 
-      {:error, _} ->
-        # Transient failure (network, throttling, 404 mid-migration).
-        # Serve the stale entry; the next query will retry.
+      {:error, :not_found} when entry.manifest.version == 3 ->
+        {:error, :managed_manifest_missing}
+
+      {:error, _} = error ->
+        stale_or_error(entry, error, tenant, signal, config)
+    end
+  end
+
+  # A format-3 root may already have reclaimed the segments a stale snapshot
+  # references, so a managed prefix fails closed. A cached legacy root keeps
+  # serving its last snapshot, as before retention existed, unless the prefix
+  # has become managed. The marker probe is advisory here: if it fails too,
+  # only a node enforcing retention for this signal fails closed.
+  defp stale_or_error(%{manifest: %Manifest{version: 3}}, error, _tenant, _signal, _config), do: error
+
+  defp stale_or_error(entry, error, tenant, signal, config) do
+    case PagedManifest.managed?(config, tenant, signal) do
+      {:ok, false} ->
         entry
+
+      {:ok, true} ->
+        if error == {:error, :not_found}, do: {:error, :managed_manifest_missing}, else: error
+
+      {:error, _} ->
+        if Retention.enforcing?(config, signal), do: error, else: entry
     end
   end
 
@@ -258,15 +280,17 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   @spec ensure_started(String.t(), String.t(), map()) ::
           {:ok, pid()} | {:error, term()}
   def ensure_started(tenant, signal, config) do
-    case Registry.lookup(@registry, {tenant, signal}) do
-      [{pid, _}] ->
+    # Raw ETS lookup can retain an exited owner until registry cleanup runs.
+    # The via-name lookup checks liveness before reusing that process.
+    case Registry.whereis_name({@registry, {tenant, signal}}) do
+      pid when is_pid(pid) ->
         {:ok, pid}
 
-      [] ->
+      :undefined ->
         opts = [tenant: tenant, signal: signal, config: config]
         spec = %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :transient}
 
-        case DynamicSupervisor.start_child(ManifestSupervisor, spec) do
+        case DynamicSupervisor.start_child(Pulso.Runtime.name(ManifestSupervisor), Pulso.Runtime.child_spec(spec)) do
           {:ok, pid} -> {:ok, pid}
           {:error, {:already_started, pid}} -> {:ok, pid}
           {:error, _} = err -> err
@@ -274,7 +298,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  @spec start_link(opts()) :: GenServer.on_start()
+  @spec start_link(opts()) :: Elixir.GenServer.on_start()
   def start_link(opts) do
     tenant = Keyword.fetch!(opts, :tenant)
     signal = Keyword.fetch!(opts, :signal)
@@ -284,7 +308,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   # ---- GenServer callbacks --------------------------------------------------
 
-  @impl GenServer
+  @impl true
   def init(opts) do
     state = %{
       tenant: Keyword.fetch!(opts, :tenant),
@@ -305,7 +329,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     {:ok, state, @idle_hibernate_ms}
   end
 
-  @impl GenServer
+  @impl true
   def handle_call(:ensure_loaded, _from, state) do
     # A cache miss must not turn an old owner snapshot into a fresh query
     # snapshot after another node has published compaction or new ingest.
@@ -347,7 +371,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  @impl GenServer
+  @impl true
   def handle_info(:flush, state) do
     do_flush(state)
   end
@@ -368,7 +392,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # the batch cap trips — flush immediately instead of waiting for the
   # timer. Under bursty load this bounds tail latency.
   defp enqueue_and_maybe_flush(state, from, segments) do
-    state = %{state | pending: state.pending ++ segments, waiters: [from | state.waiters]}
+    state = %{state | pending: state.pending ++ segments, waiters: [{from, segments} | state.waiters]}
     publish_queue_depth(state)
 
     cond do
@@ -419,13 +443,24 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp do_flush(state) do
     state = %{state | timer_ref: nil}
 
+    state =
+      case ManifestCache.get(state.tenant, state.signal) do
+        %{manifest: %{version: 3} = manifest, etag: etag} when etag != state.etag ->
+          %{state | manifest: manifest, etag: etag, loaded?: true}
+
+        _ ->
+          state
+      end
+
+    {state, deferred} = partition_waiters(state)
     result = cas_with_retry(state, state.pending, @cas_max_retries)
-    publish_queue_depth(%{state | pending: [], waiters: []})
+    remaining = Enum.flat_map(deferred, &elem(&1, 1))
+    publish_queue_depth(%{state | pending: remaining, waiters: deferred})
 
     case result do
-      {:ok, manifest, etag} ->
+      {:ok, manifest, etag, outcomes} ->
         ManifestCache.put(state.tenant, state.signal, manifest, etag)
-        Enum.each(state.waiters, &GenServer.reply(&1, :ok))
+        Enum.each(outcomes, fn {from, result} -> GenServer.reply(from, result) end)
 
         {:noreply,
          %{
@@ -433,38 +468,179 @@ defmodule Pulso.Storage.S3.ManifestOwner do
            | manifest: manifest,
              etag: etag,
              loaded?: true,
-             pending: [],
-             waiters: []
-         }, @idle_hibernate_ms}
+             pending: remaining,
+             waiters: deferred
+         }
+         |> schedule_deferred(), @idle_hibernate_ms}
 
       {:error, reason} = err ->
-        Enum.each(state.waiters, &GenServer.reply(&1, err))
+        {_eligible, outcomes} = publication_requests(state)
+        Enum.each(outcomes, fn {from, outcome} -> GenServer.reply(from, failure_reply(outcome, err)) end)
 
         Logger.warning("manifest CAS gave up tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}")
 
         # Keep the process alive: the next register_segments will start
         # from a clean slate (and if the underlying failure was
         # transient, the next flush will succeed).
-        {:noreply, %{state | pending: [], waiters: []}, @idle_hibernate_ms}
+        {:noreply, %{state | pending: remaining, waiters: deferred} |> schedule_deferred(), @idle_hibernate_ms}
     end
   end
 
-  # One CAS attempt, with recovery via reload-and-retry on
-  # `:precondition_failed` or `:already_exists` (a first-create race).
+  # An eligible caller shares the publication failure; an ineligible one keeps its own reason.
+  defp failure_reply(:ok, error), do: error
+  defp failure_reply(outcome, _error), do: outcome
+
+  defp schedule_deferred(%{pending: []} = state), do: state
+  defp schedule_deferred(state), do: %{state | timer_ref: Process.send_after(self(), :flush, state.flush_interval_ms)}
+
+  defp partition_waiters(%{manifest: %{version: 3}} = state) do
+    {selected, deferred, _, _} =
+      Enum.reduce(Enum.reverse(state.waiters), {[], [], MapSet.new(), 0}, fn {from, segments} = waiter,
+                                                                             {selected, deferred, starts, count} ->
+        own = MapSet.new(segments, &PagedManifest.bucket_start(state.manifest.paging, &1.max_ts))
+        union = MapSet.union(starts, own)
+
+        cond do
+          MapSet.size(own) > 4 or length(segments) > 256 ->
+            GenServer.reply(from, {:error, :retention_capacity})
+            {selected, deferred, starts, count}
+
+          MapSet.size(union) <= 4 and count + length(segments) <= 256 ->
+            {[waiter | selected], deferred, union, count + length(segments)}
+
+          true ->
+            {selected, [waiter | deferred], starts, count}
+        end
+      end)
+
+    {%{state | waiters: selected, pending: Enum.flat_map(selected, &elem(&1, 1))}, deferred}
+  end
+
+  defp partition_waiters(state), do: {state, []}
+
+  # One CAS attempt. Any failure reads the root back once: that read
+  # resolves a lost response and, on `:precondition_failed` or
+  # `:already_exists` (a first-create race), seeds the retry.
   # Every retry rebuilds the merged manifest against the freshest known
   # ETag, so we never overwrite a concurrent writer's segments.
+  @cas_conflicts [:precondition_failed, :already_exists]
+
   defp cas_with_retry(_state, _segments, 0), do: {:error, :cas_retries_exhausted}
 
   defp cas_with_retry(state, segments, retries_left) do
-    merged = Manifest.merge(state.manifest, segments)
+    {eligible, outcomes} = publication_requests(state)
+
+    case prepare_publication(state, segments, eligible) do
+      {:skip, manifest} ->
+        {:ok, manifest, state.etag, outcomes}
+
+      {:ok, merged} ->
+        attempt = %{
+          state: state,
+          segments: segments,
+          retries_left: retries_left,
+          merged: merged,
+          eligible: eligible,
+          outcomes: outcomes
+        }
+
+        publish(attempt)
+
+      {:error, :manifest_page_missing} when retries_left > 1 ->
+        reload_and_retry(state, segments, retries_left)
+
+      error ->
+        error
+    end
+  end
+
+  # A managed root with no eligible caller publishes nothing.
+  defp prepare_publication(%{manifest: %{version: 3} = manifest}, _segments, []), do: {:skip, manifest}
+
+  defp prepare_publication(%{manifest: %{version: 3}} = state, _segments, eligible),
+    do: PagedManifest.register(state.manifest, eligible, state.tenant, state.signal, state.config)
+
+  defp prepare_publication(state, segments, _eligible), do: {:ok, Manifest.merge(state.manifest, segments)}
+
+  defp publish(%{state: state, merged: merged} = attempt) do
     payload = merged |> Manifest.encode() |> IO.iodata_to_binary()
 
     case attempt_cas(state, payload) do
-      {:ok, new_etag} -> {:ok, merged, new_etag}
-      {:error, :precondition_failed} -> reload_and_retry(state, segments, retries_left)
-      {:error, :already_exists} -> reload_and_retry(state, segments, retries_left)
-      {:error, _} = err -> err
+      {:ok, new_etag} ->
+        {:ok, merged, new_etag, attempt.outcomes}
+
+      {:error, _} = error ->
+        # Resolve internally retried/lost CAS responses before returning failure.
+        state |> load_manifest(false) |> resolve_cas_failure(Map.put(attempt, :error, error))
     end
+  end
+
+  defp resolve_cas_failure({:ok, %{version: 3} = current, etag}, attempt),
+    do: resolve_managed_failure(current, etag, attempt)
+
+  # The read-back above is already the freshest legacy root: retry against it
+  # rather than issuing a second GET.
+  defp resolve_cas_failure({:ok, current, etag}, %{error: {:error, reason}} = attempt) when reason in @cas_conflicts,
+    do: retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
+
+  defp resolve_cas_failure({:error, _} = load_error, %{error: {:error, reason}}) when reason in @cas_conflicts,
+    do: load_error
+
+  defp resolve_cas_failure(_load, attempt), do: attempt.error
+
+  defp resolve_managed_failure(current, etag, %{merged: merged, error: {:error, reason}} = attempt) do
+    cond do
+      current.paging["nonce"] == merged.paging["nonce"] ->
+        {:ok, current, etag, attempt.outcomes}
+
+      merged.version != 3 ->
+        retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
+
+      reason not in @cas_conflicts and publication_visible?(current, attempt.eligible, attempt.state) ->
+        {:ok, current, etag, attempt.outcomes}
+
+      reason in @cas_conflicts ->
+        retry_cas(attempt, %{attempt.state | manifest: current, etag: etag})
+
+      true ->
+        attempt.error
+    end
+  end
+
+  defp retry_cas(attempt, state), do: cas_with_retry(state, attempt.segments, attempt.retries_left - 1)
+
+  defp publication_visible?(current, eligible, state) do
+    case PagedManifest.with_budget(state.config, fn ->
+           Enum.all?(
+             eligible,
+             &(PagedManifest.lookup(current, &1, state.tenant, state.signal, state.config, allow_closed: true) !=
+                 :absent)
+           )
+         end) do
+      {:ok, true} -> true
+      _ -> false
+    end
+  end
+
+  defp publication_requests(%{manifest: %{version: 3}} = state) do
+    now = System.system_time(:nanosecond)
+
+    Enum.reduce(Enum.reverse(state.waiters), {[], []}, fn {from, segments}, {accepted, outcomes} ->
+      result = eligibility(segments, state, now)
+      {if(result == :ok, do: accepted ++ segments, else: accepted), [{from, result} | outcomes]}
+    end)
+  end
+
+  defp publication_requests(state), do: {state.pending, Enum.map(state.waiters, fn {from, _} -> {from, :ok} end)}
+
+  # The first ineligible segment decides the caller's outcome.
+  defp eligibility(segments, state, now) do
+    Enum.find_value(segments, :ok, fn segment ->
+      case PagedManifest.eligible(state.manifest, segment, now, state.config) do
+        :ok -> nil
+        error -> error
+      end
+    end)
   end
 
   # `nil` etag means the owner has never seen this manifest; use
@@ -474,8 +650,12 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     key = Manifest.manifest_key(state.tenant, state.signal)
 
     case state.etag do
-      nil -> ObjectStore.put_if_none_match(state.config, key, payload)
-      etag -> ObjectStore.put_if_match(state.config, key, payload, etag)
+      nil ->
+        with :ok <- PagedManifest.check_create(state.config, state.tenant, state.signal),
+             do: ObjectStore.put_if_none_match(state.config, key, payload)
+
+      etag ->
+        ObjectStore.put_if_match(state.config, key, payload, etag)
     end
   end
 
@@ -493,14 +673,24 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
+  defp decode_manifest(body, tenant, signal) do
+    with {:ok, manifest} <- Manifest.decode(body),
+         {:ok, :ok} <- PagedManifest.validate_context(manifest, tenant, signal),
+         do: {:ok, manifest}
+  end
+
   # ---- initial load / migration ---------------------------------------------
 
   defp load_manifest(state, publish_legacy? \\ true) do
-    key = Manifest.manifest_key(state.tenant, state.signal)
-
-    case ObjectStore.get_if_none_match(state.config, key, nil) do
+    case Retention.fetch_root(
+           state.tenant,
+           state.signal,
+           state.config,
+           nil,
+           if(state.loaded?, do: state.manifest.version)
+         ) do
       {:ok, etag, body} ->
-        case Manifest.decode(body) do
+        case decode_manifest(body, state.tenant, state.signal) do
           {:ok, manifest} -> {:ok, manifest, etag}
           {:error, _} = err -> err
         end
@@ -521,7 +711,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp rebuild_from_prefix(state, publish_legacy?) do
     prefix = "tenants/#{state.tenant}/v4/signal=#{state.signal}/"
 
-    with {:ok, keys} <- ObjectStore.list(state.config, prefix) do
+    with :ok <- PagedManifest.check_create(state.config, state.tenant, state.signal),
+         {:ok, keys} <- ObjectStore.list(state.config, prefix) do
       publish_rebuilt_manifest(state, keys, publish_legacy?)
     end
   end
@@ -542,7 +733,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     payload = manifest |> Manifest.encode() |> IO.iodata_to_binary()
     manifest_key = Manifest.manifest_key(state.tenant, state.signal)
 
-    case ObjectStore.put_if_none_match(state.config, manifest_key, payload) do
+    result =
+      with :ok <- PagedManifest.check_create(state.config, state.tenant, state.signal),
+           do: ObjectStore.put_if_none_match(state.config, manifest_key, payload)
+
+    case result do
       {:ok, etag} -> {:ok, manifest, etag}
       {:error, :already_exists} -> reload_after_create_race(state, manifest_key)
       {:error, _} = err -> err
@@ -567,7 +762,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp reload_after_create_race(state, manifest_key) do
     with {:ok, etag, body} <- ObjectStore.get_if_none_match(state.config, manifest_key, nil),
-         {:ok, manifest} <- Manifest.decode(body) do
+         {:ok, manifest} <- decode_manifest(body, state.tenant, state.signal) do
       {:ok, manifest, etag}
     end
   end
@@ -587,8 +782,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # indexes, a stray upload) resolves to `:skip` and stays out of the
   # manifest.
   @spec segment_from_key(String.t()) :: {:ok, Segment.t()} | :skip
-  defp segment_from_key(key) do
-    if String.ends_with?(key, ".parquet") and not String.contains?(Path.basename(key), "-compact-") do
+  @doc false
+  def segment_from_key(key) do
+    if String.ends_with?(key, ".parquet") do
       key
       |> Path.basename()
       |> parse_bounds(key)

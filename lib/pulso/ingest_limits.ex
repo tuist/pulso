@@ -7,6 +7,8 @@ defmodule Pulso.IngestLimits do
   over-budget request is rejected in full; nothing is appended to storage.
   """
 
+  alias Pulso.Runtime
+
   @defaults %{
     max_records: 10_000,
     max_attributes: 128,
@@ -18,7 +20,7 @@ defmodule Pulso.IngestLimits do
   }
 
   def config do
-    overrides = Application.get_env(:pulso, __MODULE__, [])
+    overrides = Runtime.get_env(:pulso, __MODULE__, [])
 
     Map.new(@defaults, fn {key, default} ->
       value = Keyword.get(overrides, key, default)

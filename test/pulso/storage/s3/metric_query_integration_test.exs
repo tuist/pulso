@@ -1,9 +1,10 @@
 defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.ObjectStore
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.Memory
   alias Pulso.Storage.S3
@@ -25,21 +26,18 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
       refresh_stale_ms: 0
     }
 
-    original_storage = Application.get_env(:pulso, Storage)
-    original_config = Application.get_env(:pulso, S3)
-    Application.put_env(:pulso, S3, config)
+    Runtime.put_env(:pulso, S3, config)
     start_supervised!(ManifestSupervision)
     tenant = "metric-query-#{System.unique_integer([:positive])}"
 
-    on_exit(fn ->
-      Application.put_env(:pulso, Storage, original_storage)
-      Application.put_env(:pulso, S3, original_config)
-
-      case ObjectStore.list(config, "tenants/#{tenant}/") do
-        {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
-        _ -> :ok
-      end
-    end)
+    on_exit(
+      Runtime.capture(fn ->
+        case ObjectStore.list(config, "tenants/#{tenant}/") do
+          {:ok, keys} -> Enum.each(keys, &ObjectStore.delete(config, &1))
+          _ -> :ok
+        end
+      end)
+    )
 
     {:ok, config: config, tenant: tenant}
   end
@@ -89,7 +87,7 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
       assert :ok = S3.append(:metrics, tenant, [record])
     end
 
-    Application.put_env(:pulso, Storage, adapter: S3)
+    Runtime.put_env(:pulso, Storage, adapter: S3)
 
     assert {:ok, result} =
              Evaluator.query("up", tenant, %{
@@ -140,7 +138,7 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
     assert {:ok, full} = S3.query(:metrics, tenant, [])
     assert {:ok, pruned} = S3.query(:metrics, tenant, matchers: [{"__name__", :eq, "wanted"}])
     assert pruned == Enum.filter(full, &(&1.labels["__name__"] == "wanted"))
-    assert {:ok, entry} = ManifestOwner.ensure_loaded(tenant, "metrics", Application.fetch_env!(:pulso, S3))
+    assert {:ok, entry} = ManifestOwner.ensure_loaded(tenant, "metrics", Runtime.fetch_env!(:pulso, S3))
     assert length(entry.manifest.segments) == 3
     assert length(Enum.filter(entry.manifest.segments, &(&1.metric_names == ["wanted"]))) == 2
 
@@ -149,9 +147,9 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
     opts = %{start_ts_ns: 10_000_000_000, end_ts_ns: 20_000_000_000, step_ns: 10_000_000_000}
 
     for query <- [~s(wanted{job=~"api"}), "sum by(job) (rate(wanted[20s]))", "max(wanted)"] do
-      Application.put_env(:pulso, Storage, adapter: Memory)
+      Runtime.put_env(:pulso, Storage, adapter: Memory)
       assert {:ok, expected} = Evaluator.query(query, tenant, opts)
-      Application.put_env(:pulso, Storage, adapter: S3)
+      Runtime.put_env(:pulso, Storage, adapter: S3)
       assert {:ok, ^expected} = Evaluator.query(query, tenant, opts)
     end
   end

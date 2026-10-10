@@ -1,5 +1,5 @@
 defmodule PulsoWeb.MetricsControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Plug.Parsers.ParseError
   alias Pulso.MCP.Tools
@@ -7,6 +7,7 @@ defmodule PulsoWeb.MetricsControllerTest do
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime.Task
   alias Pulso.SelfMetrics
   alias Pulso.Storage
   alias Pulso.Storage.S3
@@ -36,14 +37,7 @@ defmodule PulsoWeb.MetricsControllerTest do
 
   defp records(outcome), do: value("pulso_ingest_records_total", ~s(signal="logs",outcome="#{outcome}"))
 
-  defp configure_storage(adapter) do
-    previous = Application.get_env(:pulso, Storage)
-    Application.put_env(:pulso, Storage, adapter: adapter)
-
-    on_exit(fn ->
-      if previous, do: Application.put_env(:pulso, Storage, previous), else: Application.delete_env(:pulso, Storage)
-    end)
-  end
+  defp configure_storage(adapter), do: Pulso.Runtime.put_env(:pulso, Storage, adapter: adapter)
 
   defp payload do
     %{
@@ -93,7 +87,8 @@ defmodule PulsoWeb.MetricsControllerTest do
     rejected = records(:rejected)
     errors = operations(:ingest, :otlp, :error)
     conn = conn |> put_req_header("content-type", "application/json") |> post("/v1/logs", payload())
-    assert conn.status == 500
+    # OTLP/HTTP clients only retry 429/502/503/504, so storage failures are retryable 503s.
+    assert %{"code" => 14} = json_response(conn, 503)
     assert records(:accepted) == accepted
     assert records(:failed) == failed + 1
     assert records(:rejected) == rejected + 1
@@ -141,13 +136,13 @@ defmodule PulsoWeb.MetricsControllerTest do
     count = operations(:object, :get, :success)
 
     1..200
-    |> Task.async_stream(fn _ -> SelfMetrics.track(:object, :get, fn -> {:ok, "body"} end) end)
+    |> Task.async_stream(fn _ -> SelfMetrics.track(:object, :get, fn -> {:ok, "body"} end) end, [])
     |> Enum.each(fn result -> assert {:ok, {:ok, "body"}} = result end)
 
     assert operations(:object, :get, :success) == count + 200
-    size = :ets.info(SelfMetrics, :size)
+    size = :ets.info(Pulso.Runtime.table(SelfMetrics), :size)
     for n <- 1..100, do: SelfMetrics.operation(:query, "untrusted-#{n}", :error, 1)
-    assert :ets.info(SelfMetrics, :size) == size
+    assert :ets.info(Pulso.Runtime.table(SelfMetrics), :size) == size
   end
 
   test "exceptions, throws and exits retain their original behavior and are counted" do
@@ -160,12 +155,13 @@ defmodule PulsoWeb.MetricsControllerTest do
 
   test "queue depth includes pending waiters without calling owners and vanishes on unregister" do
     start_supervised!({Registry, keys: :unique, name: ManifestRegistry})
-    {:ok, _} = Registry.register(ManifestRegistry, {"private-tenant", "metrics"}, 4)
+    registry = Pulso.Runtime.name(ManifestRegistry)
+    {:ok, _} = Registry.register(registry, {"private-tenant", "metrics"}, 4)
     {:message_queue_len, messages} = Process.info(self(), :message_queue_len)
     assert value("pulso_manifest_queue_depth") == 4 + messages
-    Registry.update_value(ManifestRegistry, {"private-tenant", "metrics"}, fn _ -> 0 end)
+    Registry.update_value(registry, {"private-tenant", "metrics"}, fn _ -> 0 end)
     assert value("pulso_manifest_queue_depth") == messages
-    Registry.unregister(ManifestRegistry, {"private-tenant", "metrics"})
+    Registry.unregister(registry, {"private-tenant", "metrics"})
     assert value("pulso_manifest_queue_depth") == 0
   end
 
@@ -203,14 +199,7 @@ defmodule PulsoWeb.MetricsControllerTest do
     {config, agent}
   end
 
-  defp configure_s3(config) do
-    previous = Application.get_env(:pulso, S3)
-    Application.put_env(:pulso, S3, config)
-
-    on_exit(fn ->
-      if previous, do: Application.put_env(:pulso, S3, previous), else: Application.delete_env(:pulso, S3)
-    end)
-  end
+  defp configure_s3(config), do: Pulso.Runtime.put_env(:pulso, S3, config)
 
   test "real native object operations count successful bytes, errors, and conditional hits" do
     {config, _agent} = object_store()
@@ -270,7 +259,10 @@ defmodule PulsoWeb.MetricsControllerTest do
     Agent.update(agent, &%{&1 | barriers: %{{"PUT", key} => caller}})
 
     record = %Log{timestamp_ns: 1_700_000_000_000_000_000, body: "example"}
-    task = Task.Supervisor.async_nolink(supervisor, fn -> S3.append(:logs, "self-metrics-queue", [record], []) end)
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn -> S3.append(:logs, "self-metrics-queue", [record], []) end)
+
     assert_receive {:storage_barrier, server, "PUT", ^key}, 5_000
     before_scrape = Agent.get(agent, &length(&1.requests))
     assert value("pulso_manifest_queue_depth") >= 1
@@ -305,9 +297,9 @@ defmodule PulsoWeb.MetricsControllerTest do
     worker_config = Map.merge(config, %{compaction_interval_ms: 3_600_000, compaction_timeout_ms: 100})
     start_supervised!({CompactionSupervision, worker_config})
     errors = operations(:compaction, :worker_merge, :error)
-    send(CompactionWorker, :compact)
+    send(Pulso.Runtime.whereis(CompactionWorker), :compact)
     assert_receive {:storage_barrier, server, "GET", ^source}, 5_000
-    _ = :sys.get_state(CompactionWorker)
+    _ = :sys.get_state(Pulso.Runtime.whereis(CompactionWorker))
     assert operations(:compaction, :worker_merge, :error) == errors + 1
     [task] = Task.Supervisor.children(CompactionTasks)
     ref = Process.monitor(task)

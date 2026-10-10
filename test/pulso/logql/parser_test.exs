@@ -1,5 +1,5 @@
 defmodule Pulso.LogQL.ParserTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Parser

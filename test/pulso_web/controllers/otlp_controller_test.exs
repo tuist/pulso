@@ -1,15 +1,36 @@
 defmodule PulsoWeb.OTLPControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
-  alias Pulso.Auth.Open
   alias Pulso.Auth.SharedSecret
   alias Pulso.Record.Log
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.FailingStorage
 
   setup do
     Memory.reset()
     :ok
+  end
+
+  test "retention timestamp errors are permanent; storage and metadata errors are retryable" do
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: FailingStorage)
+
+    for reason <- [
+          :retention_expired,
+          :timestamp_too_new,
+          :retention_capacity,
+          :retention_migration_required,
+          :managed_manifest_missing,
+          :manifest_page_missing,
+          :cas_retries_exhausted,
+          :storage_unavailable
+        ] do
+      Pulso.Runtime.put_env(:pulso, FailingStorage, {:error, reason})
+      response = build_conn() |> put_req_header("content-type", "application/json") |> post(~p"/v1/logs", payload())
+      permanent = reason in [:retention_expired, :timestamp_too_new]
+      assert %{"code" => code} = json_response(response, if(permanent, do: 400, else: 503))
+      assert code == if(permanent, do: 3, else: 14)
+    end
   end
 
   defp payload(ts \\ 1_700_000_000_000_000_000, body \\ "hello") do
@@ -129,14 +150,10 @@ defmodule PulsoWeb.OTLPControllerTest do
     setup do
       hex = Base.encode16(:crypto.hash(:sha256, "the-token"), case: :lower)
 
-      Application.put_env(:pulso, Pulso.Auth,
+      Pulso.Runtime.put_env(:pulso, Pulso.Auth,
         module: SharedSecret,
         tokens: %{"acme" => "sha256$#{hex}"}
       )
-
-      on_exit(fn ->
-        Application.put_env(:pulso, Pulso.Auth, module: Open)
-      end)
 
       :ok
     end

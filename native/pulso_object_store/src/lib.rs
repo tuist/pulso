@@ -9,7 +9,7 @@
 // `StoreConfig` map; nothing in this crate reads process environment.
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{
@@ -20,6 +20,7 @@ use once_cell::sync::Lazy;
 use rustler::env::SavedTerm;
 use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult, OwnedEnv};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
@@ -37,8 +38,16 @@ mod atoms {
         not_found,
         not_modified,
         already_exists,
-        precondition_failed
+        precondition_failed,
+        response_too_large,
+        retention_overloaded
     }
+}
+
+// Boot-time ABI fence: older release artifacts must fail before serving ingest.
+#[rustler::nif]
+fn retention_api_version() -> u32 {
+    1
 }
 
 #[derive(rustler::NifMap, Clone, PartialEq, Eq, Hash)]
@@ -310,6 +319,142 @@ fn get_if_none_match<'a>(
 
     let (e_tag, binary) = stream_body_into(env, obj)?;
     Ok((atoms::ok(), e_tag, binary))
+}
+
+// Reject oversized metadata before allocating its body on the Erlang heap.
+#[rustler::nif(schedule = "DirtyIo")]
+fn get_bounded<'a>(
+    env: Env<'a>,
+    config: StoreConfig,
+    key: String,
+    etag: String,
+    limit: u64,
+) -> NifResult<(Atom, String, Binary<'a>)> {
+    let store = build_store(&config)?;
+    let opts = GetOptions {
+        if_none_match: if etag.is_empty() { None } else { Some(etag) },
+        ..GetOptions::default()
+    };
+    let obj = RUNTIME
+        .block_on(store.get_opts(&Path::from(key), opts))
+        .map_err(map_object_store_error)?;
+    if obj.meta.size > limit {
+        return Err(Error::Term(Box::new(atoms::response_too_large())));
+    }
+    let (etag, body) = stream_body_into(env, obj)?;
+    Ok((atoms::ok(), etag, body))
+}
+
+// A lexical start-after cursor remains valid when earlier objects are deleted.
+// Never collect the whole provider stream; a call returns at most 1,000 keys.
+// Jump over each tenant's entire subtree instead of walking its telemetry.
+// The next ASCII character after '/' is '0'. With Pulso's tenant alphabet,
+// `<tenant>0` sorts past `<tenant>/...` but before every subsequent tenant's
+// keys, including `<tenant>0/...`. Each provider request has a bounded page.
+#[rustler::nif(schedule = "DirtyIo")]
+fn discover_tenants(
+    config: StoreConfig,
+    after: String,
+    limit: usize,
+) -> NifResult<(Atom, Vec<String>, Option<String>)> {
+    if limit == 0 || limit > 64 {
+        return Err(nif_error("invalid discovery limit"));
+    }
+    let store = build_store(&config)?;
+    let prefix = Path::from("tenants/");
+    let mut cursor = if after.is_empty() { None } else { Some(after) };
+    let mut tenants = Vec::new();
+    for _ in 0..limit {
+        let offset = cursor.as_ref().map(|t| Path::from(format!("tenants/{t}0")));
+        let mut stream = match &offset {
+            Some(path) => store.list_with_offset(Some(&prefix), path),
+            None => store.list(Some(&prefix)),
+        };
+        let object = RUNTIME
+            .block_on(stream.try_next())
+            .map_err(map_object_store_error)?;
+        let Some(object) = object else {
+            return Ok((atoms::ok(), tenants, None));
+        };
+        let key = object.location.to_string();
+        let tenant = key
+            .strip_prefix("tenants/")
+            .and_then(|k| k.split('/').next())
+            .ok_or_else(|| nif_error("invalid tenant listing"))?
+            .to_string();
+        if tenant.is_empty() {
+            return Err(nif_error("invalid tenant listing"));
+        }
+        cursor = Some(tenant.clone());
+        if tenant.len() <= 128
+            && tenant
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            tenants.push(tenant);
+        }
+    }
+    Ok((atoms::ok(), tenants, cursor))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn list_page(
+    config: StoreConfig,
+    prefix: String,
+    after: String,
+    limit: usize,
+) -> NifResult<(Atom, Vec<String>, Option<String>)> {
+    if limit == 0 || limit > 1000 {
+        return Err(nif_error("invalid list page limit"));
+    }
+    let store = build_store(&config)?;
+    let path = Path::from(prefix);
+    let offset = Path::from(after);
+    let stream = if offset.as_ref().is_empty() {
+        store.list(Some(&path))
+    } else {
+        store.list_with_offset(Some(&path), &offset)
+    };
+    let objects: Vec<_> = RUNTIME
+        .block_on(stream.take(limit + 1).try_collect())
+        .map_err(map_object_store_error)?;
+    let more = objects.len() > limit;
+    let keys: Vec<String> = objects
+        .into_iter()
+        .take(limit)
+        .map(|obj| obj.location.to_string())
+        .collect();
+    let cursor = if more { keys.last().cloned() } else { None };
+    Ok((atoms::ok(), keys, cursor))
+}
+
+// Native slots outlive a killed BEAM caller: a DOWN message cannot release an
+// I/O operation that is still running on a dirty scheduler / Tokio runtime.
+static RETENTION_DELETES: AtomicUsize = AtomicUsize::new(0);
+struct DeleteSlot;
+impl Drop for DeleteSlot {
+    fn drop(&mut self) {
+        RETENTION_DELETES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn delete_bounded(config: StoreConfig, key: String) -> NifResult<Atom> {
+    RETENTION_DELETES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            if n < 4 {
+                Some(n + 1)
+            } else {
+                None
+            }
+        })
+        .map_err(|_| Error::Term(Box::new(atoms::retention_overloaded())))?;
+    let _slot = DeleteSlot;
+    let store = build_store(&config)?;
+    RUNTIME
+        .block_on(store.delete(&Path::from(key)))
+        .map_err(map_object_store_error)?;
+    Ok(atoms::ok())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

@@ -2,8 +2,10 @@ defmodule Pulso.Storage.S3.CompactionSupervision do
   @moduledoc """
   Restarts the worker when its process-group scope restarts, restoring eligibility.
   """
-  use Supervisor
+  use Pulso.Runtime.Supervision
 
+  alias Pulso.Runtime.Supervision, as: Supervisor
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3.CompactionOwnership
   alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.CompactionWorker

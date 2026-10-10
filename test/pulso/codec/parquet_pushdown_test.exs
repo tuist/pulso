@@ -9,7 +9,7 @@ defmodule Pulso.Codec.ParquetPushdownTest do
   `severity_text` promoted-field fallback, and the line-filter body
   unescape.
   """
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Codec.NIF
   alias Pulso.Record.Log

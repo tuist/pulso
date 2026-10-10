@@ -1,7 +1,8 @@
 defmodule Pulso.QueryRunnerTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.QueryRunner
+  alias Pulso.Runtime.Task
 
   test "tenant admission is shared across query classes and released after workers finish" do
     caller = self()
@@ -20,7 +21,8 @@ defmodule Pulso.QueryRunnerTest do
             send(caller, {:finished, result})
           end)
 
-        assert_receive {:started, worker}
+        # Admission happens in supervised tasks; allow for a loaded async suite.
+        assert_receive {:started, worker}, 5_000
         worker
       end
 

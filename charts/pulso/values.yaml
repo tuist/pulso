@@ -58,6 +58,46 @@ metricsCompaction:
   # of which objects are live. See docs/configuration.md.
   enabled: false
 
+# Experimental event-time retention. Read docs/retention.md before changing any
+# of these. Defaults keep unlimited retention: no durations and no worker.
+retention:
+  # Runs the background retention/cleanup worker even when both durations are
+  # 0. The worker also runs whenever either duration is positive. Set it to
+  # true before returning both durations to 0 while committed cleanup is pending.
+  enabled: false
+  # Whole days of event-time retention per signal, 0..3650. 0 stops advancing
+  # the retention floor; it never restores expired data.
+  logsDays: 0
+  metricsDays: 0
+  # observe: preview only, but finish cleanup already committed.
+  # enforce: activate the paged manifest format and expire data. Irreversible;
+  #          first finish rolling out this image in observe mode.
+  # paused:  no floor advancement and no cleanup.
+  mode: observe
+  # Reader grace between a committed expiry and physical deletion,
+  # 60000..2592000000 ms. Keep it well above clock skew and query duration; a
+  # query that still finds an object or page deleted restarts once, then fails.
+  deleteGraceMs: 3600000
+  # Maintenance cadence, 1000..3600000 ms.
+  intervalMs: 30000
+  # Maximum DELETE attempts per node per intervalMs, 1..512, shared by
+  # retention and compaction cleanup of retention-managed prefixes. At most
+  # four run concurrently.
+  deleteLimit: 512
+  # Deadline for one maintenance operation, 1000..600000 ms. When the worker
+  # runs, the pod termination grace is raised to cover it.
+  timeoutMs: 30000
+  # Deadline for converting one existing manifest in enforce mode,
+  # 30000..3600000 ms. In enforce mode with a positive duration, the pod
+  # termination grace is raised to cover it.
+  migrationTimeoutMs: 600000
+  # Requests with records more than this far in the future are rejected once a
+  # prefix is retention-managed, 0..86400000 ms.
+  futureSkewMs: 600000
+  # Days of expired partitions revisited by orphan sweeps, 1..7302. Empty
+  # keeps the default of twice the persisted retention days plus two.
+  sweepHorizonDays: ""
+
 ingestBatching:
   # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
   # 0 disables it; 1..1000 adds up to that many ms before durable publication.

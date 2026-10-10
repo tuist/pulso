@@ -1,5 +1,5 @@
 defmodule PulsoWeb.AlertingControllerTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Alerting.Canonical
   alias Pulso.Alerting.Evaluator
@@ -9,8 +9,10 @@ defmodule PulsoWeb.AlertingControllerTest do
   alias Pulso.Alerting.Worker
   alias Pulso.MCP.Tools
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime.Task
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.MCPMessages
+  alias Pulso.Test.RuntimePlug
 
   setup do
     agent =
@@ -51,12 +53,7 @@ defmodule PulsoWeb.AlertingControllerTest do
       capabilities: ~w(alert:read alert:rules:write alert:audit:read alert:preview alert:evaluate alert:import)
     }
 
-    old = Application.get_env(:pulso, Pulso.Alerting)
-    Application.put_env(:pulso, Pulso.Alerting, principals: [actor], store_config: config)
-
-    on_exit(fn ->
-      if old, do: Application.put_env(:pulso, Pulso.Alerting, old), else: Application.delete_env(:pulso, Pulso.Alerting)
-    end)
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting, principals: [actor], store_config: config)
 
     %{config: config, actor: actor}
   end
@@ -161,10 +158,9 @@ defmodule PulsoWeb.AlertingControllerTest do
       "secret_env" => "PULSO_ALERTING_TEST_WEBHOOK"
     }
 
-    System.put_env("PULSO_ALERTING_TEST_WEBHOOK", "https://notifications.invalid/private-webhook")
-    on_exit(fn -> System.delete_env("PULSO_ALERTING_TEST_WEBHOOK") end)
+    Pulso.Runtime.put_env("PULSO_ALERTING_TEST_WEBHOOK", "https://notifications.invalid/private-webhook")
 
-    Application.put_env(:pulso, Pulso.Alerting,
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting,
       principals: [ctx.actor],
       store_config: ctx.config,
       notification_targets: [target]
@@ -214,10 +210,9 @@ defmodule PulsoWeb.AlertingControllerTest do
       "secret_env" => "PULSO_ALERTING_TEST_WEBHOOK"
     }
 
-    System.put_env("PULSO_ALERTING_TEST_WEBHOOK", "https://notifications.invalid/private-webhook")
-    on_exit(fn -> System.delete_env("PULSO_ALERTING_TEST_WEBHOOK") end)
+    Pulso.Runtime.put_env("PULSO_ALERTING_TEST_WEBHOOK", "https://notifications.invalid/private-webhook")
 
-    Application.put_env(:pulso, Pulso.Alerting,
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting,
       principals: [ctx.actor],
       store_config: ctx.config,
       notification_targets: [target]
@@ -253,7 +248,19 @@ defmodule PulsoWeb.AlertingControllerTest do
 
   test "real HTTP subscription acknowledges before hints and closes on credential revocation", ctx do
     assert {:ok, created} = Pulso.Alerting.create(ctx.actor, "backup", params("create"))
-    http = start_supervised!(Supervisor.child_spec({Bandit, plug: PulsoWeb.Endpoint, port: 0}, id: :mcp_http))
+
+    # The server's connection process must observe credential revocation made by
+    # this test, so share a test-owned runtime with it instead of a snapshot.
+    runtime = Pulso.Runtime.share()
+
+    http =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Bandit, plug: {RuntimePlug, runtime: runtime, plug: PulsoWeb.Endpoint}, port: 0},
+          id: :mcp_http
+        )
+      )
+
     {:ok, {_ip, port}} = ThousandIsland.listener_info(http)
     uri = Resources.uri(ctx.actor.tenant, "backup", "changes")
 
@@ -292,7 +299,7 @@ defmodule PulsoWeb.AlertingControllerTest do
     assert hint["method"] == "notifications/resources/updated"
     assert hint["params"]["uri"] == uri
     assert hint["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == "watch"
-    Application.put_env(:pulso, Pulso.Alerting, principals: [], store_config: ctx.config)
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting, principals: [], store_config: ctx.config)
     {completion, _buffer} = next_sse(buffer)
     assert completion["id"] == "watch"
     assert completion["result"]["resultType"] == "complete"

@@ -25,6 +25,7 @@ defmodule PulsoWeb.CompressedBodyReader do
   """
 
   alias Plug.Parsers.RequestTooLargeError
+  alias Pulso.Runtime
 
   @default_max_decompressed_bytes 16 * 1024 * 1024
 
@@ -120,7 +121,7 @@ defmodule PulsoWeb.CompressedBodyReader do
 
   defp max_decompressed_bytes do
     :pulso
-    |> Application.get_env(__MODULE__, [])
+    |> Runtime.get_env(__MODULE__, [])
     |> Keyword.get(:max_decompressed_bytes, @default_max_decompressed_bytes)
   end
 end

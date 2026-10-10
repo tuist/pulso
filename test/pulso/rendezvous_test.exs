@@ -1,5 +1,5 @@
 defmodule Pulso.RendezvousTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Rendezvous
   alias Pulso.Storage.S3.CompactionOwnership

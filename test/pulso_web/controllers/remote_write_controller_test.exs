@@ -3,7 +3,7 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
   # payload is encoded by hand here (no `prost` on either side) so the
   # fixture stays legible and the on-wire bytes we assert against are
   # exactly what Alloy / Grafana Agent / Prometheus will send.
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   import Bitwise
 
@@ -11,6 +11,7 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
   alias Pulso.Storage
   alias Pulso.Storage.Memory
   alias Pulso.Storage.S3
+  alias Pulso.Test.FailingStorage
 
   setup do
     Memory.reset()
@@ -77,6 +78,26 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     |> post(~p"/api/v1/write", body)
   end
 
+  test "retention timestamp failures are permanent and capacity/migration failures are retryable" do
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: FailingStorage)
+
+    encoded = body([%{labels: [{"__name__", "requests_total"}], samples: [{1.0, 1_700_000_000_000}]}])
+
+    for reason <- [
+          :retention_expired,
+          :timestamp_too_new,
+          :retention_capacity,
+          :retention_migration_required,
+          :managed_manifest_missing,
+          :manifest_page_missing,
+          :cas_retries_exhausted
+        ] do
+      Pulso.Runtime.put_env(:pulso, FailingStorage, {:error, reason})
+      response = post_write(build_conn(), encoded)
+      assert response.status == if(reason in [:retention_expired, :timestamp_too_new], do: 400, else: 503)
+    end
+  end
+
   # ------- happy path -------------------------------------------------------
 
   test "POST /api/v1/write returns 204 and stores metric samples", %{conn: conn} do
@@ -137,9 +158,7 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     assert response.status == 204
     assert get_resp_header(response, "x-pulso-rejected-records") == ["2"]
     assert {:ok, [%MetricSample{value: 1.0}]} = Storage.query(:metrics, "default")
-    original = Application.get_env(:pulso, Pulso.IngestLimits, [])
-    Application.put_env(:pulso, Pulso.IngestLimits, max_records: 2)
-    on_exit(fn -> Application.put_env(:pulso, Pulso.IngestLimits, original) end)
+    Pulso.Runtime.put_env(:pulso, Pulso.IngestLimits, max_records: 2)
     response = post_write(build_conn(), snappy(length_delim(1, series)))
     assert response.status == 413
   end

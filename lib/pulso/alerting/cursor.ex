@@ -1,6 +1,7 @@
 defmodule Pulso.Alerting.Cursor do
   @moduledoc false
   alias Pulso.Alerting.Canonical
+  alias Pulso.Runtime
 
   @ttl 600
 
@@ -36,7 +37,7 @@ defmodule Pulso.Alerting.Cursor do
   defp aad(principal, id), do: Canonical.encode([principal.tenant, principal.id, Enum.sort(principal.capabilities), id])
 
   defp key(opts) do
-    secret = Keyword.get(opts, :cursor_secret, Application.fetch_env!(:pulso, PulsoWeb.Endpoint)[:secret_key_base])
+    secret = Keyword.get(opts, :cursor_secret, Runtime.fetch_env!(:pulso, PulsoWeb.Endpoint)[:secret_key_base])
     :crypto.hash(:sha256, "pulso-alerting-audit-v1:" <> secret)
   end
 end

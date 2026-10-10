@@ -7,7 +7,7 @@ defmodule Pulso.Test.BlockingMetricStorage do
   def append(signal, tenant, records, opts), do: Memory.append(signal, tenant, records, opts)
 
   def query(_signal, tenant, _opts) do
-    case Application.fetch_env!(:pulso, __MODULE__) do
+    case Pulso.Runtime.fetch_env!(:pulso, __MODULE__) do
       {:error, _} = error ->
         error
 

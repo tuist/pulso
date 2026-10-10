@@ -1,5 +1,5 @@
 defmodule Pulso.PromQL.ConformanceTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.MetricSample

@@ -25,7 +25,7 @@ defmodule Pulso.Test.CompactionStore do
   defp await_barrier(agent, method, key) do
     selector = if String.contains?(key, "-compact-"), do: :replacement, else: key
 
-    case Agent.get(agent, &Map.get(&1.barriers, {method, selector})) do
+    case Agent.get(agent, &barrier_owner(&1, method, key, selector)) do
       nil ->
         :ok
 
@@ -38,6 +38,13 @@ defmodule Pulso.Test.CompactionStore do
           10_000 -> raise "storage barrier was not released"
         end
     end
+  end
+
+  defp barrier_owner(state, method, key, selector) do
+    Map.get(state.barriers, {method, selector}) ||
+      if(String.ends_with?(key, ".parquet") and selector != :replacement,
+        do: Map.get(state.barriers, {method, :segment})
+      )
   end
 
   # Faults exercise the native client's real retry and conditional-write path.
@@ -109,7 +116,10 @@ defmodule Pulso.Test.CompactionStore do
   defp list_response(state, conn) do
     prefix = Map.get(conn.query_params, "prefix", "")
 
-    keys = state.objects |> Map.keys() |> Enum.filter(&String.starts_with?(&1, prefix)) |> Enum.sort()
+    after_key = Map.get(conn.query_params, "start-after", "")
+
+    keys =
+      state.objects |> Map.keys() |> Enum.filter(&(String.starts_with?(&1, prefix) and &1 > after_key)) |> Enum.sort()
 
     {entries, truncated, token} =
       if Map.get(conn.query_params, "delimiter") == "/" do
@@ -134,7 +144,12 @@ defmodule Pulso.Test.CompactionStore do
         token = if truncated, do: "<NextContinuationToken>#{offset + length(page)}</NextContinuationToken>", else: ""
         {entries, truncated, token}
       else
-        {Enum.map_join(keys, &list_entry({&1, Map.fetch!(state.objects, &1)})), false, ""}
+        offset = conn.query_params |> Map.get("continuation-token", "0") |> String.to_integer()
+        maximum = min(3, conn.query_params |> Map.get("max-keys", "1000") |> String.to_integer())
+        page = Enum.slice(keys, offset, maximum)
+        truncated = offset + length(page) < length(keys)
+        token = if truncated, do: "<NextContinuationToken>#{offset + length(page)}</NextContinuationToken>", else: ""
+        {Enum.map_join(page, &list_entry({&1, Map.fetch!(state.objects, &1)})), truncated, token}
       end
 
     "<ListBucketResult><Name>pulso</Name><IsTruncated>#{truncated}</IsTruncated>#{token}#{entries}</ListBucketResult>"

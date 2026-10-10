@@ -35,6 +35,7 @@ defmodule PulsoWeb.MCPRequestGate do
   import Plug.Conn
 
   alias Plug.Conn.Utils
+  alias Pulso.Runtime
 
   @impl true
   def init(opts), do: opts
@@ -79,7 +80,7 @@ defmodule PulsoWeb.MCPRequestGate do
 
   defp allowed_origins do
     :pulso
-    |> Application.get_env(PulsoWeb.MCPController, [])
+    |> Runtime.get_env(PulsoWeb.MCPController, [])
     |> Keyword.get(:allowed_origins, [])
     |> Enum.flat_map(fn origin ->
       case parse_origin(origin) do

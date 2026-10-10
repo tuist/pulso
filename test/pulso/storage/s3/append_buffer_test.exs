@@ -1,8 +1,11 @@
 defmodule Pulso.Storage.S3.AppendBufferTest do
-  use ExUnit.Case, async: false
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
+  alias Pulso.Runtime.Registry
+  alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.AppendRegistry
@@ -54,12 +57,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
       ingest_flush_interval_ms: Map.get(context, :flush_interval_ms, 1000)
     }
 
-    previous = Application.get_env(:pulso, S3)
-    Application.put_env(:pulso, S3, config)
-
-    on_exit(fn ->
-      if previous, do: Application.put_env(:pulso, S3, previous), else: Application.delete_env(:pulso, S3)
-    end)
+    Runtime.put_env(:pulso, S3, config)
 
     start_supervised!(ManifestSupervision)
     tasks = start_supervised!(Task.Supervisor)

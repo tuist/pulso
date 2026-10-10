@@ -1,5 +1,5 @@
 defmodule PulsoWeb.IngestLimitsTest do
-  use PulsoWeb.ConnCase, async: false
+  use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Auth.SharedSecret
   alias Pulso.IngestLimits
@@ -11,8 +11,6 @@ defmodule PulsoWeb.IngestLimitsTest do
 
   setup do
     Memory.reset()
-    previous = Application.get_env(:pulso, IngestLimits)
-    on_exit(fn -> restore(IngestLimits, previous) end)
     :ok
   end
 
@@ -110,12 +108,9 @@ defmodule PulsoWeb.IngestLimitsTest do
   end
 
   test "authentication takes precedence over record and attribute validation" do
-    previous = Application.get_env(:pulso, Pulso.Auth)
-    on_exit(fn -> restore(Pulso.Auth, previous) end)
-
     digest = :sha256 |> :crypto.hash("secret") |> Base.encode16(case: :lower)
 
-    Application.put_env(:pulso, Pulso.Auth,
+    Pulso.Runtime.put_env(:pulso, Pulso.Auth,
       module: SharedSecret,
       tokens: %{"default" => "sha256$" <> digest}
     )
@@ -162,10 +157,7 @@ defmodule PulsoWeb.IngestLimitsTest do
     assert post_json("/v1/logs", %{"resourceLogs" => [%{"scopeLogs" => [nil, %{"logRecords" => "bad"}]}]}).status == 200
   end
 
-  defp configure(options), do: Application.put_env(:pulso, IngestLimits, options)
-
-  defp restore(key, nil), do: Application.delete_env(:pulso, key)
-  defp restore(key, previous), do: Application.put_env(:pulso, key, previous)
+  defp configure(options), do: Pulso.Runtime.put_env(:pulso, IngestLimits, options)
 
   defp assert_attribute_error(kind, opts) do
     assert json_response(ingest(kind, opts), 413) == %{"error" => "attributes_too_large"}

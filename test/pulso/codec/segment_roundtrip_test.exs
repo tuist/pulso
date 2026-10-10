@@ -1,5 +1,5 @@
 defmodule Pulso.Codec.SegmentRoundtripTest do
-  use ExUnit.Case, async: true
+  use Pulso.Test.Case, async: true
 
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
