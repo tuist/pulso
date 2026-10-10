@@ -280,11 +280,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   @spec ensure_started(String.t(), String.t(), map()) ::
           {:ok, pid()} | {:error, term()}
   def ensure_started(tenant, signal, config) do
-    case Registry.lookup(@registry, {tenant, signal}) do
-      [{pid, _}] ->
+    # Raw ETS lookup can retain an exited owner until registry cleanup runs.
+    # The via-name lookup checks liveness before reusing that process.
+    case Registry.whereis_name({@registry, {tenant, signal}}) do
+      pid when is_pid(pid) ->
         {:ok, pid}
 
-      [] ->
+      :undefined ->
         opts = [tenant: tenant, signal: signal, config: config]
         spec = %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :transient}
 
