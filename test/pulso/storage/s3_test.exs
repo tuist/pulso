@@ -8,6 +8,7 @@ defmodule Pulso.Storage.S3Test do
   alias Pulso.ObjectStore
   alias Pulso.Record.Log
   alias Pulso.Runtime
+  alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
@@ -191,21 +192,21 @@ defmodule Pulso.Storage.S3Test do
     assert length(keys) == 2
   end
 
-  test "a key deleted after listing does not fail the query", %{
+  test "a segment still referenced by the manifest cannot silently disappear from query results", %{
     tenant: tenant,
     config: config
   } do
     assert :ok = S3.append(:logs, tenant, [record(1), record(2)])
     assert :ok = S3.append(:logs, tenant, [record(3)])
 
-    # Delete one of the segment objects between our own list and get,
-    # mimicking a compaction / retention job racing with a query.
+    # Delete data without retiring its manifest reference. A legitimate
+    # compaction or retention job updates metadata before deleting data.
     assert {:ok, [first | _]} = list_segments(config, tenant)
     assert :ok = ObjectStore.delete(config, first)
 
-    # Query should still return the surviving records, not error.
-    assert {:ok, remaining} = S3.query(:logs, tenant, [])
-    assert remaining != []
+    # A metadata refresh still references the missing segment, so the query
+    # must fail instead of silently returning an incomplete result.
+    assert {:error, :not_found} = S3.query(:logs, tenant, [])
   end
 
   test "equal timestamps sort deterministically across adapters", %{tenant: tenant} do
@@ -238,9 +239,11 @@ defmodule Pulso.Storage.S3Test do
 
       tasks =
         for i <- 1..n do
-          Task.async(fn ->
-            S3.append(:logs, tenant, [record(i, service: "svc-#{i}")])
-          end)
+          Task.async(
+            Runtime.capture(fn ->
+              S3.append(:logs, tenant, [record(i, service: "svc-#{i}")])
+            end)
+          )
         end
 
       results = Task.await_many(tasks, 30_000)
@@ -398,7 +401,7 @@ defmodule Pulso.Storage.S3Test do
     case Registry.lookup(ManifestRegistry, {tenant, "logs"}) do
       [{pid, _}] ->
         ref = Process.monitor(pid)
-        DynamicSupervisor.terminate_child(ManifestSupervisor, pid)
+        DynamicSupervisor.terminate_child(Runtime.name(ManifestSupervisor), pid)
 
         receive do
           {:DOWN, ^ref, :process, ^pid, _} -> :ok
