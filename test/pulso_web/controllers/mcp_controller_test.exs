@@ -11,8 +11,15 @@ defmodule PulsoWeb.MCPControllerTest do
   test "tool discovery separates query and alert mutation annotations", %{conn: conn} do
     response = request(conn, "tools/list", %{})
     tools = response["result"]["tools"]
-    queries = Enum.filter(tools, &String.starts_with?(&1["name"], "query_"))
-    assert length(queries) == 4
+
+    queries =
+      Enum.filter(
+        tools,
+        &(String.starts_with?(&1["name"], "query_") or
+            &1["name"] in ~w(list_error_issues list_error_changes list_indexed_error_issues))
+      )
+
+    assert length(queries) == 8
     assert Enum.all?(queries, &(&1["annotations"]["readOnlyHint"] == true))
     create = Enum.find(tools, &(&1["name"] == "create_alert_rule"))
     assert create["annotations"]["readOnlyHint"] == false
@@ -40,7 +47,8 @@ defmodule PulsoWeb.MCPControllerTest do
   test "every query tool fails closed without tenant credentials", %{conn: conn} do
     Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
-    for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
+    for name <-
+          ~w(query_logs query_metrics query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
       response =
         request(conn, "tools/call", %{
           "name" => name,
@@ -86,7 +94,8 @@ defmodule PulsoWeb.MCPControllerTest do
   test "tenant authorization precedes query argument validation", %{conn: conn} do
     Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
-    for name <- ["query_logs", "query_metrics", "query_logql", "query_promql"] do
+    for name <-
+          ~w(query_logs query_metrics query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
       response =
         request(conn, "tools/call", %{
           "name" => name,

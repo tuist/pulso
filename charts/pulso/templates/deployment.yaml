@@ -75,6 +75,14 @@ spec:
               value: {{ .Values.storage.allowHttp | quote }}
             - name: PULSO_METRICS_COMPACTION_ENABLED
               value: {{ .Values.metricsCompaction.enabled | quote }}
+            - name: PULSO_SENTRY_PROJECTS_JSON
+              value: {{ .Values.sentry.projects | toJson | quote }}
+            - name: PULSO_ERROR_PROJECTION_ENABLED
+              value: {{ .Values.sentry.projectionEnabled | quote }}
+            - name: PULSO_ERROR_HISTORY_DAYS
+              value: {{ include "pulso.boundedInteger" (list "sentry.historyDays" .Values.sentry.historyDays 1 365) | quote }}
+            - name: PULSO_ERROR_PROJECTION_INTERVAL_MS
+              value: {{ include "pulso.boundedInteger" (list "sentry.projectionIntervalMs" .Values.sentry.projectionIntervalMs 1000 60000) | quote }}
             - name: PULSO_ALERTING_EVALUATION_ENABLED
               value: {{ .Values.alerting.evaluationEnabled | quote }}
             - name: PULSO_ALERTING_NOTIFICATIONS_ENABLED

@@ -4,6 +4,11 @@ An open-source, headless observability backend built for AI agents as much as fo
 
 Pulso accepts logs and metrics over the protocols your collectors already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores them as Parquet in an S3-compatible bucket, and lets agents investigate them through a native [Model Context Protocol](https://modelcontextprotocol.io/) interface. Prometheus- and Loki-compatible query APIs keep existing dashboards working.
 
+Experimental [error tracking](docs/error-tracking.md) accepts Sentry SDK JSON errors
+into the same object storage and exposes error events and issue groups through MCP.
+An optional [error monitoring index](docs/error-monitoring.md) adds compact
+retained-history summaries and replayable changes without gating ingestion.
+
 ## Why Pulso
 
 - **One system instead of three.** Logs and metrics (and, later, traces and alerting) share one ingest path, one storage format, and one query surface.

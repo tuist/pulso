@@ -121,6 +121,20 @@ alerting:
   # and capabilities. See docs/alerting.md. Never put plaintext bearer tokens here.
   principals: []
 
+sentry:
+  # Experimental JSON error ingestion. Numeric project ID => tenant, service,
+  # public_key_hashes (1..8 lowercase SHA-256 digests of ingest-only DSN keys).
+  # Empty disables ingestion. Error events share log retention. Add exact SDK
+  # paths to ingress.paths explicitly; see docs/error-tracking.md.
+  projects: {}
+  # Optional bounded S3 monitoring projection, independent of ingest success.
+  # Newness means new within historyDays, not first ever. See docs/error-monitoring.md
+  # for capacity, replay floors, and conservative resets after retention gaps.
+  projectionEnabled: false
+  historyDays: 1
+  # Round-robin cadence: each pass handles one configured project, 1000..60000.
+  projectionIntervalMs: 5000
+
 mcp:
   # Browser origins allowed to call POST /mcp. Requests without an Origin
   # header (most agents and servers) are always accepted.

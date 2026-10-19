@@ -131,6 +131,24 @@ defmodule Pulso.Storage.S3CodecTest do
   end
 
   describe "decode_segment/4" do
+    test "expanded dictionary buffers, not compressed bytes or filtered output, consume the decode budget" do
+      body = String.duplicate("x", 100_000)
+      records = for ts <- 1..20, do: %Log{timestamp_ns: ts, body: body}
+      assert {:ok, payload, 1, 20} = S3.encode_segment(:logs, records)
+      assert byte_size(payload) < 20_000
+      opts = [max_records: 20, max_decoded_bytes: 4_194_304]
+      assert {:ok, ^records, charged} = S3.decode_log_segment_bounded(payload, nil, nil, opts)
+      assert charged >= 2_000_000
+      assert charged < 2_100_000
+      assert {:ok, ^records} = S3.decode_segment(:logs, payload, nil, nil, opts)
+
+      opts = Keyword.put(opts, :max_decoded_bytes, 1_048_576)
+      assert {:error, :query_decoded_limit} = S3.decode_segment(:logs, payload, nil, nil, opts)
+      # Only one matching row does not make decoding the other rows free.
+      assert {:error, :query_decoded_limit} = S3.decode_log_segment_bounded(payload, 20, 20, opts)
+      assert {:ok, [], 0} = S3.decode_log_segment_bounded(payload, 21, nil, opts)
+    end
+
     test "a corrupt footer cannot preallocate output from an enormous claimed row count" do
       # One physical row, but the footer claims 2^36 rows (512 GiB of term
       # slots). The fixture generator verifies that metadata is readable.

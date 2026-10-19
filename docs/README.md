@@ -20,6 +20,10 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
   tokens, object storage requirements, and metrics compaction.
 - [Querying](querying.md): the Model Context Protocol tools, the Prometheus and
   Loki query APIs, the supported query subset, and query limits.
+- [Error tracking](error-tracking.md): experimental Sentry SDK ingestion,
+  object-backed error events, issue grouping and read-only agent queries.
+- [Error monitoring](error-monitoring.md): separately enabled S3-derived issue
+  summaries and replayable agent changes, with explicit history and gap semantics.
 - [Alerting](alerting.md): experimental native evaluation, dedicated credentials,
   rule management and modification history, with explicit compatibility limits.
 - [Retention](retention.md): experimental event-time retention for logs and

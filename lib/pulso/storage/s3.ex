@@ -187,13 +187,46 @@ defmodule Pulso.Storage.S3 do
     with :ok <- check_deadline(opts[:deadline_ms]), do: {:error, :query_scan_limit}
   end
 
+  @doc """
+  Strictly fresh committed log inputs, pruned and bounded like a query.
+
+  Returns candidate segments, the retained event-time floor and the root ETag.
+  It never reconstructs a missing manifest from bucket listings or serves stale
+  cache data. A snapshot is not a publication journal: inputs may expire between
+  snapshots, so consumers must not infer uninterrupted coverage from an ETag.
+  """
+  def log_snapshot(tenant, opts) do
+    deadline = System.monotonic_time(:millisecond) + 10_000
+    opts = Keyword.merge(Pulso.QueryRunner.storage_opts(deadline), opts)
+
+    with :ok <- validate_tenant(tenant),
+         :ok <- check_deadline(opts[:deadline_ms]) do
+      config = Map.put(config!(), :retention_bounded_read, true)
+      config = Map.put(config, :retention_timeout_ms, max(0, opts[:deadline_ms] - System.monotonic_time(:millisecond)))
+
+      config
+      |> PagedManifest.with_budget(fn -> read_log_snapshot(tenant, config, opts) end)
+      |> budget_result(opts)
+    end
+  end
+
+  defp read_log_snapshot(tenant, config, opts) do
+    with {:ok, root, etag} <- Retention.load(tenant, "logs", config),
+         start = retained_start(root, opts[:start_ts]),
+         {:ok, segments} <- query_segments(root, :logs, start, opts[:end_ts], opts, tenant, config),
+         :ok <- check_deadline(opts[:deadline_ms]),
+         :ok <- check_scan_budget(segments, opts) do
+      {:ok, %{segments: segments, floor_ns: retained_start(root, 0), etag: etag}}
+    end
+  end
+
   defp do_query(signal, tenant, opts, config) do
     start_ts = Keyword.get(opts, :start_ts)
     end_ts = Keyword.get(opts, :end_ts)
     limit = Keyword.get(opts, :limit)
 
     with :ok <- check_deadline(opts[:deadline_ms]),
-         {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, signal_string(signal), config),
+         {:ok, entry} <- query_manifest(tenant, signal_string(signal), config, opts),
          :ok <- check_deadline(opts[:deadline_ms]) do
       start_ts = retained_start(entry.manifest, start_ts)
 
@@ -217,6 +250,16 @@ defmodule Pulso.Storage.S3 do
         {:error, _} = err ->
           err
       end
+    end
+  end
+
+  defp query_manifest(tenant, signal, config, opts) do
+    if opts[:fresh] do
+      with {:ok, root, etag} <- Retention.load(tenant, signal, Map.put(config, :retention_bounded_read, true)) do
+        {:ok, %{manifest: root, etag: etag}}
+      end
+    else
+      ManifestOwner.ensure_loaded(tenant, signal, config)
     end
   end
 
@@ -513,7 +556,10 @@ defmodule Pulso.Storage.S3 do
 
     segments
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, %{batches: [], count: 0, top: [], bytes: 0}}, &visit_segment(&1, &2, ctx))
+    |> Enum.reduce_while(
+      {:ok, %{batches: [], count: 0, top: [], bytes: 0, decoded_bytes: 0}},
+      &visit_segment(&1, &2, ctx)
+    )
     |> case do
       {:ok, %{batches: batches}} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
       {:error, _} = err -> err
@@ -533,6 +579,7 @@ defmodule Pulso.Storage.S3 do
       {:error, :not_found} ->
         consumed = %{
           max_scan_bytes: state.bytes,
+          max_decoded_bytes: state.decoded_bytes,
           max_scan_segments: index + 1,
           max_scan_rows: ctx.segments |> Enum.take(index) |> Enum.map(&(&1.row_count || 0)) |> Enum.sum()
         }
@@ -545,16 +592,13 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, blob, index, ctx) do
-    opts =
-      case Keyword.get(ctx.opts, :max_records) do
-        nil -> ctx.opts
-        max -> Keyword.put(ctx.opts, :max_records, max - state.count)
-      end
+    opts = remaining_budget(ctx.opts, %{max_records: state.count, max_decoded_bytes: state.decoded_bytes})
 
-    case decode_segment(ctx.signal, blob, ctx.start_ts, ctx.end_ts, opts) do
-      {:ok, batch} ->
+    case decode_batch(ctx.signal, blob, ctx.start_ts, ctx.end_ts, opts) do
+      {:ok, batch, decoded_bytes} ->
         new_state = %{
           bytes: state.bytes,
+          decoded_bytes: state.decoded_bytes + decoded_bytes,
           batches: [batch | state.batches],
           count: state.count + length(batch),
           top: top_timestamps(state.top, batch, ctx.limit)
@@ -566,6 +610,14 @@ defmodule Pulso.Storage.S3 do
 
       {:error, _} = err ->
         {:halt, err}
+    end
+  end
+
+  defp decode_batch(signal, blob, start_ts, end_ts, opts) do
+    if signal == :logs and opts[:max_decoded_bytes] != nil do
+      decode_log_segment_bounded(blob, start_ts, end_ts, opts)
+    else
+      with {:ok, records} <- decode_segment(signal, blob, start_ts, end_ts, opts), do: {:ok, records, 0}
     end
   end
 
@@ -607,14 +659,15 @@ defmodule Pulso.Storage.S3 do
   @spec decode_segment(Pulso.Storage.signal(), binary(), term(), term(), keyword()) ::
           {:ok, [Pulso.Storage.signal_record()]} | {:error, term()}
   def decode_segment(:logs, blob, start_ts, end_ts, opts) when is_binary(blob) and is_list(opts) do
-    service = Keyword.get(opts, :service)
-    matchers = Keyword.get(opts, :matchers, [])
-    line_filters = Keyword.get(opts, :line_filters, [])
+    decoded =
+      if opts[:max_decoded_bytes] == nil,
+        do: decode_log_records(blob, start_ts, end_ts, opts),
+        else: decode_log_segment_bounded(blob, start_ts, end_ts, opts)
 
-    :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
-
-    case NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service, matchers, line_filters) do
+    case decoded do
       {:ok, records} -> {:ok, records}
+      {:ok, records, _bytes} -> {:ok, records}
+      {:error, _} = error -> error
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
     end
   end
@@ -638,6 +691,61 @@ defmodule Pulso.Storage.S3 do
       {:ok, records} -> {:ok, records}
       {:error, _} = error -> error
       :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
+    end
+  end
+
+  defp decode_log_records(blob, start_ts, end_ts, opts) do
+    service = opts[:service]
+    matchers = Keyword.get(opts, :matchers, [])
+    line_filters = Keyword.get(opts, :line_filters, [])
+    :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+
+    case opts[:max_records] do
+      nil ->
+        NIF.decode_log_segment_parquet(blob, start_ts, end_ts, service, matchers, line_filters)
+
+      max when is_integer(max) and max >= 0 ->
+        NIF.decode_log_segment_parquet_bounded(blob, start_ts, end_ts, service, matchers, line_filters, max)
+
+      _ ->
+        {:error, :invalid_query_limit}
+    end
+  end
+
+  @doc """
+  Decode logs with an explicit expanded-column budget and report charged bytes.
+
+  `:max_decoded_bytes` is required; `:max_records` is optional. Charges include
+  every decoded Arrow buffer, including rows later rejected by filters. The
+  entire decode fails with `:query_decoded_limit`, never a partial result, when
+  buffers or a selected row group's uncompressed metadata exceed the allowance.
+  Callers scanning multiple objects must subtract the returned charge.
+  """
+  def decode_log_segment_bounded(blob, start_ts, end_ts, opts) do
+    service = opts[:service]
+    matchers = Keyword.get(opts, :matchers, [])
+    line_filters = Keyword.get(opts, :line_filters, [])
+    :ok = validate_decode_args(blob, start_ts, end_ts, service, matchers, line_filters)
+
+    case {opts[:max_records], opts[:max_decoded_bytes]} do
+      {records, bytes}
+      when (is_nil(records) or (is_integer(records) and records >= 0)) and is_integer(bytes) and bytes >= 0 ->
+        case NIF.decode_log_segment_parquet_limited(
+               blob,
+               start_ts,
+               end_ts,
+               service,
+               matchers,
+               line_filters,
+               records,
+               bytes
+             ) do
+          :fallback -> {:error, {:decode_failed, :parquet_decoder_rejected_input}}
+          result -> result
+        end
+
+      _ ->
+        {:error, :invalid_query_limit}
     end
   end
 

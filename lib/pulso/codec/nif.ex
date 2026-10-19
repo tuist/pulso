@@ -36,6 +36,20 @@ defmodule Pulso.Codec.NIF do
   def decode_log_segment_parquet(_blob, _start_ts, _end_ts, _service, _matchers, _line_filters),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def decode_log_segment_parquet_bounded(_blob, _start_ts, _end_ts, _service, _matchers, _line_filters, _max_records),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_log_segment_parquet_limited(
+        _blob,
+        _start_ts,
+        _end_ts,
+        _service,
+        _matchers,
+        _line_filters,
+        _max_records,
+        _max_decoded_bytes
+      ), do: :erlang.nif_error(:nif_not_loaded)
+
   def encode_metric_segment_parquet(_samples), do: :erlang.nif_error(:nif_not_loaded)
 
   def decode_metric_segment_parquet(_blob, _start_ts, _end_ts, _matchers), do: :erlang.nif_error(:nif_not_loaded)

@@ -48,24 +48,102 @@ defmodule Pulso.Storage.S3.LogSummaryTest do
     end
   end
 
+  test "complete error-label sets persist independently and unknown summaries never prune" do
+    records = [
+      %Log{resource: %{"error_source" => "sentry", "error_project" => "42"}},
+      %Log{resource: %{}}
+    ]
+
+    summary = segment(records)
+    assert summary.log_labels == %{"error_source" => ["", "sentry"], "error_project" => ["", "42"]}
+    manifest = Manifest.merge(Manifest.new(), [summary])
+    assert {:ok, ^manifest} = manifest |> Manifest.encode() |> IO.iodata_to_binary() |> Manifest.decode()
+    refute Segment.matches_log_service?(summary, matchers: [{"error_project", :eq, "43"}])
+    assert Segment.matches_log_service?(summary, matchers: [{"error_source", :eq, ""}])
+
+    summary = segment(for i <- 1..33, do: %Log{resource: %{"error_source" => "sentry", "error_project" => "#{i}"}})
+    assert summary.log_labels == %{"error_source" => ["sentry"]}
+    assert Segment.matches_log_service?(summary, matchers: [{"error_project", :eq, "unknown"}])
+    refute Segment.matches_log_service?(summary, matchers: [{"error_source", :eq, "other"}])
+
+    for labels <- [
+          nil,
+          %{},
+          %{"error_source" => []},
+          %{"error_source" => [1]},
+          %{"error_project" => [String.duplicate("x", 257)]}
+        ] do
+      assert {:ok, summary} = Segment.from_wire(%{"k" => "x", "mn" => 0, "mx" => 100, "el" => labels})
+      assert summary.log_labels == nil
+      assert Segment.matches_log_service?(summary, matchers: [{"error_source", :eq, "sentry"}])
+    end
+  end
+
+  test "JSON-normalized atom label values cannot be pruned as absent" do
+    records = [%Log{timestamp_ns: 1, resource: %{"error_source" => :sentry, "error_project" => "42"}}]
+    {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+    opts = [matchers: [{"error_source", :eq, "sentry"}, {"error_project", :eq, "42"}]]
+    assert {:ok, [%Log{timestamp_ns: 1}]} = S3.decode_segment(:logs, payload, nil, nil, opts)
+    assert Segment.matches_log_service?(segment(records), opts)
+
+    # Unknown fields do not discard independently complete project sets.
+    assert segment(records).log_labels == %{"error_project" => ["42"]}
+  end
+
+  test "bounded native log decoding counts only matching rows and rejects overflow rather than truncating" do
+    records =
+      for i <- 1..4,
+          do: %Log{timestamp_ns: i, service: "api", resource: %{"error_project" => "#{rem(i, 2)}"}, body: "row #{i}"}
+
+    {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+    opts = [max_records: 2, matchers: [{"error_project", :eq, "1"}], line_filters: [{:contains, "row"}]]
+    assert {:ok, found} = S3.decode_segment(:logs, payload, nil, nil, opts)
+    assert Enum.map(found, & &1.timestamp_ns) == [1, 3]
+
+    assert {:error, :query_sample_limit} =
+             S3.decode_segment(:logs, payload, nil, nil, Keyword.put(opts, :max_records, 1))
+
+    assert {:ok, []} = S3.decode_segment(:logs, payload, 4, nil, Keyword.put(opts, :max_records, 0))
+    assert {:error, :query_sample_limit} = S3.decode_segment(:logs, payload, 3, 3, Keyword.put(opts, :max_records, 0))
+  end
+
   test "randomized pruning never excludes a segment whose native decoder returns matching rows" do
     :rand.seed(:exsss, {123, 456, 789})
 
     for iteration <- 1..50 do
       services = if rem(iteration, 2) == 0, do: ["api", "worker", "other"], else: [nil, "", "api", "worker", "other"]
 
+      resources = [
+        %{},
+        %{"error_source" => "sentry", "error_project" => "42"},
+        %{"error_source" => "sentry", "error_project" => "43"}
+      ]
+
+      resources =
+        cond do
+          rem(iteration, 3) == 0 -> [%{error_source: "sentry", error_project: "44"}]
+          rem(iteration, 5) == 0 -> [%{"error_source" => false, "error_project" => 42}]
+          rem(iteration, 7) == 0 -> [%{"error_source" => :sentry, "error_project" => "44"}]
+          true -> resources
+        end
+
       records =
         for i <- 1..40,
             do: %Log{
               timestamp_ns: i,
               service: Enum.random(services),
-              resource: %{"service" => "fallback", "service_name" => "alias"}
+              resource:
+                Map.merge(
+                  %{"service" => "fallback", "service_name" => "alias"},
+                  Enum.random(resources)
+                )
             }
 
       summary = segment(records)
       {:ok, payload, _, _} = S3.encode_segment(:logs, records)
 
-      for name <- ["service", "service_name"], value <- ["", "api", "worker", "absent", "fallback", "alias"] do
+      for name <- ["service", "service_name", "error_source", "error_project"],
+          value <- ["", "api", "worker", "absent", "fallback", "alias", "sentry", "42", "43", "44"] do
         opts = [matchers: [{name, :eq, value}]]
         {:ok, found} = S3.decode_segment(:logs, payload, nil, nil, opts)
         assert found == [] or Segment.matches_log_service?(summary, opts)

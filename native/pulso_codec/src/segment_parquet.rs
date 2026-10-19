@@ -78,6 +78,20 @@ pub struct Filter<'f> {
     pub service: Option<&'f [u8]>,
     pub matchers: Vec<Matcher>,
     pub line_filters: Vec<LineFilter>,
+    pub max_records: Option<usize>,
+    pub max_decoded_bytes: Option<usize>,
+}
+
+pub enum DecodeError {
+    Fallback,
+    TooManyRecords,
+    TooManyDecodedBytes,
+}
+
+impl From<Fallback> for DecodeError {
+    fn from(_: Fallback) -> Self {
+        Self::Fallback
+    }
 }
 
 struct Row {
@@ -383,7 +397,11 @@ fn writer_properties() -> WriterProperties {
 
 // -- decode --------------------------------------------------------------
 
-pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<Term<'a>>> {
+pub fn decode<'a>(
+    env: Env<'a>,
+    blob: &Binary<'a>,
+    filter: &Filter,
+) -> Result<(Vec<Term<'a>>, usize), DecodeError> {
     // One copy from the Erlang heap into a Rust-owned `Bytes` so the
     // Parquet reader owns something with `'static` lifetime.
     let bytes = Bytes::copy_from_slice(blob.as_slice());
@@ -409,8 +427,30 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
         .collect();
 
     if surviving.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
+
+    // Writer-owned page sizes cannot exceed their row group's uncompressed
+    // size. Reject oversized groups before Arrow allocates/decompresses them.
+    // This is not the expanded-string charge: dictionary repetition can make
+    // Arrow much larger, so actual buffers are independently checked below.
+    if let Some(max) = filter.max_decoded_bytes {
+        for &index in &surviving {
+            let size = usize::try_from(metadata.row_group(index).total_byte_size())
+                .map_err(|_| Fallback)?;
+            if size > max {
+                return Err(DecodeError::TooManyDecodedBytes);
+            }
+        }
+    }
+
+    let builder = if let Some(max) = filter.max_decoded_bytes {
+        // Sentry caps each event at 1 MiB. Do not let dictionary-expanded
+        // strings form the default 1024-row (potentially gigabyte) batch.
+        builder.with_batch_size((max / 1_048_576).clamp(1, 64))
+    } else {
+        builder
+    };
 
     let reader = builder
         .with_row_groups(surviving)
@@ -420,11 +460,24 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
     // Footer row counts are untrusted. Grow only as rows are decoded,
     // rather than allowing a corrupt footer to request a huge allocation.
     let mut out = Vec::new();
+    let mut decoded_bytes = 0usize;
     for batch in reader {
         let batch = batch.map_err(|_| Fallback)?;
+        if let Some(max) = filter.max_decoded_bytes {
+            for column in batch.columns() {
+                decoded_bytes = decoded_bytes
+                    .checked_add(column.get_buffer_memory_size())
+                    .ok_or(DecodeError::TooManyDecodedBytes)?;
+            }
+            // Charge all decoded buffers, not only matching rows. Check before
+            // materialize copies any string column into an Erlang arena.
+            if decoded_bytes > max {
+                return Err(DecodeError::TooManyDecodedBytes);
+            }
+        }
         materialize(env, &batch, filter, &mut out)?;
     }
-    Ok(out)
+    Ok((out, decoded_bytes))
 }
 
 // True when the row group's `timestamp_ns` column stats overlap the
@@ -513,7 +566,7 @@ fn materialize<'a>(
     batch: &RecordBatch,
     filter: &Filter,
     out: &mut Vec<Term<'a>>,
-) -> Res<()> {
+) -> Result<(), DecodeError> {
     let ts_col: &Int64Array = downcast_int64(batch, "timestamp_ns")?;
     let observed_col: &Int64Array = downcast_int64(batch, "observed_timestamp_ns")?;
     let sev_num_col: &Int32Array = downcast_int32(batch, "severity_number")?;
@@ -583,6 +636,12 @@ fn materialize<'a>(
         }
         if has_line_filters && !line_filters_pass(&filter.line_filters, &body, i) {
             continue;
+        }
+
+        // Count only matching rows, and reject before allocating another record.
+        // The caller passes the remaining allowance across all scanned segments.
+        if filter.max_records.is_some_and(|max| out.len() >= max) {
+            return Err(DecodeError::TooManyRecords);
         }
 
         let ts_term = int_term(env, ts_col, i, nil);
