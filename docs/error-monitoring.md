@@ -121,7 +121,10 @@ occurrence copies before deduplication, and an 8 MiB conditional root. A pass
 reads at most 32 new segments, less than 64 MiB of segment bytes and 100,000
 declared rows. Independently, a **32 MiB decoded-column budget** is cumulative
 across all newly decoded segments in that pass, including rows later filtered
-out. Highly compressed payloads cannot bypass it; exhaustion returns
+out. String lengths, including dictionary repetitions, are preflighted before
+Arrow materialization; batch sizing uses actual decoded values rather than the
+Sentry event-size cap, which does not apply to ordinary logs in shared segments.
+Highly compressed payloads cannot bypass it; exhaustion returns
 `query_decoded_limit` and publishes no progress or changes from that pass.
 Indexed titles are at most 2000 UTF-8 bytes, without changing event grouping.
 Fresh source enumeration also obeys query metadata/scan budgets;

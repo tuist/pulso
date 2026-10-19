@@ -490,8 +490,11 @@ occurrences fails explicitly in the native decoder before result limiting.
 Serialization stays inside the supervised task; pages cap JSON text at 2 MiB.
 Independently, native decoding charges expanded Arrow column buffers against a
 32 MiB whole-scan budget, including filtered-out rows and missing-object retries.
-Selected oversized uncompressed row groups fail before expansion; bounded batches
-and actual buffer checks precede Erlang arena materialization. Neither compressed
+Selected oversized uncompressed row groups fail before expansion. A low-level
+ByteArray preflight sums repeated string lengths without concatenating dictionary
+values into Arrow arrays; its actual value lengths also bound batch sizing.
+This applies to ordinary logs in legacy/mixed segments, not just size-capped
+Sentry events. Actual buffer checks still precede Erlang arena materialization. Neither compressed
 object size nor small output pages bound expanded payload memory by themselves.
 Encrypted expiring cursors bind tool/tenant/filters/window plus a full result
 digest and offset. Each continuation freshly rescans and rejects changed results

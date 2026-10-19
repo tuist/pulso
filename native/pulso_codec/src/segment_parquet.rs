@@ -41,8 +41,11 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::column::reader::ColumnReader;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::file::reader::FileReader;
+use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnPath;
 use rustler::types::atom;
@@ -405,7 +408,7 @@ pub fn decode<'a>(
     // One copy from the Erlang heap into a Rust-owned `Bytes` so the
     // Parquet reader owns something with `'static` lifetime.
     let bytes = Bytes::copy_from_slice(blob.as_slice());
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| Fallback)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|_| Fallback)?;
     let metadata = builder.metadata().clone();
 
     let ts_col = metadata
@@ -445,9 +448,14 @@ pub fn decode<'a>(
     }
 
     let builder = if let Some(max) = filter.max_decoded_bytes {
-        // Sentry caps each event at 1 MiB. Do not let dictionary-expanded
-        // strings form the default 1024-row (potentially gigabyte) batch.
-        builder.with_batch_size((max / 1_048_576).clamp(1, 64))
+        // Ordinary logs can share these segments and exceed the Sentry wire
+        // cap after JSON escaping. Count actual repeated string lengths with
+        // the low-level reader before Arrow expands dictionaries into Utf8.
+        if builder.schema().fields() != parquet_schema().fields() {
+            return Err(Fallback.into());
+        }
+        let batch_size = preflight_expansion(bytes, &surviving, max)?;
+        builder.with_batch_size(batch_size)
     } else {
         builder
     };
@@ -478,6 +486,96 @@ pub fn decode<'a>(
         materialize(env, &batch, filter, &mut out)?;
     }
     Ok((out, decoded_bytes))
+}
+
+// ByteArray values borrow dictionary/page bytes instead of concatenating every
+// occurrence into an Arrow value buffer. Read one value at a time so even a
+// large ordinary log cannot turn the preflight itself into an expanded batch.
+// Keep the normal post-decode buffer charge: lengths do not account for every
+// Arrow offset, validity bit or allocation capacity.
+fn preflight_expansion(bytes: Bytes, groups: &[usize], max: usize) -> Result<usize, DecodeError> {
+    // The fixed schema needs 20 scalar bytes, 28 offset bytes and validity
+    // bits per row. Reserve extra space for per-buffer alignment/capacity.
+    const ROW_BYTES: usize = 64;
+    const BATCH_PADDING: usize = 2048;
+
+    let reader = SerializedFileReader::new(bytes).map_err(|_| Fallback)?;
+    let mut expanded = 0usize;
+    let mut largest_row = 0usize;
+    for &index in groups {
+        let group = reader.get_row_group(index).map_err(|_| Fallback)?;
+        let rows = usize::try_from(group.metadata().num_rows()).map_err(|_| Fallback)?;
+        // Bound row/offset bookkeeping as well as string data. Never allocate
+        // from an unchecked footer row count.
+        charge_expansion(
+            &mut expanded,
+            rows.checked_mul(ROW_BYTES).ok_or(Fallback)?,
+            max,
+        )?;
+        let mut row_bound = ROW_BYTES;
+        for column in 0..group.num_columns() {
+            let descriptor = group.metadata().column(column).column_descr();
+            if descriptor.max_rep_level() != 0 || descriptor.max_def_level() > 1 {
+                return Err(Fallback.into());
+            }
+            if let ColumnReader::ByteArrayColumnReader(mut column_reader) =
+                group.get_column_reader(column).map_err(|_| Fallback)?
+            {
+                let mut values = Vec::with_capacity(1);
+                let mut definitions = Vec::with_capacity(1);
+                let mut count = 0usize;
+                let mut longest = 0usize;
+                loop {
+                    values.clear();
+                    definitions.clear();
+                    let (read, _, _) = column_reader
+                        .read_records(1, Some(&mut definitions), None, &mut values)
+                        .map_err(|_| Fallback)?;
+                    if read == 0 {
+                        break;
+                    }
+                    count = count.checked_add(read).ok_or(Fallback)?;
+                    if count > rows {
+                        return Err(Fallback.into());
+                    }
+                    for value in &values {
+                        charge_expansion(&mut expanded, value.len(), max)?;
+                        longest = longest.max(value.len());
+                    }
+                }
+                if count != rows {
+                    return Err(Fallback.into());
+                }
+                row_bound = row_bound.checked_add(longest).ok_or(Fallback)?;
+            }
+        }
+        largest_row = largest_row.max(row_bound);
+    }
+    // Allow for geometrically grown value buffers and fixed per-column
+    // allocation padding. A single row grows from empty rather than doubling.
+    let single_row = largest_row.checked_add(BATCH_PADDING).ok_or(Fallback)?;
+    if single_row > max {
+        return Err(DecodeError::TooManyDecodedBytes);
+    }
+    let per_row = largest_row
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(BATCH_PADDING))
+        .ok_or(Fallback)?;
+    // Power-of-two batches avoid charging unused geometric buffer capacity
+    // for repeated dictionary values (e.g. 20 equal strings reserve 32).
+    let rows = (max / per_row).clamp(1, 64);
+    Ok(1usize << rows.ilog2())
+}
+
+fn charge_expansion(total: &mut usize, bytes: usize, max: usize) -> Result<(), DecodeError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or(DecodeError::TooManyDecodedBytes)?;
+    if *total > max {
+        Err(DecodeError::TooManyDecodedBytes)
+    } else {
+        Ok(())
+    }
 }
 
 // True when the row group's `timestamp_ns` column stats overlap the
@@ -929,6 +1027,61 @@ fn parse_json_sub<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn string_segment(strings: Vec<Option<&str>>, groups: usize) -> Bytes {
+        let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(strings))])
+                .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_properties())).unwrap();
+        for _ in 0..groups {
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn preflight_rejects_repeated_dictionary_payloads_before_arrow_expansion() {
+        let body = "\\u0000".repeat(500_000);
+        let bytes = string_segment(vec![Some(body.as_str()); 32], 1);
+        assert!(bytes.len() < 10_000);
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        assert!(reader.metadata().row_group(0).total_byte_size() < 33_554_432);
+        // This exercises only the low-level preflight, not an Arrow reader:
+        // rejection cannot depend on allocating the 96 MB expanded batch.
+        assert!(matches!(
+            preflight_expansion(bytes, &[0], 33_554_432),
+            Err(DecodeError::TooManyDecodedBytes)
+        ));
+    }
+
+    #[test]
+    fn preflight_sizes_batches_from_actual_values_and_counts_null_rows() {
+        let body = "x".repeat(3_000_000);
+        let bytes = string_segment(vec![None, Some(body.as_str()), None], 1);
+        let batch = preflight_expansion(bytes, &[0], 8_388_608)
+            .unwrap_or_else(|_| panic!("valid preflight"));
+        assert_eq!(batch, 1);
+        let bytes = string_segment(vec![None, Some("small"), None], 1);
+        assert_eq!(
+            preflight_expansion(bytes, &[0], 8_388_608)
+                .unwrap_or_else(|_| panic!("valid preflight")),
+            64
+        );
+    }
+
+    #[test]
+    fn preflight_accumulates_expansion_across_row_groups() {
+        let bytes = string_segment(vec![Some("x"); 32], 2);
+        assert!(preflight_expansion(bytes.clone(), &[0], 4096).is_ok());
+        assert!(matches!(
+            preflight_expansion(bytes, &[0, 1], 4096),
+            Err(DecodeError::TooManyDecodedBytes)
+        ));
+    }
 
     #[test]
     fn long_utf8_statistics_are_conservative_and_timestamp_bounds_stay_exact() {

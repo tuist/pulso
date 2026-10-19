@@ -716,9 +716,12 @@ defmodule Pulso.Storage.S3 do
   Decode logs with an explicit expanded-column budget and report charged bytes.
 
   `:max_decoded_bytes` is required; `:max_records` is optional. Charges include
-  every decoded Arrow buffer, including rows later rejected by filters. The
-  entire decode fails with `:query_decoded_limit`, never a partial result, when
-  buffers or a selected row group's uncompressed metadata exceed the allowance.
+  every decoded Arrow buffer, including rows later rejected by filters. Repeated
+  string lengths and row bookkeeping are preflighted before Arrow expansion;
+  batch sizes are bounded from actual values, not a receiver-specific row cap.
+  The entire decode fails with `:query_decoded_limit`, never a partial result,
+  when preflight, buffers or a selected row group's uncompressed metadata exceed
+  the allowance.
   Callers scanning multiple objects must subtract the returned charge.
   """
   def decode_log_segment_bounded(blob, start_ts, end_ts, opts) do

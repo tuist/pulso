@@ -167,10 +167,12 @@ This is the `tools/call` body inside the normal MCP request; see
   window or filters. This is a bounded scan, not an indexed hyperscale issue store.
 - S3 diagnosis scans also have a separate **32 MiB decoded-column budget** across
   the whole window, including work repeated after a missing-object retry. Small
-  compressed objects can expand far beyond their stored size. All decoded column
-  buffers count, including rows later rejected inside a mixed batch; oversized
-  selected row groups are rejected before expansion. Exhaustion returns
-  `query_decoded_limit`, never partial results. A 2 MiB output page or `limit: 1`
+  compressed objects can expand far beyond their stored size. Expanded string
+  lengths are preflighted before Arrow materialization, including ordinary log
+  rows in legacy or mixed segments that exceed the Sentry event-size cap. All
+  decoded column buffers count, including rows later rejected inside a mixed
+  batch; oversized selected row groups are rejected before expansion. Exhaustion
+  returns `query_decoded_limit`, never partial results. A 2 MiB output page or `limit: 1`
   does not reduce the work needed for exact whole-window counts and grouping.
 
 Issue grouping is versioned (`v1_` plus SHA-256) and project-scoped. It uses the
