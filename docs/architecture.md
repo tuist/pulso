@@ -505,7 +505,11 @@ value sets, reusing independent metric-label summary budgets. Only exact
 mismatches prune; old/malformed/oversized summaries remain unknown. Candidate
 pruning precedes segment/row/byte scan limits. Mixed log/error segments still
 consume full candidate budgets. Service/time pruning and resource-label filtering
-reuse the native log path. Errors share log retention.
+reuse the native log path. Errors share log retention. Both diagnosis and
+projection validate the structured error subtype before grouping/compacting:
+resource labels alone are not an origin discriminator. Malformed claims remain
+raw logs and consume scan budgets, but are excluded from error results. The
+projector marks their source segments processed instead of repeatedly crashing.
 
 `S3.log_snapshot/2` exposes strictly fresh committed log candidate segments,
 retained event-time floor and root ETag under the query scan/metadata/deadline

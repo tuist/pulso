@@ -178,7 +178,7 @@ defmodule Pulso.Errors.Projection do
              true <- budget.rows + (segment.row_count || 100_000) <= 100_000,
              {:ok, _, blob} <- ObjectStore.get_bounded(config, segment.key, nil, 67_108_864 - budget.bytes),
              {:ok, rows, charged_bytes} <- S3.decode_log_segment_bounded(blob, floor, nil, opts),
-             rows = Enum.map(rows, &compact/1),
+             rows = rows |> Enum.filter(&Errors.error_record?/1) |> Enum.map(&compact/1),
              next = %{
                sources: Map.put(budget.sources, segment.key, rows),
                records: budget.records + length(rows),

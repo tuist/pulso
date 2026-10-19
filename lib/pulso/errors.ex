@@ -49,6 +49,33 @@ defmodule Pulso.Errors do
 
   def record(_, _, _, _), do: {:error, :invalid_event}
 
+  @doc "Validate the structured error subtype; resource labels alone are not a discriminator."
+  def error_record?(%Log{
+        body: %{} = event,
+        resource: resource,
+        service: service,
+        timestamp_ns: timestamp,
+        observed_timestamp_ns: received
+      })
+      when is_binary(service) and is_integer(received) and not is_struct(event) do
+    error_timestamp?(timestamp) and error_identity?(resource, event)
+  end
+
+  def error_record?(_), do: false
+
+  defp error_identity?(
+         %{"error_source" => "sentry", "error_project" => project, "error_event_id" => id, "error_issue_id" => issue},
+         %{"event_id" => id}
+       )
+       when is_binary(project) and is_binary(id) and is_binary(issue) do
+    Regex.match?(~r/\A[0-9]{1,32}\z/, project) and
+      Regex.match?(~r/\A[0-9a-f]{32}\z/, id) and Regex.match?(~r/\Av1_[0-9a-f]{64}\z/, issue)
+  end
+
+  defp error_identity?(_, _), do: false
+  defp error_timestamp?(value) when is_integer(value) and value in 0..@max_ts, do: true
+  defp error_timestamp?(_), do: false
+
   @doc "Return byte-bounded JSON, including serialization inside the supervised query task."
   def query(kind, tenant, args) when kind in [:events, :issues] do
     start = args["start_ts_ns"]
@@ -85,6 +112,7 @@ defmodule Pulso.Errors do
          {:ok, records} <- Storage.query(:logs, tenant, opts) do
       events =
         records
+        |> Enum.filter(&error_record?/1)
         |> Enum.sort_by(
           &{&1.timestamp_ns, &1.resource["error_event_id"], event_digest(&1), &1.resource["error_project"],
            &1.observed_timestamp_ns},

@@ -4,6 +4,7 @@ defmodule Pulso.ErrorsTest do
   alias Pulso.Auth.SharedSecret
   alias Pulso.Errors
   alias Pulso.MCP.Tools
+  alias Pulso.Record.Log
   alias Pulso.Storage
 
   @project %{"tenant" => "acme", "service" => "api"}
@@ -27,6 +28,32 @@ defmodule Pulso.ErrorsTest do
   defp query(name, fields \\ %{}) do
     assert {:ok, [%{"text" => text}]} = Tools.call(name, Map.merge(@range, fields))
     Pulso.JSON.decode!(text)
+  end
+
+  test "resource labels alone cannot turn malformed ordinary logs into errors" do
+    valid = record(1, 10)
+    assert Errors.error_record?(valid)
+
+    malformed = [
+      %{valid | body: "ordinary log"},
+      %{valid | body: %{}},
+      %{valid | body: %Log{}},
+      %{valid | body: Map.put(valid.body, "event_id", String.duplicate("f", 32))},
+      %{valid | resource: Map.drop(valid.resource, ["error_event_id", "error_issue_id"])},
+      %{valid | resource: Map.put(valid.resource, "error_event_id", 123)},
+      %{valid | resource: Map.put(valid.resource, "error_issue_id", "bad")},
+      %{valid | resource: Map.put(valid.resource, "error_project", "bad/project")},
+      %{valid | timestamp_ns: nil},
+      %{valid | observed_timestamp_ns: nil},
+      %{valid | service: nil}
+    ]
+
+    for row <- malformed, do: refute(Errors.error_record?(row))
+    refute Errors.error_record?(nil)
+    assert :ok = Storage.append(:logs, "acme", [valid | malformed])
+    assert %{"matched_events" => 1, "results" => [%{"event_id" => id}]} = query("query_errors")
+    assert id == valid.resource["error_event_id"]
+    assert %{"matched_events" => 1, "results" => [%{"count" => 1}]} = query("list_error_issues")
   end
 
   test "issue counts are complete for the filtered window before result limiting and deduplicate retries" do

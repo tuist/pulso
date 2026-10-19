@@ -80,6 +80,11 @@ timestamp, then the SHA-256 digest of canonical JSON `[payload, service, issue_i
 receipt time does not choose the winner. Counts are not summed segment totals,
 and deduplication does not extend beyond the explicit retained-history horizon.
 
+Ordinary logs with Sentry labels but without a valid structured error record are
+excluded from summaries and changes; their segments are still marked processed,
+so they cannot stall reconciliation. They remain available through raw log
+queries and consume scan budgets.
+
 ## Freshness, gaps, and resets
 
 Responses expose the last inspected source manifest's ETag, `indexed_at_ns`,

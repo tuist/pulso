@@ -117,6 +117,59 @@ defmodule Pulso.Errors.ProjectionTest do
     assert is_binary(next)
   end
 
+  test "ordinary Loki and OTLP logs cannot poison error reads or subsequent projection passes", ctx do
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
+    valid = record(1, ctx.now)
+    assert :ok = S3.append(:logs, ctx.tenant, [valid])
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+
+    for labels <- [
+          %{"error_source" => "sentry", "error_project" => "1"},
+          valid.resource
+        ] do
+      loki = %{
+        streams: [%{stream: labels, values: [[to_string(ctx.now), "ordinary log"]]}]
+      }
+
+      otlp = %{
+        resourceLogs: [
+          %{
+            resource: %{
+              attributes: Enum.map(labels, fn {key, value} -> %{key: key, value: %{stringValue: value}} end)
+            },
+            scopeLogs: [%{logRecords: [%{timeUnixNano: to_string(ctx.now), body: %{stringValue: "ordinary log"}}]}]
+          }
+        ]
+      }
+
+      for {path, payload, status} <- [{"/loki/api/v1/push", loki, 204}, {"/v1/logs", otlp, 200}] do
+        conn =
+          :post
+          |> Plug.Test.conn(path, Pulso.JSON.encode!(payload))
+          |> Plug.Conn.put_req_header("content-type", "application/json")
+          |> Plug.Conn.put_req_header("x-scope-orgid", ctx.tenant)
+          |> PulsoWeb.Endpoint.call([])
+
+        assert conn.status == status
+      end
+    end
+
+    assert :ok = S3.append(:logs, ctx.tenant, [record(2, ctx.now)])
+    for _ <- 1..2, do: assert({:ok, %{"complete_at_index" => true}} = step(ctx))
+    assert {:ok, %{"results" => [%{"retained_count" => 2}]}} = Projection.read(:issues, ctx.tenant, "1")
+
+    assert {:ok, %{"changes" => [%{"kind" => "issue_observation", "issue" => %{"retained_count" => 2}}]}} =
+             changes(ctx, cursor)
+
+    args = %{"project" => "1", "start_ts_ns" => 0, "end_ts_ns" => ctx.now}
+
+    for kind <- [:events, :issues] do
+      assert {:ok, json} = Errors.query(kind, ctx.tenant, args)
+      assert %{"matched_events" => 2} = Pulso.JSON.decode!(json)
+    end
+  end
+
   test "bootstrap is a baseline, late uploads are discovered, SDK copies deduplicate deterministically", ctx do
     old = record(1, ctx.now - 1_000_000_000)
     assert :ok = S3.append(:logs, ctx.tenant, [old])

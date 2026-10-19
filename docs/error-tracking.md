@@ -198,6 +198,14 @@ their full row/byte budget. Existing segments are not retroactively summarized.
 Error queries require a fresh committed manifest: refresh failures or missing
 manifests fail explicitly rather than serving stale data or discovering objects
 by listing the bucket.
+
+Only well-formed structured error rows participate in error queries and the
+monitoring index. Ordinary Loki/OTLP logs claiming Sentry resource labels but
+missing valid event/issue IDs, a matching event object, or the required typed
+fields are ignored by these error surfaces. They remain available through raw
+log queries and still consume candidate, row and byte scan budgets. Resource
+labels alone are not proof that a row came through the Sentry receiver.
+
 No second event publication authority is introduced. Any node can ingest/query
 after a restart without recovering local issue state. Run multiple instances
 against the same bucket and project configuration: each acknowledges only its
