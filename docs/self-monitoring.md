@@ -66,7 +66,7 @@ with count and sum only, without quantiles.
 
 Operation layers:
 
-- `ingest`: `otlp`, `loki`, `remote_write`. Timing starts before body parsing and
+- `ingest`: `otlp`, `loki`, `remote_write`, `sentry`. Timing starts before body parsing and
   includes decoding, append, and response preparation. Partial-success responses
   remain successful requests, with decoder drops counted separately.
 - `query`: `http` for compatibility queries/discovery; `mcp` for direct tool
@@ -117,11 +117,12 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 
 Detailed operation labels:
 
-- `kind=ingest`: `otlp`, `loki` (both formats), `remote_write`. HTTP 4xx are
+- `kind=ingest`: `otlp`, `loki` (both formats), `remote_write`, `sentry`. HTTP 4xx are
   `rejected`; 5xx are `error` or `exception`; successful/partial responses are
   `ok`. Parser failures count before controllers run. Each request counts once.
 - `kind=query`: `http_promql`, `http_logql`, `http_labels`, and tool names
-  `query_logs`, `query_metrics`, `query_logql`, `query_promql`. Tool errors count
+  `query_logs`, `query_metrics`, `query_logql`, `query_promql`, `query_errors`,
+  `list_error_issues`, `list_error_changes`, `list_indexed_error_issues`. Tool errors count
   as `error` even when the MCP transport returns HTTP 200. Direct `Tools.call`
   calls collapse unknown names to `unknown_tool`; the MCP dispatcher rejects
   unknown names before dispatch, so they are not tool attempts over MCP. Internal

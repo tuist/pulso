@@ -56,6 +56,7 @@ mod atoms {
         fallback,
         too_big,
         query_sample_limit,
+        query_decoded_limit,
         storage,
         lines,
         eq,
@@ -426,6 +427,71 @@ fn decode_log_segment_parquet<'a>(
     matchers: Term<'a>,
     line_filters: Term<'a>,
 ) -> Term<'a> {
+    decode_logs(
+        env,
+        blob,
+        (start_ts, end_ts, service, matchers, line_filters),
+        None,
+        None,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+#[allow(clippy::too_many_arguments)]
+fn decode_log_segment_parquet_bounded<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    service: Term<'a>,
+    matchers: Term<'a>,
+    line_filters: Term<'a>,
+    max_records: usize,
+) -> Term<'a> {
+    decode_logs(
+        env,
+        blob,
+        (start_ts, end_ts, service, matchers, line_filters),
+        Some(max_records),
+        None,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+#[allow(clippy::too_many_arguments)]
+fn decode_log_segment_parquet_limited<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    service: Term<'a>,
+    matchers: Term<'a>,
+    line_filters: Term<'a>,
+    max_records: Option<usize>,
+    max_decoded_bytes: usize,
+) -> Term<'a> {
+    decode_logs(
+        env,
+        blob,
+        (start_ts, end_ts, service, matchers, line_filters),
+        max_records,
+        Some(max_decoded_bytes),
+    )
+}
+
+fn decode_logs<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    (start_ts, end_ts, service, matchers, line_filters): (
+        Term<'a>,
+        Term<'a>,
+        Term<'a>,
+        Term<'a>,
+        Term<'a>,
+    ),
+    max_records: Option<usize>,
+    max_decoded_bytes: Option<usize>,
+) -> Term<'a> {
     let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
         return atoms::fallback().encode(env);
     };
@@ -447,9 +513,20 @@ fn decode_log_segment_parquet<'a>(
         service: service_bin.as_ref().map(|b| b.as_slice()),
         matchers: matchers_vec,
         line_filters: line_filters_vec,
+        max_records,
+        max_decoded_bytes,
     };
     match segment_parquet::decode(env, &blob, &filter) {
-        Ok(records) => (atoms::ok(), records).encode(env),
+        Ok((records, bytes)) if max_decoded_bytes.is_some() => {
+            (atoms::ok(), records, bytes).encode(env)
+        }
+        Ok((records, _)) => (atoms::ok(), records).encode(env),
+        Err(segment_parquet::DecodeError::TooManyRecords) => {
+            (atoms::error(), atoms::query_sample_limit()).encode(env)
+        }
+        Err(segment_parquet::DecodeError::TooManyDecodedBytes) => {
+            (atoms::error(), atoms::query_decoded_limit()).encode(env)
+        }
         Err(_) => atoms::fallback().encode(env),
     }
 }

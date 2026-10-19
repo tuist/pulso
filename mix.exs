@@ -43,7 +43,7 @@ defmodule Pulso.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"},
+      {:bandit, "~> 1.13"},
       {:req, "~> 0.5"},
       {:nimble_parsec, "~> 1.4"},
       {:rustler, "~> 0.38.0", optional: true},

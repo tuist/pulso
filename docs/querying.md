@@ -26,6 +26,10 @@ All tools are read-only and take the tenant as an argument:
 | `query_logql` | Evaluate a LogQL expression and return the same envelope as `/loki/api/v1/query_range`. |
 | `query_metrics` | Return raw metric samples for a time range, filtered by label matchers. |
 | `query_promql` | Evaluate a Prometheus Query Language expression, instant or range. |
+| `query_errors` | Read Sentry error events and scrubbed payloads in a required time window. |
+| `list_error_issues` | Group Sentry errors with exact window-scoped counts and first/last seen; see [error tracking](error-tracking.md). |
+| `list_error_changes` | Poll the separately enabled experimental index for retained-history issue changes and explicit resets; save the cursor durably. |
+| `list_indexed_error_issues` | Read compact deduplicated retained-history summaries and example references from that index; see [error monitoring](error-monitoring.md). |
 
 `tools/list` returns each tool's full input schema. Invalid arguments, such as a
 reversed time range, return an explicit error instead of an empty result.

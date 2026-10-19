@@ -6,6 +6,11 @@ Snappy protobuf (`/loki/api/v1/push`), and Prometheus remote write v1
 (`/api/v1/write`). They are conservative safety defaults, not measured capacity
 or a guarantee that every request within the limits can be served concurrently.
 
+Sentry JSON errors reuse the structural budgets (`max_depth`, `max_nodes`,
+`max_attributes`, `max_key_bytes`), with a separate 1 MiB event byte cap, at most
+one event and 100 envelope items. See [error tracking](error-tracking.md) for the
+receiver's complete contract.
+
 ## Defaults and configuration
 
 Configure `Pulso.IngestLimits` through Elixir configuration or the optional

@@ -28,6 +28,10 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_S3_ENDPOINT` | Amazon S3 | URL of an S3-compatible endpoint, for example `https://<account>.r2.cloudflarestorage.com`. |
 | `PULSO_S3_ALLOW_HTTP` | `false` | Allow a plain-HTTP storage endpoint. Use only for storage on a private network. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
+| `PULSO_SENTRY_PROJECTS_JSON` | `{}` | Ingest-only Sentry project map: numeric ID to `tenant`, `service`, `public_key_hashes` (1–8 lowercase SHA-256 digests). At most 256 projects. Empty disables ingestion. See [error tracking](error-tracking.md). |
+| `PULSO_ERROR_PROJECTION_ENABLED` | `false` | Enable the experimental S3-derived issue index and replayable change feed. Independent of ingestion and diagnosis; see [error monitoring](error-monitoring.md). |
+| `PULSO_ERROR_HISTORY_DAYS` | `1` | Derived error history in whole days, integer `1..365`. Newness and counts are limited to this horizon and raw log retention. Changing it rebaselines the index. |
+| `PULSO_ERROR_PROJECTION_INTERVAL_MS` | `5000` | Derived-index worker cadence, integer `1000..60000`. Each pass visits one configured project and at most 32 new segments; catchup and freshness depend on project count and storage latency. |
 | `PULSO_ALERTING_PRINCIPALS_JSON` | `[]` | Dedicated alerting principal array with `tenant`, `id`, `type`, `token_hash` and `capabilities`; at most 256 entries. See [alerting credentials](alerting.md#configure-credentials-and-evaluation). |
 | `PULSO_ALERTING_EVALUATION_ENABLED` | `false` | Enable experimental native threshold evaluation. Grafana execution remains unsupported; native Slack delivery has a separate opt-in. |
 | `PULSO_ALERTING_NOTIFICATIONS_ENABLED` | `false` | Enable native Slack delivery from committed bounded outboxes. See [delivery semantics](alerting.md#native-slack-delivery). |
@@ -53,7 +57,9 @@ Boolean variables accept `true`, `1`, or `yes`; anything else is false.
 
 ## Tenants and tokens
 
-Every ingest and query request belongs to a tenant. HTTP requests name it in the
+Every ingest and query request belongs to a tenant. Sentry SDK ingestion maps
+project credentials to tenant/service instead of trusting tenant headers; its
+public keys never grant read access. Other HTTP requests name the tenant in the
 `X-Scope-OrgID` header, the convention Loki, Mimir, and Cortex clients already
 support; requests without the header use the tenant `default`. Model Context
 Protocol tools take the tenant as an argument instead. Tenant names use letters,

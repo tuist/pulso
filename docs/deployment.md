@@ -77,6 +77,10 @@ The ones you are most likely to change:
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
+| `sentry.projects` | Experimental Sentry ingest-only project credentials and tenant/service bindings. Empty by default; add exact SDK ingress paths explicitly. See [error tracking](error-tracking.md). |
+| `sentry.projectionEnabled` | Separately enable the experimental S3 issue index, default `false`; no effect on ingest acknowledgment. See [error monitoring](error-monitoring.md). |
+| `sentry.historyDays` | Derived error-history horizon (`1..365` days), default `1`; independent of raw log retention. |
+| `sentry.projectionIntervalMs` | One-project worker cadence (`1000..60000` ms), default `5000`; measure freshness and read cost before reducing it. |
 | `alerting.principals` | Dedicated alert principal identities, hashed credentials and capabilities; see [alerting](alerting.md). |
 | `alerting.evaluationEnabled` | Opt-in experimental native evaluation, default `false`. Grafana execution remains unsupported; native delivery has a separate opt-in. |
 | `alerting.notificationsEnabled` | Opt-in native Slack delivery, default `false`; not Grafana routing/template parity. |

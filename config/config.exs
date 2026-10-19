@@ -14,6 +14,8 @@ config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+config :phoenix, :filter_parameters, ["password", "sentry_key", "dsn"]
+
 # Phoenix's JSON library: `Pulso.JSON` encodes and decodes in Rust and
 # defers to Elixir's built-in `JSON` for anything it cannot match exactly,
 # so behavior is `JSON`'s (no Jason dependency; see AGENTS.md conventions).
@@ -22,9 +24,9 @@ config :phoenix, :json_library, Pulso.JSON
 # Explicit auth default. Environment-specific configs override; prod requires
 # a runtime override to `Pulso.Auth.SharedSecret` via runtime.exs — an unset
 # release still raises rather than falling back to open access.
+# Configure the endpoint
 config :pulso, Pulso.Auth, module: Open
 
-# Configure the endpoint
 config :pulso, PulsoWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,

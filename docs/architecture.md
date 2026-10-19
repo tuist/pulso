@@ -381,7 +381,7 @@ defines replay/retention gaps and the external proactive-agent flow. These resou
 methods and live subscriptions are not implemented yet. Agent-triggered
 infrastructure remediation remains in a separate server with runtime policy/HITL.
 
-All four query tools advertise read-only, non-destructive, idempotent, closed-world
+All diagnosis tools advertise read-only, non-destructive, idempotent, closed-world
 annotations as defined by the [Model Context Protocol tool schema](https://modelcontextprotocol.io/specification/2026-07-28/schema#tool).
 Calls validate the schema vocabulary used by the registry before evaluation:
 required fields, types, numeric bounds, string lengths, and enum values, including
@@ -470,6 +470,90 @@ If you feel the urge to add one of these, revisit "Core bets" first.
 - **Rust toolchain** for the NIF (added when the NIF lands).
 
 ## Signal-specific notes
+
+### Error tracking (structured logs)
+
+Sentry SDK error envelopes (`POST /api/:project/envelope/`) and legacy plain
+JSON store requests (`POST /api/:project/store/`) publish structured `Log`
+records through the existing Parquet/S3 manifest path. This is a semantic log
+subtype, not a new signal/codec. Operator-provisioned hashed ingest keys bind
+projects to tenants/services; they never authorize reads. Both segment PUT and
+manifest CAS precede HTTP success. Retries can create duplicate occurrences;
+stock SDK transports can drop unacknowledged failures, so this is not an
+end-to-end at-least-once capture guarantee.
+
+`query_errors` and `list_error_issues` use tenant read authorization and the
+existing bounded query runner. Immutable versioned fingerprints are carried by
+events; groups/counts/first-last seen are computed from the complete filtered
+window, deduplicated by project/event ID. More than 5,000 matching stored
+occurrences fails explicitly in the native decoder before result limiting.
+Serialization stays inside the supervised task; pages cap JSON text at 2 MiB.
+Independently, native decoding charges expanded Arrow column buffers against a
+32 MiB whole-scan budget, including filtered-out rows and missing-object retries.
+Selected oversized uncompressed row groups fail before expansion. A low-level
+ByteArray preflight sums repeated string lengths without concatenating dictionary
+values into Arrow arrays; its actual value lengths also bound batch sizing.
+This applies to ordinary logs in legacy/mixed segments, not just size-capped
+Sentry events. Actual buffer checks still precede Erlang arena materialization. Neither compressed
+object size nor small output pages bound expanded payload memory by themselves.
+Encrypted expiring cursors bind tool/tenant/filters/window plus a full result
+digest and offset. Each continuation freshly rescans and rejects changed results
+instead of silently skipping late arrivals or retention removals. This is
+bounded diagnosis, not a durable monitoring checkpoint or first-ever novelty.
+No mutable issue heads, counter cache, local queue, SQL database or new event
+publication authority is needed for these diagnosis tools.
+
+New log manifest entries carry optional `el` complete error-source/project
+value sets, reusing independent metric-label summary budgets. Only exact
+mismatches prune; old/malformed/oversized summaries remain unknown. Candidate
+pruning precedes segment/row/byte scan limits. Mixed log/error segments still
+consume full candidate budgets. Service/time pruning and resource-label filtering
+reuse the native log path. Errors share log retention. Both diagnosis and
+projection validate the structured error subtype before grouping/compacting:
+resource labels alone are not an origin discriminator. Malformed claims remain
+raw logs and consume scan budgets, but are excluded from error results. The
+projector marks their source segments processed instead of repeatedly crashing.
+
+`S3.log_snapshot/2` exposes strictly fresh committed log candidate segments,
+retained event-time floor and root ETag under the query scan/metadata/deadline
+budgets. It never discovers by listing or falls back to stale roots. Consumers
+use bounded `S3.decode_segment/5` after fetching those objects. A manifest
+snapshot is not a source journal: inputs can arrive and expire between snapshots,
+so projections must explicitly report coverage gaps rather than infer continuous
+history from an ETag. See [error tracking](error-tracking.md) for the SDK subset,
+privacy baseline, credential rotation, counts and unsupported functionality.
+
+The separately enabled error monitoring projection is derived, never an ingest
+release gate. Each `(tenant, project)` has one conditional S3 root publishing
+processed segment identities, pending source coverage, compact occurrences,
+deduplicated issue summaries and immutable change-page references together.
+An ambiguous write reads back its exact publication; competing workers cannot
+emit changes outside the winning root. Rendezvous ownership reduces work, while
+the root CAS fences publication across independent nodes and partitions. No
+local index, queue, affinity, SQL database or leader is required for recovery.
+
+Segment identity prevents reprocessing, while `(tenant, project, event_id)`
+deduplicates retries across segments. Conflicting occurrences choose the greatest
+occurrence timestamp then canonical payload/service/issue digest. History is
+explicitly bounded; bootstrap/rebaseline suppresses historical novelty and only
+complete reconciliation exposes exact counts. Newness means
+`new_in_retained_history`, never first ever. Occurrence timestamps and projection
+discovery sequence/time remain separate. A higher raw floor beyond previous
+coverage, or known unprocessed input disappearing, forces a conservative reset;
+current manifests cannot prove that unseen input did not arrive and expire.
+Raw retention never waits for projection progress.
+
+The initial implementation bounds each project to 4096 source segments, 20,000
+stored occurrence copies and an 8 MiB root, processing at most 32 new segments per
+pass under query admission/deadline/scan budgets and an independently cumulative
+32 MiB expanded-column allowance. The root references at most 64
+immutable replay pages of up to 64 changes each and advances its replay floor
+before deleting old pages. Authenticated tenant/project-bound cursors resume on
+any node; missing retained pages or expired replay coverage require explicit
+reset. Indexed source ETag/time, history floor, baseline/backlog and unknown lag
+are public, not an implicit continuity promise. See
+[error monitoring](error-monitoring.md) for operation, capacities and derived
+object cleanup limitations. Lifecycle and native error alerts remain out of scope.
 
 ### Logs
 

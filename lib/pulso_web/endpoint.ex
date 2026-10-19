@@ -40,6 +40,8 @@ defmodule PulsoWeb.Endpoint do
   # non-JSON body are refused before the body is read.
   plug PulsoWeb.MCPRequestGate
 
+  plug PulsoWeb.SentryBody
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],

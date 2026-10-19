@@ -14,6 +14,7 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.Alerting.Tools
   alias Pulso.Auth
   alias Pulso.Codec.NIF
+  alias Pulso.Errors.Projection
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Envelope
   alias Pulso.LogQL.Evaluator
@@ -37,7 +38,64 @@ defmodule Pulso.MCP.Tools do
     "openWorldHint" => false
   }
 
+  @error_schema %{
+    "type" => "object",
+    "properties" => %{
+      "tenant" => %{"type" => "string", "minLength" => 1},
+      "project" => %{"type" => "string"},
+      "service" => %{"type" => "string"},
+      "environment" => %{"type" => "string"},
+      "release" => %{"type" => "string"},
+      "issue_id" => %{"type" => "string"},
+      "event_id" => %{"type" => "string"},
+      "start_ts_ns" => Map.put(@timestamp_schema, "minimum", 0),
+      "end_ts_ns" => Map.put(@timestamp_schema, "minimum", 0),
+      "cursor" => %{"type" => "string", "minLength" => 1, "description" => "Opaque continuation, at most 4096 bytes."},
+      "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 5000}
+    },
+    "required" => ["tenant", "start_ts_ns", "end_ts_ns"]
+  }
+
+  @error_index_schema %{
+    "type" => "object",
+    "properties" => %{
+      "tenant" => %{"type" => "string", "minLength" => 1},
+      "project" => %{"type" => "string", "minLength" => 1},
+      "cursor" => %{"type" => "string", "minLength" => 1},
+      "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 100}
+    },
+    "required" => ["tenant", "project"]
+  }
+
   @tools [
+    %{
+      "name" => "query_errors",
+      "annotations" => @read_only_annotations,
+      "description" =>
+        "Read Sentry error events and scrubbed payloads, newest first. Requires a time window; scans above 5,000 stored occurrences or 32 MiB of decoded S3 columns fail, independently of the page limit. Retries deduplicate by project/event ID. Pages contain at most 2 MiB of JSON; use next_cursor with the same filters/window. Changed results or expired cursors require restarting without the cursor. This is diagnosis, not a monitoring change feed.",
+      "inputSchema" => @error_schema
+    },
+    %{
+      "name" => "list_error_issues",
+      "annotations" => @read_only_annotations,
+      "description" =>
+        "Group Sentry errors in a required time window; returns exact retained-window counts and first/last seen, newest issue first. Same filters, pagination and scan limits as query_errors. Not lifetime counts, new-issue detection or resolved/ignored state.",
+      "inputSchema" => @error_schema
+    },
+    %{
+      "name" => "list_error_changes",
+      "annotations" => @read_only_annotations,
+      "description" =>
+        "Poll the experimental opt-in S3 error index: baseline_ready, new_in_retained_history, issue_observation and explicit reset changes. Save next_cursor durably and deduplicate change_id. Newness is scoped to the reported project/history floor, never first-ever. Inspect indexed_at_ns and backlog; current lag is unknown. Cursors below replay_floor require reset.",
+      "inputSchema" => @error_index_schema
+    },
+    %{
+      "name" => "list_indexed_error_issues",
+      "annotations" => @read_only_annotations,
+      "description" =>
+        "Read compact issue summaries from the experimental opt-in S3 error index, with exact deduplicated retained-history counts and latest example references. No payloads or lifetime counts. Inspect indexed_at_ns/history_floor_ns; incomplete reconciliation errors rather than returning partial counts. Fetch payloads separately with query_errors. Changed snapshots require cursor reset.",
+      "inputSchema" => @error_index_schema
+    },
     %{
       "name" => "query_promql",
       "annotations" => @read_only_annotations,
@@ -219,6 +277,23 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp validate_range_fields(_name, _args), do: :ok
+
+  defp execute(name, %{"tenant" => tenant} = args) when name in ["query_errors", "list_error_issues"] do
+    kind = if name == "query_errors", do: :events, else: :issues
+
+    with {:ok, json} <- Pulso.Errors.query(kind, tenant, args) do
+      {:ok, [%{"type" => "text", "text" => json}]}
+    end
+  end
+
+  defp execute(name, %{"tenant" => tenant, "project" => project} = args)
+       when name in ["list_error_changes", "list_indexed_error_issues"] do
+    kind = if name == "list_error_changes", do: :changes, else: :issues
+
+    with {:ok, result} <- Projection.read(kind, tenant, project, args) do
+      {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
+    end
+  end
 
   defp execute("query_logs", %{"tenant" => tenant} = args) when is_binary(tenant) do
     opts =
