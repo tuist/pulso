@@ -7,6 +7,9 @@ integration_enabled? =
     _ -> true
   end
 
-exclude = if integration_enabled?, do: [], else: [:integration]
+# Optional real SDK/Collector harnesses are never part of the S3 integration job.
+# Opt in explicitly with --include collector_bridge, elixir_sdk, or rust_sdk.
+external = [:collector_bridge, :elixir_sdk, :rust_sdk]
+exclude = if integration_enabled?, do: external, else: [:integration | external]
 
 ExUnit.start(exclude: exclude)

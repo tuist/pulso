@@ -5,6 +5,7 @@ defmodule Pulso.Test.Case do
   import ExUnit.Callbacks,
     except: [start_supervised: 1, start_supervised: 2, start_supervised!: 1, start_supervised!: 2]
 
+  alias Pulso.Loki.Tail
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Storage.Memory
@@ -36,6 +37,7 @@ defmodule Pulso.Test.Case do
     start_supervised!(Pulso.SelfMetrics)
     start_supervised!({Task.Supervisor, name: TaskSupervisor, max_children: 4})
     start_supervised!({Registry, keys: :unique, name: QuerySlots})
+    start_supervised!(Tail)
     {:ok, runtime: runtime}
   end
 
