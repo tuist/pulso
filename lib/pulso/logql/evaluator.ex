@@ -17,7 +17,10 @@ defmodule Pulso.LogQL.Evaluator do
   alias Pulso.LogQL.MetricEval
   alias Pulso.LogQL.Pipeline
   alias Pulso.LogQL.QueryValidation
+  alias Pulso.LogQL.StreamMatchers
+  alias Pulso.PromQL.Evaluator
   alias Pulso.QueryRunner
+  alias Pulso.Record.Log
   alias Pulso.Storage
 
   @type opts :: %{
@@ -51,6 +54,18 @@ defmodule Pulso.LogQL.Evaluator do
     end)
   end
 
+  # With a limit, keep only the `limit` newest (backward) or oldest (forward)
+  # entries across all streams while folding, as Loki does, instead of
+  # materializing every match.
+  defp do_evaluate_log(query, tenant, %{limit: limit} = opts) when is_integer(limit) and limit > 0 do
+    with {:ok, entries} <- do_select_entries(query, tenant, opts, fn entry, _record -> entry end) do
+      entries
+      |> group_streams()
+      |> apply_direction(Map.get(opts, :direction, :backward))
+      |> ok()
+    end
+  end
+
   defp do_evaluate_log(query, tenant, opts) do
     with {:ok, entries} <- evaluate_log_raw(query, tenant, opts) do
       entries
@@ -58,6 +73,46 @@ defmodule Pulso.LogQL.Evaluator do
       |> apply_direction(Map.get(opts, :direction, :backward))
       |> apply_limit(Map.get(opts, :limit))
       |> ok()
+    end
+  end
+
+  @doc """
+  The `opts.limit` newest (`direction: :backward`, the default) or oldest
+  selected entries across all streams, newest or oldest first, each as
+  `project.(entry, record)`. Reads like a limited log query, keeping only the
+  retained entries while folding. Optional `finish` runs only on the final
+  selected values, inside the same admitted query task.
+  """
+  @spec select_entries(AST.LogQuery.t(), Storage.tenant(), opts(), (Entry.t(), Log.t() -> term())) ::
+          {:ok, [term()]} | {:error, term()}
+  def select_entries(query, tenant, opts, project, finish \\ &Function.identity/1)
+
+  def select_entries(%AST.LogQuery{} = query, tenant, %{limit: limit} = opts, project, finish)
+      when is_binary(tenant) and is_integer(limit) and limit > 0 do
+    QueryRunner.run(
+      tenant,
+      :logql,
+      fn deadline ->
+        Process.put(:query_deadline_ms, deadline)
+
+        with {:ok, selected} <- do_select_entries(query, tenant, opts, project) do
+          {:ok, Enum.map(selected, finish)}
+        end
+      end,
+      opts
+    )
+  end
+
+  defp do_select_entries(query, tenant, %{limit: limit} = opts, project) do
+    direction = Map.get(opts, :direction, :backward)
+    stop = if direction == :backward, do: &newest_complete?(&1, &2, limit)
+    retain = &retain(&1, &2, &3, limit, direction, project)
+
+    with {:ok, {retained, _size}} <- fold_log(query, tenant, opts, {:gb_sets.empty(), 0}, retain, stop) do
+      ordered =
+        if direction == :backward, do: Enum.reverse(:gb_sets.to_list(retained)), else: :gb_sets.to_list(retained)
+
+      {:ok, Enum.map(ordered, &elem(&1, tuple_size(&1) - 1))}
     end
   end
 
@@ -72,6 +127,11 @@ defmodule Pulso.LogQL.Evaluator do
     with :ok <- QueryValidation.validate(query),
          {storage_opts, remaining_stages} <- push_down(query, opts),
          {:ok, records} <- query_storage(tenant, storage_opts) do
+      if Process.get(:promql_budget) do
+        Evaluator.charge(:samples, length(records))
+        Evaluator.charge(:work, length(records))
+      end
+
       compiled = Pipeline.compile(remaining_stages)
 
       entries =
@@ -84,11 +144,58 @@ defmodule Pulso.LogQL.Evaluator do
     end
   end
 
-  defp query_storage(tenant, opts) do
-    case Storage.query(:logs, tenant, opts) do
-      {:error, reason} when reason in [:query_scan_limit, :query_sample_limit, :query_timeout] -> {:error, reason}
-      {:error, reason} -> {:error, {:storage_error, reason}}
-      result -> result
+  @doc """
+  Fold the entries a log query selects, one storage batch at a time, as
+  `fun.(entry, record, acc)`. Validation, pushdown and the pipeline are those
+  of `evaluate_log_raw/3`, but no complete result is materialized, so memory
+  follows one batch plus the accumulator. Entries arrive in no defined order.
+  """
+  @spec fold_log(AST.LogQuery.t(), Storage.tenant(), opts(), acc, (Entry.t(), Log.t(), acc -> acc)) ::
+          {:ok, acc} | {:error, term()}
+        when acc: term()
+  def fold_log(%AST.LogQuery{} = query, tenant, opts, acc, fun, stop \\ nil) when is_binary(tenant) do
+    with :ok <- QueryValidation.validate(query),
+         {storage_opts, remaining_stages} <- push_down(query, opts) do
+      compiled = Pipeline.compile(remaining_stages)
+
+      storage_opts = if stop, do: Keyword.put(storage_opts, :log_fold_stop, stop), else: storage_opts
+      storage_result(Storage.fold_logs(tenant, storage_opts, acc, &fold_records(&1, &2, compiled, fun)))
+    end
+  end
+
+  defp fold_records(records, acc, compiled, fun) do
+    # Log lines share the cross-language sample quota, as when materialized.
+    if Process.get(:promql_budget), do: Evaluator.charge(:work, length(records))
+
+    Enum.reduce(records, acc, &fold_record(&1, &2, compiled, fun))
+  end
+
+  defp fold_record(record, acc, compiled, fun) do
+    case Pipeline.apply(compiled, Entry.from_record(record)) do
+      {:keep, entry} -> fun.(entry, record, acc)
+      :drop -> acc
+    end
+  end
+
+  defp query_storage(tenant, opts), do: storage_result(Storage.query(:logs, tenant, opts))
+
+  defp storage_result(result) do
+    case result do
+      {:error, reason}
+      when reason in [
+             :query_scan_limit,
+             :query_sample_limit,
+             :query_timeout,
+             :manifest_freshness_unavailable,
+             :signal_authority_missing
+           ] ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, {:storage_error, reason}}
+
+      result ->
+        result
     end
   end
 
@@ -127,9 +234,7 @@ defmodule Pulso.LogQL.Evaluator do
   @doc false
   @spec push_down(AST.LogQuery.t(), opts()) :: {keyword(), [struct()]}
   def push_down(%AST.LogQuery{selector: sel, stages: stages}, opts) do
-    matchers = Enum.map(sel.matchers, &to_matcher_tuple/1)
-
-    {service, matchers_wo_service} = extract_service_matcher(matchers)
+    {service, matchers_wo_service} = StreamMatchers.split(sel.matchers)
 
     {pushdown_line_filters, remaining} = split_head_line_filters(stages)
 
@@ -142,23 +247,8 @@ defmodule Pulso.LogQL.Evaluator do
       |> maybe_put_list(:line_filters, pushdown_line_filters)
 
     deadline = Process.get(:query_deadline_ms)
-    storage_opts = storage_opts ++ Keyword.delete(QueryRunner.storage_opts(deadline), :max_records)
+    storage_opts = storage_opts ++ Evaluator.logql_storage_opts(deadline)
     {storage_opts, remaining}
-  end
-
-  # `service` and `service_name` project onto the dedicated Parquet
-  # `service` column, which is dictionary-encoded and faster to filter
-  # than an equivalent matcher against `resource`. So we peel it out and
-  # let the storage layer route it through the `service` option.
-  defp extract_service_matcher(matchers) do
-    Enum.reduce(matchers, {nil, []}, fn
-      {name, :eq, value}, {nil, acc} when name in ["service", "service_name"] ->
-        {value, acc}
-
-      m, {service, acc} ->
-        {service, [m | acc]}
-    end)
-    |> then(fn {service, acc} -> {service, Enum.reverse(acc)} end)
   end
 
   # A consecutive run of `LineFilter` stages at the head of the pipeline
@@ -171,7 +261,7 @@ defmodule Pulso.LogQL.Evaluator do
   # `Pulso.LogQL.QueryValidation` before we get here, so we only handle
   # string and regex forms.
   defp split_head_line_filters(stages) do
-    {head, rest} = Enum.split_while(stages, &match?(%AST.LineFilter{}, &1))
+    {head, rest} = Enum.split_while(stages, &AST.LineFilter.native?/1)
 
     pushable =
       Enum.map(head, fn %AST.LineFilter{op: op, value: value} ->
@@ -183,8 +273,6 @@ defmodule Pulso.LogQL.Evaluator do
 
   defp line_filter_value({:string, s}), do: s
   defp line_filter_value({:re, s}), do: s
-
-  defp to_matcher_tuple(%AST.Matcher{name: n, op: op, value: v}), do: {n, op, v}
 
   defp maybe_put(kw, _key, nil), do: kw
   defp maybe_put(kw, key, value), do: Keyword.put(kw, key, value)
@@ -200,6 +288,38 @@ defmodule Pulso.LogQL.Evaluator do
   # entries is `[[ts_ns_string, line], ...]` — we emit `{ts_ns, line}`
   # tuples and let the marshaller stringify. Timestamp-descending within
   # each stream matches Loki's `direction=backward` default.
+  # Keys order entries by time, then the canonical record tie-breakers; the
+  # sequence number keeps otherwise identical entries distinct.
+  defp retain(entry, record, {set, size}, limit, direction, project) do
+    key =
+      {entry.timestamp_ns || 0, record.observed_timestamp_ns || 0, record.trace_id || "", record.span_id || "",
+       entry.line, System.unique_integer([:monotonic])}
+
+    cond do
+      size < limit ->
+        {:gb_sets.add(retainable(key, project.(entry, record)), set), size + 1}
+
+      better?(key, worst(set, direction), direction) ->
+        {:gb_sets.add(retainable(key, project.(entry, record)), drop_worst(set, direction)), size}
+
+      true ->
+        {set, size}
+    end
+  end
+
+  defp worst(set, :backward), do: :gb_sets.smallest(set)
+  defp worst(set, :forward), do: :gb_sets.largest(set)
+  defp drop_worst(set, :backward), do: elem(:gb_sets.take_smallest(set), 1)
+  defp drop_worst(set, :forward), do: elem(:gb_sets.take_largest(set), 1)
+  defp better?(key, worst, :backward), do: key > Tuple.delete_at(worst, tuple_size(worst) - 1)
+  defp better?(key, worst, :forward), do: key < Tuple.delete_at(worst, tuple_size(worst) - 1)
+
+  # Retained values are copied so they never keep a decoded chunk alive.
+  defp retainable(key, value), do: Tuple.insert_at(Pulso.JSON.detach(key), tuple_size(key), Pulso.JSON.detach(value))
+
+  defp newest_complete?({set, size}, next_max_ts, limit),
+    do: size >= limit and is_integer(next_max_ts) and next_max_ts < elem(:gb_sets.smallest(set), 0)
+
   defp group_streams(entries) do
     entries
     |> Enum.group_by(fn %Entry{labels: l} -> l end)

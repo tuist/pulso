@@ -23,6 +23,15 @@ defmodule Pulso.LogQL.MetricEval do
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Entry
   alias Pulso.LogQL.Evaluator
+  alias Pulso.LogQL.NativeRange
+  alias Pulso.LogQL.Quantile
+  alias Pulso.LogQL.Quantity
+  alias Pulso.PromQL.Evaluator, as: Budget
+  alias Pulso.PromQL.FloatParser
+  alias Pulso.PromQL.Number
+  alias Pulso.PromQL.Operations
+  alias Pulso.PromQL.RangeMath
+  alias Pulso.Storage.SortOrder
 
   @default_step_ns 60 * 1_000_000_000
   @max_steps Pulso.QueryLimits.max_evaluation_steps()
@@ -34,17 +43,37 @@ defmodule Pulso.LogQL.MetricEval do
 
   @spec evaluate(term(), Pulso.Storage.tenant(), Evaluator.opts()) :: {:ok, result()} | {:error, term()}
   def evaluate(expr, tenant, opts) when is_binary(tenant) and is_map(opts) do
+    if !Process.get(:promql_budget),
+      do: Process.put(:promql_budget, %{samples: 0, work: 0, points: 0, materialized: 0, log_samples: 0})
+
+    if !Process.get(:promql_deadline_ms),
+      do:
+        Process.put(:promql_deadline_ms, Process.get(:query_deadline_ms, System.monotonic_time(:millisecond) + 10_000))
+
     with :ok <- validate_steps(opts),
          {:ok, kind, series} <- eval(expr, tenant, opts) do
       {:ok, {kind, series}}
     end
+  catch
+    {:promql_error, reason} -> {:error, reason}
+    {:logql_error, reason} -> {:error, reason}
   end
 
   # ---------------------------------------------------------------------------
   # Number literal
   # ---------------------------------------------------------------------------
 
-  defp eval(%AST.NumberLit{value: v}, _tenant, opts) do
+  defp eval(expr, tenant, opts) do
+    Budget.charge(:work, 1)
+
+    with {:ok, kind, series} <- do_eval(expr, tenant, opts) do
+      points = Enum.reduce(series, 0, fn item, n -> n + point_count(item, kind) end)
+      Budget.charge(:points, points)
+      {:ok, kind, series}
+    end
+  end
+
+  defp do_eval(%type{value: v}, _tenant, opts) when type in [AST.NumberLit, AST.VectorLit] do
     kind = result_kind(opts)
 
     series =
@@ -64,14 +93,46 @@ defmodule Pulso.LogQL.MetricEval do
   # Range aggregation
   # ---------------------------------------------------------------------------
 
-  defp eval(%AST.RangeAgg{} = agg, tenant, opts) do
+  # Range aggregations stream the selected entries, reducing each to a
+  # compact `{timestamp, tie, value}` sample of its series instead of holding
+  # pipeline entries. Every window then reads a slice of the series' samples
+  # in the canonical log order, so results match evaluating the materialized
+  # entries while memory follows two numbers per log line.
+  defp do_eval(%AST.RangeAgg{op: :absent_over_time} = agg, tenant, opts) do
     kind = result_kind(opts)
-    unwrap = extract_unwrap(agg.inner)
-    inner_no_unwrap = remove_unwrap(agg.inner)
+    times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
+    offset = agg.offset_ns || 0
+    {first, last} = Enum.min_max(times)
+    spec = %{op: :absent_over_time, unwrap: extract_unwrap(agg.inner), grouping: :all}
 
-    case kind do
-      :matrix -> run_range_matrix(agg, inner_no_unwrap, unwrap, tenant, opts)
-      :vector -> run_range_vector(agg, inner_no_unwrap, unwrap, tenant, opts)
+    with {:ok, collected} <-
+           collect(remove_unwrap(agg.inner), spec, tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
+      samples = collected |> Map.values() |> List.flatten() |> ordered()
+
+      points =
+        for t <- times, window(samples, t - offset - agg.range_ns + 1, t - offset) == :empty, do: {t, 1.0}
+
+      labels = absence_labels(agg.inner.selector.matchers)
+      series = if points == [], do: [], else: [{labels, points}]
+      {:ok, kind, result_series(series, kind)}
+    end
+  end
+
+  defp do_eval(%AST.RangeAgg{op: op, range_ns: range, offset_ns: offset, param: param} = agg, tenant, opts) do
+    kind = result_kind(opts)
+    offset = offset || 0
+    times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
+    spec = %{op: op, param: param, unwrap: extract_unwrap(agg.inner), grouping: agg.grouping}
+
+    if times == [] do
+      {:ok, kind, []}
+    else
+      {first, last} = Enum.min_max(times)
+
+      with {:ok, collected} <-
+             collect(remove_unwrap(agg.inner), spec, tenant, opts, first - offset - range + 1, last - offset) do
+        {:ok, kind, Enum.flat_map(collected, &series_points(&1, times, spec, range, offset, kind))}
+      end
     end
   end
 
@@ -79,7 +140,7 @@ defmodule Pulso.LogQL.MetricEval do
   # Vector aggregation
   # ---------------------------------------------------------------------------
 
-  defp eval(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
+  defp do_eval(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
     with {:ok, kind, inner_series} <- eval(inner, tenant, opts) do
       grouped =
         case kind do
@@ -95,28 +156,24 @@ defmodule Pulso.LogQL.MetricEval do
   # Binary operator
   # ---------------------------------------------------------------------------
 
-  defp eval(%AST.BinaryOp{op: op, left: l, right: r, bool: bool, matching: matching}, tenant, opts) do
-    with {:ok, lk, lser} <- eval(l, tenant, opts),
-         {:ok, rk, rser} <- eval(r, tenant, opts) do
-      combine_binop(lk, lser, rk, rser, op, bool, matching)
-    end
-  end
+  defp do_eval(%AST.BinaryOp{op: op, left: l, right: r, bool: bool, matching: matching}, tenant, opts) do
+    with {:ok, kind, lser} <- eval(l, tenant, opts),
+         {:ok, ^kind, rser} <- eval(r, tenant, opts) do
+      times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
 
-  # If either side is a scalar (single series, empty label bag), broadcast.
-  defp combine_binop(lk, lser, rk, rser, op, bool, matching) do
-    cond do
-      scalar?(lser) and scalar?(rser) ->
-        combine_scalars(lk, rk, lser, rser, op, bool)
+      series =
+        Operations.binary(
+          operator(op),
+          modifiers(bool, matching),
+          normalized(lser, kind),
+          normalized(rser, kind),
+          expression_type(l),
+          expression_type(r),
+          times
+        )
 
-      scalar?(lser) ->
-        {:ok, rk, broadcast_scalar_op(rser, extract_scalar(lser), op, bool, :left)}
-
-      scalar?(rser) ->
-        {:ok, lk, broadcast_scalar_op(lser, extract_scalar(rser), op, bool, :right)}
-
-      true ->
-        kind = if lk == :matrix or rk == :matrix, do: :matrix, else: :vector
-        {:ok, kind, combine_vectors(lser, rser, op, bool, matching, kind)}
+      result = result_series(series, kind)
+      {:ok, kind, result}
     end
   end
 
@@ -124,74 +181,15 @@ defmodule Pulso.LogQL.MetricEval do
   # Range helpers
   # ---------------------------------------------------------------------------
 
-  # One storage query for the whole matrix: fetch (min_step - offset - r,
-  # max_step - offset] once, then bucket in Elixir per step. Before this
-  # refactor a `rate({...}[1h])` at step=15s issued 240 Storage.query
-  # calls; now it issues one, at the cost of holding one range's worth of
-  # entries in memory for the fold.
-  defp run_range_matrix(%AST.RangeAgg{op: op, range_ns: r, offset_ns: off, param: p}, inner, unwrap, tenant, opts) do
-    step_ts_list = steps(opts)
+  defp entry_label_key(%Entry{labels: labels}, unwrap, grouping) do
+    labels = if unwrap, do: Map.delete(labels, unwrap.label), else: labels
 
-    if step_ts_list == [] do
-      {:ok, :matrix, []}
-    else
-      spec = %{op: op, range: r, offset: off || 0, param: p, unwrap: unwrap, steps: step_ts_list}
-      fetch_and_bucket(spec, inner, tenant, opts)
+    case grouping do
+      nil -> labels
+      %AST.Grouping{mode: :by, labels: names} -> Map.take(labels, names)
+      %AST.Grouping{mode: :without, labels: names} -> Map.drop(labels, names)
     end
   end
-
-  defp fetch_and_bucket(spec, inner, tenant, opts) do
-    {min_step, max_step} = Enum.min_max(spec.steps)
-    union_start = min_step - spec.offset - spec.range + 1
-    union_end = max_step - spec.offset
-
-    with {:ok, entries} <- query_window(inner, tenant, opts, union_start, union_end) do
-      series =
-        entries
-        |> Enum.group_by(&entry_label_key/1)
-        |> Enum.map(&bucket_series(&1, spec))
-
-      {:ok, :matrix, series}
-    end
-  end
-
-  defp bucket_series({labels, es}, spec) do
-    samples = Enum.map(spec.steps, &bucket_sample(&1, es, spec))
-    {labels, samples}
-  end
-
-  defp bucket_sample(t, es, spec) do
-    bucket_end = t - spec.offset
-    bucket_start = bucket_end - spec.range + 1
-    bucketed = filter_by_bucket(es, bucket_start, bucket_end)
-    {t, compute_range_agg(spec.op, bucketed, spec.unwrap, bucket_start, bucket_end, spec.param)}
-  end
-
-  defp run_range_vector(%AST.RangeAgg{op: op, range_ns: r, offset_ns: off, param: p}, inner, unwrap, tenant, opts) do
-    offset = off || 0
-    ts = evaluation_ts(opts)
-    end_ts = ts - offset
-    start_ts = end_ts - r + 1
-
-    with {:ok, entries} <- query_window(inner, tenant, opts, start_ts, end_ts) do
-      series =
-        entries
-        |> Enum.group_by(&entry_label_key/1)
-        |> Enum.map(fn {labels, es} ->
-          {labels, {ts, compute_range_agg(op, es, unwrap, start_ts, end_ts, p)}}
-        end)
-
-      {:ok, :vector, series}
-    end
-  end
-
-  defp filter_by_bucket(entries, start_ts, end_ts) do
-    Enum.filter(entries, fn %Entry{timestamp_ns: ts} ->
-      is_integer(ts) and ts >= start_ts and ts <= end_ts
-    end)
-  end
-
-  defp entry_label_key(%Entry{labels: labels}), do: labels
 
   defp extract_unwrap(%AST.LogQuery{stages: stages}) do
     Enum.find(stages, &match?(%AST.Unwrap{}, &1))
@@ -201,89 +199,237 @@ defmodule Pulso.LogQL.MetricEval do
     %{q | stages: Enum.reject(stages, &match?(%AST.Unwrap{}, &1))}
   end
 
-  # `param` is the AST-level scalar argument (currently only
-  # `quantile_over_time` uses it). Passing it explicitly avoids the
-  # process-dictionary hop that broke on future concurrent evaluation.
-  defp compute_range_agg(:count_over_time, entries, _, _, _, _), do: length(entries) * 1.0
+  # ---------------------------------------------------------------------------
+  # Streamed samples
+  # ---------------------------------------------------------------------------
 
-  defp compute_range_agg(:rate, entries, _, start_ts, end_ts, _) do
-    seconds = (end_ts - start_ts) / 1_000_000_000
-    if seconds > 0, do: length(entries) / seconds, else: 0.0
-  end
+  # Every entry in (start, finish] becomes one sample of its series. A
+  # pipeline error fails the query wherever it occurs, as before; an unwrap
+  # failure is kept as `:error` and fails only a window that reads it.
+  defp collect(_inner, _spec, _tenant, _opts, _start, finish) when finish < @minimum_timestamp, do: {:ok, %{}}
 
-  defp compute_range_agg(:rate_counter, entries, unwrap, start_ts, end_ts, param) do
-    compute_range_agg(:rate, entries, unwrap, start_ts, end_ts, param)
-  end
+  defp collect(inner, spec, tenant, opts, start, finish) do
+    query_opts =
+      opts
+      |> Map.put(:start_ts_ns, max(start, @minimum_timestamp))
+      |> Map.put(:end_ts_ns, finish)
+      |> Map.drop([:limit, :direction, :step_ns])
 
-  defp compute_range_agg(:bytes_over_time, entries, _, _, _, _) do
-    entries |> Enum.map(&byte_size(&1.line)) |> Enum.sum() |> Kernel.*(1.0)
-  end
-
-  defp compute_range_agg(:bytes_rate, entries, _, start_ts, end_ts, _) do
-    seconds = (end_ts - start_ts) / 1_000_000_000
-    total = entries |> Enum.map(&byte_size(&1.line)) |> Enum.sum()
-    if seconds > 0, do: total / seconds, else: 0.0
-  end
-
-  defp compute_range_agg(:absent_over_time, entries, _, _, _, _) do
-    if entries == [], do: 1.0, else: 0.0
-  end
-
-  defp compute_range_agg(:first_over_time, entries, unwrap, _, _, _) do
-    entries
-    |> Enum.sort_by(& &1.timestamp_ns)
-    |> List.first()
-    |> unwrap_value(unwrap, 0.0)
-  end
-
-  defp compute_range_agg(:last_over_time, entries, unwrap, _, _, _) do
-    entries
-    |> Enum.sort_by(& &1.timestamp_ns)
-    |> List.last()
-    |> unwrap_value(unwrap, 0.0)
-  end
-
-  defp compute_range_agg(op, entries, unwrap, _start_ts, _end_ts, _) when op in @over_time_ops do
-    values = for e <- entries, v = unwrap_value(e, unwrap, nil), v != nil, do: v
-    over_time(op, values)
-  end
-
-  defp compute_range_agg(:quantile_over_time, entries, unwrap, _, _, param) do
-    values = for e <- entries, v = unwrap_value(e, unwrap, nil), v != nil, do: v
-    q = if is_number(param), do: param * 1.0, else: 0.99
-    if values == [], do: 0.0, else: quantile(values, q)
-  end
-
-  defp over_time(:sum_over_time, values), do: Enum.sum(values) * 1.0
-  defp over_time(:avg_over_time, []), do: 0.0
-  defp over_time(:avg_over_time, values), do: Enum.sum(values) / length(values)
-  defp over_time(:max_over_time, []), do: 0.0
-  defp over_time(:max_over_time, values), do: Enum.max(values) * 1.0
-  defp over_time(:min_over_time, []), do: 0.0
-  defp over_time(:min_over_time, values), do: Enum.min(values) * 1.0
-  defp over_time(:stddev_over_time, values), do: stddev(values)
-  defp over_time(:stdvar_over_time, values), do: variance(values)
-
-  defp unwrap_value(entry, nil, default), do: length_or_default(entry, default)
-
-  defp unwrap_value(nil, _unwrap, default), do: default
-
-  defp unwrap_value(%Entry{labels: labels}, %AST.Unwrap{label: name, conversion: conv}, default) do
-    case Map.get(labels, name) do
-      nil ->
-        default
-
-      v ->
-        parse_unwrap(conv, v) || default
+    case NativeRange.collect(inner, spec, tenant, query_opts) do
+      :fallback -> collect_entries(inner, spec, tenant, query_opts)
+      result -> result
     end
   end
 
-  defp length_or_default(nil, default), do: default
-  defp length_or_default(_entry, _default), do: 1.0
+  defp collect_entries(inner, spec, tenant, query_opts) do
+    Evaluator.fold_log(inner, tenant, query_opts, %{}, &add_entry(&1, &2, &3, spec))
+  end
+
+  defp add_entry(entry, record, acc, spec) do
+    check_pipeline_error(entry)
+
+    case entry.timestamp_ns do
+      ts when is_integer(ts) ->
+        Budget.charge(:log_samples, 1)
+        add_sample(acc, series_key(entry, spec), {ts, tie(spec.op, record), entry_value(spec, entry)})
+
+      _ ->
+        acc
+    end
+  end
+
+  defp add_sample(acc, key, sample) do
+    case acc do
+      %{^key => samples} -> %{acc | key => [sample | samples]}
+      # Labels can be slices of a decoded chunk; copy the first so a series
+      # never keeps its chunk alive.
+      _ -> Map.put(acc, :erlang.binary_to_term(:erlang.term_to_binary(key)), [sample])
+    end
+  end
+
+  defp series_key(_entry, %{grouping: :all}), do: %{}
+  defp series_key(entry, %{unwrap: unwrap, grouping: grouping}), do: entry_label_key(entry, unwrap, grouping)
+
+  # Equal timestamps keep the canonical log order only where it decides the
+  # result (first/last); the key is copied so it never pins segment memory.
+  defp tie(op, record) when op in [:first_over_time, :last_over_time],
+    do: record |> SortOrder.log_key() |> :erlang.term_to_binary() |> :erlang.binary_to_term()
+
+  defp tie(_op, _record), do: nil
+
+  defp entry_value(%{op: op}, entry) when op in [:bytes_over_time, :bytes_rate], do: byte_size(entry.line)
+  defp entry_value(%{op: :count_over_time}, _entry), do: 1.0
+  defp entry_value(%{unwrap: nil}, _entry), do: 1.0
+
+  # absent_over_time checks every unwrapped entry of its whole range.
+  defp entry_value(%{op: :absent_over_time, unwrap: unwrap}, entry) do
+    if unwrapped(entry, unwrap) == :error, do: throw({:logql_error, :sample_extraction_error}), else: 1.0
+  end
+
+  defp entry_value(%{unwrap: unwrap}, entry), do: unwrapped(entry, unwrap)
+
+  defp unwrapped(%Entry{labels: labels}, %AST.Unwrap{label: name, conversion: conv}) do
+    with value when is_binary(value) <- Map.get(labels, name),
+         number when not is_nil(number) <- parse_unwrap(conv, value) do
+      number
+    else
+      _ -> :error
+    end
+  end
+
+  # Descending timestamp, then the canonical tie: the order a materialized,
+  # sorted result presents entries in. Windows are contiguous slices.
+  # Samples are a tuple of `{ts, tie, value}` (Elixir pipeline) or native
+  # `{:packed, binary}` of `<<ts::64, tag::8, value::64>>` records, which stay
+  # off the process heap: windows decode only the slice they read.
+  defp ordered({:packed, _} = packed), do: packed
+  defp ordered(samples), do: samples |> Enum.sort(:desc) |> List.to_tuple()
+
+  defp size({:packed, binary}), do: div(byte_size(binary), 17)
+  defp size(samples), do: tuple_size(samples)
+
+  defp ts_at({:packed, binary}, i) do
+    <<ts::signed-64>> = binary_part(binary, i * 17, 8)
+    ts
+  end
+
+  defp ts_at(samples, i), do: elem(elem(samples, i), 0)
+
+  defp value_at({:packed, binary}, i) do
+    case binary_part(binary, i * 17 + 8, 9) do
+      <<0, value::float-64>> -> value
+      <<1, _::binary>> -> :error
+      <<2, value::signed-64>> -> value
+    end
+  end
+
+  defp value_at(samples, i), do: elem(elem(samples, i), 2)
+
+  defp window(samples, start, finish) do
+    first = search(samples, &(&1 <= finish))
+    last = search(samples, &(&1 < start)) - 1
+    if first > last, do: :empty, else: {first, last}
+  end
+
+  # First index whose timestamp satisfies a predicate monotone in the order.
+  defp search(samples, predicate), do: search(samples, predicate, 0, size(samples))
+  defp search(_samples, _predicate, low, high) when low >= high, do: low
+
+  defp search(samples, predicate, low, high) do
+    middle = div(low + high, 2)
+
+    if predicate.(ts_at(samples, middle)),
+      do: search(samples, predicate, low, middle),
+      else: search(samples, predicate, middle + 1, high)
+  end
+
+  defp window_point(t, samples, spec, range, offset) do
+    finish = t - offset
+    start = finish - range + 1
+
+    case window(samples, start, finish) do
+      :empty ->
+        nil
+
+      {first, last} ->
+        Budget.charge(:work, last - first + 1)
+        {t, aggregate(spec, samples, first, last, start, finish)}
+    end
+  end
+
+  defp series_points({labels, samples}, times, spec, range, offset, kind) do
+    samples = ordered(samples)
+    points = for t <- times, point = window_point(t, samples, spec, range, offset), point != nil, do: point
+    range_series(labels, points, kind)
+  end
+
+  defp range_series(_labels, [], _kind), do: []
+  defp range_series(labels, points, :matrix), do: [{labels, points}]
+  defp range_series(labels, [point], :vector), do: [{labels, point}]
+
+  defp aggregate(%{op: :count_over_time}, _samples, first, last, _start, _finish), do: (last - first + 1) * 1.0
+
+  defp aggregate(%{op: :rate, unwrap: unwrap}, samples, first, last, start, finish) do
+    seconds = (finish - start + 1) / 1_000_000_000
+    total = if unwrap, do: over_time(:sum_over_time, values!(samples, first, last)), else: (last - first + 1) * 1.0
+    Number.binary("/", total, seconds)
+  end
+
+  defp aggregate(%{op: :bytes_over_time}, samples, first, last, _start, _finish),
+    do: samples |> slice(first, last) |> Enum.sum() |> Kernel.*(1.0)
+
+  defp aggregate(%{op: :bytes_rate}, samples, first, last, start, finish) do
+    seconds = (finish - start + 1) / 1_000_000_000
+    total = samples |> slice(first, last) |> Enum.sum()
+    if seconds > 0, do: total / seconds, else: 0.0
+  end
+
+  # Ascending by time, first keeps the earliest timestamp's first entry in
+  # canonical order and last keeps the latest timestamp's last entry.
+  defp aggregate(%{op: :first_over_time}, samples, first, last, _start, _finish) do
+    validate_window!(samples, first, last)
+    earliest = ts_at(samples, last)
+    index = search(samples, &(&1 <= earliest))
+    checked(samples, max(index, first))
+  end
+
+  defp aggregate(%{op: :last_over_time}, samples, first, last, _start, _finish) do
+    validate_window!(samples, first, last)
+    latest = ts_at(samples, first)
+    index = search(samples, &(&1 < latest)) - 1
+    checked(samples, min(index, last))
+  end
+
+  defp aggregate(%{op: op}, samples, first, last, _start, _finish) when op in @over_time_ops,
+    do: over_time(op, values!(samples, first, last))
+
+  defp aggregate(%{op: :quantile_over_time, param: param}, samples, first, last, _start, _finish),
+    do: Quantile.calculate(param, values!(samples, first, last))
+
+  defp slice(samples, first, last), do: for(i <- first..last//1, do: value_at(samples, i))
+
+  defp values!(samples, first, last) do
+    values = slice(samples, first, last)
+    if Enum.member?(values, :error), do: throw({:logql_error, :sample_extraction_error}), else: values
+  end
+
+  # First/last need no materialized values list, but every selected sample in
+  # this window must validate. Gaps between sparse evaluation windows do not.
+  defp validate_window!(samples, first, last) do
+    Enum.each(first..last, &checked(samples, &1))
+  end
+
+  defp checked(samples, index) do
+    case value_at(samples, index) do
+      :error -> throw({:logql_error, :sample_extraction_error})
+      value -> value
+    end
+  end
+
+  defp absence_labels(matchers) do
+    duplicates =
+      matchers
+      |> Enum.frequencies_by(& &1.name)
+      |> Enum.filter(fn {_, count} -> count > 1 end)
+      |> Enum.map(&elem(&1, 0))
+
+    for %AST.Matcher{op: :eq, name: name, value: value} <- matchers,
+        name != "__name__" and name not in duplicates,
+        into: %{},
+        do: {name, value}
+  end
+
+  defp over_time(:sum_over_time, values), do: Enum.reduce(values, 0.0, &Number.add/2)
+  defp over_time(:avg_over_time, []), do: :nan
+  defp over_time(:avg_over_time, values), do: Number.average(values)
+  defp over_time(:max_over_time, values), do: Enum.reduce(values, :nan, &Number.max/2)
+  defp over_time(:min_over_time, values), do: Enum.reduce(values, :nan, &Number.min/2)
+  defp over_time(:stddev_over_time, values), do: stddev(values)
+  defp over_time(:stdvar_over_time, values), do: variance(values)
 
   defp parse_unwrap(:none, v) do
     case parse_number_str(v) do
-      {:ok, n} -> n * 1.0
+      {:ok, n} -> n
       :error -> nil
     end
   end
@@ -341,27 +487,26 @@ defmodule Pulso.LogQL.MetricEval do
     end)
   end
 
-  defp apply_vector_op(op, group_labels, _group, values, _param)
+  defp apply_vector_op(op, group_labels, group, values, _param)
        when op in [:sum, :avg, :min, :max, :count, :stddev, :stdvar] do
-    [{group_labels, {0, aggregator(op, values)}}]
+    {_labels, {ts, _value}} = hd(group)
+    [{group_labels, {ts, aggregator(op, values)}}]
   end
 
   defp apply_vector_op(:topk, _group_labels, group, _values, k) when is_integer(k) do
     group
-    |> Enum.sort_by(fn {_l, {_ts, v}} -> v end, :desc)
-    |> Enum.take(k)
+    |> sort_group(:desc, :vector)
+    |> Enum.take(max(k, 0))
   end
 
   defp apply_vector_op(:bottomk, _group_labels, group, _values, k) when is_integer(k) do
     group
-    |> Enum.sort_by(fn {_l, {_ts, v}} -> v end)
-    |> Enum.take(k)
+    |> sort_group(:asc, :vector)
+    |> Enum.take(max(k, 0))
   end
 
-  defp apply_vector_op(:sort, _group_labels, group, _values, _), do: Enum.sort_by(group, fn {_l, {_ts, v}} -> v end)
-
-  defp apply_vector_op(:sort_desc, _group_labels, group, _values, _),
-    do: Enum.sort_by(group, fn {_l, {_ts, v}} -> v end, :desc)
+  defp apply_vector_op(:sort, _group_labels, group, _values, _), do: sort_group(group, :asc, :vector)
+  defp apply_vector_op(:sort_desc, _group_labels, group, _values, _), do: sort_group(group, :desc, :vector)
 
   defp apply_vector_op_matrix(op, group_labels, _entries, values, _param)
        when op in [:sum, :avg, :min, :max, :count, :stddev, :stdvar] do
@@ -370,32 +515,37 @@ defmodule Pulso.LogQL.MetricEval do
 
   defp apply_vector_op_matrix(:topk, _group_labels, entries, _values, k) when is_integer(k) do
     entries
-    |> Enum.sort_by(fn {_l, v} -> v end, :desc)
-    |> Enum.take(k)
+    |> sort_group(:desc, :matrix)
+    |> Enum.take(max(k, 0))
   end
 
   defp apply_vector_op_matrix(:bottomk, _group_labels, entries, _values, k) when is_integer(k) do
     entries
-    |> Enum.sort_by(fn {_l, v} -> v end)
-    |> Enum.take(k)
+    |> sort_group(:asc, :matrix)
+    |> Enum.take(max(k, 0))
   end
 
-  defp apply_vector_op_matrix(op, group_labels, _entries, values, _param) when op in [:sort, :sort_desc] do
-    [{group_labels, aggregator(op, values)}]
+  defp apply_vector_op_matrix(op, _group_labels, entries, _values, _param) when op in [:sort, :sort_desc], do: entries
+
+  defp sort_group(group, direction, kind) do
+    Enum.sort(group, fn left, right -> ordered?(sample_value(left, kind), sample_value(right, kind), direction) end)
   end
 
-  defp aggregator(:sum, values), do: Enum.sum(values) * 1.0
+  defp sample_value({_, {_, value}}, :vector), do: value
+  defp sample_value({_, value}, :matrix), do: value
+  defp ordered?(:nan, :nan, _), do: true
+  defp ordered?(:nan, _, _), do: false
+  defp ordered?(_, :nan, _), do: true
+  defp ordered?(left, right, :asc), do: not Number.less?(right, left)
+  defp ordered?(left, right, :desc), do: not Number.less?(left, right)
+
+  defp aggregator(:sum, values), do: Enum.reduce(values, 0.0, &Number.add/2)
   defp aggregator(:count, values), do: length(values) * 1.0
-  defp aggregator(:avg, []), do: 0.0
-  defp aggregator(:avg, values), do: Enum.sum(values) / length(values)
-  defp aggregator(:min, []), do: 0.0
-  defp aggregator(:min, values), do: Enum.min(values) * 1.0
-  defp aggregator(:max, []), do: 0.0
-  defp aggregator(:max, values), do: Enum.max(values) * 1.0
+  defp aggregator(:avg, values), do: over_time(:avg_over_time, values)
+  defp aggregator(:min, values), do: over_time(:min_over_time, values)
+  defp aggregator(:max, values), do: over_time(:max_over_time, values)
   defp aggregator(:stddev, values), do: stddev(values)
   defp aggregator(:stdvar, values), do: variance(values)
-  defp aggregator(:sort, values), do: Enum.min(values, fn -> 0.0 end) * 1.0
-  defp aggregator(:sort_desc, values), do: Enum.max(values, fn -> 0.0 end) * 1.0
 
   defp group_key(_labels, nil), do: %{}
 
@@ -411,175 +561,58 @@ defmodule Pulso.LogQL.MetricEval do
   # Binary op helpers
   # ---------------------------------------------------------------------------
 
-  # A scalar is a *single* series with an *empty* label bag. The
-  # `%{}` pattern alone would match any map (it means "at least these
-  # keys"); the `map_size == 0` guard is what makes it a true scalar.
-  defp scalar?([{labels, _}]) when is_map(labels), do: map_size(labels) == 0
-  defp scalar?(_), do: false
+  @operators %{
+    add: "+",
+    sub: "-",
+    mul: "*",
+    div: "/",
+    mod: "%",
+    pow: "^",
+    eq: "==",
+    neq: "!=",
+    lt: "<",
+    lte: "<=",
+    gt: ">",
+    gte: ">=",
+    and: "and",
+    or: "or",
+    unless: "unless"
+  }
+  defp operator(op), do: Map.fetch!(@operators, op)
+  defp expression_type(%AST.NumberLit{}), do: :scalar
 
-  defp extract_scalar([{_labels, {_ts, v}}]), do: v
-  defp extract_scalar([{_labels, samples}]) when is_list(samples), do: samples
-
-  defp combine_scalars(lk, _rk, [{_, {ts, lv}}], [{_, {_, rv}}], op, bool) do
-    case apply_binop(op, lv, rv, bool) do
-      :drop -> {:ok, lk, []}
-      value -> {:ok, lk, [{%{}, {ts, value}}]}
-    end
+  defp expression_type(%AST.BinaryOp{left: left, right: right}) do
+    if expression_type(left) == :scalar and expression_type(right) == :scalar, do: :scalar, else: :vector
   end
 
-  defp combine_scalars(lk, _rk, l, r, op, bool) do
-    lv = extract_scalar(l)
-    rv = extract_scalar(r)
-    combine_scalars(lk, lk, [{%{}, {0, lv}}], [{%{}, {0, rv}}], op, bool)
+  defp expression_type(_), do: :vector
+  defp point_count({_, values}, :matrix), do: length(values)
+  defp point_count(_, :vector), do: 1
+  defp result_series(series, :matrix), do: series
+  defp result_series(series, :vector), do: Enum.map(series, fn {labels, [point]} -> {labels, point} end)
+  defp normalized(series, :matrix), do: series
+  defp normalized(series, :vector), do: Enum.map(series, fn {labels, point} -> {labels, [point]} end)
+
+  defp modifiers(bool, matching) do
+    boolean = if bool, do: ["bool"], else: []
+    boolean ++ matching_modifiers(matching)
   end
 
-  # A `:drop` from `apply_binop` (an un-`bool`ed comparison that failed)
-  # means "this series/sample is filtered out of the result". Every caller
-  # must drop it — leaking it through would crash `Envelope.value_str`
-  # which only handles numeric values.
-  defp broadcast_scalar_op(series, scalar, op, bool, side) do
-    series
-    |> Enum.map(&broadcast_one(&1, scalar, op, bool, side))
-    |> Enum.reject(&is_nil/1)
+  defp matching_modifiers(nil), do: []
+
+  defp matching_modifiers(%AST.VectorMatching{mode: mode, labels: labels, group: group, group_labels: included}) do
+    match = [[Atom.to_string(mode), labels]]
+    if group, do: match ++ [["group_#{group}", included]], else: match
   end
-
-  defp broadcast_one({labels, {ts, v}}, scalar, op, bool, side) do
-    {a, b} = order_operands(scalar, v, side)
-
-    case apply_binop(op, a, b, bool) do
-      :drop -> nil
-      value -> {labels, {ts, value}}
-    end
-  end
-
-  defp broadcast_one({labels, samples}, scalar, op, bool, side) when is_list(samples) do
-    new = broadcast_samples(samples, scalar, op, bool, side)
-    if new != [], do: {labels, new}
-  end
-
-  defp broadcast_samples(samples, scalar, op, bool, side) do
-    for {ts, v} <- samples,
-        {a, b} = order_operands(scalar, v, side),
-        value = apply_binop(op, a, b, bool),
-        value != :drop do
-      {ts, value}
-    end
-  end
-
-  defp order_operands(scalar, v, :left), do: {scalar, v}
-  defp order_operands(scalar, v, :right), do: {v, scalar}
-
-  defp combine_vectors(left, right, op, bool, matching, :vector) do
-    right_index = index_by(right, matching)
-
-    left
-    |> Enum.map(&combine_vector_pair(&1, right_index, op, bool, matching))
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp combine_vectors(left, right, op, bool, matching, :matrix) do
-    right_index = index_by(right, matching)
-    Enum.flat_map(left, &combine_matrix_pair(&1, right_index, op, bool, matching))
-  end
-
-  defp combine_vector_pair({labels, {ts, lv}}, right_index, op, bool, matching) do
-    key = match_key(labels, matching)
-
-    with {rlabels, {_rts, rv}} <- Map.get(right_index, key) || :no_match,
-         value when value != :drop <- apply_binop(op, lv, rv, bool) do
-      {result_labels(labels, rlabels, matching), {ts, value}}
-    else
-      _ -> nil
-    end
-  end
-
-  defp combine_matrix_pair({labels, samples}, right_index, op, bool, matching) do
-    key = match_key(labels, matching)
-
-    case Map.get(right_index, key) do
-      nil -> []
-      right_entry -> combine_matrix_samples(labels, samples, right_entry, op, bool, matching)
-    end
-  end
-
-  defp combine_matrix_samples(labels, samples, {rlabels, rsamples}, op, bool, matching) do
-    rmap = Map.new(rsamples)
-
-    combined =
-      for {ts, lv} <- samples,
-          rv = Map.get(rmap, ts),
-          rv != nil,
-          value = apply_binop(op, lv, rv, bool),
-          value != :drop do
-        {ts, value}
-      end
-
-    if combined == [], do: [], else: [{result_labels(labels, rlabels, matching), combined}]
-  end
-
-  defp index_by(series, matching) do
-    Map.new(series, fn {labels, samples} -> {match_key(labels, matching), {labels, samples}} end)
-  end
-
-  defp match_key(labels, nil), do: labels
-
-  defp match_key(labels, %AST.VectorMatching{mode: :on, labels: names}), do: Map.take(labels, names)
-
-  defp match_key(labels, %AST.VectorMatching{mode: :ignoring, labels: names}), do: Map.drop(labels, names)
-
-  defp result_labels(l, _r, nil), do: l
-
-  defp result_labels(l, _r, %AST.VectorMatching{group: nil}), do: l
-
-  defp result_labels(l, r, %AST.VectorMatching{group: :left, group_labels: add}) do
-    Map.merge(l, Map.take(r, add))
-  end
-
-  defp result_labels(l, r, %AST.VectorMatching{group: :right, group_labels: add}) do
-    Map.merge(r, Map.take(l, add))
-  end
-
-  defp apply_binop(:add, a, b, _), do: (a + b) * 1.0
-  defp apply_binop(:sub, a, b, _), do: (a - b) * 1.0
-  defp apply_binop(:mul, a, b, _), do: a * b * 1.0
-  defp apply_binop(:div, _, 0, _), do: 0.0
-  defp apply_binop(:div, _, +0.0, _), do: 0.0
-  defp apply_binop(:div, a, b, _), do: a / b * 1.0
-  defp apply_binop(:mod, _, 0, _), do: 0.0
-  defp apply_binop(:mod, a, b, _) when is_integer(a) and is_integer(b), do: rem(a, b) * 1.0
-  defp apply_binop(:mod, a, b, _), do: (a - Float.floor(a / b) * b) * 1.0
-  defp apply_binop(:pow, a, b, _), do: :math.pow(a, b)
-  defp apply_binop(:eq, a, b, true), do: if(a == b, do: 1.0, else: 0.0)
-  defp apply_binop(:eq, a, b, false), do: if(a == b, do: a * 1.0, else: :drop)
-  defp apply_binop(:neq, a, b, true), do: if(a == b, do: 0.0, else: 1.0)
-  defp apply_binop(:neq, a, b, false), do: if(a == b, do: :drop, else: a * 1.0)
-  defp apply_binop(:lt, a, b, true), do: if(a < b, do: 1.0, else: 0.0)
-  defp apply_binop(:lt, a, b, false), do: if(a < b, do: a * 1.0, else: :drop)
-  defp apply_binop(:lte, a, b, true), do: if(a <= b, do: 1.0, else: 0.0)
-  defp apply_binop(:lte, a, b, false), do: if(a <= b, do: a * 1.0, else: :drop)
-  defp apply_binop(:gt, a, b, true), do: if(a > b, do: 1.0, else: 0.0)
-  defp apply_binop(:gt, a, b, false), do: if(a > b, do: a * 1.0, else: :drop)
-  defp apply_binop(:gte, a, b, true), do: if(a >= b, do: 1.0, else: 0.0)
-  defp apply_binop(:gte, a, b, false), do: if(a >= b, do: a * 1.0, else: :drop)
-  defp apply_binop(:and, _, _, _), do: 1.0
-  defp apply_binop(:or, _, _, _), do: 1.0
-  defp apply_binop(:unless, _, _, _), do: 1.0
 
   # ---------------------------------------------------------------------------
   # Bucketing / opts helpers
   # ---------------------------------------------------------------------------
 
-  defp query_window(_inner, _tenant, _opts, _start, finish) when finish < @minimum_timestamp, do: {:ok, []}
+  defp check_pipeline_error(%{labels: %{"__error__" => error}}) when error != "",
+    do: throw({:logql_error, :pipeline_error})
 
-  defp query_window(inner, tenant, opts, start, finish) do
-    query_opts =
-      opts
-      |> Map.put(:start_ts_ns, max(start, @minimum_timestamp))
-      |> Map.put(:end_ts_ns, finish)
-      |> Map.drop([:limit, :direction, :step_ns])
-
-    Evaluator.evaluate_log_raw(inner, tenant, query_opts)
-  end
+  defp check_pipeline_error(_), do: :ok
 
   defp result_kind(opts) do
     if Map.get(opts, :step_ns), do: :matrix, else: :vector
@@ -622,71 +655,11 @@ defmodule Pulso.LogQL.MetricEval do
   # Numeric helpers
   # ---------------------------------------------------------------------------
 
-  defp parse_number_str(str) when is_binary(str) do
-    case Integer.parse(str) do
-      {n, ""} ->
-        {:ok, n}
+  defp parse_number_str(str), do: FloatParser.parse(str)
 
-      _ ->
-        case Float.parse(str) do
-          {n, ""} -> {:ok, n}
-          _ -> :error
-        end
-    end
-  end
+  defp parse_duration(str), do: Quantity.duration(str)
+  defp parse_bytes(str), do: Quantity.bytes(str)
 
-  defp parse_number_str(_), do: :error
-
-  defp parse_duration(str) when is_binary(str) do
-    case Integer.parse(str) do
-      {n, "ns"} -> {:ok, n}
-      {n, "us"} -> {:ok, n * 1_000}
-      {n, "ms"} -> {:ok, n * 1_000_000}
-      {n, "s"} -> {:ok, n * 1_000_000_000}
-      {n, "m"} -> {:ok, n * 60 * 1_000_000_000}
-      {n, "h"} -> {:ok, n * 3_600 * 1_000_000_000}
-      _ -> :error
-    end
-  end
-
-  @byte_factors %{
-    "" => 1,
-    "B" => 1,
-    "kB" => 1_000,
-    "MB" => 1_000_000,
-    "GB" => 1_000_000_000,
-    "KiB" => 1024,
-    "MiB" => 1024 * 1024,
-    "GiB" => 1024 * 1024 * 1024
-  }
-
-  defp parse_bytes(str) when is_binary(str) do
-    case Integer.parse(str) do
-      {n, unit} ->
-        case Map.get(@byte_factors, unit) do
-          nil -> :error
-          f -> {:ok, n * f}
-        end
-
-      :error ->
-        :error
-    end
-  end
-
-  defp stddev([]), do: 0.0
-  defp stddev(values), do: :math.sqrt(variance(values))
-
-  defp variance([]), do: 0.0
-
-  defp variance(values) do
-    mean = Enum.sum(values) / length(values)
-    sum_sq = Enum.reduce(values, 0.0, fn v, acc -> acc + (v - mean) * (v - mean) end)
-    sum_sq / length(values)
-  end
-
-  defp quantile(values, q) when q >= 0.0 and q <= 1.0 do
-    sorted = Enum.sort(values)
-    idx = min(length(sorted) - 1, max(0, trunc(q * (length(sorted) - 1))))
-    Enum.at(sorted, idx) * 1.0
-  end
+  defp stddev(values), do: RangeMath.deviation(Enum.map(values, &%{value: &1}))
+  defp variance(values), do: RangeMath.variance(Enum.map(values, &%{value: &1}))
 end

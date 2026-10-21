@@ -2,6 +2,8 @@ defmodule PulsoWeb.LokiControllerTest do
   use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Auth.SharedSecret
+  alias Pulso.Codec.NIF
+  alias Pulso.Loki.Push
   alias Pulso.Loki.PushProto
   alias Pulso.Record.Log
   alias Pulso.Storage
@@ -220,6 +222,24 @@ defmodule PulsoWeb.LokiControllerTest do
                 resource: %{"service_name" => "api", "level" => "info"}
               }
             ]} = Storage.query(:logs, "acme")
+  end
+
+  # Alloy and Promtail push Snappy protobuf. The native decoder must build
+  # complete `%Log{}` records, or the Parquet encoder rejects the whole push
+  # on S3 (the Memory adapter above never encodes).
+  test "natively decoded protobuf pushes are complete records the segment encoder accepts" do
+    body =
+      [line: "07:48:21.000 request_kind=page_load [info] Sent 200 in 154ms", metadata: [{"trace_id", "abc"}]]
+      |> proto_payload()
+      |> encode_proto()
+      |> encode_snappy()
+
+    assert {:ok, [record], 0} = Push.decode_protobuf(body, 1_048_576)
+    assert record |> Map.keys() |> Enum.sort() == %Log{} |> Map.keys() |> Enum.sort()
+    assert {:ok, blob, _, _, 1} = NIF.encode_log_segment_parquet([record])
+
+    assert {:ok, [%Log{body: "07:48:21.000 request_kind=page_load [info] Sent 200 in 154ms", otlp: nil}]} =
+             NIF.decode_log_segment_parquet(blob, nil, nil, nil, [], [])
   end
 
   test "POST /loki/api/v1/push treats an absent Content-Encoding on protobuf as snappy",

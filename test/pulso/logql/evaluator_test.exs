@@ -12,6 +12,22 @@ defmodule Pulso.LogQL.EvaluatorTest do
     :ok
   end
 
+  test "expensive sample finishing runs only on final top-k values inside the query task" do
+    records = for i <- 1..20, do: record(timestamp_ns: i, service: "api", body: Integer.to_string(i))
+    log("sample-final", records)
+    {:ok, ast} = Parser.parse(~s({service="api"}))
+    owner = self()
+
+    assert {:ok, ["20", "19", "18"]} =
+             Evaluator.select_entries(ast, "sample-final", %{limit: 3}, fn entry, _record -> entry end, fn entry ->
+               send(owner, {:sample_finished, entry.timestamp_ns})
+               entry.line
+             end)
+
+    for ts <- [20, 19, 18], do: assert_received({:sample_finished, ^ts})
+    refute_received {:sample_finished, _}
+  end
+
   # -- Test helpers ----------------------------------------------------------
 
   defp log(tenant, records) do
@@ -283,11 +299,12 @@ defmodule Pulso.LogQL.EvaluatorTest do
                run(~s({env=~"("}))
     end
 
-    test "regex accepted by Elixir but unsupported by the native decoder is rejected before storage" do
+    test "PCRE-only regex is rejected regardless of its pipeline position" do
       assert {:error, {:invalid_regex, :line_filter, "foo(?=bar)", _}} =
                run(~s[{service="api"} |~ "foo(?=bar)"])
 
-      assert {:ok, _} = run(~s[{service="api"} | json |~ "foo(?=bar)"])
+      assert {:error, {:invalid_regex, :line_filter, "foo(?=bar)", _}} =
+               run(~s[{service="api"} | json |~ "foo(?=bar)"])
     end
 
     test "invalid regex in line filter returns :invalid_regex" do

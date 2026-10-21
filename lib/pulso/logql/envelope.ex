@@ -7,9 +7,12 @@ defmodule Pulso.LogQL.Envelope do
   (`query_logql`) so both surfaces emit byte-identical payloads.
 
     * Streams entries use nanosecond timestamp strings.
-    * Matrix and vector samples use second-precision timestamp floats
-      as strings, matching Grafana's Loki wire format.
+    * Matrix and vector samples are `[<seconds as a JSON number>, "<value>"]`,
+      as Loki documents and Grafana decodes them.
   """
+
+  alias Pulso.PromQL.Evaluator
+  alias Pulso.PromQL.Time
 
   @spec streams([{map(), [{integer(), String.t()}]}]) :: map()
   def streams(streams) when is_list(streams) do
@@ -73,11 +76,9 @@ defmodule Pulso.LogQL.Envelope do
 
   defp stringify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {to_string(k), to_string(v)} end)
 
-  defp seconds_str(ts_ns) when is_integer(ts_ns) do
-    seconds = ts_ns / 1_000_000_000
-    Float.to_string(seconds)
-  end
+  # Like Loki and Prometheus: the timestamp is a JSON number of seconds and
+  # the value is Go-formatted text. Grafana decodes the timestamp as a float.
+  defp seconds_str(ts_ns) when is_integer(ts_ns), do: Time.seconds(ts_ns)
 
-  defp value_str(v) when is_float(v), do: Float.to_string(v)
-  defp value_str(v) when is_integer(v), do: Integer.to_string(v)
+  defp value_str(v), do: Evaluator.format_value(v)
 end
