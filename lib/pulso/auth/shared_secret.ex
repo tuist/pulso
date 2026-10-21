@@ -1,6 +1,7 @@
 defmodule Pulso.Auth.SharedSecret do
   @moduledoc """
-  Per-tenant Bearer-token authentication. A minimal but real auth surface
+  Per-tenant Bearer-token authentication. HTTP Basic credentials are accepted
+  too, with the tenant as username and the token as password. A minimal but real auth surface
   suitable for prod until Pulso grows a real accounts service.
 
   Tokens are configured as:
@@ -25,17 +26,28 @@ defmodule Pulso.Auth.SharedSecret do
 
   @impl Pulso.Auth
   def verify(conn, tenant) when is_binary(tenant) do
-    with {:ok, presented} <- extract_token(conn),
+    with {:ok, presented} <- extract_token(conn, tenant),
          {:ok, stored_hash} <- fetch_stored_hash(tenant) do
       compare_hash(presented, stored_hash)
     end
   end
 
-  defp extract_token(conn) do
+  # Basic credentials carry the token as the password and authorize only the
+  # tenant named by their username, the Grafana Cloud convention.
+  defp extract_token(conn, tenant) do
     case Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] when byte_size(token) > 0 -> {:ok, token}
-      ["bearer " <> token] when byte_size(token) > 0 -> {:ok, token}
-      _ -> {:error, :missing_token}
+      ["Bearer " <> token] when byte_size(token) > 0 ->
+        {:ok, token}
+
+      ["bearer " <> token] when byte_size(token) > 0 ->
+        {:ok, token}
+
+      _ ->
+        case Pulso.Auth.basic_credentials(conn) do
+          {:ok, ^tenant, password} -> {:ok, password}
+          {:ok, _other, _password} -> {:error, :invalid_token}
+          :error -> {:error, :missing_token}
+        end
     end
   end
 

@@ -28,6 +28,7 @@ defmodule PulsoWeb.CompressedBodyReader do
   alias Pulso.Runtime
 
   @default_max_decompressed_bytes 16 * 1024 * 1024
+  @max_gzip_members 64
 
   @spec read_body(Plug.Conn.t(), keyword()) ::
           {:ok, binary(), Plug.Conn.t()}
@@ -46,6 +47,13 @@ defmodule PulsoWeb.CompressedBodyReader do
     end
   end
 
+  @doc false
+  def decompress(conn, body) do
+    maybe_decompress(conn, body)
+  rescue
+    RequestTooLargeError -> {:error, :payload_too_large}
+  end
+
   defp maybe_decompress(conn, body) do
     case Plug.Conn.get_req_header(conn, "content-encoding") do
       ["gzip"] -> gunzip(body)
@@ -59,20 +67,21 @@ defmodule PulsoWeb.CompressedBodyReader do
   defp gunzip(<<>>), do: {:error, :invalid_gzip}
 
   defp gunzip(body) do
-    {:ok, IO.iodata_to_binary(inflate_members(body, [], max_decompressed_bytes()))}
+    {:ok, IO.iodata_to_binary(inflate_members(body, [], max_decompressed_bytes(), 0))}
   rescue
     e in RequestTooLargeError -> reraise e, __STACKTRACE__
     _ -> {:error, :invalid_gzip}
   end
 
-  defp inflate_members(<<>>, acc, _budget), do: acc
+  defp inflate_members(<<>>, acc, _budget, _members), do: acc
+  defp inflate_members(_body, _acc, _budget, @max_gzip_members), do: raise(RequestTooLargeError)
 
-  defp inflate_members(body, acc, budget) do
+  defp inflate_members(body, acc, budget, members) do
     output = inflate_member(body, budget)
     size = IO.iodata_length(output)
     consumed = member_size(body, output)
     rest = binary_part(body, consumed, byte_size(body) - consumed)
-    inflate_members(rest, [acc, output], budget - size)
+    inflate_members(rest, [acc, output], budget - size, members + 1)
   end
 
   defp inflate_member(body, budget) do
@@ -106,17 +115,25 @@ defmodule PulsoWeb.CompressedBodyReader do
   defp member_size(body, output) do
     trailer = <<:erlang.crc32(output)::little-32, rem(IO.iodata_length(output), 4_294_967_296)::little-32>>
 
-    body
-    |> :binary.matches(trailer)
-    |> Enum.find_value(fn {pos, len} ->
-      member_end = pos + len
+    member_end(body, trailer, 0)
+  end
 
-      case binary_part(body, member_end, min(2, byte_size(body) - member_end)) do
-        <<>> -> member_end
-        <<0x1F, 0x8B>> -> member_end
-        _ -> nil
-      end
-    end) || raise "gzip member boundary not found"
+  defp member_end(body, trailer, offset) do
+    case :binary.match(body, trailer, scope: {offset, byte_size(body) - offset}) do
+      {pos, len} ->
+        next = pos + len
+
+        case binary_part(body, next, min(2, byte_size(body) - next)) do
+          <<>> -> next
+          <<0x1F, 0x8B>> -> next
+          # Consider overlapping candidates; an empty member's zero trailer
+          # overlaps the end of its deflate block by one byte.
+          _ -> member_end(body, trailer, pos + 1)
+        end
+
+      :nomatch ->
+        raise "gzip member boundary not found"
+    end
   end
 
   defp max_decompressed_bytes do

@@ -23,7 +23,7 @@ defmodule PulsoWeb.IngestLimitsTest do
       assert length(records) == 2
       Memory.reset()
 
-      assert json_response(ingest(kind, records: 3), 413) == %{"error" => "too_many_records"}
+      assert json_response(ingest(kind, records: 3), 413) == error_body(kind, "too_many_records")
       assert {:ok, []} = Storage.query(signal(kind), "default")
     end
   end
@@ -87,7 +87,7 @@ defmodule PulsoWeb.IngestLimitsTest do
     configure(max_records: 2)
     otlp = %{"resourceLogs" => [%{"scopeLogs" => [%{"logRecords" => [nil, nil, nil]}]}]}
     loki = %{"streams" => [%{"values" => [nil, nil]}, %{"values" => [nil]}]}
-    assert json_response(post_json("/v1/logs", otlp), 413) == %{"error" => "too_many_records"}
+    assert json_response(post_json("/v1/logs", otlp), 413) == error_body(:otlp, "too_many_records")
     assert json_response(post_json("/loki/api/v1/push", loki), 413) == %{"error" => "too_many_records"}
     assert {:ok, []} = Storage.query(:logs, "default")
   end
@@ -96,7 +96,7 @@ defmodule PulsoWeb.IngestLimitsTest do
     configure(max_records: 2)
 
     assert json_response(post_json("/v1/logs", %{"resourceLogs" => List.duplicate(%{}, 5)}), 413) ==
-             %{"error" => "too_many_records"}
+             error_body(:otlp, "too_many_records")
 
     assert json_response(post_json("/loki/api/v1/push", %{"streams" => [%{}, %{}, %{}]}), 413) ==
              %{"error" => "too_many_records"}
@@ -138,7 +138,7 @@ defmodule PulsoWeb.IngestLimitsTest do
         |> put_req_header("content-encoding", "gzip")
         |> post(path, :zlib.gzip(Pulso.JSON.encode!(payload)))
 
-      assert json_response(conn, 413) == %{"error" => "too_many_records"}
+      assert json_response(conn, 413) == error_body(path, "too_many_records")
       assert {:ok, []} = Storage.query(:logs, "default")
     end
   end
@@ -149,20 +149,23 @@ defmodule PulsoWeb.IngestLimitsTest do
     value = %{"arrayValue" => %{"values" => [%{"arrayValue" => %{"values" => [%{"stringValue" => "v"}]}}]}}
     otlp = %{"resourceLogs" => [%{"scopeLogs" => [%{"logRecords" => [%{"body" => value}]}]}]}
     assert json_response(post_json("/loki/api/v1/push", loki), 413) == %{"error" => "attributes_too_large"}
-    assert json_response(post_json("/v1/logs", otlp), 413) == %{"error" => "attributes_too_large"}
+    assert json_response(post_json("/v1/logs", otlp), 413) == error_body(:otlp, "attributes_too_large")
     assert {:ok, []} = Storage.query(:logs, "default")
   end
 
   test "malformed in-budget OTLP scope containers do not crash" do
-    assert post_json("/v1/logs", %{"resourceLogs" => [%{"scopeLogs" => [nil, %{"logRecords" => "bad"}]}]}).status == 200
+    assert post_json("/v1/logs", %{"resourceLogs" => [%{"scopeLogs" => [nil, %{"logRecords" => "bad"}]}]}).status == 400
   end
 
   defp configure(options), do: Pulso.Runtime.put_env(:pulso, IngestLimits, options)
 
   defp assert_attribute_error(kind, opts) do
-    assert json_response(ingest(kind, opts), 413) == %{"error" => "attributes_too_large"}
+    assert json_response(ingest(kind, opts), 413) == error_body(kind, "attributes_too_large")
     assert {:ok, []} = Storage.query(signal(kind), "default")
   end
+
+  defp error_body(kind, reason) when kind in [:otlp, "/v1/logs"], do: %{"code" => 8, "message" => reason}
+  defp error_body(_, reason), do: %{"error" => reason}
 
   defp signal(:metrics), do: :metrics
   defp signal(_), do: :logs
