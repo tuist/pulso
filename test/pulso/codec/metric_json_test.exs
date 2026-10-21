@@ -4,9 +4,15 @@ defmodule Pulso.Codec.MetricJSONTest do
   import Bitwise
 
   alias Pulso.Codec.NIF
+  alias Pulso.Record.Exemplar
   alias Pulso.Record.MetricSample
 
-  defp fields(sample), do: Map.take(sample, [:series_id, :timestamp_ns, :value, :labels])
+  # Exemplars render as their struct fields, only when present (as the MCP
+  # tools' Elixir reference does).
+  defp fields(sample) do
+    fields = Map.take(sample, [:series_id, :timestamp_ns, :value, :labels, :otlp])
+    if sample.exemplars, do: Map.put(fields, :exemplars, Enum.map(sample.exemplars, &Map.from_struct/1)), else: fields
+  end
 
   test "native response encoding matches the Elixir reference across randomized batches" do
     for _ <- 1..200 do
@@ -17,8 +23,14 @@ defmodule Pulso.Codec.MetricJSONTest do
           %MetricSample{
             series_id: Enum.random([nil, -9_223_372_036_854_775_808, i]),
             timestamp_ns: Enum.random([nil, -i, 9_223_372_036_854_775_807]),
-            value: Enum.random([nil, i, i / 3, -0.0]),
-            labels: Enum.random([labels, %{}, Map.put(labels, "instance", "node-#{i}")])
+            value: Enum.random([nil, i, i / 3, -0.0, :nan, :stale, :infinity, :negative_infinity]),
+            otlp: Enum.random([nil, %{"nested" => [%{"doubleValue" => -0.0}, %{"bytesValue" => "AP8="}]}]),
+            labels: Enum.random([labels, %{}, Map.put(labels, "instance", "node-#{i}")]),
+            exemplars:
+              Enum.random([
+                nil,
+                [%Exemplar{labels: %{"trace_id" => "t#{i}"}, value: Enum.random([i / 7, :nan]), timestamp_ns: i}]
+              ])
           }
         end
 

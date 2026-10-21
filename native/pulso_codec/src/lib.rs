@@ -15,29 +15,53 @@
 // Callers that keep decoded data past a request should `:binary.copy/1`
 // the fields they keep.
 
+mod bounded_json;
+mod erlang_bytes;
+mod exemplar;
 mod ingest_limits;
 mod json_read;
 mod json_write;
 mod labels;
+mod log_discovery;
+mod log_metric;
 mod loki;
+mod metric_discovery;
+mod metric_footer;
 mod metric_json;
+mod metric_postings;
 mod metric_regex;
 mod metric_segment_parquet;
 mod metric_value;
+mod native_histogram;
+mod otlp_json;
+mod otlp_traces;
 mod out;
+mod patterns;
 mod query_filter;
+mod query_regex;
 mod remote_write;
 mod segment;
 mod segment_parquet;
 mod stable_hash;
+mod tempo_discovery;
+mod tempo_duration;
+mod tempo_expression;
+mod tempo_float;
+mod tempo_search;
 mod term_json;
+mod trace_export;
+mod trace_metadata;
+mod trace_metrics;
+mod trace_query;
+mod trace_search;
+mod trace_segment_parquet;
+mod trace_sort_key;
 mod wire;
 
 use json_read::Parser;
 use memchr::memmem::Finder;
 use out::BinSink;
 use query_filter::{LineFilter, LineFilterOp, MatchOp, Matcher};
-use regex::bytes::Regex;
 use term_json::{EncodeError, JsonEncoder, TermBuilder};
 
 use rustler::{Binary, Encoder, Env, ListIterator, NewBinary, NifResult, Term};
@@ -45,6 +69,10 @@ use std::borrow::Cow;
 
 mod atoms {
     rustler::atoms! {
+        done,
+        exemplars,
+        histogram,
+        more,
         ok,
         error,
         nil,
@@ -52,10 +80,20 @@ mod atoms {
         invalid_protobuf,
         payload_too_large,
         too_many_records,
+        too_many_trace_nodes,
+        too_many_otlp_nodes,
+        invalid_otlp,
+        invalid_otlp_integer,
+        logs,
+        metrics,
+        traces,
+        trace_projection_invalid,
         attributes_too_large,
         fallback,
         too_big,
         query_sample_limit,
+        query_resource_limit,
+        query_result_limit,
         storage,
         lines,
         eq,
@@ -79,6 +117,7 @@ mod atoms {
         attributes,
         resource,
         metric_sample = "Elixir.Pulso.Record.MetricSample",
+        otlp,
         series_id,
         value,
         labels,
@@ -173,6 +212,9 @@ fn to_terms<'a>(env: Env<'a>, buffer: &Binary<'a>, decoded: &loki::Decoded) -> N
         atoms::span_id(),
         atoms::attributes(),
         atoms::resource(),
+        // Every `%Pulso.Record.Log{}` field: the segment encoder rejects a
+        // record map missing one. Loki pushes carry no OTLP envelope.
+        atoms::otlp(),
     ]
     .map(|atom| atom.encode(env));
     let struct_name = atoms::log().encode(env);
@@ -214,6 +256,7 @@ fn to_terms<'a>(env: Env<'a>, buffer: &Binary<'a>, decoded: &loki::Decoded) -> N
                 optional(env, buffer, record.span_id)?,
                 Term::map_from_arrays(env, &attr_keys, &attr_values)?,
                 resource,
+                nil,
             ];
             records.push(Term::map_from_arrays(env, &keys, &fields)?);
         }
@@ -336,6 +379,28 @@ fn encode_log_segment<'a>(
     }
 }
 
+/// Public raw log responses prove their full JSON size before allocating the
+/// result binary. Counter and writer use the exact same reference encoder.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_log_segment_bounded<'a>(env: Env<'a>, records: Term<'a>, limit: usize) -> Term<'a> {
+    use out::Sink;
+    let encoder = JsonEncoder::new(env, limit);
+    let mut counter = out::Counter::new(limit);
+    let mode = segment::Mode::Plain;
+    let framing = segment::Framing::Array;
+    match segment::encode(env, &mut counter, records, mode, framing, &encoder) {
+        Ok(_) if counter.len() <= limit => (),
+        Ok(_) | Err(EncodeError::TooBig) => return error(env, atoms::query_result_limit()),
+        Err(_) => return atoms::fallback().encode(env),
+    }
+    let mut out = BinSink::with_capacity(counter.len());
+    match segment::encode(env, &mut out, records, mode, framing, &encoder) {
+        Ok(_) => (atoms::ok(), out.finish(env)).encode(env),
+        Err(EncodeError::TooBig) => error(env, atoms::query_result_limit()),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
 fn optional_int(t: Term) -> Result<Option<i128>, ()> {
     if t.decode::<rustler::Atom>().ok() == Some(atoms::nil()) {
         Ok(None)
@@ -383,16 +448,17 @@ fn decode_log_segment<'a>(
 /// treats `:fallback` here as a hard error rather than falling back to
 /// pure Elixir, since there is no Elixir Parquet encoder.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn encode_log_segment_parquet<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
+fn encode_log_segment_parquet_v2<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
     match segment_parquet::encode(env, records) {
         Ok((buf, b)) => (
             atoms::ok(),
-            copy(env, &buf),
+            buf,
             integer(env, b.min_ts),
             integer(env, b.max_ts),
             b.count,
         )
             .encode(env),
+        Err(EncodeError::TooBig) => error(env, atoms::payload_too_large()),
         Err(_) => atoms::fallback().encode(env),
     }
 }
@@ -417,7 +483,7 @@ fn encode_log_segment_parquet<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
 /// pushdown — a Parquet segment lacks the Elixir reference
 /// implementation the JSON codecs have.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn decode_log_segment_parquet<'a>(
+fn decode_log_segment_parquet_v2<'a>(
     env: Env<'a>,
     blob: Binary<'a>,
     start_ts: Term<'a>,
@@ -454,20 +520,382 @@ fn decode_log_segment_parquet<'a>(
     }
 }
 
+#[rustler::nif(schedule = "DirtyCpu")]
+fn otlp_json_decode<'a>(env: Env<'a>, body: Binary<'a>) -> Term<'a> {
+    match otlp_json::decode(env, body) {
+        Ok(value) => (atoms::ok(), value).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn otlp_json_decode_scoped<'a>(env: Env<'a>, body: Binary<'a>, signal: rustler::Atom) -> Term<'a> {
+    let schema = if signal == atoms::logs() {
+        otlp_traces::Schema::ExportLogs
+    } else if signal == atoms::metrics() {
+        otlp_traces::Schema::ExportMetrics
+    } else if signal == atoms::traces() {
+        otlp_traces::Schema::Export
+    } else {
+        return atoms::fallback().encode(env);
+    };
+    match otlp_json::decode_scoped(env, body, Some(schema)) {
+        Ok(value) => (atoms::ok(), value).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn otlp_json_negative_zero<'a>(env: Env<'a>, body: Binary<'a>) -> Binary<'a> {
+    otlp_json::negative_zero(env, body)
+}
+
+#[rustler::nif]
+fn log_metadata_api_version() -> u32 {
+    1
+}
+
+#[rustler::nif]
+fn trace_metadata_api_version() -> u32 {
+    2
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn trace_payload_size<'a>(env: Env<'a>, records: Term<'a>, limit: usize) -> Term<'a> {
+    match trace_segment_parquet::payload_size(env, records, limit) {
+        Ok(size) => (atoms::ok(), size).encode(env),
+        Err(EncodeError::TooBig) => error(env, atoms::payload_too_large()),
+        Err(_) => error(env, atoms::invalid_otlp()),
+    }
+}
+
+#[rustler::nif]
+fn metric_metadata_api_version() -> u32 {
+    1
+}
+
+#[rustler::nif]
+fn otlp_wire_api_version() -> u32 {
+    3
+}
+
+#[rustler::nif]
+fn otlp_metrics_api_version() -> u32 {
+    2
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_payload_size<'a>(env: Env<'a>, records: Term<'a>, limit: usize) -> Term<'a> {
+    match segment_parquet::payload_size(env, records, limit) {
+        Ok(size) => (atoms::ok(), size).encode(env),
+        Err(EncodeError::TooBig) => error(env, atoms::payload_too_large()),
+        Err(_) => error(env, atoms::invalid_otlp()),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn metric_metadata_size<'a>(env: Env<'a>, samples: Term<'a>, limit: usize) -> Term<'a> {
+    match metric_segment_parquet::metadata_size(env, samples, limit) {
+        Ok(size) => (atoms::ok(), size).encode(env),
+        Err(metric_segment_parquet::EncodeError::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
+        Err(_) => error(env, atoms::invalid_otlp()),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_otlp_metrics<'a>(
+    env: Env<'a>,
+    body: Binary<'a>,
+    limits: otlp_traces::Options,
+) -> Term<'a> {
+    match otlp_traces::decode_metrics(env, body.as_slice(), limits) {
+        Ok(payload) => (atoms::ok(), payload).encode(env),
+        Err(reason) => error(
+            env,
+            match reason {
+                otlp_traces::Error::InvalidProtobuf => atoms::invalid_protobuf(),
+                otlp_traces::Error::TooManyRecords => atoms::too_many_records(),
+                otlp_traces::Error::AttributesTooLarge => atoms::attributes_too_large(),
+                otlp_traces::Error::TooManyNodes => atoms::too_many_otlp_nodes(),
+            },
+        ),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_otlp_logs<'a>(env: Env<'a>, body: Binary<'a>, limits: otlp_traces::Options) -> Term<'a> {
+    match otlp_traces::decode_logs(env, body.as_slice(), limits) {
+        Ok(payload) => (atoms::ok(), payload).encode(env),
+        Err(error) => {
+            let reason = match error {
+                otlp_traces::Error::InvalidProtobuf => atoms::invalid_protobuf(),
+                otlp_traces::Error::TooManyRecords => atoms::too_many_records(),
+                otlp_traces::Error::AttributesTooLarge => atoms::attributes_too_large(),
+                otlp_traces::Error::TooManyNodes => atoms::too_many_otlp_nodes(),
+            };
+            (atoms::error(), reason).encode(env)
+        }
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_otlp_traces<'a>(
+    env: Env<'a>,
+    body: Binary<'a>,
+    limits: otlp_traces::Options,
+) -> Term<'a> {
+    match otlp_traces::decode(env, body.as_slice(), limits) {
+        Ok(payload) => (atoms::ok(), payload).encode(env),
+        Err(error) => {
+            let reason = match error {
+                otlp_traces::Error::InvalidProtobuf => atoms::invalid_protobuf(),
+                otlp_traces::Error::TooManyRecords => atoms::too_many_records(),
+                otlp_traces::Error::AttributesTooLarge => atoms::attributes_too_large(),
+                otlp_traces::Error::TooManyNodes => atoms::too_many_trace_nodes(),
+            };
+            (atoms::error(), reason).encode(env)
+        }
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_trace_segment_parquet<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
+    encode_trace_segment_impl(env, records, false)
+}
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_trace_segment_parquet_v2<'a>(env: Env<'a>, records: Term<'a>) -> Term<'a> {
+    encode_trace_segment_impl(env, records, true)
+}
+fn encode_trace_segment_impl<'a>(env: Env<'a>, records: Term<'a>, proof: bool) -> Term<'a> {
+    match trace_segment_parquet::encode(env, records) {
+        Ok((blob, min, max, count, safe)) => {
+            if proof {
+                (atoms::ok(), blob, min, max, count, safe).encode(env)
+            } else {
+                (atoms::ok(), blob, min, max, count).encode(env)
+            }
+        }
+        Err(trace_segment_parquet::Error::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
+        Err(trace_segment_parquet::Error::InvalidProjection) if proof => {
+            error(env, atoms::trace_projection_invalid())
+        }
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn compact_trace_segments<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Term<'a> {
+    compact_trace_segments_impl(env, blobs, max_rows, false)
+}
+#[rustler::nif(schedule = "DirtyCpu")]
+fn compact_trace_segments_v2<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Term<'a> {
+    compact_trace_segments_impl(env, blobs, max_rows, true)
+}
+fn compact_trace_segments_impl<'a>(
+    env: Env<'a>,
+    blobs: Term<'a>,
+    max_rows: usize,
+    proof: bool,
+) -> Term<'a> {
+    if max_rows == 0
+        || max_rows > 100_000
+        || blobs.list_length().is_err()
+        || blobs.list_length().unwrap() > 32
+    {
+        return atoms::fallback().encode(env);
+    }
+    match trace_segment_parquet::compact(env, blobs, max_rows) {
+        Ok((blob, min, max, count, services, ids, safe)) => {
+            if proof {
+                (atoms::ok(), blob, min, max, count, (services, ids, safe)).encode(env)
+            } else {
+                (atoms::ok(), blob, min, max, count, services, ids).encode(env)
+            }
+        }
+        Err(trace_segment_parquet::Error::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
+        Err(trace_segment_parquet::Error::InvalidProjection) if proof => {
+            error(env, atoms::trace_projection_invalid())
+        }
+        Err(trace_segment_parquet::Error::TooMany) => error(env, atoms::query_sample_limit()),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// Streaming counterpart of `decode_log_segment_parquet_v2`: the same
+/// filters, decoded a bounded chunk at a time by `log_segment_reader_next`.
+pub struct LogSegmentReader(std::sync::Mutex<Option<segment_parquet::Reader>>);
+
+#[rustler::resource_impl]
+impl rustler::Resource for LogSegmentReader {}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_segment_reader_new<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    service: Term<'a>,
+    matchers: Term<'a>,
+    line_filters: Term<'a>,
+) -> Term<'a> {
+    let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
+        return atoms::fallback().encode(env);
+    };
+    let service_bin: Option<Binary> = service.decode().ok();
+    if service_bin.is_none() && service.decode::<rustler::Atom>().ok() != Some(atoms::nil()) {
+        return atoms::fallback().encode(env);
+    }
+    let (Ok(matchers), Ok(line_filters)) =
+        (decode_matchers(matchers), decode_line_filters(line_filters))
+    else {
+        return atoms::fallback().encode(env);
+    };
+    let filter = segment_parquet::Filter {
+        start,
+        end,
+        service: service_bin.as_ref().map(|b| b.as_slice()),
+        matchers,
+        line_filters,
+    };
+    match segment_parquet::Reader::new(&blob, filter) {
+        Ok(reader) => (
+            atoms::ok(),
+            rustler::ResourceArc::new(LogSegmentReader(std::sync::Mutex::new(reader))),
+        )
+            .encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+/// `{:ok, records}` with at least `min_records` records unless the segment
+/// ends first, `:done` once exhausted, `:fallback` on a corrupt segment.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_segment_reader_next<'a>(
+    env: Env<'a>,
+    reader: rustler::ResourceArc<LogSegmentReader>,
+    min_records: usize,
+) -> Term<'a> {
+    let Ok(mut guard) = reader.0.lock() else {
+        return atoms::fallback().encode(env);
+    };
+    let Some(state) = guard.as_mut() else {
+        return atoms::done().encode(env);
+    };
+    match state.next(env, min_records.max(1)) {
+        Ok(Some(records)) => (atoms::ok(), records).encode(env),
+        Ok(None) => {
+            guard.take();
+            atoms::done().encode(env)
+        }
+        Err(_) => {
+            guard.take();
+            atoms::fallback().encode(env)
+        }
+    }
+}
+
+/// Merge up to 32 log Parquet segments natively into one replacement:
+/// `{:ok, blob, min_ts, max_ts, count, services | nil}`. Mirrors
+/// `compact_trace_segments_v2`; records never become Erlang terms.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn compact_log_segments<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Term<'a> {
+    if max_rows == 0 || max_rows > 100_000 || blobs.list_length().map_or(true, |n| n > 32) {
+        return atoms::fallback().encode(env);
+    }
+    match segment_parquet::compact(env, blobs, max_rows) {
+        Ok((blob, b, services)) => (
+            atoms::ok(),
+            blob,
+            integer(env, b.min_ts),
+            integer(env, b.max_ts),
+            b.count,
+            services,
+        )
+            .encode(env),
+        Err(segment_parquet::CompactError::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
+        Err(segment_parquet::CompactError::TooMany) => error(env, atoms::query_sample_limit()),
+        Err(segment_parquet::CompactError::Invalid) => atoms::fallback().encode(env),
+    }
+}
+
+/// Row count of a log segment, verified against its row groups.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_segment_parquet_row_count<'a>(env: Env<'a>, blob: Binary<'a>) -> Term<'a> {
+    match trace_segment_parquet::row_count(blob) {
+        Ok(count) => (atoms::ok(), count).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn trace_segment_parquet_row_count<'a>(env: Env<'a>, blob: Binary<'a>) -> Term<'a> {
+    match trace_segment_parquet::row_count(blob) {
+        Ok(count) => (atoms::ok(), count).encode(env),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_trace_segment_parquet<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start: Term<'a>,
+    end: Term<'a>,
+    filters: Term<'a>,
+    max: usize,
+) -> Term<'a> {
+    let (Ok(start), Ok(end)) = (optional_int(start), optional_int(end)) else {
+        return atoms::fallback().encode(env);
+    };
+    match trace_segment_parquet::decode(env, blob, start, end, filters, max) {
+        Ok(records) => (atoms::ok(), records).encode(env),
+        Err(trace_segment_parquet::Error::TooMany) => {
+            (atoms::error(), atoms::query_sample_limit()).encode(env)
+        }
+        Err(trace_segment_parquet::Error::QueryBytes) => error(env, atoms::query_resource_limit()),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
 /// Encode `[%Pulso.Record.MetricSample{}]` as an Apache Parquet segment
 /// for the metrics S3 storage path. Returns
 /// `{:ok, binary, min_ts, max_ts, count}` on success or `:fallback`.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn encode_metric_segment_parquet<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
-    match metric_segment_parquet::encode(env, samples) {
+fn encode_metric_segment_parquet_v2<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
+    encode_metrics(env, samples, false)
+}
+
+#[rustler::nif]
+fn metric_postings_api_version() -> u32 {
+    1
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_metric_segment_parquet_indexed_v1<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
+    encode_metrics(env, samples, true)
+}
+
+fn encode_metrics<'a>(env: Env<'a>, samples: Term<'a>, indexed: bool) -> Term<'a> {
+    match metric_segment_parquet::encode(env, samples, indexed) {
         Ok((buf, b)) => (
             atoms::ok(),
-            copy(env, &buf),
+            buf,
             integer(env, b.min_ts),
             integer(env, b.max_ts),
             b.count,
         )
             .encode(env),
+        Err(metric_segment_parquet::EncodeError::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
         Err(_) => atoms::fallback().encode(env),
     }
 }
@@ -477,18 +905,31 @@ fn encode_metric_segment_parquet<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a
 /// `[start_ts, end_ts]` and matching every supplied label matcher.
 /// Matchers are a list of `{name :: binary, op :: :eq | :neq | :re | :nre, value :: binary}`.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn decode_metric_segment_parquet<'a>(
+fn decode_metric_segment_parquet_v2<'a>(
     env: Env<'a>,
     blob: Binary<'a>,
     start_ts: Term<'a>,
     end_ts: Term<'a>,
     matchers: Term<'a>,
 ) -> Term<'a> {
-    decode_metrics(env, blob, start_ts, end_ts, matchers, None)
+    decode_metrics(env, blob, start_ts, end_ts, matchers, None, None, false)
+}
+
+/// Like `decode_metric_segment_parquet_v2`, keeping only samples that carry
+/// exemplars, for exemplar queries.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_metric_exemplars_parquet<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    matchers: Term<'a>,
+) -> Term<'a> {
+    decode_metrics(env, blob, start_ts, end_ts, matchers, None, None, true)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn decode_metric_segment_parquet_bounded<'a>(
+fn decode_metric_segment_parquet_bounded_v2<'a>(
     env: Env<'a>,
     blob: Binary<'a>,
     start_ts: Term<'a>,
@@ -496,9 +937,19 @@ fn decode_metric_segment_parquet_bounded<'a>(
     matchers: Term<'a>,
     max_samples: usize,
 ) -> Term<'a> {
-    decode_metrics(env, blob, start_ts, end_ts, matchers, Some(max_samples))
+    decode_metrics(
+        env,
+        blob,
+        start_ts,
+        end_ts,
+        matchers,
+        Some(max_samples),
+        None,
+        false,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_metrics<'a>(
     env: Env<'a>,
     blob: Binary<'a>,
@@ -506,6 +957,8 @@ fn decode_metrics<'a>(
     end_ts: Term<'a>,
     matchers: Term<'a>,
     max_samples: Option<usize>,
+    footer_size: Option<u64>,
+    exemplars_only: bool,
 ) -> Term<'a> {
     let (Ok(start), Ok(end)) = (optional_int(start_ts), optional_int(end_ts)) else {
         return atoms::fallback().encode(env);
@@ -547,7 +1000,15 @@ fn decode_metrics<'a>(
         end,
         matchers: matcher_views,
         max_samples,
+        exemplars_only,
     };
+    if let Some(size) = footer_size {
+        return match metric_footer::plan(erlang_bytes::from_binary(blob), size, &filter) {
+            metric_footer::Plan::Scan { rows, empty } => (atoms::ok(), rows, empty).encode(env),
+            metric_footer::Plan::More(bytes) => (atoms::ok(), atoms::more(), bytes).encode(env),
+            metric_footer::Plan::Unknown => atoms::fallback().encode(env),
+        };
+    }
     match metric_segment_parquet::decode(env, &blob, &filter) {
         Ok(records) => (atoms::ok(), records).encode(env),
         Err(metric_segment_parquet::DecodeError::TooManySamples) => {
@@ -555,6 +1016,23 @@ fn decode_metrics<'a>(
         }
         Err(_) => atoms::fallback().encode(env),
     }
+}
+
+#[rustler::nif]
+fn metric_footer_api_version() -> u32 {
+    1
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn metric_segment_footer_plan<'a>(
+    env: Env<'a>,
+    tail: Binary<'a>,
+    size: u64,
+    start: Term<'a>,
+    end: Term<'a>,
+    matchers: Term<'a>,
+) -> Term<'a> {
+    decode_metrics(env, tail, start, end, matchers, None, Some(size), false)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -568,7 +1046,7 @@ fn validate_metric_regex(pattern: &str) -> rustler::Atom {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn validate_log_regex(pattern: &str) -> rustler::Atom {
-    if Regex::new(pattern).is_ok() {
+    if query_regex::bytes(pattern).is_ok() {
         atoms::ok()
     } else {
         atoms::error()
@@ -596,7 +1074,7 @@ fn decode_remote_write<'a>(
     compressed: Binary<'a>,
     max_decompressed: usize,
 ) -> NifResult<Term<'a>> {
-    decode_remote_write_inner(env, compressed, max_decompressed, None)
+    decode_remote_write_inner(env, compressed, max_decompressed, None, false)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -606,7 +1084,32 @@ fn decode_remote_write_limited<'a>(
     max_decompressed: usize,
     options: ingest_limits::Options,
 ) -> NifResult<Term<'a>> {
-    decode_remote_write_inner(env, compressed, max_decompressed, Some(options.into()))
+    decode_remote_write_inner(
+        env,
+        compressed,
+        max_decompressed,
+        Some(options.into()),
+        false,
+    )
+}
+
+/// Like `decode_remote_write_limited`, for a Remote Write 2.0
+/// `io.prometheus.write.v2.Request` (`remote_write::decode_v2`), with the same
+/// result shape.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_remote_write_v2_limited<'a>(
+    env: Env<'a>,
+    compressed: Binary<'a>,
+    max_decompressed: usize,
+    options: ingest_limits::Options,
+) -> NifResult<Term<'a>> {
+    decode_remote_write_inner(
+        env,
+        compressed,
+        max_decompressed,
+        Some(options.into()),
+        true,
+    )
 }
 
 fn decode_remote_write_inner<'a>(
@@ -614,6 +1117,7 @@ fn decode_remote_write_inner<'a>(
     compressed: Binary<'a>,
     max_decompressed: usize,
     limits: Option<ingest_limits::Limits>,
+    v2: bool,
 ) -> NifResult<Term<'a>> {
     let input = compressed.as_slice();
     let len = match snap::raw::decompress_len(input) {
@@ -632,12 +1136,22 @@ fn decode_remote_write_inner<'a>(
     let buffer: Binary = buffer.into();
 
     if let Some(limits) = limits {
-        if let Err(reason) = limits.remote_write(buffer.as_slice()) {
+        let preflight = if v2 {
+            limits.remote_write_v2(buffer.as_slice())
+        } else {
+            limits.remote_write(buffer.as_slice())
+        };
+        if let Err(reason) = preflight {
             return Ok(ingest_error(env, reason));
         }
     }
 
-    let decoded = match remote_write::decode(buffer.as_slice()) {
+    let decoded = if v2 {
+        remote_write::decode_v2(buffer.as_slice())
+    } else {
+        remote_write::decode(buffer.as_slice())
+    };
+    let decoded = match decoded {
         Some(d) => d,
         None => return Ok(error(env, atoms::invalid_protobuf())),
     };
@@ -665,10 +1179,41 @@ fn decode_remote_write_inner<'a>(
         let sorted_pairs: Vec<(&[u8], &[u8])> =
             series.labels.iter().map(|(n, v)| (*n, *v)).collect();
         let series_id = stable_hash::stable_hash(sorted_pairs) as i64;
-        series_terms.push((labels_map, samples, series_id).encode(env));
+        let histograms: Vec<Term<'a>> = series
+            .histograms
+            .iter()
+            .map(|(h, ts)| (ts.encode(env), h.to_term(env)).encode(env))
+            .collect();
+        // Exemplar timestamps leave in nanoseconds, like stored ones.
+        let exemplars: Vec<Term<'a>> = series
+            .exemplars
+            .iter()
+            .map(|e| {
+                exemplar::to_term(
+                    env,
+                    &e.labels,
+                    e.value,
+                    e.timestamp_ms.saturating_mul(1_000_000),
+                )
+            })
+            .collect();
+        series_terms.push((labels_map, samples, series_id, histograms, exemplars).encode(env));
     }
 
-    Ok((atoms::ok(), series_terms, decoded.rejected).encode(env))
+    let mut metadata_terms: Vec<Term<'a>> = Vec::with_capacity(decoded.metadata.len());
+    for entry in &decoded.metadata {
+        metadata_terms.push(
+            (
+                slice(env, &buffer, entry.name)?,
+                entry.kind,
+                slice(env, &buffer, entry.help)?,
+                slice(env, &buffer, entry.unit)?,
+            )
+                .encode(env),
+        );
+    }
+
+    Ok((atoms::ok(), series_terms, decoded.rejected, metadata_terms).encode(env))
 }
 
 // -- LogQL pushdown helpers for `decode_log_segment_parquet` ---------------
@@ -679,7 +1224,7 @@ fn decode_remote_write_inner<'a>(
 // row shape and column set are different — a near-duplicate that is a
 // documented follow-up when the two filter shapes converge.
 
-fn decode_matchers(term: Term<'_>) -> Result<Vec<Matcher>, ()> {
+pub(crate) fn decode_matchers(term: Term<'_>) -> Result<Vec<Matcher>, ()> {
     let list: Vec<Term> = term.decode().map_err(|_| ())?;
     let mut out = Vec::with_capacity(list.len());
     for item in list {
@@ -691,7 +1236,7 @@ fn decode_matchers(term: Term<'_>) -> Result<Vec<Matcher>, ()> {
         match op {
             MatchOp::Re | MatchOp::Nre => {
                 let pat = std::str::from_utf8(&value_vec).map_err(|_| ())?;
-                let re = Regex::new(pat).map_err(|_| ())?;
+                let re = query_regex::bytes(pat).map_err(|_| ())?;
                 out.push(Matcher::Regex {
                     name: name_vec,
                     op,
@@ -722,7 +1267,7 @@ fn decode_match_op(atom: rustler::Atom) -> Result<MatchOp, ()> {
     }
 }
 
-fn decode_line_filters(term: Term<'_>) -> Result<Vec<LineFilter>, ()> {
+pub(crate) fn decode_line_filters(term: Term<'_>) -> Result<Vec<LineFilter>, ()> {
     let list: Vec<Term> = term.decode().map_err(|_| ())?;
     let mut out = Vec::with_capacity(list.len());
     for item in list {
@@ -738,7 +1283,7 @@ fn decode_line_filters(term: Term<'_>) -> Result<Vec<LineFilter>, ()> {
             }
             LineFilterOp::MatchRe | LineFilterOp::NotMatchRe => {
                 let pat = std::str::from_utf8(value.as_slice()).map_err(|_| ())?;
-                let re = Regex::new(pat).map_err(|_| ())?;
+                let re = query_regex::bytes(pat).map_err(|_| ())?;
                 out.push(LineFilter::Regex { op, regex: re });
             }
         }
@@ -766,8 +1311,9 @@ fn decode_line_filter_op(atom: rustler::Atom) -> Result<LineFilterOp, ()> {
 /// with the same JSON values. The Elixir caller uses `JSON.encode!` then.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
-    match metric_json::encode(env, samples) {
-        Ok(buf) => (atoms::ok(), copy(env, &buf)).encode(env),
+    match metric_json::encode(env, samples, metric_json::MAX_PAYLOAD) {
+        Ok(buf) => (atoms::ok(), buf).encode(env),
+        Err(crate::term_json::EncodeError::TooBig) => error(env, atoms::query_result_limit()),
         Err(_) => atoms::fallback().encode(env),
     }
 }

@@ -117,6 +117,56 @@ impl Limits {
         })
     }
 
+    /// Remote Write 2.0: the same series/record/label budgets as v1, with
+    /// labels resolved through the symbol table. Unresolvable references are
+    /// left to the decoder, which rejects their series.
+    pub fn remote_write_v2(&self, input: &[u8]) -> Result<(), Error> {
+        let mut symbols: Vec<&[u8]> = Vec::new();
+        fields(input, |field, value| {
+            if let (4, Value::Bytes(symbol)) = (field, value) {
+                symbols.push(symbol);
+            }
+            Ok(())
+        })?;
+        let (mut records, mut groups) = (0, 0);
+        fields(input, |field, value| {
+            if let (5, Value::Bytes(series)) = (field, value) {
+                increment(&mut groups, self.records)?;
+                let mut refs: Vec<u64> = Vec::new();
+                fields(series, |field, value| {
+                    match (field, value) {
+                        (1, Value::Bytes(packed)) => {
+                            let mut reader = Reader::new(packed);
+                            while !reader.is_empty() {
+                                refs.push(reader.read_varint().ok_or(Error::InvalidProtobuf)?);
+                                if refs.len() > self.attributes.saturating_mul(2) {
+                                    return Err(Error::AttributesTooLarge);
+                                }
+                            }
+                        }
+                        (1, Value::Varint(r)) => {
+                            refs.push(r);
+                            if refs.len() > self.attributes.saturating_mul(2) {
+                                return Err(Error::AttributesTooLarge);
+                            }
+                        }
+                        (2..=4, Value::Bytes(_)) => increment(&mut records, self.records)?,
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                let (mut count, mut bytes) = (0, 0);
+                let symbol = |r: u64| usize::try_from(r).ok().and_then(|i| symbols.get(i));
+                for pair in refs.chunks_exact(2) {
+                    if let (Some(key), Some(value)) = (symbol(pair[0]), symbol(pair[1])) {
+                        self.pair(key, value, &mut count, &mut bytes)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn loki(&self, input: &[u8]) -> Result<(), Error> {
         let (mut records, mut groups) = (0, 0);
         fields(input, |field, value| {
@@ -236,6 +286,42 @@ mod tests {
         assert_eq!(
             limits().loki(&field(1, &field(1, br#"{a="12345"}"#))),
             Err(Error::AttributesTooLarge)
+        );
+    }
+
+    #[test]
+    fn remote_write_v2_resolves_symbols_before_charging_labels() {
+        // Symbols: "", "a", "123", "12345"; limits allow two pairs of 8 bytes.
+        let symbols: Vec<u8> = [&b""[..], b"a", b"123", b"12345"]
+            .iter()
+            .flat_map(|s| field(4, s))
+            .collect();
+        let request = |refs: &[u8], samples: usize| {
+            let series = [field(1, refs), field(2, b"").repeat(samples)].concat();
+            [field(5, &series), symbols.clone()].concat()
+        };
+        assert_eq!(limits().remote_write_v2(&request(&[1, 2, 1, 2], 2)), Ok(()));
+        assert_eq!(
+            limits().remote_write_v2(&request(&[1, 2, 1, 2, 1, 2], 1)),
+            Err(Error::AttributesTooLarge)
+        );
+        assert_eq!(
+            limits().remote_write_v2(&request(&[1, 3], 1)),
+            Err(Error::AttributesTooLarge)
+        );
+        assert_eq!(
+            limits().remote_write_v2(&request(&[1, 2], 3)),
+            Err(Error::TooManyRecords)
+        );
+        // Out-of-table references are the decoder's to reject.
+        assert_eq!(limits().remote_write_v2(&request(&[1, 9], 1)), Ok(()));
+        assert_eq!(
+            limits().remote_write_v2(&field(5, b"").repeat(3)),
+            Err(Error::TooManyRecords)
+        );
+        assert_eq!(
+            limits().remote_write_v2(&field(5, &field(1, &[0x80]))),
+            Err(Error::InvalidProtobuf)
         );
     }
 

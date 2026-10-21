@@ -11,6 +11,20 @@ defmodule Pulso.JSONTest do
   alias Pulso.Record.Log
   alias Pulso.Test.RandomTerms
 
+  test "projected tuple keys and values detach slices without copying standalone binaries" do
+    arena = String.duplicate("x", 1024 * 1024)
+    slice = binary_part(arena, 1, 100)
+    standalone = :binary.copy(slice)
+    assert :binary.referenced_byte_size(slice) > byte_size(slice)
+    {key, %{value: value, standalone: kept}} = Pulso.JSON.detach({{slice}, %{value: slice, standalone: standalone}})
+    assert elem(key, 0) == value
+    assert :binary.referenced_byte_size(elem(key, 0)) == 100
+    assert :binary.referenced_byte_size(value) == 100
+    assert :erts_debug.same(kept, standalone)
+    assert %Log{body: detached} = Pulso.JSON.detach(%Log{body: slice})
+    assert :binary.referenced_byte_size(detached) == 100
+  end
+
   @backslash <<92>>
 
   defp same_decode(doc) do

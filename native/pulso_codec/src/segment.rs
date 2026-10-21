@@ -30,11 +30,12 @@ mod atoms {
         span_id,
         attributes,
         resource,
+        otlp,
     }
 }
 
 // Field order of the written object and of the struct we build.
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 11] = [
     "attributes",
     "body",
     "observed_timestamp_ns",
@@ -45,6 +46,7 @@ const FIELDS: [&str; 10] = [
     "span_id",
     "timestamp_ns",
     "trace_id",
+    "otlp",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -67,7 +69,7 @@ pub struct Bounds {
     pub count: usize,
 }
 
-fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 10] {
+fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 11] {
     [
         atoms::attributes(),
         atoms::body(),
@@ -79,6 +81,7 @@ fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 10] {
         atoms::span_id(),
         atoms::timestamp_ns(),
         atoms::trace_id(),
+        atoms::otlp(),
     ]
     .map(|a| a.encode(env))
 }
@@ -230,7 +233,7 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
     let mut builder = TermBuilder::new(env, blob);
     let mut stacks = Stacks::new();
 
-    let mut all_keys = Vec::with_capacity(11);
+    let mut all_keys = Vec::with_capacity(12);
     all_keys.push(struct_key);
     all_keys.extend_from_slice(&keys);
     let filtered = time_filter || filter.service.is_some();
@@ -248,7 +251,7 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
             direct_line(line, &mut builder, &mut stacks)?
         };
 
-        let mut values = Vec::with_capacity(11);
+        let mut values = Vec::with_capacity(12);
         values.push(log);
         for (i, name) in FIELDS.iter().enumerate() {
             let term = slots[i].unwrap_or(nil);
@@ -265,7 +268,7 @@ pub fn decode<'a>(env: Env<'a>, blob: &Binary<'a>, filter: &Filter) -> Res<Vec<T
     Ok(out)
 }
 
-type Slots<'a> = [Option<Term<'a>>; 10];
+type Slots<'a> = [Option<Term<'a>>; 11];
 
 fn field_index(key: &[u8]) -> Option<usize> {
     FIELDS.iter().position(|f| f.as_bytes() == key)
@@ -277,7 +280,7 @@ fn direct_line<'a>(
     builder: &mut TermBuilder<'a, '_>,
     stacks: &mut Stacks<Term<'a>>,
 ) -> Res<Slots<'a>> {
-    let mut slots: Slots = [None; 10];
+    let mut slots: Slots = [None; 11];
     let mut seen: Vec<Cow<'a, [u8]>> = Vec::with_capacity(12);
     let mut p = Parser::new(line);
     p.ws();
@@ -360,7 +363,7 @@ fn filtered_line<'a>(
         }
     }
 
-    let mut slots: Slots = [None; 10];
+    let mut slots: Slots = [None; 11];
     for (key, raw) in &fields {
         if let Some(i) = field_index(key) {
             slots[i] = Some(Parser::new(raw).document_with(builder, stacks)?);

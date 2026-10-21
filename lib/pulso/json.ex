@@ -45,6 +45,21 @@ defmodule Pulso.JSON do
     end
   end
 
+  @doc """
+  Copy every string of a decoded or projected term that is a sub-binary of a larger
+  binary, so the term neither pins its input nor counts the whole input once
+  per string against a process cap that includes shared binaries.
+  """
+  @spec detach(term()) :: term()
+  def detach(binary) when is_binary(binary) do
+    if :binary.referenced_byte_size(binary) > byte_size(binary), do: :binary.copy(binary), else: binary
+  end
+
+  def detach(list) when is_list(list), do: Enum.map(list, &detach/1)
+  def detach(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> Enum.map(&detach/1) |> List.to_tuple()
+  def detach(%{} = map), do: :maps.fold(fn key, value, acc -> Map.put(acc, detach(key), detach(value)) end, %{}, map)
+  def detach(other), do: other
+
   @spec encode!(term()) :: binary()
   def encode!(term) do
     case nif_encode(term) do

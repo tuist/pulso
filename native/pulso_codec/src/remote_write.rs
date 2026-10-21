@@ -6,7 +6,12 @@
 //! ```proto
 //! message WriteRequest {
 //!   repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
-//!   // metadata is optional and ignored here
+//!   repeated MetricMetadata metadata = 3 [(gogoproto.nullable) = false];
+//! }
+//!
+//! message MetricMetadata {
+//!   MetricType type = 1; string metric_family_name = 2;
+//!   string help = 4; string unit = 5;
 //! }
 //!
 //! message TimeSeries {
@@ -33,6 +38,8 @@
 //! decoded `Sample` and let the Elixir caller scale to nanoseconds
 //! at the storage boundary.
 
+use crate::exemplar::{self, Exemplar};
+use crate::native_histogram::{self, Histogram};
 use crate::wire::{Reader, Value};
 
 pub struct Sample {
@@ -43,11 +50,23 @@ pub struct Sample {
 pub struct Series<'a> {
     pub labels: Vec<(&'a [u8], &'a [u8])>,
     pub samples: Vec<Sample>,
+    /// Native histograms with their millisecond timestamps.
+    pub histograms: Vec<(Histogram, i64)>,
+    pub exemplars: Vec<Exemplar<'a>>,
+}
+
+/// One `MetricMetadata` entry: family name, Prometheus type name, help, unit.
+pub struct Metadata<'a> {
+    pub name: &'a [u8],
+    pub kind: &'static str,
+    pub help: &'a [u8],
+    pub unit: &'a [u8],
 }
 
 pub struct Decoded<'a> {
     pub series: Vec<Series<'a>>,
     pub rejected: u64,
+    pub metadata: Vec<Metadata<'a>>,
 }
 
 pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
@@ -55,6 +74,7 @@ pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
     let mut decoded = Decoded {
         series: Vec::new(),
         rejected: 0,
+        metadata: Vec::new(),
     };
 
     loop {
@@ -67,8 +87,14 @@ pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
                 }
                 Err(rejected) => decoded.rejected = decoded.rejected.saturating_add(rejected),
             },
-            // Other fields (metadata, exemplars at the top level in
-            // v2, etc.) are ignored.
+            // Metadata without a valid UTF-8 family name and known type is
+            // dropped; it never fails the samples of the request.
+            Some((3, Value::Bytes(bytes))) => {
+                if let Some(entry) = decode_metadata(bytes) {
+                    decoded.metadata.push(entry);
+                }
+            }
+            // Other fields are ignored.
             _ => {}
         }
     }
@@ -76,45 +102,119 @@ pub fn decode(input: &[u8]) -> Option<Decoded<'_>> {
     Some(decoded)
 }
 
+// Prometheus `MetricMetadata.MetricType` names, as `/api/v1/metadata` reports them.
+const METRIC_TYPES: [&str; 8] = [
+    "unknown",
+    "counter",
+    "gauge",
+    "histogram",
+    "gaugehistogram",
+    "summary",
+    "info",
+    "stateset",
+];
+
+fn decode_metadata(input: &[u8]) -> Option<Metadata<'_>> {
+    let mut reader = Reader::new(input);
+    let mut entry = Metadata {
+        name: &[],
+        kind: METRIC_TYPES[0],
+        help: &[],
+        unit: &[],
+    };
+    loop {
+        match reader.next_field()? {
+            None => break,
+            Some((1, Value::Varint(t))) => {
+                entry.kind = METRIC_TYPES.get(usize::try_from(t).ok()?)?;
+            }
+            Some((2, Value::Bytes(b))) => entry.name = b,
+            Some((4, Value::Bytes(b))) => entry.help = b,
+            Some((5, Value::Bytes(b))) => entry.unit = b,
+            _ => {}
+        }
+    }
+    let valid = |b: &[u8]| simdutf8::basic::from_utf8(b).is_ok();
+    (!entry.name.is_empty() && valid(entry.name) && valid(entry.help) && valid(entry.unit))
+        .then_some(entry)
+}
+
 fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
     let mut reader = Reader::new(input);
     let mut labels: Vec<(&[u8], &[u8])> = Vec::new();
-    let mut samples: Vec<Sample> = Vec::new();
-    let mut rejected = 0u64;
-    let mut total_samples = 0u64;
+    let mut parts = Parts::default();
 
     loop {
-        match reader.next_field().ok_or(total_samples.max(1))? {
+        match reader.next_field().ok_or(parts.total.max(1))? {
             None => break,
             Some((1, Value::Bytes(bytes))) => {
-                let label = decode_label(bytes).ok_or(total_samples.max(1))?;
+                let label = decode_label(bytes).ok_or(parts.total.max(1))?;
                 labels.push(label);
             }
-            Some((2, Value::Bytes(bytes))) => {
-                total_samples = total_samples.saturating_add(1);
-                let sample = decode_sample(bytes).ok_or(total_samples)?;
-                samples.push(sample);
-            }
-            Some((3 | 4, Value::Bytes(_))) => {
-                // Exemplars and native histograms have no storage model yet.
-                // Count them explicitly instead of silently acknowledging loss.
-                total_samples = total_samples.saturating_add(1);
-                rejected = rejected.saturating_add(1);
-            }
+            Some((2, Value::Bytes(bytes))) => parts.sample(bytes)?,
+            Some((3, Value::Bytes(bytes))) => parts.exemplar(exemplar::decode_v1(bytes)),
+            Some((4, Value::Bytes(bytes))) => parts.histogram(bytes),
             _ => {}
         }
     }
 
+    let rejected = parts.rejected;
+    let series = finish_series(labels, parts)?;
+    Ok((series, rejected))
+}
+
+// What one series carries, shared by both protocol versions. `total` counts
+// supplied samples and histograms, so a rejected series reports all of them;
+// invalid histograms count as rejected, invalid exemplars are dropped (they
+// are not samples), as in Prometheus.
+#[derive(Default)]
+struct Parts<'a> {
+    samples: Vec<Sample>,
+    histograms: Vec<(Histogram, i64)>,
+    exemplars: Vec<Exemplar<'a>>,
+    total: u64,
+    rejected: u64,
+}
+
+impl<'a> Parts<'a> {
+    fn sample(&mut self, bytes: &[u8]) -> Result<(), u64> {
+        self.total = self.total.saturating_add(1);
+        self.samples.push(decode_sample(bytes).ok_or(self.total)?);
+        Ok(())
+    }
+
+    fn histogram(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(1);
+        match native_histogram::decode_wire(bytes) {
+            Some(histogram) => self.histograms.push(histogram),
+            None => self.rejected = self.rejected.saturating_add(1),
+        }
+    }
+
+    fn exemplar(&mut self, exemplar: Option<Exemplar<'a>>) {
+        self.exemplars.extend(exemplar);
+    }
+}
+
+// Shared by both protocol versions, after the whole series was read so
+// rejected counts include every supplied sample.
+fn finish_series<'a>(
+    mut labels: Vec<(&'a [u8], &'a [u8])>,
+    parts: Parts<'a>,
+) -> Result<Series<'a>, u64> {
+    let total_samples = parts.total;
     // Prometheus requires at least `__name__` and one sample per series.
     // Treat a labels- or samples-empty series as rejected rather than
-    // feeding a nameless point into storage.
-    if labels.is_empty() || samples.is_empty() {
+    // feeding a nameless point into storage. Senders put exemplars in
+    // series entries of their own, so exemplars alone are enough.
+    let empty =
+        parts.samples.is_empty() && parts.histograms.is_empty() && parts.exemplars.is_empty();
+    if labels.is_empty() || empty {
         return Err(total_samples.max(1));
     }
 
-    // Validate after reading the whole series so rejected counts include
-    // every supplied sample. UTF-8 validation also excludes the 0xff byte
-    // used as the canonical label separator in storage.
+    // UTF-8 validation also excludes the 0xff byte used as the canonical
+    // label separator in storage.
     if labels.iter().any(|(name, value)| {
         simdutf8::basic::from_utf8(name).is_err() || simdutf8::basic::from_utf8(value).is_err()
     }) {
@@ -124,7 +224,180 @@ fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
     if labels.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(total_samples.max(1));
     }
-    Ok((Series { labels, samples }, rejected))
+    Ok(Series {
+        labels,
+        samples: parts.samples,
+        histograms: parts.histograms,
+        exemplars: parts.exemplars,
+    })
+}
+
+/// Decode a Remote Write 2.0 `io.prometheus.write.v2.Request`:
+///
+/// ```proto
+/// message Request { repeated string symbols = 4; repeated TimeSeries timeseries = 5; }
+/// message TimeSeries {
+///   repeated uint32 labels_refs = 1;   // name/value pairs of symbol indexes
+///   repeated Sample samples = 2;
+///   repeated Histogram histograms = 3; // native histograms: rejected
+///   repeated Exemplar exemplars = 4;   // not stored: reported as unwritten
+///   Metadata metadata = 5;             // type = 1, help_ref = 3, unit_ref = 4
+/// }
+/// ```
+///
+/// Series and samples follow the v1 rules. A series whose label or metadata
+/// references fall outside the symbol table is rejected whole, as Prometheus's
+/// receiver does. Metadata is reported once per distinct entry, under the
+/// series' metric family name (OpenMetrics suffixes trimmed by type, as Mimir
+/// does), and only when it carries a type, help or unit.
+pub fn decode_v2(input: &[u8]) -> Option<Decoded<'_>> {
+    // Symbols may appear anywhere in the message, so collect them first.
+    let mut symbols: Vec<&[u8]> = Vec::new();
+    let mut reader = Reader::new(input);
+    while let Some((field, value)) = reader.next_field()? {
+        if let (4, Value::Bytes(symbol)) = (field, value) {
+            symbols.push(symbol);
+        }
+    }
+
+    let mut decoded = Decoded {
+        series: Vec::new(),
+        rejected: 0,
+        metadata: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut reader = Reader::new(input);
+    while let Some((field, value)) = reader.next_field()? {
+        let (5, Value::Bytes(bytes)) = (field, value) else {
+            continue;
+        };
+        match decode_series_v2(bytes, &symbols) {
+            Ok((series, rejected, metadata)) => {
+                decoded.series.push(series);
+                decoded.rejected = decoded.rejected.saturating_add(rejected);
+                if let Some(m) = metadata {
+                    if seen.insert((m.name, m.kind, m.help, m.unit)) {
+                        decoded.metadata.push(m);
+                    }
+                }
+            }
+            Err(rejected) => decoded.rejected = decoded.rejected.saturating_add(rejected),
+        }
+    }
+    Some(decoded)
+}
+
+type SeriesV2<'a> = (Series<'a>, u64, Option<Metadata<'a>>);
+
+fn decode_series_v2<'a>(input: &'a [u8], symbols: &[&'a [u8]]) -> Result<SeriesV2<'a>, u64> {
+    let mut reader = Reader::new(input);
+    let mut refs: Vec<u64> = Vec::new();
+    let mut metadata: &[u8] = &[];
+    let mut parts = Parts::default();
+
+    loop {
+        match reader.next_field().ok_or(parts.total.max(1))? {
+            None => break,
+            // Repeated scalars may arrive packed or one varint per element.
+            Some((1, Value::Bytes(packed))) => {
+                let mut pos = 0;
+                while pos < packed.len() {
+                    let (r, consumed) = read_varint(packed, pos).ok_or(parts.total.max(1))?;
+                    refs.push(r);
+                    pos += consumed;
+                }
+            }
+            Some((1, Value::Varint(r))) => refs.push(r),
+            Some((2, Value::Bytes(bytes))) => parts.sample(bytes)?,
+            Some((3, Value::Bytes(bytes))) => parts.histogram(bytes),
+            Some((4, Value::Bytes(bytes))) => parts.exemplar(exemplar::decode_v2(bytes, symbols)),
+            Some((5, Value::Bytes(bytes))) => metadata = bytes,
+            _ => {}
+        }
+    }
+
+    let fail = parts.total.max(1);
+    let rejected = parts.rejected;
+    let symbol = |r: u64| -> Result<&'a [u8], u64> {
+        usize::try_from(r)
+            .ok()
+            .filter(|_| r <= u64::from(u32::MAX))
+            .and_then(|i| symbols.get(i).copied())
+            .ok_or(fail)
+    };
+    if !refs.len().is_multiple_of(2) {
+        return Err(fail);
+    }
+    let mut labels = Vec::with_capacity(refs.len() / 2);
+    for pair in refs.chunks_exact(2) {
+        let name = symbol(pair[0])?;
+        if name.is_empty() {
+            return Err(fail);
+        }
+        labels.push((name, symbol(pair[1])?));
+    }
+
+    let (mut kind, mut help_ref, mut unit_ref) = (0u64, 0u64, 0u64);
+    let mut meta = Reader::new(metadata);
+    while let Some(field) = meta.next_field().ok_or(fail)? {
+        match field {
+            (1, Value::Varint(v)) => kind = v,
+            (3, Value::Varint(v)) => help_ref = v,
+            (4, Value::Varint(v)) => unit_ref = v,
+            _ => {}
+        }
+    }
+    // An empty symbol table resolves nothing, but unset references are zero.
+    let optional = |r: u64| {
+        if r == 0 && symbols.is_empty() {
+            Ok(&[][..])
+        } else {
+            symbol(r)
+        }
+    };
+    let (help, unit) = (optional(help_ref)?, optional(unit_ref)?);
+
+    let series = finish_series(labels, parts)?;
+    let family = series
+        .labels
+        .iter()
+        .find(|(name, _)| *name == b"__name__")
+        .map(|(_, value)| *value);
+    let kind = usize::try_from(kind)
+        .ok()
+        .and_then(|k| METRIC_TYPES.get(k))
+        .copied()
+        .unwrap_or(METRIC_TYPES[0]);
+    let entry = family
+        .map(|name| family_name(name, kind))
+        .filter(|name| !name.is_empty())
+        .filter(|_| kind != METRIC_TYPES[0] || !help.is_empty() || !unit.is_empty())
+        .filter(|_| {
+            simdutf8::basic::from_utf8(help).is_ok() && simdutf8::basic::from_utf8(unit).is_ok()
+        })
+        .map(|name| Metadata {
+            name,
+            kind,
+            help,
+            unit,
+        });
+    Ok((series, rejected, entry))
+}
+
+// The metric family a series belongs to, cutting the suffix its type
+// mandates in OpenMetrics. `_total` and `_info` stay, as Prometheus's
+// metadata reports them.
+fn family_name<'a>(series_name: &'a [u8], kind: &str) -> &'a [u8] {
+    let suffixes: &[&[u8]] = match kind {
+        "summary" => &[b"_count", b"_sum"],
+        "histogram" => &[b"_bucket", b"_count", b"_sum"],
+        "gaugehistogram" => &[b"_bucket", b"_gcount", b"_gsum"],
+        _ => &[],
+    };
+    suffixes
+        .iter()
+        .find_map(|suffix| series_name.strip_suffix(*suffix))
+        .unwrap_or(series_name)
 }
 
 fn decode_label(input: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -259,6 +532,37 @@ mod tests {
     }
 
     #[test]
+    fn decodes_metric_metadata_and_drops_invalid_entries() {
+        let entry = |kind: u8, name: &[u8], help: &[u8]| {
+            let mut fields = vec![0x08, kind];
+            fields.extend(bytes_field(0x12, name));
+            fields.extend(bytes_field(0x22, help));
+            fields.extend(bytes_field(0x2a, b"seconds"));
+            bytes_field(0x1a, &fields)
+        };
+        let request = [
+            entry(1, b"http_requests_total", b"Requests."),
+            entry(9, b"unknown_type", b""),
+            entry(2, b"", b"no name"),
+            entry(3, b"latency\xff", b""),
+        ]
+        .concat();
+        let decoded = decode(&request).unwrap();
+        assert!(decoded.series.is_empty());
+        assert_eq!(decoded.metadata.len(), 1);
+        let m = &decoded.metadata[0];
+        assert_eq!(
+            (m.name, m.kind, m.help, m.unit),
+            (
+                &b"http_requests_total"[..],
+                "counter",
+                &b"Requests."[..],
+                &b"seconds"[..]
+            )
+        );
+    }
+
+    #[test]
     fn rejects_invalid_utf8_and_duplicates_before_materializing_labels() {
         let invalid: &[&[(&[u8], &[u8])]] = &[
             &[(b"job", b"a\xffb")],
@@ -276,6 +580,154 @@ mod tests {
             assert_eq!(decoded.series.len(), 1);
             assert_eq!(decoded.series[0].labels[1].1, "é😀".as_bytes());
             assert_eq!(decoded.series[0].samples.len(), 3);
+        }
+    }
+
+    const SYMBOLS: [&[u8]; 11] = [
+        b"",
+        b"__name__",
+        b"http_requests_total",
+        b"job",
+        b"api",
+        b"Requests.",
+        b"latency_seconds_bucket",
+        b"le",
+        b"0.5",
+        b"Latency.",
+        b"seconds",
+    ];
+
+    fn sample(timestamp: u8) -> Vec<u8> {
+        let fields = [
+            vec![0x09],
+            2.5f64.to_le_bytes().to_vec(),
+            vec![0x10, timestamp],
+        ]
+        .concat();
+        bytes_field(0x12, &fields)
+    }
+
+    // `refs` are packed (one length-delimited field) unless `unpacked`.
+    fn series_v2(refs: &[u8], unpacked: bool, samples: u8, metadata: &[u8]) -> Vec<u8> {
+        let mut out = if unpacked {
+            refs.iter().flat_map(|r| [0x08, *r]).collect()
+        } else {
+            bytes_field(0x0a, refs)
+        };
+        for t in 1..=samples {
+            out.extend(sample(t));
+        }
+        if !metadata.is_empty() {
+            out.extend(bytes_field(0x2a, metadata));
+        }
+        bytes_field(0x2a, &out)
+    }
+
+    fn request_v2(series: &[Vec<u8>]) -> Vec<u8> {
+        // Symbols after the series: a decoder must not depend on field order.
+        let symbols: Vec<u8> = SYMBOLS.iter().flat_map(|s| bytes_field(0x22, s)).collect();
+        [series.concat(), symbols].concat()
+    }
+
+    #[test]
+    fn decodes_v2_series_through_the_symbol_table() {
+        let counter = [0x08, 1, 0x18, 5];
+        let histogram = [0x08, 3, 0x18, 9, 0x20, 10];
+        let request = request_v2(&[
+            series_v2(&[3, 4, 1, 2], false, 2, &counter),
+            series_v2(&[1, 2, 3, 4], true, 1, &counter),
+            series_v2(&[1, 6, 7, 8], false, 1, &histogram),
+        ]);
+        let decoded = decode_v2(&request).unwrap();
+        assert_eq!(decoded.rejected, 0);
+        assert_eq!(decoded.series.len(), 3);
+        let first = &decoded.series[0];
+        assert_eq!(
+            first.labels,
+            vec![
+                (&b"__name__"[..], &b"http_requests_total"[..]),
+                (&b"job"[..], &b"api"[..])
+            ]
+        );
+        assert_eq!(first.samples.len(), 2);
+        assert_eq!(first.samples[1].timestamp_ms, 2);
+        assert_eq!(first.samples[1].value, 2.5);
+
+        // Identical metadata repeats per series but is reported once, and the
+        // histogram family loses its `_bucket` suffix.
+        let metadata: Vec<_> = decoded
+            .metadata
+            .iter()
+            .map(|m| (m.name, m.kind, m.help, m.unit))
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![
+                (
+                    &b"http_requests_total"[..],
+                    "counter",
+                    &b"Requests."[..],
+                    &b""[..]
+                ),
+                (
+                    &b"latency_seconds"[..],
+                    "histogram",
+                    &b"Latency."[..],
+                    &b"seconds"[..]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn v2_rejects_unresolvable_series_whole_and_counts_invalid_histograms() {
+        // A float histogram (count_float = 2) with one observation, and one
+        // whose span claims a bucket it never sends.
+        let valid = [vec![0x11], 1.0f64.to_le_bytes().to_vec()].concat();
+        let invalid = [valid.clone(), bytes_field(0x5a, &[0x08, 0x00, 0x10, 0x01])].concat();
+        let histogram_only = {
+            let refs = bytes_field(0x0a, &[1, 2]);
+            bytes_field(0x2a, &[refs, bytes_field(0x1a, &valid)].concat())
+        };
+        let with_histogram = {
+            let refs = bytes_field(0x0a, &[1, 2]);
+            bytes_field(
+                0x2a,
+                &[refs, sample(1), bytes_field(0x1a, &invalid)].concat(),
+            )
+        };
+        let request = request_v2(&[
+            series_v2(&[1, 2, 3], false, 2, &[]),      // odd reference count
+            series_v2(&[1, 2, 3, 99], false, 3, &[]),  // value outside the table
+            series_v2(&[0, 2], false, 1, &[]),         // empty label name
+            series_v2(&[1, 2], false, 1, &[0x18, 99]), // help outside the table
+            series_v2(&[1, 2], false, 0, &[]),         // no samples
+            histogram_only,                            // kept: a histogram is a sample
+            with_histogram,                            // sample kept, histogram rejected
+            series_v2(&[1, 2], false, 1, &[0x08, 42]), // unknown type stays a sample
+        ]);
+        let decoded = decode_v2(&request).unwrap();
+        assert_eq!(decoded.series.len(), 3);
+        assert_eq!(decoded.series[0].histograms.len(), 1);
+        assert_eq!(decoded.series[0].histograms[0].0.count, 1.0);
+        assert_eq!(decoded.rejected, 2 + 3 + 1 + 1 + 1 + 1);
+        // Neither kept series carries metadata worth recording.
+        assert!(decoded.metadata.is_empty());
+    }
+
+    #[test]
+    fn v2_metric_families_trim_only_their_types_suffixes() {
+        for (name, kind, family) in [
+            (&b"rpc_seconds_count"[..], "summary", &b"rpc_seconds"[..]),
+            (b"rpc_seconds_sum", "summary", b"rpc_seconds"),
+            (b"rpc_seconds_bucket", "summary", b"rpc_seconds_bucket"),
+            (b"queue_gcount", "gaugehistogram", b"queue"),
+            (b"queue_count", "gaugehistogram", b"queue_count"),
+            (b"requests_total", "counter", b"requests_total"),
+            (b"build_info", "info", b"build_info"),
+            (b"_bucket", "histogram", b""),
+        ] {
+            assert_eq!(family_name(name, kind), family);
         }
     }
 }

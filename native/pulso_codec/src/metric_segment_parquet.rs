@@ -1,8 +1,9 @@
 //! Parquet metric segment encoding and decoding.
 //!
-//! Fixed six-column schema (`series_id Int64`, `timestamp_ns Int64`,
-//! `value Float64`, `metric_name Utf8`, `labels_canonical Utf8`,
-//! `labels_json Utf8`), one row group per segment, rows sorted by
+//! Six scalar/label columns plus nullable typed `otlp Utf8` JSON metadata:
+//! `series_id Int64`, `timestamp_ns Int64`, `value Float64`, `metric_name Utf8`,
+//! `labels_canonical Binary`, `labels_json Utf8`. Legacy six-column reads remain
+//! supported. Row groups adapt to series runs; rows sorted by
 //! `(series_id, timestamp_ns)` on write. That sort is what the
 //! Prometheus storage model expects on the hot query path: a
 //! label-matcher query picks series, then streams samples per series in
@@ -15,17 +16,17 @@
 //! `labels_canonical` is the exact byte sequence hashed into
 //! `series_id` (see [`crate::stable_hash`]): `name<0xff>value<0xff>…`
 //! across sorted labels. Keeping it in the segment lets a decoder
-//! re-verify series identity without rebuilding the hash and lets a
-//! future postings-list sidecar be computed by LIST-walking segments
-//! without opening the `labels_json` column.
+//! re-verify series identity without rebuilding the hash. Optional native
+//! footer postings map complete label values to canonical-series ordinals
+//! and row groups; unknown/over-budget indexes retain the scan path.
 //!
 //! The matcher-pushdown surface for v1 metrics is deliberately small:
 //! a decoder-side filter accepts a list of `(name, op, value)`
 //! matchers and only materialises rows for which every matcher
 //! holds. `op` is one of `:eq | :neq | :re | :nre`. Regex matchers
-//! compile once per decode and apply per row — fine for the
-//! single-row-group segments v1 produces; a sidecar postings index
-//! will take over the heavy lifting later.
+//! compile once per decode and apply per row. Positive equality matchers
+//! first intersect optional footer postings; other matchers still filter
+//! surviving rows. This saves Arrow decode work, not S3 download bytes.
 //!
 //! No fallback to Elixir: a decode failure here is a hard error (the
 //! Elixir side maps `:fallback` to `{:error, {:decode_failed, _}}`),
@@ -35,10 +36,9 @@ use crate::stable_hash;
 
 use arrow::array::{
     Array, BinaryArray, BinaryBuilder, DictionaryArray, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, RecordBatch, StringBuilder,
+    Int64Builder, RecordBatch, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -60,6 +60,9 @@ mod atoms {
         timestamp_ns,
         value,
         labels,
+        otlp,
+        histogram,
+        exemplars,
         nil,
         name_atom = "__name__",
         eq,
@@ -94,6 +97,8 @@ pub struct Filter<'f> {
     pub end: Option<i128>,
     pub matchers: Vec<Matcher<'f>>,
     pub max_samples: Option<usize>,
+    /// Only rows carrying exemplars, for exemplar queries.
+    pub exemplars_only: bool,
 }
 
 struct Row {
@@ -101,6 +106,9 @@ struct Row {
     timestamp_ns: i64,
     value: f64,
     labels: Rc<EncodedLabels>,
+    otlp: Option<Vec<u8>>,
+    histogram: Option<Vec<u8>>,
+    exemplars: Option<Vec<u8>>,
 }
 
 struct EncodedLabels {
@@ -114,6 +122,7 @@ struct EncodedLabels {
 pub enum EncodeError {
     BadInput,
     Writer,
+    PayloadTooLarge,
 }
 
 #[derive(Debug)]
@@ -123,7 +132,12 @@ pub enum DecodeError {
     TooManySamples,
 }
 
-pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), EncodeError> {
+pub fn encode<'a>(
+    env: Env<'a>,
+    samples: Term<'a>,
+    indexed: bool,
+) -> Result<(Binary<'a>, Bounds), EncodeError> {
+    metadata_size(env, samples, crate::metric_json::MAX_PAYLOAD)?;
     let len = samples.list_length().map_err(|_| EncodeError::BadInput)?;
     let items: ListIterator = samples.decode().map_err(|_| EncodeError::BadInput)?;
     let struct_key = atoms::struct_key().encode(env);
@@ -164,18 +178,59 @@ pub fn encode<'a>(env: Env<'a>, samples: Term<'a>) -> Result<(Vec<u8>, Bounds), 
     });
 
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
-    let props = writer_properties(row_group_size(&rows));
+    let group_size = row_group_size(&rows);
+    // Keyed appends retain the byte-stable v2 encoder. Only unkeyed and
+    // compaction outputs opt into additive footer bytes under fresh keys.
+    let postings = if indexed {
+        crate::metric_postings::build(
+            rows.iter().map(|row| row.labels.canonical.as_slice()),
+            group_size,
+        )
+    } else {
+        None
+    };
+    let props = writer_properties(group_size, postings);
     // Arrow owns the finished columns now. Do not retain the input row
     // metadata through compression, when writer buffers are at their peak.
     drop(rows);
     drop(previous_labels);
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + len * 32);
+    let mut buf = crate::out::BinaryWriter(crate::out::BinSink::with_capacity(64 + len * 32));
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
     writer.close().map_err(|_| EncodeError::Writer)?;
 
-    Ok((buf, bounds))
+    Ok((buf.0.finish(env), bounds))
+}
+
+// Bound only the additive envelope column, not existing label/scalar rows.
+// Ordinary 100,000-row compactions must not acquire an ingest/result-text cap.
+pub fn metadata_size<'a>(
+    env: Env<'a>,
+    samples: Term<'a>,
+    limit: usize,
+) -> Result<usize, EncodeError> {
+    use crate::out::Sink;
+    samples.list_length().map_err(|_| EncodeError::BadInput)?;
+    let items: ListIterator = samples.decode().map_err(|_| EncodeError::BadInput)?;
+    let nil = atoms::nil().encode(env);
+    let enc = crate::term_json::JsonEncoder::new(env, limit);
+    let mut counter = crate::out::Counter::new(limit);
+    for sample in items {
+        let metadata = sample.map_get(atoms::otlp()).unwrap_or(nil);
+        if metadata.as_c_arg() == nil.as_c_arg() {
+            continue;
+        }
+        if metadata.get_type() != rustler::TermType::Map {
+            return Err(EncodeError::BadInput);
+        }
+        enc.value(&mut counter, metadata, 0)
+            .map_err(|error| match error {
+                crate::term_json::EncodeError::TooBig => EncodeError::PayloadTooLarge,
+                _ => EncodeError::BadInput,
+            })?;
+    }
+    Ok(counter.len())
 }
 
 fn extract_row<'a>(
@@ -222,11 +277,57 @@ fn extract_row<'a>(
         ts_term.decode().map_err(|_| EncodeError::BadInput)?
     };
 
+    let exemplars_term = sample.map_get(atoms::exemplars()).unwrap_or(nil);
+    let exemplars = if exemplars_term.as_c_arg() == nil.as_c_arg() {
+        None
+    } else {
+        let list: Vec<Term> = exemplars_term.decode().map_err(|_| EncodeError::BadInput)?;
+        let owned = list
+            .into_iter()
+            .map(crate::exemplar::from_term)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(EncodeError::BadInput)?;
+        (!owned.is_empty()).then(|| crate::exemplar::to_bytes(&owned))
+    };
+
+    // Rows without a float value keep one older readers understand: a
+    // histogram sample stores the stale marker, so the series ends rather than
+    // showing an invented number, and a row that only carries exemplars
+    // stores a reserved NaN that queries skip.
+    let histogram_term = sample.map_get(atoms::histogram()).unwrap_or(nil);
     let value_term = sample
         .map_get(atoms::value().encode(env))
         .map_err(|_| EncodeError::BadInput)?;
-    let value = crate::metric_value::decode(value_term).map_err(|_| EncodeError::BadInput)?;
+    let (value, histogram) = if histogram_term.as_c_arg() != nil.as_c_arg() {
+        let histogram = crate::native_histogram::Histogram::from_term(histogram_term)
+            .ok_or(EncodeError::BadInput)?;
+        (
+            f64::from_bits(crate::metric_value::STALE_BITS),
+            Some(histogram.to_bytes()),
+        )
+    } else if value_term.as_c_arg() == nil.as_c_arg() && exemplars.is_some() {
+        (
+            f64::from_bits(crate::metric_value::EXEMPLAR_ONLY_BITS),
+            None,
+        )
+    } else {
+        let value = crate::metric_value::decode(value_term).map_err(|_| EncodeError::BadInput)?;
+        (value, None)
+    };
 
+    let metadata = sample.map_get(atoms::otlp()).unwrap_or(nil);
+    let otlp = if metadata.as_c_arg() == nil.as_c_arg() {
+        None
+    } else {
+        if metadata.get_type() != rustler::TermType::Map {
+            return Err(EncodeError::BadInput);
+        }
+        let mut json = Vec::new();
+        crate::term_json::JsonEncoder::new(env, crate::metric_json::MAX_PAYLOAD)
+            .value(&mut json, metadata, 0)
+            .map_err(|_| EncodeError::BadInput)?;
+        Some(json)
+    };
     bounds.count += 1;
     let ts = i128::from(timestamp_ns);
     if ts < bounds.min_ts {
@@ -241,6 +342,9 @@ fn extract_row<'a>(
         timestamp_ns,
         value,
         labels,
+        otlp,
+        histogram,
+        exemplars,
     })
 }
 
@@ -284,7 +388,7 @@ fn canonical_bytes(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
     out
 }
 
-fn labels_as_json(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+pub(crate) fn labels_as_json(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
     // Minimal JSON encoder for `{"name":"value",…}` — label names and
     // values can contain anything, but Prometheus's own convention
     // restricts them to UTF-8 and names to `[A-Za-z_][A-Za-z0-9_]*`, so
@@ -307,7 +411,7 @@ fn labels_as_json(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
     out
 }
 
-fn encode_json_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn encode_json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for &b in s {
         match b {
@@ -338,8 +442,22 @@ fn hex_nibble(n: u8) -> u8 {
     }
 }
 
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+// `histogram` and `exemplars` exist only in segments with rows that carry
+// them, so segments of plain samples keep their exact earlier bytes (keyed
+// retries compare bytes) and readers that predate them keep working.
+fn schema(histograms: bool, exemplars: bool) -> SchemaRef {
+    let mut fields = base_fields();
+    if histograms {
+        fields.push(Field::new("histogram", DataType::Binary, true));
+    }
+    if exemplars {
+        fields.push(Field::new("exemplars", DataType::Binary, true));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+fn base_fields() -> Vec<Field> {
+    vec![
         Field::new("series_id", DataType::Int64, false),
         Field::new("timestamp_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
@@ -354,7 +472,8 @@ fn schema() -> SchemaRef {
         // sub-binaries of the arena without a second parse.
         Field::new("labels_canonical", DataType::Binary, false),
         Field::new("labels_json", DataType::Utf8, false),
-    ]))
+        Field::new("otlp", DataType::Utf8, true),
+    ]
 }
 
 fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
@@ -369,6 +488,13 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut metric_name = StringBuilder::with_capacity(rows.len(), name_bytes);
     let mut labels_canonical = BinaryBuilder::with_capacity(rows.len(), canonical_bytes);
     let mut labels_json = StringBuilder::with_capacity(rows.len(), json_bytes);
+    let mut otlp = StringBuilder::with_capacity(
+        rows.len(),
+        rows.iter()
+            .filter_map(|r| r.otlp.as_ref())
+            .map(Vec::len)
+            .sum(),
+    );
 
     for row in rows {
         series_id.append_value(row.series_id);
@@ -381,21 +507,46 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
         append_string(&mut metric_name, &row.labels.metric_name);
         labels_canonical.append_value(&row.labels.canonical);
         append_string(&mut labels_json, &row.labels.json);
+        match &row.otlp {
+            Some(json) => append_string(&mut otlp, json),
+            None => otlp.append_null(),
+        };
     }
 
-    let batch = RecordBatch::try_new(
-        schema(),
-        vec![
-            Arc::new(series_id.finish()),
-            Arc::new(ts.finish()),
-            Arc::new(value.finish()),
-            Arc::new(metric_name.finish()),
-            Arc::new(labels_canonical.finish()),
-            Arc::new(labels_json.finish()),
-        ],
-    )?;
+    let mut columns: Vec<arrow::array::ArrayRef> = vec![
+        Arc::new(series_id.finish()),
+        Arc::new(ts.finish()),
+        Arc::new(value.finish()),
+        Arc::new(metric_name.finish()),
+        Arc::new(labels_canonical.finish()),
+        Arc::new(labels_json.finish()),
+        Arc::new(otlp.finish()),
+    ];
+    let histograms = rows.iter().any(|row| row.histogram.is_some());
+    let exemplars = rows.iter().any(|row| row.exemplars.is_some());
+    if histograms {
+        columns.push(Arc::new(optional_binary(
+            rows.iter().map(|r| r.histogram.as_deref()),
+        )));
+    }
+    if exemplars {
+        columns.push(Arc::new(optional_binary(
+            rows.iter().map(|r| r.exemplars.as_deref()),
+        )));
+    }
+    RecordBatch::try_new(schema(histograms, exemplars), columns)
+}
 
-    Ok(batch)
+fn optional_binary<'r>(values: impl Iterator<Item = Option<&'r [u8]>> + Clone) -> BinaryArray {
+    let bytes = values.clone().flatten().map(<[u8]>::len).sum();
+    let mut builder = BinaryBuilder::with_capacity(values.clone().count(), bytes);
+    for value in values {
+        match value {
+            Some(bytes) => builder.append_value(bytes),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
 }
 
 fn append_string(b: &mut StringBuilder, bytes: &[u8]) {
@@ -436,8 +587,15 @@ fn row_group_size(rows: &[Row]) -> usize {
     65_536
 }
 
-fn writer_properties(max_rows: usize) -> WriterProperties {
+fn writer_properties(max_rows: usize, postings: Option<String>) -> WriterProperties {
+    let metadata = postings.map(|value| {
+        vec![parquet::format::KeyValue {
+            key: crate::metric_postings::KEY.to_owned(),
+            value: Some(value),
+        }]
+    });
     let mut builder = WriterProperties::builder()
+        .set_key_value_metadata(metadata)
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
@@ -510,13 +668,50 @@ impl<'a> BinaryArena<'a> {
     }
 }
 
+// Shared by full decoding and footer-only negative proofs. Never let pruning
+// turn an invalid projected schema into a successful empty result.
+pub(super) fn optional_columns(schema: &Schema) -> Result<[Option<usize>; 3], DecodeError> {
+    let fields = schema.fields();
+    for (i, kind) in [
+        (0, DataType::Int64),
+        (1, DataType::Int64),
+        (2, DataType::Float64),
+        (4, DataType::Binary),
+    ] {
+        if fields.get(i).is_none_or(|field| field.data_type() != &kind) {
+            return Err(DecodeError::Reader);
+        }
+    }
+    let mut columns = [None; 3];
+    for (slot, (name, kind)) in [
+        ("otlp", DataType::Utf8),
+        ("histogram", DataType::Binary),
+        ("exemplars", DataType::Binary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (i, field) in fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name() == name)
+        {
+            if columns[slot].is_some() || field.data_type() != &kind {
+                return Err(DecodeError::Reader);
+            }
+            columns[slot] = Some(i);
+        }
+    }
+    Ok(columns)
+}
+
 pub fn decode<'a>(
     env: Env<'a>,
     blob: &Binary<'a>,
     filter: &Filter<'_>,
 ) -> Result<Term<'a>, DecodeError> {
     let regex_cache = compile_regexes(&filter.matchers)?;
-    let bytes = Bytes::copy_from_slice(blob.as_slice());
+    let bytes = crate::erlang_bytes::from_binary(*blob);
 
     // Preserve the label dictionary instead of expanding identical bytes
     // for every sample. Plain/fallback pages remain supported: parquet-rs
@@ -524,6 +719,7 @@ pub fn decode<'a>(
     // and metadata unchanged, including legacy fixture schemas.
     let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
         .map_err(|_| DecodeError::Reader)?;
+    let [otlp_column, histogram_column, exemplars_column] = optional_columns(metadata.schema())?;
     let mut fields = metadata.schema().fields().to_vec();
     let labels_field = fields.get(4).ok_or(DecodeError::Reader)?;
     if labels_field.data_type() != &DataType::Binary {
@@ -564,8 +760,18 @@ pub fn decode<'a>(
     // on-disk schema (position 3), so dropping it renumbers the two
     // columns after it; the indices below reflect the post-projection
     // order and must stay in sync with the mask.
-    let projection =
-        parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), [0usize, 1, 2, 4]);
+    // Optional columns follow, in on-disk order, from projected index 4.
+    let mut projected = vec![0usize, 1, 2, 4];
+    let mut place = |column: Option<usize>| {
+        column.map(|column| {
+            projected.push(column);
+            projected.len() - 1
+        })
+    };
+    let otlp_index = place(otlp_column);
+    let histogram_index = place(histogram_column);
+    let exemplars_index = place(exemplars_column);
+    let projection = parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), projected);
 
     // Row-group pruning: when a time filter is set, consult each row
     // group's `timestamp_ns` min/max chunk stats and only read the
@@ -574,21 +780,7 @@ pub fn decode<'a>(
     // so a tight filter can skip irrelevant groups without opening any
     // column pages.
     let metadata = builder.metadata().clone();
-    let ts_col: Option<usize> = metadata
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|c| c.name() == "timestamp_ns");
-    let time_filter = filter.start.is_some() || filter.end.is_some();
-    let surviving: Vec<usize> = (0..metadata.num_row_groups())
-        .filter(|&i| {
-            if !time_filter {
-                return true;
-            }
-            row_group_matches_time(metadata.row_group(i), ts_col, filter)
-        })
-        .collect();
+    let surviving = surviving_row_groups(&metadata, filter);
 
     if surviving.is_empty() {
         return Ok(Vec::<Term<'a>>::new().encode(env));
@@ -608,6 +800,9 @@ pub fn decode<'a>(
         atoms::timestamp_ns().encode(env),
         atoms::value().encode(env),
         atoms::labels().encode(env),
+        atoms::otlp().encode(env),
+        atoms::histogram().encode(env),
+        atoms::exemplars().encode(env),
     ];
     let struct_name = atoms::metric_sample().encode(env);
     // Arrow reconstructs array wrappers across batches, but dictionary
@@ -620,6 +815,19 @@ pub fn decode<'a>(
         let series_id_arr = col::<Int64Array>(&batch, 0)?;
         let ts_arr = col::<Int64Array>(&batch, 1)?;
         let value_arr = col::<Float64Array>(&batch, 2)?;
+        let otlp_arr = otlp_index
+            .map(|i| col::<StringArray>(&batch, i))
+            .transpose()?;
+        let histogram_arr = histogram_index
+            .map(|i| col::<BinaryArray>(&batch, i))
+            .transpose()?;
+        let exemplars_arr = exemplars_index
+            .map(|i| col::<BinaryArray>(&batch, i))
+            .transpose()?;
+        let otlp_arena =
+            otlp_arr.map(|array| crate::segment_parquet::StringArena::from(env, array));
+        let mut stacks = crate::json_read::Stacks::new();
+        let mut interned_keys = Vec::new();
         // Post-projection column 3 is `labels_canonical` (`metric_name`
         // and `labels_json` were masked out). `labels_canonical` carries
         // the raw `name<0xff>value<0xff>...` bytes we hashed into
@@ -672,7 +880,8 @@ pub fn decode<'a>(
         // Updating a fixed-key flat map shares its key tuple, unlike
         // constructing one from arrays for every row. Compare exact terms
         // so unchanged fields (and duplicate samples) require no update.
-        let mut previous_record: Option<(Term<'a>, [Term<'a>; 5])> = None;
+        let mut previous_record: Option<(Term<'a>, [Term<'a>; 8])> = None;
+        let mut previous_raw = None;
 
         for row in 0..batch.num_rows() {
             let ts = ts_arr.value(row) as i128;
@@ -685,6 +894,9 @@ pub fn decode<'a>(
                 if ts > end {
                     continue;
                 }
+            }
+            if filter.exemplars_only && present(exemplars_arr, row).is_none() {
+                continue;
             }
 
             let label_index = labels_dict.key(row).ok_or(DecodeError::Reader)?;
@@ -733,19 +945,82 @@ pub fn decode<'a>(
                 }
             };
 
+            let nil = atoms::nil().encode(env);
+            let metadata = match &otlp_arena {
+                Some(arena) => crate::segment_parquet::json_term(
+                    env,
+                    arena,
+                    row,
+                    nil,
+                    &mut stacks,
+                    &mut interned_keys,
+                )
+                .map_err(|_| DecodeError::Reader)?,
+                None => nil,
+            };
+            if otlp_arr.is_some_and(|array| !array.is_null(row))
+                && metadata.get_type() != rustler::TermType::Map
+            {
+                return Err(DecodeError::Reader);
+            }
+            let histogram_bytes = present(histogram_arr, row);
+            let exemplar_bytes = present(exemplars_arr, row);
+            let raw = (
+                series_id,
+                ts_arr.value(row),
+                value.to_bits(),
+                row_bytes,
+                otlp_arr.and_then(|array| {
+                    if array.is_null(row) {
+                        None
+                    } else {
+                        Some(array.value(row))
+                    }
+                }),
+                histogram_bytes,
+                exemplar_bytes,
+            );
+            // A histogram row's float value is the stale marker kept for
+            // older readers; its sample value is the histogram. A row that only
+            // carries exemplars has no value.
+            let exemplar_only = exemplar_bytes.is_some()
+                && value.to_bits() == crate::metric_value::EXEMPLAR_ONLY_BITS;
+            let (value_term, histogram_term) = match histogram_bytes {
+                Some(bytes) => (
+                    nil,
+                    crate::native_histogram::Histogram::from_bytes(bytes)
+                        .ok_or(DecodeError::Reader)?
+                        .to_term(env),
+                ),
+                None if exemplar_only => (nil, nil),
+                None => (crate::metric_value::encode(env, value), nil),
+            };
+            let exemplars_term = match exemplar_bytes {
+                Some(bytes) => crate::exemplar::from_bytes(bytes)
+                    .ok_or(DecodeError::Reader)?
+                    .iter()
+                    .map(|(labels, value, ts)| crate::exemplar::to_term(env, labels, *value, *ts))
+                    .collect::<Vec<_>>()
+                    .encode(env),
+                None => nil,
+            };
             let fields = [
                 struct_name,
                 series_id.encode(env),
                 ts_arr.value(row).encode(env),
-                crate::metric_value::encode(env, value),
+                value_term,
                 labels_term,
+                metadata,
+                histogram_term,
+                exemplars_term,
             ];
             let record = match previous_record {
+                Some((record, _)) if previous_raw == Some(raw) => record,
                 Some((mut record, previous_fields)) => {
                     for ((key, field), previous) in
                         keys.iter().zip(fields.iter()).zip(previous_fields.iter())
                     {
-                        if field.as_c_arg() != previous.as_c_arg() && field != previous {
+                        if field.as_c_arg() != previous.as_c_arg() {
                             record = record
                                 .map_update(*key, *field)
                                 .map_err(|_| DecodeError::Reader)?;
@@ -758,6 +1033,7 @@ pub fn decode<'a>(
                 }
             };
             previous_record = Some((record, fields));
+            previous_raw = Some(raw);
             records.push(record);
         }
     }
@@ -765,11 +1041,31 @@ pub fn decode<'a>(
     Ok(records.encode(env))
 }
 
+pub(super) fn surviving_row_groups(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    filter: &Filter<'_>,
+) -> Vec<usize> {
+    let ts_col = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| column.name() == "timestamp_ns");
+    let time_filter = filter.start.is_some() || filter.end.is_some();
+    let postings = crate::metric_postings::candidate_groups(metadata, &filter.matchers);
+    (0..metadata.num_row_groups())
+        .filter(|&i| {
+            postings.as_ref().is_none_or(|groups| groups[i])
+                && (!time_filter || row_group_matches_time(metadata.row_group(i), ts_col, filter))
+        })
+        .collect()
+}
+
 // Split a row's canonical bytes (`name<0xff>value<0xff>...`) into
 // borrowed `(name, value)` pairs. Returns `Err(())` on a stray trailing
 // byte or a missing separator — a well-formed segment never produces
 // either.
-fn parse_canonical_pairs<'r>(
+pub(crate) fn parse_canonical_pairs<'r>(
     bytes: &'r [u8],
     out: &mut Vec<(&'r [u8], &'r [u8])>,
 ) -> Result<(), ()> {
@@ -787,6 +1083,10 @@ fn parse_canonical_pairs<'r>(
         i = value_end + 1;
     }
     Ok(())
+}
+
+fn present(array: Option<&BinaryArray>, row: usize) -> Option<&[u8]> {
+    array.and_then(|a| (!a.is_null(row)).then(|| a.value(row)))
 }
 
 fn col<T: 'static>(batch: &RecordBatch, idx: usize) -> Result<&T, DecodeError> {
@@ -831,78 +1131,13 @@ fn row_group_matches_time(
     true
 }
 
-/// Prometheus uses ASCII Perl classes and word boundaries. Rust's defaults
-/// are Unicode, so translate these escapes before compiling for both adapters.
 pub fn compile_metric_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    reject_class_extensions(pattern)?;
-    let mut translated = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            translated.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('d') => translated.push_str("[0-9]"),
-            Some('D') => translated.push_str("[^0-9]"),
-            Some('w') => translated.push_str("[A-Za-z0-9_]"),
-            Some('W') => translated.push_str("[^A-Za-z0-9_]"),
-            Some('s') => translated.push_str(r"[\t\n\f\r ]"),
-            Some('S') => translated.push_str(r"[^\t\n\f\r ]"),
-            Some('b') => translated.push_str(r"(?-u:\b)"),
-            Some('B') => translated.push_str(r"(?-u:\B)"),
-            Some(next) => {
-                translated.push('\\');
-                translated.push(next);
-            }
-            None => translated.push('\\'),
-        }
-    }
-    regex::RegexBuilder::new(&translated)
-        .size_limit(1_048_576)
-        .dfa_size_limit(1_048_576)
-        .build()
+    crate::query_regex::string(pattern)
 }
 
-// Rust class intersection/difference and nested classes have different
-// meanings from Prometheus classes. Reject them instead of returning wrong
-// matches. POSIX named classes remain supported.
-fn reject_class_extensions(pattern: &str) -> Result<(), regex::Error> {
-    let mut depth = 0usize;
-    let mut escaped = false;
-    let mut previous = '\0';
-    let mut chars = pattern.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if escaped {
-            escaped = false;
-            previous = '\0';
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            previous = '\0';
-            continue;
-        }
-        if (depth > 0 && ch == previous && matches!(ch, '&' | '-' | '~'))
-            || (depth > 0 && ch == '[' && chars.peek() != Some(&':'))
-            || (depth > 0 && ch == ']' && matches!(previous, '[' | '^'))
-        {
-            return Err(regex::Error::Syntax(
-                "Unsupported character-class extension".into(),
-            ));
-        }
-        if ch == '[' {
-            depth += 1;
-        }
-        if ch == ']' {
-            depth = depth.saturating_sub(1);
-        }
-        previous = ch;
-    }
-    Ok(())
-}
-
-fn compile_regexes(matchers: &[Matcher<'_>]) -> Result<Vec<Option<regex::Regex>>, DecodeError> {
+pub(super) fn compile_regexes(
+    matchers: &[Matcher<'_>],
+) -> Result<Vec<Option<regex::Regex>>, DecodeError> {
     matchers
         .iter()
         .map(|m| match m.op {
@@ -916,6 +1151,14 @@ fn compile_regexes(matchers: &[Matcher<'_>]) -> Result<Vec<Option<regex::Regex>>
             _ => Ok(None),
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(super) fn matches_canonical_for_test(bytes: &[u8], matchers: &[Matcher<'_>]) -> bool {
+    let mut labels = Vec::new();
+    parse_canonical_pairs(bytes, &mut labels).unwrap();
+    let regex_cache = compile_regexes(matchers).unwrap();
+    labels_match(&labels, matchers, &regex_cache)
 }
 
 fn labels_match(
@@ -953,12 +1196,16 @@ fn labels_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn row(series_id: i64, timestamp_ns: i64) -> Row {
         Row {
             series_id,
             timestamp_ns,
             value: 1.0,
+            otlp: None,
+            histogram: None,
+            exemplars: None,
             labels: Rc::new(EncodedLabels {
                 series_hash: stable_hash::stable_hash([(b"host".as_slice(), b"node".as_slice())])
                     as i64,
@@ -966,6 +1213,112 @@ mod tests {
                 canonical: b"host\xffnode\xff".to_vec(),
                 json: b"{\"host\":\"node\"}".to_vec(),
             }),
+        }
+    }
+
+    fn parquet_rows(rows: &[Row], postings: Option<String>, duplicate: bool) -> Bytes {
+        let batch = build_batch(rows).unwrap();
+        let duplicate_value = postings.clone();
+        let props = writer_properties(8192, postings);
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        if duplicate {
+            writer.append_key_value_metadata(parquet::format::KeyValue {
+                key: crate::metric_postings::KEY.to_owned(),
+                value: duplicate_value,
+            });
+        }
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn native_postings_select_groups_before_arrow_and_combine_with_time_statistics() {
+        // Deliberately identical hashes across different canonical identities.
+        let rows: Vec<_> = (0..24_576)
+            .map(|i| {
+                let mut row = row(1, i);
+                if (8192..16384).contains(&i) {
+                    row.labels = Rc::new(EncodedLabels {
+                        series_hash: 1,
+                        metric_name: vec![],
+                        canonical: b"env\xffdev\xffhost\xffother\xff".to_vec(),
+                        json: b"{}".to_vec(),
+                    });
+                } else {
+                    row.labels = Rc::new(EncodedLabels {
+                        series_hash: 1,
+                        metric_name: vec![],
+                        canonical: b"env\xffprod\xffhost\xffnode\xff".to_vec(),
+                        json: b"{}".to_vec(),
+                    });
+                }
+                row
+            })
+            .collect();
+        let postings = crate::metric_postings::build(
+            rows.iter().map(|row| row.labels.canonical.as_slice()),
+            8192,
+        )
+        .unwrap();
+        let bytes = parquet_rows(&rows, Some(postings.clone()), false);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+        let mut filter = Filter {
+            start: None,
+            end: None,
+            matchers: vec![Matcher {
+                name: b"host",
+                op: MatcherOp::Eq,
+                value: b"node",
+            }],
+            max_samples: None,
+            exemplars_only: false,
+        };
+        assert_eq!(
+            surviving_row_groups(builder.metadata(), &filter),
+            vec![0, 2]
+        );
+        let selected = surviving_row_groups(builder.metadata(), &filter);
+        let decoded_rows: usize = builder
+            .with_row_groups(selected)
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(decoded_rows, 16_384); // not 24,576 Arrow rows followed by filtering
+        filter.start = Some(8192);
+        filter.end = Some(16383);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        assert!(surviving_row_groups(builder.metadata(), &filter).is_empty());
+        filter.start = None;
+        filter.end = None;
+        filter.matchers.push(Matcher {
+            name: b"env",
+            op: MatcherOp::Eq,
+            value: b"dev",
+        });
+        assert!(surviving_row_groups(builder.metadata(), &filter).is_empty());
+
+        // A complete index is optional. Missing, malformed, duplicate and
+        // geometrically inconsistent metadata never prove exclusion.
+        let wrong_geometry = crate::metric_postings::build(
+            rows.iter().map(|row| row.labels.canonical.as_slice()),
+            8193,
+        )
+        .unwrap();
+        for (postings, duplicate) in [
+            (None, false),
+            (Some("bad".to_owned()), false),
+            (Some(postings.clone()), true),
+            (Some(wrong_geometry), false),
+        ] {
+            let bytes = parquet_rows(&rows, postings, duplicate);
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            assert_eq!(
+                surviving_row_groups(builder.metadata(), &filter),
+                vec![0, 1, 2]
+            );
         }
     }
 
@@ -981,7 +1334,7 @@ mod tests {
         for rows in [short_runs, long_run] {
             let batch = build_batch(&rows).unwrap();
             let mut buf = Vec::new();
-            let props = writer_properties(row_group_size(&rows));
+            let props = writer_properties(row_group_size(&rows), None);
             let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
