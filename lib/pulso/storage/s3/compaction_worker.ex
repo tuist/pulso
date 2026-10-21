@@ -12,13 +12,14 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   use Pulso.Runtime.GenServer
 
   alias Pulso.Runtime.GenServer
-  alias Pulso.Runtime.ProcessGroup
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3.CompactionDiscovery
   alias Pulso.Storage.S3.CompactionOwnership
   alias Pulso.Storage.S3.CompactionSupervision
   alias Pulso.Storage.S3.CompactionTasks
+  alias Pulso.Storage.S3.LogCompactor
   alias Pulso.Storage.S3.MetricsCompactor
+  alias Pulso.Storage.S3.TraceCompactor
 
   require Logger
 
@@ -26,7 +27,10 @@ defmodule Pulso.Storage.S3.CompactionWorker do
 
   @doc false
   def children(config) do
-    if Map.get(config, :compaction_enabled, false), do: [{CompactionSupervision, config}], else: []
+    if Map.get(config, :compaction_enabled, false) or CompactionOwnership.trace_maintenance_enabled?(config) or
+         CompactionOwnership.log_maintenance_enabled?(config),
+       do: [{CompactionSupervision, config}],
+       else: []
   end
 
   @impl true
@@ -63,45 +67,88 @@ defmodule Pulso.Storage.S3.CompactionWorker do
     end
   end
 
-  defp maintain_tenant(tenant, config) do
-    if ready?(tenant, config) and CompactionOwnership.local_owner?(tenant, "metrics", config) do
-      maintain_owned_tenant(tenant, config)
-    else
-      {:cont, config}
+  defp maintain_tenant(tenant, config), do: maintain_signals(CompactionOwnership.signals(config), tenant, config)
+  defp maintain_signals([], _tenant, config), do: {:cont, config}
+
+  defp maintain_signals([signal | rest], tenant, config) do
+    case maintain_signal(tenant, signal, config) do
+      {:cont, updated} -> maintain_signals(rest, tenant, updated)
+      {:halt, updated} -> {:halt, updated}
     end
   end
 
-  defp maintain_owned_tenant(tenant, config) do
-    backoff = Map.get(config, :compaction_backoff, %{})
+  defp maintain_signal(tenant, signal, config) do
+    if ready?(tenant, signal, config) and CompactionOwnership.local_owner?(tenant, signal, config),
+      do: maintain_owned_tenant(tenant, signal, config),
+      else: {:cont, config}
+  end
 
-    case compact_tenant(tenant, config) do
+  defp backoff_key(tenant, "metrics"), do: tenant
+  defp backoff_key(tenant, "traces"), do: {tenant, "traces"}
+  defp backoff_key(tenant, "logs"), do: {tenant, "logs"}
+
+  defp maintain_owned_tenant(tenant, signal, config) do
+    backoff = Map.get(config, :compaction_backoff, %{})
+    key = backoff_key(tenant, signal)
+
+    case compact_tenant(tenant, signal, config) do
       {:error, :timeout} ->
         deadline = System.monotonic_time(:millisecond) + Map.get(config, :compaction_retry_ms, 300_000)
-        {:halt, Map.put(config, :compaction_backoff, Map.put(backoff, tenant, deadline))}
+        {:halt, Map.put(config, :compaction_backoff, Map.put(backoff, key, deadline))}
 
       _result ->
-        {:cont, Map.put(config, :compaction_backoff, Map.delete(backoff, tenant))}
+        {:cont, Map.put(config, :compaction_backoff, Map.delete(backoff, key))}
     end
   end
 
-  defp ready?(tenant, config) do
-    deadline = config |> Map.get(:compaction_backoff, %{}) |> Map.get(tenant, 0)
+  defp ready?(tenant, signal, config) do
+    deadline = config |> Map.get(:compaction_backoff, %{}) |> Map.get(backoff_key(tenant, signal), 0)
     deadline == 0 or deadline <= System.monotonic_time(:millisecond)
   end
 
-  defp compact_tenant(tenant, config) do
-    opts = Map.get(config, :compaction_options, [])
-    cleanup_opts = Map.get(config, :compaction_cleanup_options, [])
-    result = run_operation(fn -> MetricsCompactor.compact(tenant, config, opts) end, tenant, "merge", config)
-    cleanup_if_owner(result, tenant, config, cleanup_opts)
+  defp maintenance("metrics"), do: {MetricsCompactor, :compaction_options, :compaction_cleanup_options}
+  defp maintenance("traces"), do: {TraceCompactor, :trace_compaction_options, :trace_compaction_cleanup_options}
+  defp maintenance("logs"), do: {LogCompactor, :log_compaction_options, :log_compaction_cleanup_options}
+
+  defp compact_tenant(tenant, signal, config) do
+    {module, option_key, cleanup_key} = maintenance(signal)
+    opts = Map.get(config, option_key, [])
+    cleanup_opts = Map.get(config, cleanup_key, [])
+    result = merge_while_progressing(module, tenant, config, opts, Map.get(config, :compaction_max_merges, 32))
+    cleanup_if_owner(result, tenant, signal, config, module, cleanup_opts)
   end
 
-  defp cleanup_if_owner({:error, :timeout} = result, _tenant, _config, _opts), do: result
+  # One merge combines at most 32 segments, while frequent pushers (a log
+  # shipper flushing every second) create more than that per interval. Keep
+  # merging while each merge makes progress, within a per-pass budget, so
+  # compaction can catch up instead of falling further behind.
+  defp merge_while_progressing(module, tenant, config, opts, remaining) do
+    result = run_operation(fn -> merge_operation(module, tenant, config, opts) end, tenant, "merge", config)
 
-  defp cleanup_if_owner(result, tenant, config, opts) do
+    case result do
+      {:ok, %{merged: merged}} when merged > 0 and remaining > 1 ->
+        if CompactionOwnership.local_owner?(tenant, signal_of(module), config),
+          do: merge_while_progressing(module, tenant, config, opts, remaining - 1),
+          else: result
+
+      _ ->
+        result
+    end
+  end
+
+  defp signal_of(MetricsCompactor), do: "metrics"
+  defp signal_of(TraceCompactor), do: "traces"
+  defp signal_of(LogCompactor), do: "logs"
+
+  defp merge_operation(TraceCompactor, tenant, config, opts), do: TraceCompactor.maintain(tenant, config, opts)
+  defp merge_operation(module, tenant, config, opts), do: module.compact(tenant, config, opts)
+
+  defp cleanup_if_owner({:error, :timeout} = result, _tenant, _signal, _config, _module, _opts), do: result
+
+  defp cleanup_if_owner(result, tenant, signal, config, module, opts) do
     # Recheck after the merge: ownership may have moved while storage was busy.
-    if CompactionOwnership.local_owner?(tenant, "metrics", config) do
-      run_operation(fn -> MetricsCompactor.cleanup(tenant, config, opts) end, tenant, "cleanup", config)
+    if CompactionOwnership.local_owner?(tenant, signal, config) do
+      run_operation(fn -> module.cleanup(tenant, config, opts) end, tenant, "cleanup", config)
     else
       result
     end
@@ -132,7 +179,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         # a dirty native call can signal termination before native work ends,
         # hiding it from admission checks. Late publication remains conditional.
         Process.demonitor(task.ref, [:flush])
-        ProcessGroup.leave(CompactionOwnership.scope(), CompactionOwnership.group(config), self())
+        CompactionOwnership.leave(config)
         :telemetry.execute([:pulso, :compaction, :timeout], %{}, %{operation: name})
         report_failure(tenant, name, :timeout)
     end

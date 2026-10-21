@@ -5,9 +5,21 @@ defmodule Pulso.Test.FailingStorage do
   @impl true
   def append(_signal, _tenant, _records, _opts) do
     case Pulso.Runtime.get_env(:pulso, __MODULE__, :error) do
-      :error -> {:error, :storage_unavailable}
-      :raise -> raise "storage crashed"
-      {:error, _} = error -> error
+      :error ->
+        {:error, :storage_unavailable}
+
+      :raise ->
+        raise "storage crashed"
+
+      {:block, owner} ->
+        send(owner, {:append_started, self()})
+
+        receive do
+          :continue -> :ok
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
 

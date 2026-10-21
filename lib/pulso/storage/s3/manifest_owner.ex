@@ -182,7 +182,51 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   """
   @spec ensure_loaded(String.t(), String.t(), map()) ::
           {:ok, ManifestCache.entry()} | {:error, term()}
-  def ensure_loaded(tenant, signal, config) when is_binary(tenant) and is_binary(signal) and is_map(config) do
+  def ensure_loaded(tenant, signal, config), do: ensure_loaded(tenant, signal, config, [])
+
+  @doc "Required snapshots always validate the root with S3 and never serve stale cache or reconstruct missing authority."
+  def ensure_loaded(tenant, signal, config, opts) when is_binary(tenant) and is_binary(signal) and is_map(config) do
+    if Keyword.get(opts, :require_fresh_manifest, false) do
+      required_snapshot(tenant, signal, config)
+    else
+      cached_snapshot(tenant, signal, config)
+    end
+  end
+
+  defp required_snapshot(tenant, signal, config) do
+    {entry, token} = ManifestCache.snapshot(tenant, signal)
+    etag = if entry, do: entry.etag
+    version = if entry, do: entry.manifest.version
+
+    case Retention.fetch_root(tenant, signal, config, etag, version) do
+      :not_modified when is_map(entry) ->
+        cache_snapshot(tenant, signal, entry.manifest, entry.etag, token)
+
+      {:ok, fresh_etag, body} ->
+        case decode_manifest(body, tenant, signal) do
+          {:ok, manifest} ->
+            cache_snapshot(tenant, signal, manifest, fresh_etag, token)
+
+          {:error, _} = error ->
+            ManifestCache.drop(tenant, signal)
+            error
+        end
+
+      {:error, :not_found} ->
+        ManifestCache.drop(tenant, signal)
+        {:error, :signal_authority_missing}
+
+      _ ->
+        {:error, :manifest_freshness_unavailable}
+    end
+  end
+
+  defp cache_snapshot(tenant, signal, manifest, etag, token) do
+    ManifestCache.put_snapshot(tenant, signal, manifest, etag, token)
+    {:ok, %{manifest: manifest, etag: etag, refreshed_at_mono: System.monotonic_time(:millisecond)}}
+  end
+
+  defp cached_snapshot(tenant, signal, config) do
     case ManifestCache.get(tenant, signal) do
       %{} = entry ->
         case maybe_refresh(entry, tenant, signal, config) do
@@ -202,9 +246,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # conditional GET so a manifest another node committed becomes
   # visible without waiting for a local write. The refresh happens on
   # the caller's process (the query path) — not through the owner —
-  # because it does not need serialization; `:ets.insert/2` is atomic
-  # per key, so two racing refreshers converge to the same fresh
-  # value.
+  # with a conditional ETS replacement: a delayed reader may return its own
+  # validated snapshot, but must never regress a newer cached publication.
   defp maybe_refresh(entry, tenant, signal, config) do
     if stale?(entry, config) do
       refresh(entry, tenant, signal, config)
@@ -224,13 +267,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         # No new writes; just touch the freshness timestamp so we don't
         # keep issuing 304s on every query.
         touched = %{entry | refreshed_at_mono: System.monotonic_time(:millisecond)}
-        ManifestCache.put(tenant, signal, touched.manifest, touched.etag)
+        ManifestCache.put_snapshot(tenant, signal, touched.manifest, touched.etag, entry.token)
         touched
 
       {:ok, new_etag, body} ->
         case decode_manifest(body, tenant, signal) do
           {:ok, manifest} ->
-            ManifestCache.put(tenant, signal, manifest, new_etag)
+            ManifestCache.put_snapshot(tenant, signal, manifest, new_etag, entry.token)
 
             %{
               manifest: manifest,
@@ -239,7 +282,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
             }
 
           {:error, _} = error ->
-            stale_or_error(entry, error, tenant, signal, config)
+            # A fetched undecodable authority is not a transport failure.
+            # Never hide corruption/new formats behind stale successful data.
+            ManifestCache.drop(tenant, signal)
+            error
         end
 
       {:error, :not_found} when entry.manifest.version == 3 ->
@@ -333,9 +379,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   def handle_call(:ensure_loaded, _from, state) do
     # A cache miss must not turn an old owner snapshot into a fresh query
     # snapshot after another node has published compaction or new ingest.
+    {_entry, token} = ManifestCache.snapshot(state.tenant, state.signal)
+
     case load_manifest(state) do
       {:ok, manifest, etag} ->
-        ManifestCache.put(state.tenant, state.signal, manifest, etag)
+        ManifestCache.put_snapshot(state.tenant, state.signal, manifest, etag, token)
         state = %{state | manifest: manifest, etag: etag, loaded?: true}
 
         entry = %{
@@ -355,11 +403,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     if state.loaded? do
       enqueue_and_maybe_flush(state, from, segments)
     else
+      {_entry, token} = ManifestCache.snapshot(state.tenant, state.signal)
+
       case load_manifest(state, false) do
         {:ok, manifest, etag} ->
           # A rebuilt manifest without an ETag is not yet published. Do not
           # expose it through the shared query cache until the CAS succeeds.
-          cache_loaded(state, manifest, etag)
+          cache_loaded(state, manifest, etag, token)
 
           state
           |> Map.merge(%{manifest: manifest, etag: etag, loaded?: true})
@@ -382,9 +432,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     {:noreply, state, :hibernate}
   end
 
-  defp cache_loaded(_state, _manifest, nil), do: :ok
+  defp cache_loaded(_state, _manifest, nil, _token), do: :ok
 
-  defp cache_loaded(state, manifest, etag), do: ManifestCache.put(state.tenant, state.signal, manifest, etag)
+  defp cache_loaded(state, manifest, etag, token),
+    do: ManifestCache.put_snapshot(state.tenant, state.signal, manifest, etag, token)
 
   # ---- flush pipeline -------------------------------------------------------
 
@@ -441,6 +492,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp do_flush(state) do
+    base = ManifestCache.publication_base(state.tenant, state.signal)
     state = %{state | timer_ref: nil}
 
     state =
@@ -458,8 +510,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     publish_queue_depth(%{state | pending: remaining, waiters: deferred})
 
     case result do
-      {:ok, manifest, etag, outcomes} ->
-        ManifestCache.put(state.tenant, state.signal, manifest, etag)
+      {kind, manifest, etag, outcomes} when kind in [:ok, :skipped] ->
+        # Rejected-only attempts performed neither CAS nor a fresh authority
+        # read. Their private root must never repopulate an invalidated cache.
+        if kind == :ok, do: ManifestCache.publish(state.tenant, state.signal, manifest, etag, state.etag, base)
         Enum.each(outcomes, fn {from, result} -> GenServer.reply(from, result) end)
 
         {:noreply,
@@ -494,22 +548,24 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp schedule_deferred(state), do: %{state | timer_ref: Process.send_after(self(), :flush, state.flush_interval_ms)}
 
   defp partition_waiters(%{manifest: %{version: 3}} = state) do
-    {selected, deferred, _, _} =
-      Enum.reduce(Enum.reverse(state.waiters), {[], [], MapSet.new(), 0}, fn {from, segments} = waiter,
-                                                                             {selected, deferred, starts, count} ->
+    {selected, deferred, _, _, _} =
+      Enum.reduce(Enum.reverse(state.waiters), {[], [], MapSet.new(), 0, 0}, fn {from, segments} = waiter,
+                                                                                {selected, deferred, starts, count,
+                                                                                 bytes} ->
         own = MapSet.new(segments, &PagedManifest.bucket_start(state.manifest.paging, &1.max_ts))
         union = MapSet.union(starts, own)
+        wire_bytes = IO.iodata_length(Pulso.JSON.encode_to_iodata!(Enum.map(segments, &Segment.to_wire/1)))
 
         cond do
-          MapSet.size(own) > 4 or length(segments) > 256 ->
+          MapSet.size(own) > 4 or length(segments) > 256 or wire_bytes > 65_536 ->
             GenServer.reply(from, {:error, :retention_capacity})
-            {selected, deferred, starts, count}
+            {selected, deferred, starts, count, bytes}
 
-          MapSet.size(union) <= 4 and count + length(segments) <= 256 ->
-            {[waiter | selected], deferred, union, count + length(segments)}
+          MapSet.size(union) <= 4 and count + length(segments) <= 256 and bytes + wire_bytes <= 65_536 ->
+            {[waiter | selected], deferred, union, count + length(segments), bytes + wire_bytes}
 
           true ->
-            {selected, [waiter | deferred], starts, count}
+            {selected, [waiter | deferred], starts, count, bytes}
         end
       end)
 
@@ -532,7 +588,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
     case prepare_publication(state, segments, eligible) do
       {:skip, manifest} ->
-        {:ok, manifest, state.etag, outcomes}
+        {:skipped, manifest, state.etag, outcomes}
 
       {:ok, merged} ->
         attempt = %{
@@ -578,10 +634,22 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp resolve_cas_failure({:ok, %{version: 3} = current, etag}, attempt),
     do: resolve_managed_failure(current, etag, attempt)
 
-  # The read-back above is already the freshest legacy root: retry against it
-  # rather than issuing a second GET.
-  defp resolve_cas_failure({:ok, current, etag}, %{error: {:error, reason}} = attempt) when reason in @cas_conflicts,
-    do: retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
+  # A fresh legacy root can also prove that a lost response committed.
+  # Never republish an already-visible unkeyed append merely to obtain an ACK.
+  defp resolve_cas_failure({:ok, current, etag}, %{error: {:error, reason}} = attempt) when is_binary(etag) do
+    keys = MapSet.new(current.segments, & &1.key)
+
+    cond do
+      Enum.all?(attempt.segments, &MapSet.member?(keys, &1.key)) ->
+        {:ok, current, etag, attempt.outcomes}
+
+      reason in @cas_conflicts ->
+        retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
+
+      true ->
+        attempt.error
+    end
+  end
 
   defp resolve_cas_failure({:error, _} = load_error, %{error: {:error, reason}}) when reason in @cas_conflicts,
     do: load_error
@@ -596,7 +664,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       merged.version != 3 ->
         retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
 
-      reason not in @cas_conflicts and publication_visible?(current, attempt.eligible, attempt.state) ->
+      publication_visible?(current, attempt.eligible, attempt.state) ->
         {:ok, current, etag, attempt.outcomes}
 
       reason in @cas_conflicts ->
@@ -718,7 +786,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp publish_rebuilt_manifest(state, keys, publish_legacy?) do
-    if Enum.any?(keys, &String.contains?(Path.basename(&1), "-compact-")) do
+    if Enum.any?(keys, &authoritative_manifest_required?/1) do
       # Once compacted, only the manifest can distinguish published replacements
       # from orphan uploads and retired sources. Never guess by listing objects.
       {:error, :compacted_manifest_missing}
@@ -727,6 +795,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
       if publish_legacy?, do: publish_legacy_manifest(state, manifest), else: {:ok, manifest, nil}
     end
+  end
+
+  # Also fence dev buckets that exercised the unreleased trace receipt/marker
+  # layout. Removing obsolete code must never authorize LIST resurrection.
+  defp authoritative_manifest_required?(key) do
+    String.contains?(Path.basename(key), "-compact-") or String.contains?(key, "/retirements/") or
+      Path.basename(key) == "retention.marker.json"
   end
 
   defp publish_legacy_manifest(state, manifest) do
@@ -798,7 +873,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       <<min_str::binary-size(@sort_key_width), "-", max_str::binary-size(@sort_key_width), "-", _::binary>> ->
         with {min_ts, ""} <- Integer.parse(min_str),
              {max_ts, ""} <- Integer.parse(max_str) do
-          {:ok, Segment.build(key, min_ts, max_ts, 0)}
+          {:ok, %Segment{key: key, min_ts: min_ts, max_ts: max_ts}}
         else
           _ -> :skip
         end

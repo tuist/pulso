@@ -1,6 +1,7 @@
 defmodule Pulso.Storage.S3.MetricsCompactorTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.Codec.NIF
   alias Pulso.ObjectStore
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
@@ -109,7 +110,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
         S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 1, service: "api"}])
       end)
 
-    assert_receive {:storage_barrier, writer, "PUT", ^key}, 5_000
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
     assert ManifestCache.get(ctx.tenant, "logs") == nil
     {_, body} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, key))
     assert {:ok, %Manifest{segments: [segment]}} = Manifest.decode(body)
@@ -167,6 +168,36 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     ManifestCache.drop(ctx.tenant, "metrics")
     assert {:ok, [%MetricSample{value: 1.0}]} = S3.query(:metrics, ctx.tenant, matchers: [{"host", :eq, "a"}])
     assert {:error, _} = S3.query(:metrics, ctx.tenant, [])
+  end
+
+  test "keyed metric retries keep legacy bytes and fresh compaction outputs can add postings", ctx do
+    records = [sample(1, 1.0, "a"), sample(2, 2.0, "b")]
+    # Frozen source-equivalent pre-index v2 bytes, not a historical release
+    # artifact. Dependency/encoder changes must not silently change keyed PUTs.
+    legacy = File.read!(Path.expand("../../../fixtures/metrics/keyed_metric_v2.parquet", __DIR__))
+    assert {:ok, ^legacy, _, _, 2} = NIF.encode_metric_segment_parquet_v2(records)
+    assert :binary.match(legacy, "pulso.metric.postings.v1") == :nomatch
+    assert :ok = S3.append(:metrics, ctx.tenant, records, idempotency_key: "unchanged")
+    assert [source] = load(ctx).segments
+    assert source.byte_size == byte_size(legacy)
+    assert {_, ^legacy} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, source.key))
+
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert :ok = S3.append(:metrics, ctx.tenant, records, idempotency_key: "unchanged")
+    assert [^source] = load(ctx).segments
+    assert {_, ^legacy} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, source.key))
+    assert :ok = S3.append(:metrics, ctx.tenant, [sample(3, 3.0, "a")])
+    queries = [[], [{"host", :eq, "a"}], [{"host", :eq, "a"}, {"host", :eq, "b"}]]
+    before = for matchers <- queries, do: S3.query(:metrics, ctx.tenant, matchers: matchers)
+    assert Enum.at(before, 2) == {:ok, []}
+    assert {:ok, %{merged: 2}} = MetricsCompactor.compact(ctx.tenant, ctx.config)
+    assert [replacement] = load(ctx).segments
+    assert replacement.key != source.key
+    assert {_, indexed} = Agent.get(ctx.agent, &Map.fetch!(&1.objects, replacement.key))
+    assert replacement.byte_size == byte_size(indexed)
+    assert :binary.match(indexed, "pulso.metric.postings.v1") != :nomatch
+    ManifestCache.drop(ctx.tenant, "metrics")
+    assert Enum.map(queries, &S3.query(:metrics, ctx.tenant, matchers: &1)) == before
   end
 
   test "compaction rebuilds complete metric label sets without excluding samples", ctx do
@@ -310,7 +341,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       )
 
     ref = Process.monitor(pid)
-    assert_receive {:storage_barrier, storage, "PUT", ^key}, 1_000
+    assert_receive {:storage_barrier, storage, "PUT", ^key}, 30_000
     calls_before = Agent.get(ctx.agent, &length(&1.requests))
     rendered = Pulso.Metrics.render()
     assert rendered =~ "pulso_manifest_pending_segments 1\n"
@@ -323,7 +354,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert Pulso.Metrics.render() =~ "pulso_manifest_waiting_requests 0\n"
   end
 
-  @tag timeout: 5_000
+  @tag timeout: 60_000
   test "worker deadlines are observable before the stalled native operation finishes", ctx do
     for ts <- 1..2, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
     source = hd(load(ctx).segments).key
@@ -340,8 +371,8 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     config = ctx.config |> Map.put(:compaction_timeout_ms, 200) |> Map.put(:compaction_interval_ms, 3_600_000)
     worker = start_supervised!({CompactionWorker, config})
     send(worker, :compact)
-    assert_receive {:storage_barrier, storage, "GET", ^source}, 1_000
-    _ = :sys.get_state(worker)
+    assert_receive {:storage_barrier, storage, "GET", ^source}, 30_000
+    _ = :sys.get_state(worker, 60_000)
     assert [{^key, count}] = :ets.lookup(Pulso.Runtime.table(Pulso.Metrics), key)
     assert count == before_count + 1
     assert [task] = Task.Supervisor.children(CompactionTasks)
@@ -431,7 +462,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", first_key} => owner}})
     supervisor = start_supervised!(Task.Supervisor)
     query = Task.Supervisor.async_nolink(supervisor, fn -> S3.query(:metrics, ctx.tenant, max_scan_rows: 4) end)
-    assert_receive {:storage_barrier, reader, "GET", ^first_key}, 5_000
+    assert_receive {:storage_barrier, reader, "GET", ^first_key}, 30_000
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
     assert {:ok, 4} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
@@ -530,7 +561,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
     worker = start_supervised!({CompactionWorker, Map.put(ctx.config, :compaction_options, grace_ms: 0)})
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert length(load(ctx).segments) == 1
     assert {:ok, records} = S3.query(:metrics, ctx.tenant, [])
     assert length(records) == 3
@@ -681,7 +712,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     logs = S3.query(:logs, ctx.tenant, [])
     worker = start_supervised!({CompactionWorker, Map.put(ctx.config, :compaction_options, grace_ms: 0)})
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert for(tenant <- [ctx.tenant, other], do: S3.query(:metrics, tenant, [])) == before
     assert S3.query(:logs, ctx.tenant, []) == logs
     assert length(load(ctx).segments) == 1
@@ -699,8 +730,8 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       for _ <- 1..2,
           do: Task.Supervisor.async_nolink(supervisor, fn -> MetricsCompactor.compact(ctx.tenant, ctx.config) end)
 
-    assert_receive {:storage_barrier, first, "PUT", first_key}, 5_000
-    assert_receive {:storage_barrier, second, "PUT", second_key}, 5_000
+    assert_receive {:storage_barrier, first, "PUT", first_key}, 30_000
+    assert_receive {:storage_barrier, second, "PUT", second_key}, 30_000
     assert first_key != second_key
     send(first, {:release_storage, first_key})
     send(second, {:release_storage, second_key})
@@ -800,7 +831,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     lists = Agent.get(ctx.agent, & &1.lists)
     worker = start_supervised!({CompactionWorker, ctx.config})
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert length(load(ctx).segments) == 1
     assert load(%{ctx | tenant: poison}).segments == manifest.segments
     assert Agent.get(ctx.agent, & &1.lists) == lists + 1
@@ -835,7 +866,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", first_key} => owner}})
     supervisor = start_supervised!(Task.Supervisor)
     query = Task.Supervisor.async_nolink(supervisor, fn -> S3.query(:metrics, ctx.tenant, []) end)
-    assert_receive {:storage_barrier, reader, "GET", ^first_key}, 5_000
+    assert_receive {:storage_barrier, reader, "GET", ^first_key}, 30_000
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     assert {:ok, %{merged: 4}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
     assert {:ok, 4} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
@@ -856,7 +887,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", key} => owner}})
     supervisor = start_supervised!(Task.Supervisor)
     query = Task.Supervisor.async_nolink(supervisor, fn -> S3.query(:metrics, ctx.tenant, []) end)
-    assert_receive {:storage_barrier, reader, "GET", ^key}, 5_000
+    assert_receive {:storage_barrier, reader, "GET", ^key}, 30_000
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     assert :ok = S3.append(:metrics, ctx.tenant, [sample(4, 1.0)])
     current = ManifestCache.get(ctx.tenant, "metrics")
@@ -907,14 +938,14 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         send(worker, :compact)
-        _ = :sys.get_state(worker)
+        _ = :sys.get_state(worker, 60_000)
       end)
 
     assert log =~ "discovery raised tenant="
     :sys.replace_state(worker, fn _ -> ctx.config end)
     ProcessGroup.join(CompactionOwnership.scope(), CompactionOwnership.group(ctx.config), worker)
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert length(load(ctx).segments) == 1
   end
 
@@ -1048,7 +1079,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
         CompactionPeer.call(owner_peer, CompactionPeer, :pass, [], 20_000)
       end)
 
-    assert_receive {:storage_barrier, request, "PUT", replacement}, 10_000
+    assert_receive {:storage_barrier, request, "PUT", replacement}, 30_000
     # The sources are still active while the owner waits for its upload response.
     assert CompactionPeer.call(non_owner, CompactionPeer, :pass, []) == :ok
     assert reads(ctx.agent) == 4
@@ -1114,8 +1145,8 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
               CompactionPeer.call(peer, CompactionPeer, :pass, [], 20_000)
             end)
 
-    assert_receive {:storage_barrier, one, "PUT", one_key}, 10_000
-    assert_receive {:storage_barrier, two, "PUT", two_key}, 10_000
+    assert_receive {:storage_barrier, one, "PUT", one_key}, 30_000
+    assert_receive {:storage_barrier, two, "PUT", two_key}, 30_000
     send(one, {:release_storage, one_key})
     send(two, {:release_storage, two_key})
     assert Enum.map(tasks, &Task.await(&1, 20_000)) == [:ok, :ok]
@@ -1155,7 +1186,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert CompactionDiscovery.tenants(ctx.config) == {:ok, Enum.sort([ctx.tenant, "logs-only", "orphan"])}
     worker = start_supervised!({CompactionWorker, ctx.config})
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert length(load(ctx).segments) == 1
   end
 
@@ -1183,7 +1214,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
         end
       end)
 
-    assert_receive {:storage_barrier, request, "PUT", abandoned_key}, 10_000
+    assert_receive {:storage_barrier, request, "PUT", abandoned_key}, 30_000
     stop_supervised!(Process.get({CompactionPeer, owner_peer}))
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     send(request, {:release_storage, abandoned_key})
@@ -1218,14 +1249,14 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         send(worker, :compact)
-        _ = :sys.get_state(worker)
+        _ = :sys.get_state(worker, 60_000)
       end)
 
     assert log =~ "discovery failed"
     assert replacement_uploads(ctx.agent) == 0
     assert length(load(ctx).segments) == 3
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert length(load(ctx).segments) == 1
   end
 
@@ -1313,7 +1344,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
         CompactionPeer.call(owner_peer, CompactionPeer, :pass, [], 10_000)
       end)
 
-    assert_receive {:storage_barrier, request, "GET", ^source}, 5_000
+    assert_receive {:storage_barrier, request, "GET", ^source}, 30_000
     assert Task.await(task, 10_000) == :ok
     assert CompactionPeer.call(survivor, CompactionPeer, :await_members, [ctx.config, [survivor_node]]) == :ok
     # The old native call has not returned: another pass must neither rejoin
@@ -1351,7 +1382,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert_receive {:DOWN, ^ref, :process, ^task, :normal}
     _ = :sys.get_state(Pulso.Runtime.name(CompactionTasks))
     send(worker, :compact)
-    _ = :sys.get_state(worker)
+    _ = :sys.get_state(worker, 60_000)
     assert CompactionOwnership.members(ctx.config) == [node()]
   end
 

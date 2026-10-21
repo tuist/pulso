@@ -34,7 +34,10 @@ defmodule Pulso.Storage.S3.MetadataCache do
   def put(ref, data) do
     # References decoded from a root can contain sub-binaries that pin the
     # entire root generation. Retain only independent reference strings.
-    ref = Map.new(ref, fn {key, value} -> {key, if(is_binary(value), do: :binary.copy(value), else: value)} end)
+    ref = copy_reference(ref)
+    # Newly written leaf data may still refer to a much larger decoded root.
+    # Accounted leaf bytes cannot cover that arena: detach its strings too.
+    data = copy_reference(data)
     GenServer.call(__MODULE__, {:put, ref, data})
   catch
     :exit, _ -> :ok
@@ -56,14 +59,23 @@ defmodule Pulso.Storage.S3.MetadataCache do
         [] -> 0
       end
 
-    reference_bytes =
-      Enum.reduce(ref, 0, fn {_key, value}, sum -> if is_binary(value), do: sum + byte_size(value), else: sum end)
+    reference_bytes = IO.iodata_length(Pulso.JSON.encode_to_iodata!(ref))
 
     bytes = ref["b"] + 2 * reference_bytes
     :ets.insert(table(), {ref["k"], ref, data, bytes, System.monotonic_time(:millisecond)})
     state = evict(%{state | bytes: state.bytes - old + bytes})
     {:reply, :ok, state}
   end
+
+  # Leaf summaries contain nested binaries; shallow copying/accounting could
+  # pin an entire decoded index page and evade the cache's byte ceiling.
+  defp copy_reference(value) when is_binary(value), do: :binary.copy(value)
+  defp copy_reference(value) when is_list(value), do: Enum.map(value, &copy_reference/1)
+
+  defp copy_reference(value) when is_map(value),
+    do: Map.new(value, fn {key, val} -> {copy_reference(key), copy_reference(val)} end)
+
+  defp copy_reference(value), do: value
 
   defp evict(state) do
     # ETS accounts decoded maps, lists, inline binaries and table overhead.

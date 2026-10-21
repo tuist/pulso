@@ -6,11 +6,14 @@
 > test bucket first and keep independent monitoring of Pulso.
 
 By default Pulso keeps every acknowledged record indefinitely. Event-time
-retention lets you keep logs and metrics for a fixed number of days instead,
+retention lets you keep logs, metrics and traces for a fixed number of days instead,
 without bucket lifecycle rules. Pulso decides what has expired from record
 timestamps, records that decision in the bucket, and deletes objects itself.
 
-Traces are not stored yet, so there is no trace retention setting.
+Trace retention uses **span start** timestamps. Search and `get_trace` hide
+expired spans even inside mixed-age segments. Trace assembly reports its
+snapshot's `retention_floor_ns` so clients can distinguish retention boundaries
+from exporter completeness. See [traces](traces.md#retention).
 
 ## How it works
 
@@ -20,8 +23,11 @@ never moves back. Records at exactly the floor are kept.
 
 - **Ingest** rejects a whole request if any of its records is older than the
   floor, or more than the future-skew allowance ahead of the node's clock.
-  Records without a timestamp count as too old. Nothing is silently dropped
-  from an otherwise accepted request.
+  Records without a timestamp count as too old. Unkeyed OTLP traces can instead
+  report out-of-retention spans individually through `partialSuccess` after
+  safety preflight; keyed payloads are never rewritten. Publication always
+  checks the latest committed floor, so a concurrent advance can still reject
+  a queued trace batch as a whole. Nothing is silently dropped.
 - **Queries** never return records below the floor, even when they are inside
   an object that also holds newer records.
 - **Deletion** happens in whole time buckets after a grace period (one hour by
@@ -82,9 +88,10 @@ legacy manifest costs one extra, unlimited read.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PULSO_RETENTION_ENABLED` | `false` | Run the background retention and cleanup worker even when both durations are `0`. The worker also runs whenever either duration is positive. |
+| `PULSO_RETENTION_ENABLED` | `false` | Run the background retention and cleanup worker even when all durations are `0`. The worker also runs whenever any duration is positive. |
 | `PULSO_LOGS_RETENTION_DAYS` | `0` | Log retention in whole days, `0..3650`. `0` stops advancing the floor. |
 | `PULSO_METRICS_RETENTION_DAYS` | `0` | Metric retention in whole days, `0..3650`. |
+| `PULSO_TRACES_RETENTION_DAYS` | `0` | Trace retention by span start in whole days, `0..3650`. |
 | `PULSO_RETENTION_MODE` | `observe` | `observe`, `enforce`, or `paused`. See [Modes](#modes). |
 | `PULSO_RETENTION_DELETE_GRACE_MS` | `3600000` | Time between expiry being committed and objects being deleted, `60000..2592000000`. |
 | `PULSO_RETENTION_INTERVAL_MS` | `30000` | Maintenance cadence, `1000..3600000`. |
@@ -117,9 +124,17 @@ floor or restores deleted data.
 that node picks up the setting; storage calls already in flight finish.
 
 Set `PULSO_RETENTION_ENABLED=true` before you set the durations back to `0` if
-expired buckets are still waiting for cleanup. With both durations at `0` and
+expired buckets are still waiting for cleanup. With all durations at `0` and
 the flag off, the worker does not start, and that committed work and its objects
 stay in place until it runs again.
+
+Keyed segment uploads are now create-only, with bounded exact-byte streaming
+verification after a failed create. The latest retention floor and retirement
+records still fence publication; a recreated retired source only rearms cleanup,
+never duplicates a replacement. Failed publication may leave orphans; flat scopes
+still lack a general orphan sweeper. A permanent HTTP409 byte conflict is not
+permission to delete source history or change retry keys. See
+[keyed ingestion and upgrade requirements](keyed-ingestion.md).
 
 ## Enabling retention
 
@@ -213,7 +228,7 @@ kubectl -n observability exec deploy/pulso -- /app/bin/pulso rpc '
   |> IO.inspect()'
 ```
 
-`apply_policy/5` takes the tenant, the signal (`"logs"` or `"metrics"`), the
+`apply_policy/5` takes the tenant, the signal (`"logs"`, `"metrics"` or `"traces"`), the
 storage configuration, the duration you expect to be recorded now, and the new
 duration (`1..3650`). It is a conditional write: it fails with
 `:retention_policy_mismatch` if the recorded duration is not the expected one,
@@ -328,12 +343,19 @@ Retention keeps metadata proportional to the retained window, not to how long
 the bucket has existed. It still has limits, and exceeding them returns an
 explicit capacity error rather than dropping data:
 
-- one append can touch at most four time buckets;
+- one owner publication can touch at most four time buckets and admit at most
+  256 segments / 64 KiB of new encoded wire metadata; additional callers defer;
+- live indexes preserve both byte and leaf-reference headroom for expiry;
+  trace references cap at 4 KiB, with optional summaries omitted when needed;
+  trace-heavy buckets can reach byte capacity well before 1,024 references;
+  overflow is retryable until the bucket rolls over, not a throughput promise;
 - each bucket's metadata (current and superseded pages) is capped;
 - a root, page or index that would exceed its size budget is refused;
 - a query reads at most 128 manifest pages plus two per time bucket in the
-  manifest, and at most 8 MiB of manifest data, within one deadline shared with
-  its retry. A query reads one index per overlapping time bucket plus the leaves
+  manifest, and by default at most 8 MiB of manifest data, within one deadline
+  shared with its retry. Exact-ID trace queries add 64 KiB per overlapping live
+  bucket to that default, capped at 32 MiB total; explicit configured byte
+  limits are never raised. A query reads one index per overlapping time bucket plus the leaves
   that match, so long ranges work as long as they stay within the byte budget
   and the segment scan limits. Very dense ranges fail with `:metadata_scan_limit`
   or the usual scan-limit error rather than returning partial results;
@@ -346,6 +368,20 @@ held in memory, not just the bytes read from storage. Pages are
 content-addressed and checksum-verified when first read, so a cached page stays
 valid for as long as it is cached.
 
+Trace leaf references carry bounded ID blooms and complete service sets, so
+exact-ID lookup can skip irrelevant leaves before reading them. Unknown,
+legacy or over-budget summaries scan conservatively, and false positives consume
+metadata budgets. This improves lookup but does not guarantee that any retained
+window fits a query budget. Large batches and compaction outputs use a versioned
+fixed 2 KiB ID bloom instead of a truncated ID-hash set. Mixed leaves combine
+only identically sized canonical blooms; unknown/legacy sets always scan.
+
+Each signal's own compaction grace affects its bucket-width window, together
+with the shared retention deletion grace. Changing only trace compaction grace
+does not resize or stop log/metric windows. Increasing the shared retention
+grace can still exceed a scope's recorded width; keep these values stable after
+activation and inspect capacity before changing them.
+
 Expect more storage requests than without retention: inline entries are
 periodically written out as pages, and cleanup issues list and delete requests.
 Normal appends still cost one segment write plus one manifest write. Measure
@@ -353,7 +389,7 @@ request counts on your provider before production use; see
 [storage costs](storage-costs.md).
 
 Deletion throughput is bounded per node: by default at most 512 DELETE attempts
-per 30 seconds, about 17 per second, for all tenants and both signals together,
+per 30 seconds, about 17 per second, for all tenants and all three signals together,
 and lower if DELETE latency limits four concurrent requests. If ingest creates
 segments faster than cleanup removes expired ones, the backlog grows. Watch
 storage growth and the metrics below after enabling enforcement.
@@ -408,7 +444,14 @@ Watch collector drop counters while switching to `enforce`.
   manifest when the manifest cannot be refreshed, because cleanup may already
   have deleted what the stale copy references.
 - Queries against a prefix in the old format keep serving the last manifest
-  they loaded when a refresh fails, as before. Pulso first checks the
+  they loaded after a transport refresh failure, as before. A successfully
+  fetched malformed or unsupported manifest instead fails the query and
+  invalidates the cache; it is never hidden by an older readable root.
+  Required-fresh alert reads invalidate an ordinary cached root after a decoded
+  corruption error or confirmed root absence, even inside its freshness interval.
+  They never reconstruct authority by LIST; managed prefixes remain fail-closed
+  after invalidation. Transport errors alone do not erase a warm snapshot.
+  For transport failures Pulso first checks the
   `.managed` marker: if it exists (another node converted the prefix), the query
   fails. If the marker check also fails, a node that enforces retention for that
   signal fails the query; other nodes, including those in `observe` or `paused`

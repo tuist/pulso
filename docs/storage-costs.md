@@ -63,6 +63,22 @@ allowances. This can dwarf storage for small batches. A stored GiB held for a
 month costs $0.02 regardless of whether it represents logs or metric samples.
 Neither figure includes Pulso compute.
 
+[Keyed retries](keyed-ingestion.md) now use conditional creates and streaming GET
+verification after a failed create, including lost responses. A normal successful
+first create needs no verification GET; retries can add up to two create/verify
+rounds, with provider SDK retries additional. All instances contribute pressure.
+A size-header mismatch can avoid consuming the streamed body but still incurs a
+provider GET and transport traffic. Budget provider operations independently of
+node-local consumed-byte counters.
+
+Optional [metric footer-first pruning](metric-footer-pruning.md) can avoid
+full-body bytes for proven-empty sources. Matching sources still GET the whole
+object and can add one or two suffix GETs; small complete suffixes are reused.
+Strong ETags/Range/If-Match support is required. Scan admission charges at least
+full logical source sizes, even when downloaded bytes fall, and extra traffic
+can hit limits sooner. Discovery remains whole-object. Measure the actual query
+mix across all instances, not just native decode savings.
+
 ## Avoiding amplification
 
 By default Pulso writes one immutable Parquet segment per nonempty append and
@@ -92,9 +108,13 @@ not reduce initial ingest PUTs. Test total lifecycle costs against the query mix
 before enabling it. Manifests and permanent ingest-retry tombstones still grow;
 compaction is not a bound on lifetime metadata.
 
-Pulso does not yet implement retention or a local segment cache. Do not apply
-bucket lifecycle deletion to active segments: it leaves manifest references
-pointing at missing data. Compaction recovery requires preserving manifests.
+Experimental [event-time retention](retention.md) is implemented for logs,
+metrics and traces. Managed scopes add immutable metadata pages, cleanup requests
+and a grace-period storage overlap; measure the full lifecycle, not just ingest
+PUTs. Flat retain-forever catalogs and their tombstones still grow without bound.
+A local segment cache remains unimplemented. Do not apply bucket lifecycle
+deletion to referenced segments or pages: it leaves dangling manifest references.
+Recovery requires coherent manifest, metadata-page and segment backups.
 Infrequent Access adds retrieval charges and a 30-day minimum; Archive Instant
 Retrieval adds retrieval charges and a 90-day minimum. Archive requires a restore
 before reading. Tiering mutable manifests or short-lived compaction sources can

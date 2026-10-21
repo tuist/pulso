@@ -46,16 +46,20 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     ArgumentError -> totals
   end
 
-  def append(signal, tenant, records, config) do
+  def append(signal, tenant, records, config, opts \\ []) do
     rows = length(records)
     bytes = :erlang.external_size(records)
 
     if rows > @max_rows or bytes > @max_bytes do
       :unbuffered
     else
+      # Copy before reservation: a heap/watchdog kill during detachment must
+      # not strand credits for a message the owner never received.
+      records = Pulso.JSON.detach(records)
+
       with {:ok, pid, admission} <- ensure_started(signal, tenant, config),
            :ok <- reserve(admission, bytes, rows) do
-        call(pid, {:append, records, bytes, rows})
+        call(pid, {:append, records, bytes, rows, opts})
       end
     end
   end
@@ -137,8 +141,8 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   end
 
   @impl true
-  def handle_call({:append, records, bytes, rows}, from, state) do
-    pending = [{from, records, bytes, rows} | state.pending]
+  def handle_call({:append, records, bytes, rows, opts}, from, state) do
+    pending = [{from, records, bytes, rows, opts} | state.pending]
     state = %{state | pending: pending}
     state = if state.timer, do: state, else: schedule(state)
     {:noreply, state, @idle_ms}
@@ -153,32 +157,65 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   @impl true
   def handle_info({:flush, token}, %{timer: {_ref, token}} = state) do
     pending = Enum.reverse(state.pending)
-    records = Enum.flat_map(pending, fn {_from, records, _bytes, _rows} -> records end)
-    result = S3.append_unbuffered(state.signal, state.tenant, records, [], state.config)
+    records = Enum.flat_map(pending, fn {_from, records, _bytes, _rows, _opts} -> records end)
+    result = S3.append_unbuffered(state.signal, state.tenant, records, [split_admission_errors: true], state.config)
 
     # An invalid input must not poison other valid requests sharing a flush.
     # Encoding errors occur before any upload. Never fall back after a storage
     # error: a lost response could have published the combined segment already.
-    results =
-      if encoding_error?(result) do
-        Enum.map(pending, fn {_from, records, _bytes, _rows} ->
-          S3.append_unbuffered(state.signal, state.tenant, records, [], state.config)
-        end)
-      else
-        List.duplicate(result, length(pending))
-      end
+    if encoding_error?(result) do
+      pending
+      |> Pulso.Runtime.Task.async_stream(&split_reply(&1, state),
+        max_concurrency: 8,
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Stream.run()
+    else
+      # After PUT/CAS begins, a moving floor can reject the combined segment.
+      # Fresh siblings must retry, not receive a permanent drop; do not split an
+      # ambiguous publication into new segments that could duplicate its data.
+      result =
+        case {result, pending} do
+          {{:error, :retention_expired}, [_, _ | _]} -> {:error, :retention_floor_advanced}
+          _ -> result
+        end
 
-    Enum.zip(pending, results)
-    |> Enum.each(fn {{from, _records, bytes, rows}, result} ->
-      release(state.admission, bytes, rows)
-      GenServer.reply(from, result)
-    end)
+      Enum.each(pending, &reply_pending(&1, result, state))
+    end
 
     {:noreply, %{state | pending: [], timer: nil}, @idle_ms}
   end
 
   def handle_info({:flush, _obsolete}, state), do: {:noreply, state, @idle_ms}
   def handle_info(:timeout, %{pending: []} = state), do: {:stop, :normal, state}
+
+  defp split_reply({_from, records, _bytes, _rows, opts} = pending, state) do
+    result =
+      try do
+        S3.append_unbuffered(state.signal, state.tenant, records, opts, state.config)
+      rescue
+        _error -> {:error, :storage_unavailable}
+      catch
+        :exit, _reason -> {:error, :storage_unavailable}
+      end
+
+    reply_pending(pending, result, state)
+  end
+
+  defp reply_pending({from, _records, bytes, rows, _opts}, result, state) do
+    # Native work keeps its reservation until it finishes, even if its caller
+    # timed out. Replies are sent from the bounded tasks as each write completes.
+    release(state.admission, bytes, rows)
+    GenServer.reply(from, result)
+  end
+
+  # Retention preflight failures precede PUT, so split valid siblings safely.
+  # Once PUT/CAS starts, storage errors remain ambiguous and never split.
+  defp encoding_error?({:error, :payload_too_large}), do: true
+
+  defp encoding_error?({:error, {:admission_rejected, reason}}) when reason in [:retention_expired, :timestamp_too_new],
+    do: true
 
   defp encoding_error?({:error, {kind, _}}) when kind in [:encode_failed, :attribute_key_collision], do: true
   defp encoding_error?(_), do: false

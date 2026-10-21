@@ -1,6 +1,6 @@
 # Application-managed telemetry retention and bounded manifests
 
-Status: proposed, not implemented. Expanded after the user's metadata-growth objection and joint review with Claude, October 9, 2026. Bounded active manifests and reclaimable deletion metadata are part of this feature, not deferred production prerequisites.
+Status: implemented experimentally by PR #32, now extended to traces. The sections below preserve the original design proposal; `docs/retention.md` and `docs/architecture.md` describe actual behavior and limits. Expanded after the user's metadata-growth objection and joint review with Claude, October 9, 2026. Bounded active manifests and reclaimable deletion metadata are part of this feature, not deferred production prerequisites.
 
 ## Goal and scope
 

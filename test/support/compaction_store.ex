@@ -10,7 +10,7 @@ defmodule Pulso.Test.CompactionStore do
     conn = fetch_query_params(conn)
     agent = Keyword.fetch!(opts, :agent)
     key = conn.request_path |> URI.decode() |> String.trim_leading("/pulso/")
-    {:ok, body, conn} = read_body(conn, length: 16_000_000)
+    {body, conn} = read_full_body(conn, [])
 
     {status, etag, response} =
       Agent.get_and_update(agent, fn state ->
@@ -19,7 +19,21 @@ defmodule Pulso.Test.CompactionStore do
 
     await_barrier(agent, conn.method, key)
     conn = if etag, do: put_resp_header(conn, "etag", etag), else: conn
-    send_resp(conn, status, response)
+
+    case response do
+      {:range, first, size, bytes} ->
+        conn |> put_resp_header("content-range", "bytes #{first}-#{size - 1}/#{size}") |> send_resp(status, bytes)
+
+      bytes ->
+        send_resp(conn, status, bytes)
+    end
+  end
+
+  defp read_full_body(conn, chunks) do
+    case read_body(conn, length: 16_000_000) do
+      {:more, chunk, conn} -> read_full_body(conn, [chunk | chunks])
+      {:ok, chunk, conn} -> {IO.iodata_to_binary(Enum.reverse([chunk | chunks])), conn}
+    end
   end
 
   defp await_barrier(agent, method, key) do
@@ -101,17 +115,52 @@ defmodule Pulso.Test.CompactionStore do
     }
 
     none = List.first(get_req_header(conn, "if-none-match"))
+    match = List.first(get_req_header(conn, "if-match"))
+    range = List.first(get_req_header(conn, "range"))
+
+    state = record_range_request(state, key, range, match)
 
     case Map.get(state.objects, key) do
-      nil when is_map_key(conn.query_params, "list-type") -> {{200, nil, list_response(state, conn)}, state}
-      nil -> {{404, nil, ""}, state}
-      {etag, _} when etag == none -> {{304, etag, ""}, state}
-      {etag, body} -> {{200, etag, body}, state}
+      nil when is_map_key(conn.query_params, "list-type") ->
+        {{200, nil, list_response(state, conn)}, state}
+
+      nil ->
+        {{404, nil, ""}, state}
+
+      {etag, _} when match != nil and etag != match ->
+        {{412, etag, ""}, state}
+
+      {etag, _} when etag == none ->
+        {{304, etag, ""}, state}
+
+      {etag, body} when is_binary(range) ->
+        suffix_response(state, etag, body, range)
+
+      {etag, body} ->
+        {{200, etag, body}, state}
     end
   end
 
   defp request("DELETE", key, _body, _conn, state),
     do: {{204, nil, ""}, %{state | objects: Map.delete(state.objects, key), deletes: [key | state.deletes]}}
+
+  defp record_range_request(state, key, range, match) do
+    if range || match,
+      do: Map.update(state, :range_requests, [{key, range, match}], &[{key, range, match} | &1]),
+      else: state
+  end
+
+  defp suffix_response(state, etag, body, range) do
+    case Integer.parse(String.replace_prefix(range, "bytes=-", "")) do
+      {suffix, ""} when suffix > 0 ->
+        first = max(0, byte_size(body) - suffix)
+        bytes = binary_part(body, first, byte_size(body) - first)
+        {{206, etag, {:range, first, byte_size(body), bytes}}, state}
+
+      _ ->
+        {{416, etag, ""}, state}
+    end
+  end
 
   defp list_response(state, conn) do
     prefix = Map.get(conn.query_params, "prefix", "")

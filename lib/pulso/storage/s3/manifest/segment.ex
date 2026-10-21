@@ -12,8 +12,19 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   """
 
   alias Pulso.Storage.S3.MetricLabelSummary
+  alias Pulso.Storage.S3.TraceSummary
 
-  defstruct [:key, :min_ts, :max_ts, :row_count, :byte_size, :metric_names, :log_services, :metric_labels]
+  defstruct [
+    :key,
+    :min_ts,
+    :max_ts,
+    :row_count,
+    :byte_size,
+    :metric_names,
+    :log_services,
+    :metric_labels,
+    :trace_summary
+  ]
 
   @type t :: %__MODULE__{
           key: String.t(),
@@ -23,7 +34,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           byte_size: non_neg_integer() | nil,
           metric_names: [String.t()] | nil,
           log_services: [String.t()] | nil,
-          metric_labels: %{String.t() => [String.t()]} | nil
+          metric_labels: %{String.t() => [String.t()]} | nil,
+          trace_summary: TraceSummary.t() | nil
         }
 
   @doc """
@@ -79,7 +91,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
     base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
     base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
-    if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
+    base = if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
+    if segment.trace_summary, do: Map.put(base, "t", TraceSummary.to_wire(segment.trace_summary)), else: base
   end
 
   @doc """
@@ -102,7 +115,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        byte_size: byte_size,
        metric_names: valid_names(wire["n"]),
        log_services: valid_services(wire["ls"]),
-       metric_labels: MetricLabelSummary.parse(wire["l"])
+       metric_labels: MetricLabelSummary.parse(wire["l"]),
+       trace_summary: TraceSummary.parse(wire["t"])
      }}
   end
 

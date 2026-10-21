@@ -6,6 +6,8 @@ defmodule Pulso.Storage.S3.Retention do
   alias Pulso.ObjectStore
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.CASBackoff
+  alias Pulso.Storage.S3.LogCompactor
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestOwner
@@ -14,15 +16,19 @@ defmodule Pulso.Storage.S3.Retention do
   alias Pulso.Storage.S3.RetentionAdmission
   alias Pulso.Storage.S3.RetentionCatchup
   alias Pulso.Storage.S3.RetentionTasks
+  alias Pulso.Storage.S3.TraceCompactor
 
   @day_ns 86_400_000_000_000
   @legacy_limit 16_777_216
 
-  def days(config, signal),
-    do: Map.get(config, if(signal == "logs", do: :logs_retention_days, else: :metrics_retention_days), 0)
+  def signals, do: ["logs", "metrics", "traces"]
+  def days(config, "logs"), do: Map.get(config, :logs_retention_days, 0)
+  def days(config, "metrics"), do: Map.get(config, :metrics_retention_days, 0)
+  def days(config, "traces"), do: Map.get(config, :traces_retention_days, 0)
+  def days(_config, _signal), do: 0
 
   def configured?(config),
-    do: days(config, "logs") > 0 or days(config, "metrics") > 0 or Map.get(config, :retention_enabled, false)
+    do: Enum.any?(signals(), &(days(config, &1) > 0)) or Map.get(config, :retention_enabled, false)
 
   @doc "Whether this node enforces retention for `signal` (and therefore gates legacy roots)."
   def enforcing?(config, signal),
@@ -136,22 +142,44 @@ defmodule Pulso.Storage.S3.Retention do
     end
   end
 
-  def effective_grace(config) do
-    options = Map.new(Map.get(config, :compaction_options, []))
+  def effective_grace(config, signal) do
+    options =
+      case signal do
+        "metrics" ->
+          Map.new(Map.get(config, :compaction_options, []))
+
+        "traces" ->
+          Map.new(Map.get(config, :trace_compaction_options, []))
+
+        "logs" ->
+          if(Map.get(config, :log_compaction_enabled, false),
+            do: Map.new(Map.get(config, :log_compaction_options, [])),
+            else: %{grace_ms: 0}
+          )
+
+        _ ->
+          %{grace_ms: 0}
+      end
+
     max(Map.get(config, :retention_delete_grace_ms, 3_600_000), Map.get(options, :grace_ms, 3_600_000))
   end
 
-  def window_ns(days, config),
-    do: days * @day_ns + (effective_grace(config) + Map.get(config, :retention_future_skew_ms, 600_000)) * 1_000_000
+  def window_ns(days, config, signal),
+    do:
+      days * @day_ns +
+        (effective_grace(config, signal) + Map.get(config, :retention_future_skew_ms, 600_000)) * 1_000_000
 
-  def validate_capacity(root, config, new_days \\ nil) do
+  def validate_capacity(root, config, new_days, signal) do
     duration = new_days || root.paging["days"]
     width = root.paging["width"]
-    if div(window_ns(duration, config) + width - 1, width) + 4 <= 512, do: :ok, else: {:error, :retention_capacity}
+
+    if div(window_ns(duration, config, signal) + width - 1, width) + 4 <= 512,
+      do: :ok,
+      else: {:error, :retention_capacity}
   end
 
-  defp capacity!(root, config, new_days \\ nil) do
-    case validate_capacity(root, config, new_days) do
+  defp capacity!(root, config, new_days, signal) do
+    case validate_capacity(root, config, new_days, signal) do
       :ok -> :ok
       {:error, reason} -> Pages.fail(reason)
     end
@@ -204,7 +232,7 @@ defmodule Pulso.Storage.S3.Retention do
 
     root = activate(root, tenant, signal, initial)
     if root.paging["days"] != days(config, signal), do: Pages.fail(:retention_policy_mismatch)
-    capacity!(root, config)
+    capacity!(root, config, nil, signal)
 
     floor = max(root.paging["floor"], max(0, now_ns - days(config, signal) * @day_ns))
     root = %{root | paging: %{root.paging | "floor" => floor}}
@@ -234,7 +262,7 @@ defmodule Pulso.Storage.S3.Retention do
   def apply_policy(tenant, signal, config, expected_days, new_days) when new_days in 1..3650 do
     transact(tenant, signal, config, fn root ->
       if root.version != 3 or root.paging["days"] != expected_days, do: Pages.fail(:retention_policy_mismatch)
-      capacity!(root, config, new_days)
+      capacity!(root, config, new_days, signal)
 
       {%{root | paging: %{root.paging | "days" => new_days}}, :ok}
     end)
@@ -284,8 +312,13 @@ defmodule Pulso.Storage.S3.Retention do
   defp cleanup_retired_root(%Manifest{version: 3}, now, tenant, signal, config, _opts),
     do: transact(tenant, signal, config, &retired_step(&1, now, tenant, signal, config))
 
+  defp cleanup_retired_root(_legacy, _now, tenant, "logs", config, opts), do: LogCompactor.cleanup(tenant, config, opts)
+
   defp cleanup_retired_root(_legacy, _now, tenant, "metrics", config, opts),
     do: MetricsCompactor.cleanup(tenant, config, opts)
+
+  defp cleanup_retired_root(_legacy, _now, tenant, "traces", config, opts),
+    do: TraceCompactor.cleanup(tenant, config, opts)
 
   defp cleanup_retired_root(_legacy, _now, _tenant, _signal, _config, _opts), do: {:ok, 0}
 
@@ -430,16 +463,28 @@ defmodule Pulso.Storage.S3.Retention do
     if start + paging["width"] <= watermark and start >= first, do: start, else: first
   end
 
+  defp prepare_transaction(original, config, fun),
+    do: Pages.with_budget(transaction_budget(original, config), fn -> fun.(original) end)
+
   def transact(tenant, signal, config, fun, attempts \\ 5)
   def transact(_tenant, _signal, _config, _fun, 0), do: {:error, :cas_retries_exhausted}
 
   def transact(tenant, signal, config, fun, attempts) do
     with {:ok, original, etag} <- load(tenant, signal, config),
-         {:ok, {updated, result}} <- Pages.with_budget(transaction_budget(original, config), fn -> fun.(original) end) do
+         {:ok, {updated, result}} <- prepare_transaction(original, config, fun) do
       if updated == original do
         {:ok, result}
       else
-        transaction = %{tenant: tenant, signal: signal, config: config, fun: fun, attempts: attempts}
+        transaction = %{
+          tenant: tenant,
+          signal: signal,
+          config: config,
+          fun: fun,
+          attempts: attempts,
+          etag: etag,
+          cache_base: ManifestCache.publication_base(tenant, signal)
+        }
+
         commit(stamp_nonce(updated), result, etag, transaction)
       end
     end
@@ -463,7 +508,7 @@ defmodule Pulso.Storage.S3.Retention do
 
       case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal), body, etag) do
         {:ok, new_etag} ->
-          ManifestCache.put(tenant, signal, updated, new_etag)
+          ManifestCache.publish(tenant, signal, updated, new_etag, etag, transaction.cache_base)
           {:ok, result}
 
         {:error, reason} ->
@@ -479,11 +524,20 @@ defmodule Pulso.Storage.S3.Retention do
   defp resolve_commit({:ok, current, current_etag}, reason, updated, result, transaction) do
     cond do
       current.paging != nil and updated.paging != nil and current.paging["nonce"] == updated.paging["nonce"] ->
-        ManifestCache.put(transaction.tenant, transaction.signal, current, current_etag)
+        ManifestCache.publish(
+          transaction.tenant,
+          transaction.signal,
+          current,
+          current_etag,
+          transaction.etag,
+          transaction.cache_base
+        )
+
         {:ok, result}
 
       reason == :precondition_failed ->
         %{tenant: tenant, signal: signal, config: config, fun: fun, attempts: attempts} = transaction
+        CASBackoff.wait(attempts)
         transact(tenant, signal, config, fun, attempts - 1)
 
       true ->
@@ -670,7 +724,7 @@ defmodule Pulso.Storage.S3.Retention do
     end
   end
 
-  defp validate_signal(signal) when signal in ["logs", "metrics"], do: :ok
+  defp validate_signal(signal) when signal in ["logs", "metrics", "traces"], do: :ok
   defp validate_signal(_), do: {:error, :unsupported_signal}
 
   def metadata_stats(%{version: 3} = root) do

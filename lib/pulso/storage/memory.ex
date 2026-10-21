@@ -20,6 +20,7 @@ defmodule Pulso.Storage.Memory do
   alias Pulso.Codec.NIF
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.Record.Span
   alias Pulso.Runtime.GenServer
   alias Pulso.Storage.SortOrder
 
@@ -43,7 +44,7 @@ defmodule Pulso.Storage.Memory do
         [] -> []
       end
 
-    :ets.insert(table(), {key, existing ++ records})
+    :ets.insert(table(), {key, existing ++ Pulso.JSON.detach(records)})
     :ok
   end
 
@@ -57,12 +58,16 @@ defmodule Pulso.Storage.Memory do
         [] -> []
       end
 
+    {matchers, filters} = query_filters(signal, opts)
+
     filtered =
       records
       |> filter_by_time(Keyword.get(opts, :start_ts), Keyword.get(opts, :end_ts))
       |> filter_by_service(Keyword.get(opts, :service))
-      |> filter_by_matchers(Keyword.get(opts, :matchers, []))
-      |> filter_by_line_filters(Keyword.get(opts, :line_filters, []))
+      |> filter_spans(opts)
+      |> filter_by_matchers(matchers)
+      |> filter_by_line_filters(filters)
+      |> filter_exemplars(Keyword.get(opts, :exemplars, false))
       |> SortOrder.sort(signal)
       |> take_limit(Keyword.get(opts, :limit))
 
@@ -71,6 +76,50 @@ defmodule Pulso.Storage.Memory do
       _ -> {:ok, filtered}
     end
   end
+
+  defp filter_exemplars(records, false), do: records
+  defp filter_exemplars(records, true), do: Enum.filter(records, &(&1.exemplars not in [nil, []]))
+
+  @impl Pulso.Storage
+  def put_metric_metadata(tenant, entries, today) do
+    {:ok, set} = metric_metadata(tenant)
+    :ets.insert(table(), {{tenant, :metric_metadata}, Pulso.MetricMetadata.merge(set, entries, today)})
+    :ok
+  end
+
+  @impl Pulso.Storage
+  def metric_metadata(tenant) do
+    case :ets.lookup(table(), {tenant, :metric_metadata}) do
+      [{_, set}] -> {:ok, set}
+      [] -> {:ok, %{}}
+    end
+  end
+
+  @doc """
+  Select log records exactly as `query/3` does for the `:service`,
+  `:matchers` and `:line_filters` options, compiling each regex once. Live
+  tailing uses it so tailed and queried records agree.
+  """
+  @spec select_logs([Log.t()], keyword()) :: [Log.t()]
+  def select_logs(records, opts) do
+    records
+    |> filter_by_service(Keyword.get(opts, :service))
+    |> filter_by_matchers(Enum.map(Keyword.get(opts, :matchers, []), &compile_matcher/1))
+    |> filter_by_line_filters(Enum.map(Keyword.get(opts, :line_filters, []), &compile_line_filter/1))
+  end
+
+  defp query_filters(:logs, opts) do
+    {Enum.map(Keyword.get(opts, :matchers, []), &compile_matcher/1),
+     Enum.map(Keyword.get(opts, :line_filters, []), &compile_line_filter/1)}
+  end
+
+  defp query_filters(_signal, opts), do: {Keyword.get(opts, :matchers, []), Keyword.get(opts, :line_filters, [])}
+
+  defp compile_matcher({name, op, pattern}) when op in [:re, :nre], do: {name, op, compile_regex!(pattern)}
+  defp compile_matcher(matcher), do: matcher
+
+  defp compile_line_filter({op, pattern}) when op in [:match_re, :not_match_re], do: {op, compile_regex!(pattern)}
+  defp compile_line_filter(filter), do: filter
 
   @doc false
   @spec reset() :: :ok
@@ -106,6 +155,14 @@ defmodule Pulso.Storage.Memory do
 
   defp record_ts(%Log{timestamp_ns: ts}), do: ts
   defp record_ts(%MetricSample{timestamp_ns: ts}), do: ts
+  defp record_ts(%Span{timestamp_ns: ts}), do: ts
+
+  defp filter_spans(records, opts) do
+    Enum.filter(records, fn
+      %Span{} = s -> Span.matches?(s, opts)
+      _ -> true
+    end)
+  end
 
   # Logs-only convenience filter — metric samples have no `service`
   # field so a service filter is undefined for them; pass them through
@@ -115,6 +172,7 @@ defmodule Pulso.Storage.Memory do
   defp filter_by_service(records, service) do
     Enum.filter(records, fn
       %Log{service: s} -> s == service
+      %Span{service: s} -> s == service
       %MetricSample{} -> true
     end)
   end
@@ -142,6 +200,14 @@ defmodule Pulso.Storage.Memory do
     end
   end
 
+  @doc false
+  def log_matcher_value(record, name) do
+    case label_from_record(record, name) do
+      value when is_binary(value) -> value
+      _ -> ""
+    end
+  end
+
   # Logs: promoted typed fields first (service, service_name, level,
   # detected_level), then resource JSON. Attributes are NOT consulted —
   # they are per-record structured metadata, not stream labels, and
@@ -159,11 +225,15 @@ defmodule Pulso.Storage.Memory do
 
   defp label_from_record(%MetricSample{labels: labels}, name), do: Map.get(labels, name)
 
-  defp promoted_field(%Log{} = record, name) when name in ["service", "service_name"], do: record.service
+  # Empty promoted values are absent, so the resource is consulted, as in Rust.
+  defp promoted_field(%Log{} = record, name) when name in ["service", "service_name"], do: present(record.service)
 
-  defp promoted_field(%Log{} = record, name) when name in ["level", "detected_level"], do: record.severity_text
+  defp promoted_field(%Log{} = record, name) when name in ["level", "detected_level"], do: present(record.severity_text)
 
   defp promoted_field(_record, _name), do: nil
+
+  defp present(""), do: nil
+  defp present(value), do: value
 
   defp apply_matcher_op(:eq, actual, wanted), do: actual == wanted
   defp apply_matcher_op(:neq, actual, wanted), do: actual != wanted
@@ -173,10 +243,13 @@ defmodule Pulso.Storage.Memory do
   # Invalid regexes are caught by `Pulso.LogQL.QueryValidation` before the
   # storage layer runs. If we somehow get here with one, raise rather
   # than silently invert to `true` for the `:nre` / `:not_match_re` op.
-  defp regex_match?(pattern, subject) do
-    case Regex.compile(pattern) do
-      {:ok, re} -> Regex.match?(re, subject)
-      {:error, reason} -> raise ArgumentError, "invalid regex #{inspect(pattern)}: #{inspect(reason)}"
+  defp regex_match?({:native_regex, re}, subject), do: NIF.match_log_regex(re, subject)
+  defp regex_match?(pattern, subject), do: regex_match?(compile_regex!(pattern), subject)
+
+  defp compile_regex!(pattern) do
+    case NIF.compile_log_regex(pattern) do
+      {:ok, re} -> {:native_regex, re}
+      :error -> raise ArgumentError, "invalid regex #{inspect(pattern)}"
     end
   end
 
@@ -199,9 +272,10 @@ defmodule Pulso.Storage.Memory do
     end)
   end
 
-  defp line_from_record(%{body: nil}), do: ""
-  defp line_from_record(%{body: body}) when is_binary(body), do: body
-  defp line_from_record(%{body: body}), do: Pulso.JSON.encode!(body)
+  @doc false
+  def line_from_record(%{body: nil}), do: ""
+  def line_from_record(%{body: body}) when is_binary(body), do: body
+  def line_from_record(%{body: body}), do: Pulso.JSON.encode!(body)
 
   defp line_filter_matches?({:contains, needle}, body), do: String.contains?(body, needle)
   defp line_filter_matches?({:not_contains, needle}, body), do: not String.contains?(body, needle)
