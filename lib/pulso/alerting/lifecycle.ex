@@ -13,12 +13,20 @@ defmodule Pulso.Alerting.Lifecycle do
     end
   end
 
-  defp transition(_rule, previous, points, _timestamp) when map_size(points) == 0, do: {:ok, previous, [], "no_data"}
-
   defp transition(rule, previous, points, timestamp) do
+    health = if map_size(points) == 0, do: "no_data", else: "ok"
+
+    if health == "no_data" and Map.get(rule, "no_data_policy", "keep_last") == "keep_last" do
+      {:ok, previous, [], health}
+    else
+      transition_instances(rule, previous, points, timestamp, health)
+    end
+  end
+
+  defp transition_instances(rule, previous, points, timestamp, health) do
     keys = (Map.keys(previous) ++ Map.keys(points)) |> Enum.uniq() |> Enum.sort()
     {instances, events} = Enum.reduce(keys, {%{}, []}, &step_instance(&1, &2, previous, points, rule, timestamp))
-    if map_size(instances) <= @max_instances, do: {:ok, instances, events, "ok"}, else: {:error, :instance_limit}
+    if map_size(instances) <= @max_instances, do: {:ok, instances, events, health}, else: {:error, :instance_limit}
   end
 
   defp step_instance(key, {acc, events}, previous, points, rule, timestamp) do

@@ -2,7 +2,7 @@ defmodule Pulso.Alerting.Worker do
   @moduledoc "Opt-in disposable native evaluator. Membership reduces work; rule-head CAS enforces correctness."
   use Pulso.Runtime.GenServer
 
-  alias Pulso.Alerting.{Canonical, Evaluator, Repository}
+  alias Pulso.Alerting.{Canonical, Evaluator, Recording, Repository}
   alias Pulso.Alerting.Membership
   alias Pulso.Alerting.Notifier
   alias Pulso.Alerting.Tasks
@@ -15,6 +15,8 @@ defmodule Pulso.Alerting.Worker do
 
   @impl true
   def init(opts) do
+    cache = :ets.new(:alert_budget_skips, [:set, :public])
+    opts = Keyword.put(opts, :budget_skip_cache, cache)
     config = Keyword.get(opts, :store_config, Runtime.get_env(:pulso, S3, [])) |> Map.new()
     group = {:alerting, Canonical.hash(Enum.map([:bucket, :endpoint, :region], &Map.get(config, &1)))}
     :ok = :pg.join(Membership, group, self())
@@ -56,7 +58,8 @@ defmodule Pulso.Alerting.Worker do
       store: store,
       store_config: config,
       evaluation_enabled: Keyword.get(opts, :evaluation_enabled, true),
-      notifications_enabled: Keyword.get(opts, :notifications_enabled, false)
+      notifications_enabled: Keyword.get(opts, :notifications_enabled, false),
+      budget_skip_cache: Keyword.get(opts, :budget_skip_cache)
     ]
 
     with {:ok, prefixes} <- store.list_prefixes(config, "tenants/") do
@@ -82,10 +85,14 @@ defmodule Pulso.Alerting.Worker do
         tenant: tenant,
         id: "pulso-evaluator",
         type: "service",
-        capabilities: ~w(alert:read alert:evaluate alert:import)
+        capabilities: ~w(alert:read alert:evaluate alert:import alert:record)
       }
 
-      if Keyword.get(opts, :evaluation_enabled, true), do: Evaluator.evaluate(actor, id, opts)
+      if Keyword.get(opts, :evaluation_enabled, true) do
+        Recording.drain(tenant, id, opts)
+        Evaluator.evaluate(actor, id, Keyword.put(opts, :require_recording_drained, true))
+      end
+
       if Keyword.get(opts, :notifications_enabled, false), do: Notifier.run_once(tenant, id, opts)
       count + 1
     else

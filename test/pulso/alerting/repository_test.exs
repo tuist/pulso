@@ -3,6 +3,7 @@ defmodule Pulso.Alerting.RepositoryTest do
 
   alias Pulso.Alerting
   alias Pulso.Alerting.{Canonical, Evaluator, Importer, Repository}
+  alias Pulso.Record.MetricSample
   alias Pulso.Runtime.Task
   alias Pulso.Test.CompactionStore
 
@@ -83,6 +84,47 @@ defmodule Pulso.Alerting.RepositoryTest do
 
     assert {:error, :operation_reused} =
              Alerting.create(ctx.actor, "backup", request(rule(%{"name" => "Other"}), "create"), ctx.opts)
+  end
+
+  test "exact mutation retries use committed target bindings after configuration changes", ctx do
+    target = %{"tenant" => "alerts", "id" => "slack", "type" => "slack_webhook", "secret_env" => "PULSO_ALERTING_OLD"}
+    Pulso.Runtime.put_env(:pulso, Alerting, notification_targets: [target])
+    params = request(rule(%{"notification_targets" => ["slack"]}), "target-retry")
+    assert {:ok, first} = Alerting.create(ctx.actor, "backup", params, ctx.opts)
+    [binding] = first["notification_targets"]
+    assert binding["secret_env"] == "PULSO_ALERTING_OLD"
+
+    for targets <- [[%{target | "secret_env" => "PULSO_ALERTING_NEW"}], []] do
+      Pulso.Runtime.put_env(:pulso, Alerting, notification_targets: targets)
+      assert {:ok, ^first} = Alerting.create(ctx.actor, "backup", params, ctx.opts)
+      changed = put_in(params, ["rule", "name"], "Different caller request")
+      assert {:error, :operation_reused} = Alerting.create(ctx.actor, "backup", changed, ctx.opts)
+    end
+
+    # A genuinely new operation still has to bind current operator targets.
+    assert {:error, :invalid_target} =
+             Alerting.create(ctx.actor, "other", %{params | "operation_id" => "new-target-operation"}, ctx.opts)
+  end
+
+  test "ancestry recovery verifies the existing digest format against original bindings", ctx do
+    target = %{"tenant" => "alerts", "id" => "slack", "type" => "slack_webhook", "secret_env" => "PULSO_ALERTING_OLD"}
+    Pulso.Runtime.put_env(:pulso, Alerting, notification_targets: [target])
+    params = request(rule(%{"notification_targets" => ["slack"]}), "original-target")
+    assert {:ok, first} = Alerting.create(ctx.actor, "backup", params, ctx.opts)
+    assert {:ok, _} = Alerting.update(ctx.actor, "backup", request(rule(), "later", first["revision"]), ctx.opts)
+    Pulso.Runtime.put_env(:pulso, Alerting, notification_targets: [])
+
+    # Model bounded receipt eviction without manufacturing a new revision or
+    # changing the immutable original digest/bindings.
+    assert {:ok, head, _} = Repository.load("alerts", "backup", ctx.opts)
+    key = "tenants/alerts/alerting/v1/rules/backup/head.json"
+
+    assert {:ok, _} =
+             Pulso.ObjectStore.put(ctx.opts[:store_config], key, Canonical.encode(%{head | "operations" => []}))
+
+    assert {:ok, ^first} = Alerting.create(ctx.actor, "backup", params, ctx.opts)
+    changed = put_in(params, ["rule", "name"], "Changed")
+    assert {:error, :operation_reused} = Alerting.create(ctx.actor, "backup", changed, ctx.opts)
   end
 
   test "actual native commit-then-500/412 is read back as success", ctx do
@@ -229,6 +271,51 @@ defmodule Pulso.Alerting.RepositoryTest do
     assert state["completed_at_ns"] == "2000000000"
   end
 
+  test "scheduled budget memo avoids repeated work without publishing a completed tick", ctx do
+    assert {:ok, created} = Alerting.create(ctx.actor, "backup", request(rule(), "create"), ctx.opts)
+    cache = :ets.new(:budget_skips, [:set, :public])
+    owner = self()
+
+    failed = fn _, _, _ ->
+      send(owner, :ran_query)
+      {:error, :query_work_limit}
+    end
+
+    opts = ctx.opts ++ [budget_skip_cache: cache, timestamp_ns: 2_000_000_000, query: failed]
+
+    for _ <- 1..2, do: assert({:error, :evaluation_skipped} = Evaluator.evaluate(ctx.actor, "backup", opts))
+    assert_received :ran_query
+    refute_received :ran_query
+    assert {:ok, state} = Alerting.state(ctx.actor, "backup", ctx.opts)
+    assert state["completed_at_ns"] == "-1"
+
+    assert {:error, :evaluation_skipped} =
+             Evaluator.evaluate(ctx.actor, "backup", Keyword.put(opts, :timestamp_ns, 3_000_000_000))
+
+    assert_received :ran_query
+
+    assert {:ok, _} =
+             Alerting.update(
+               ctx.actor,
+               "backup",
+               request(rule(%{"name" => "Edited"}), "edit", created["revision"]),
+               ctx.opts
+             )
+
+    assert {:error, :evaluation_skipped} = Evaluator.evaluate(ctx.actor, "backup", opts)
+    assert_received :ran_query
+
+    transient = fn _, _, _ ->
+      send(owner, :transient_query)
+      {:error, :query_overloaded}
+    end
+
+    opts = opts |> Keyword.put(:timestamp_ns, 4_000_000_000) |> Keyword.put(:query, transient)
+    for _ <- 1..2, do: assert({:error, :evaluation_skipped} = Evaluator.evaluate(ctx.actor, "backup", opts))
+    assert_received :transient_query
+    assert_received :transient_query
+  end
+
   test "sealed pages provide forward replay, and candidate integrity is checked", ctx do
     assert {:ok, _} = Alerting.create(ctx.actor, "backup", request(rule(), "create"), ctx.opts)
 
@@ -323,6 +410,57 @@ defmodule Pulso.Alerting.RepositoryTest do
              )
 
     assert snapshot["rule"]["original"] == original
+  end
+
+  test "authorized disabled Grafana preview reads native sources without any rule-state publication", ctx do
+    uid = "bound-preview"
+
+    original = %{
+      "uid" => uid,
+      "condition" => "B",
+      "data" => [
+        %{
+          "refId" => "A",
+          "datasourceUid" => "native",
+          "model" => %{"instant" => true, "expr" => "sum(preview_metric)"}
+        },
+        %{"refId" => "B", "datasourceUid" => "__expr__", "model" => %{"type" => "math", "expression" => "$A > 2"}}
+      ]
+    }
+
+    assert {:ok, _} =
+             Alerting.create(
+               ctx.actor,
+               uid,
+               request(%{"kind" => "grafana", "original" => original}, "preview-import"),
+               ctx.opts
+             )
+
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting,
+      source_bindings: [%{"tenant" => ctx.actor.tenant, "uid" => "native", "type" => "native_promql"}]
+    )
+
+    assert :ok =
+             Pulso.Storage.append(:metrics, ctx.actor.tenant, [
+               %MetricSample{
+                 series_id: 1,
+                 timestamp_ns: System.system_time(:nanosecond),
+                 value: 3.0,
+                 labels: %{"__name__" => "preview_metric"}
+               }
+             ])
+
+    before = Agent.get(ctx.agent, & &1.objects)
+    assert {:ok, preview} = Evaluator.preview(ctx.actor, uid, ctx.opts)
+    assert preview["result"] == %{"type" => "numbers", "frames" => [%{"labels" => %{}, "value" => "1.0"}]}
+    assert preview["executable"] == false
+    assert before == Agent.get(ctx.agent, & &1.objects)
+    reader = %{ctx.actor | capabilities: ctx.actor.capabilities -- ["alert:import"]}
+    assert {:error, :forbidden} = Evaluator.preview(reader, uid, ctx.opts)
+    assert {:error, :rule_disabled} = Evaluator.evaluate(ctx.actor, uid, ctx.opts)
+    assert {:ok, state} = Alerting.state(ctx.actor, uid, ctx.opts)
+    assert state["state"] == "disabled"
+    assert state["instances"] == %{}
   end
 
   test "rejects broken/cyclic Grafana dependency graphs without writing", ctx do

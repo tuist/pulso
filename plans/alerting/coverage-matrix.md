@@ -1,6 +1,6 @@
 # Grafana rule-by-rule modeling checklist
 
-Generated from `grafana-rule-inventory.json` by `validate_inventory.py --write-matrix`.
+Generated from `grafana-rule-inventory.json` by `mix run --no-start plans/alerting/validate_inventory.exs --write-matrix`.
 All 115 UIDs are included. This is a planning inventory, not a claim of implemented compatibility.
 Every row still requires importer round-trip, source binding, numerical/label/error fixtures,
 routing fixtures and shadow comparison before its migration status can become approved.

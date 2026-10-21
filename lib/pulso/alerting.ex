@@ -1,6 +1,6 @@
 defmodule Pulso.Alerting do
   @moduledoc "Shared, capability-checked alert rule management and durable history service."
-  alias Pulso.Alerting.{Cursor, Principal, Repository, Rule}
+  alias Pulso.Alerting.{Cursor, Principal, Recording, Repository, Rule}
 
   def get(principal, id, opts \\ []) do
     with :ok <- Principal.authorize(principal, "alert:read"),
@@ -112,7 +112,7 @@ defmodule Pulso.Alerting do
   def state(principal, id, opts \\ []) do
     with :ok <- Principal.authorize(principal, "alert:read"),
          {:ok, head, _} <- Repository.load(principal.tenant, id, opts),
-         :ok <- Principal.authorize(principal, "alert:read", head["classification"]) do
+         :ok <- Principal.authorize(principal, "alert:read", Recording.state_classification(head)) do
       notifications =
         Map.get(head, "outboxes", %{})
         |> Enum.map(fn {version, box} ->
@@ -126,7 +126,10 @@ defmodule Pulso.Alerting do
 
       {:ok,
        head
-       |> Map.take(~w(id generation state completed_at_ns evaluation_revision health instances))
+       |> Map.take(
+         ~w(id generation state completed_at_ns evaluation_revision health instances recording_last recording_error recording_fence_ns)
+       )
+       |> Map.put("recording_pending", length(Map.get(head, "recording_queue", [])))
        |> Map.put("notifications", notifications)}
     end
   end
@@ -140,7 +143,9 @@ defmodule Pulso.Alerting do
       next =
         if events == [], do: after_seq, else: events |> List.last() |> Map.fetch!("sequence") |> String.to_integer()
 
-      allowed = Enum.filter(events, &(Principal.authorize(principal, "alert:read", &1["classification"]) == :ok))
+      allowed =
+        Enum.filter(events, &(Principal.authorize(principal, "alert:read", Recording.event_classification(&1)) == :ok))
+
       {:ok, %{"events" => allowed, "next_cursor" => Cursor.seal(principal, "events:" <> id, %{"after" => next}, opts)}}
     end
   end

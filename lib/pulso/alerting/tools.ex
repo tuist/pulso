@@ -25,9 +25,10 @@ defmodule Pulso.Alerting.Tools do
      :read},
     {"read_alert_events", "Read committed per-rule transitions with an encrypted application cursor.", "alert:read",
      ~w(tenant id), :read},
-    {"preview_alert_rule", "Evaluate a native rule without writes or notifications.", "alert:preview", ~w(tenant id),
-     :read},
-    {"evaluate_alert_rule", "Evaluate an enabled native rule and commit its lifecycle and transitions.",
+    {"preview_alert_rule",
+     "Preview native rules or disabled imported expressions with explicit tenant-local source bindings; no alert-state writes or notifications.",
+     "alert:preview", ~w(tenant id), :read},
+    {"evaluate_alert_rule", "Evaluate an enabled native rule and commit its lifecycle or recording publication intent.",
      "alert:evaluate", ~w(tenant id), :evaluate}
   ]
   @properties %{
@@ -85,6 +86,8 @@ defmodule Pulso.Alerting.Tools do
       {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
     else
       {:error, {:invalid_arguments, _}} = error -> error
+      {:error, {:graph_source, _, _}} -> {:error, :unsupported_graph_source}
+      {:error, {:expression_node, _, _}} -> {:error, :unsupported_expression}
       {:error, reason} when is_atom(reason) -> {:error, reason}
       {:error, _} -> {:error, :alerting_unavailable}
       _ -> {:error, :unauthorized}

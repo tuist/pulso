@@ -109,33 +109,94 @@ defmodule PulsoWeb.AlertingController do
   end
 
   defp error(conn, reason) do
-    {status, code} =
-      case reason do
-        :unauthorized ->
-          {401, "unauthorized"}
-
-        :forbidden ->
-          {403, "forbidden"}
-
-        :not_found ->
-          {404, "not_found"}
-
-        reason when reason in [:conflict, :operation_reused, :not_due, :stale_evaluation] ->
-          {409, Atom.to_string(reason)}
-
-        reason when reason in [:invalid_arguments, :invalid_rule, :invalid_id, :invalid_import, :duplicate_rule_id] ->
-          {400, Atom.to_string(reason)}
-
-        reason when reason in [:reset_required, :invalid_or_expired_position] ->
-          {409, Atom.to_string(reason)}
-
-        reason when reason in [:rule_disabled, :unsupported_rule] ->
-          {422, Atom.to_string(reason)}
-
-        _ ->
-          {503, "alerting_unavailable"}
-      end
-
+    {status, code} = error_status(reason)
+    conn = if status == 429 or reason == :evaluation_skipped, do: put_resp_header(conn, "retry-after", "1"), else: conn
     conn |> put_status(status) |> json(%{"error" => code})
+  end
+
+  defp error_status({:graph_source, _, _}), do: {422, "unsupported_graph_source"}
+  defp error_status({:expression_node, _, _}), do: {422, "unsupported_expression"}
+
+  defp error_status(reason)
+       when reason in [:invalid_expression_graph, :unsupported_series_math, :expression_label_loss],
+       do: {422, "unsupported_expression"}
+
+  defp error_status(:evaluation_skipped), do: {503, "evaluation_skipped"}
+  defp error_status(:query_overloaded), do: {429, "query_overloaded"}
+  defp error_status(reason) when reason in [:query_timeout, :expression_timeout], do: {504, Atom.to_string(reason)}
+
+  defp error_status(reason)
+       when reason in [
+              :query_scan_limit,
+              :query_sample_limit,
+              :query_work_limit,
+              :query_result_limit,
+              :query_intermediate_limit,
+              :query_resource_limit,
+              :expression_input_limit,
+              :expression_work_limit,
+              :expression_result_limit,
+              :query_expression_limit,
+              :many_to_many_matching,
+              :duplicate_result_label_sets,
+              :invalid_aggregation_parameter,
+              :invalid_duration,
+              :invalid_range_or_too_many_steps,
+              :invalid_timestamp,
+              :nonfinite_result,
+              :non_finite_sample_value,
+              :unsupported_sample_value,
+              :invalid_stored_sample,
+              :pipeline_error,
+              :sample_extraction_error
+            ], do: {422, Atom.to_string(reason)}
+
+  defp error_status(reason)
+       when reason in [
+              :invalid_or_unsupported_query,
+              :invalid_range,
+              :invalid_operand,
+              :invalid_function_arguments,
+              :invalid_aggregation,
+              :invalid_binary_expression,
+              :invalid_grouping,
+              :invalid_subquery,
+              :invalid_label_replace,
+              :invalid_selector,
+              :invalid_evaluation_time_or_step,
+              :invalid_query_batch,
+              :invalid_query_result,
+              :invalid_logql,
+              :unsupported_source_query
+            ], do: {422, "unsupported_source_query"}
+
+  defp error_status(:invalid_source_bindings), do: {500, "invalid_source_bindings"}
+
+  defp error_status(reason) do
+    case reason do
+      :unauthorized ->
+        {401, "unauthorized"}
+
+      :forbidden ->
+        {403, "forbidden"}
+
+      :not_found ->
+        {404, "not_found"}
+
+      reason when reason in [:conflict, :operation_reused, :not_due, :stale_evaluation] ->
+        {409, Atom.to_string(reason)}
+
+      reason when reason in [:invalid_arguments, :invalid_rule, :invalid_id, :invalid_import, :duplicate_rule_id] ->
+        {400, Atom.to_string(reason)}
+
+      reason when reason in [:reset_required, :invalid_or_expired_position] ->
+        {409, Atom.to_string(reason)}
+
+      reason when reason in [:rule_disabled, :unsupported_rule] ->
+        {422, Atom.to_string(reason)}
+
+      _ ->
+        {503, "alerting_unavailable"}
+    end
   end
 end

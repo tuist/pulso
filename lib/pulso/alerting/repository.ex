@@ -1,6 +1,6 @@
 defmodule Pulso.Alerting.Repository do
   @moduledoc "S3 rule authority, immutable revision audit chain, and bounded committed transition history."
-  alias Pulso.Alerting.{Canonical, Principal, Rule, Targets}
+  alias Pulso.Alerting.{Canonical, Principal, Recording, Rule, Targets}
   alias Pulso.Runtime
   alias Pulso.Storage.S3
 
@@ -12,7 +12,7 @@ defmodule Pulso.Alerting.Repository do
   def load(tenant, id, opts \\ []) do
     with :ok <- identifiers(tenant, id),
          {:ok, store, config} <- backend(opts),
-         {:ok, etag, bytes} <- store.get_if_none_match(config, base(tenant, id) <> "/head.json", nil),
+         {:ok, etag, bytes} <- store.get_bounded(config, base(tenant, id) <> "/head.json", nil, @max_object_bytes),
          {:ok, head} <- decode(bytes),
          true <- valid_head?(head, tenant, id) do
       {:ok, head, etag}
@@ -29,7 +29,7 @@ defmodule Pulso.Alerting.Repository do
            is_binary(key) and String.starts_with?(key, base(tenant, id) <> "/g/") and
              is_binary(digest) and is_integer(size) and size in 1..@max_object_bytes,
          {:ok, store, config} <- backend(opts),
-         {:ok, bytes} <- store.get(config, key),
+         {:ok, _etag, bytes} <- store.get_bounded(config, key, nil, size),
          true <-
            byte_size(bytes) == size and Canonical.digest(bytes) == digest and
              String.ends_with?(key, "/#{digest}.json"),
@@ -39,6 +39,7 @@ defmodule Pulso.Alerting.Repository do
     else
       false -> {:error, :integrity_error}
       {:error, :not_found} -> {:error, :committed_object_unavailable}
+      {:error, :response_too_large} -> {:error, :integrity_error}
       {:error, _} = error -> error
       _ -> {:error, :integrity_error}
     end
@@ -49,10 +50,9 @@ defmodule Pulso.Alerting.Repository do
          :ok <- identifiers(principal.tenant, id),
          :ok <- mutation_parameters(params),
          {:ok, old, etag} <- existing(principal.tenant, id, opts),
-         :ok <- authorize_old(principal, old, opts),
-         {:ok, targets} <- bind_targets(principal.tenant, rule, action, old) do
-      digest =
-        Canonical.hash(%{
+         :ok <- authorize_old(principal, old, opts) do
+      request =
+        %{
           "action" => action,
           "id" => id,
           "tenant" => principal.tenant,
@@ -61,9 +61,8 @@ defmodule Pulso.Alerting.Repository do
           "expected_revision" => params["expected_revision"],
           "operation_id" => params["operation_id"],
           "reason" => params["reason"],
-          "restored_from" => params["restored_from"],
-          "notification_targets" => if(action == "delete", do: [], else: targets)
-        })
+          "restored_from" => params["restored_from"]
+        }
 
       context = %{
         principal: principal,
@@ -71,11 +70,10 @@ defmodule Pulso.Alerting.Repository do
         action: action,
         rule: rule,
         params: params,
-        digest: digest,
+        request: request,
         old: old,
         etag: etag,
-        opts: opts,
-        targets: targets
+        opts: opts
       }
 
       change_result(find_receipt(old, params["operation_id"]), context)
@@ -122,7 +120,8 @@ defmodule Pulso.Alerting.Repository do
         {:error, :stale_evaluation}
 
       true ->
-        with {:ok, next} <- append_events(head, events, opts) do
+        with {:ok, next} <- append_events(head, events, opts),
+             {:ok, next} <- enqueue_recording(next, Map.get(evaluation, :recording), opts) do
           next =
             Map.merge(next, %{
               "completed_at_ns" => Integer.to_string(timestamp),
@@ -133,6 +132,72 @@ defmodule Pulso.Alerting.Repository do
 
           write_head(tenant, id, next, etag, opts)
         end
+    end
+  end
+
+  defp enqueue_recording(head, nil, _opts), do: {:ok, head}
+
+  defp enqueue_recording(head, result, opts) do
+    queue = Map.get(head, "recording_queue", [])
+    head = Map.put(head, "recording_series", result["next_series"])
+
+    object =
+      Map.merge(Map.delete(result, "next_series"), %{
+        "schema_version" => 1,
+        "tenant" => head["tenant"],
+        "id" => head["id"],
+        "generation" => head["generation"],
+        "revision" => head["revision"]
+      })
+
+    cond do
+      result["samples"] == [] ->
+        {:ok, head}
+
+      length(queue) >= 64 ->
+        {:error, :recording_backlog}
+
+      byte_size(Canonical.encode(object)) > 65_536 ->
+        {:error, :invalid_recording_result}
+
+      true ->
+        with {:ok, ref} <- immutable(head["tenant"], head["id"], head["generation"], "recordings", object, opts),
+             do: {:ok, Map.put(head, "recording_queue", queue ++ [ref])}
+    end
+  end
+
+  @doc false
+  def ack_recording(tenant, id, ref, opts \\ []) do
+    with {:ok, head, etag} <- load(tenant, id, opts),
+         do: ack_recording_head(tenant, id, {head, etag}, ref, opts)
+  end
+
+  defp ack_recording_head(tenant, id, {head, etag}, ref, opts) do
+    case Map.get(head, "recording_queue", []) do
+      [^ref | rest] ->
+        events = if opts[:recording_event], do: [opts[:recording_event]], else: []
+
+        with {:ok, next} <- append_events(head, events, opts),
+             next = Map.put(next, "recording_queue", rest),
+             next = next |> Map.put("recording_last", opts[:recording_progress]) |> Map.delete("recording_error"),
+             {:ok, _} <- write_head(tenant, id, next, etag, opts),
+             do: :ok
+
+      queue ->
+        # A competing consumer may already have acknowledged this same
+        # immutable result. Never remove the next result on a stale ack.
+        if ref in queue, do: {:error, :recording_conflict}, else: :ok
+    end
+  end
+
+  @doc false
+  def recording_error(tenant, id, ref, reason, opts \\ []) do
+    with {:ok, head, etag} <- load(tenant, id, opts) do
+      error = %{"digest" => ref["digest"], "reason" => reason}
+
+      if List.first(Map.get(head, "recording_queue", [])) == ref and head["recording_error"] != error,
+        do: write_head(tenant, id, Map.put(head, "recording_error", error), etag, opts),
+        else: :ok
     end
   end
 
@@ -151,10 +216,23 @@ defmodule Pulso.Alerting.Repository do
   defp bind_targets(_tenant, _rule, "delete", old) when is_map(old), do: {:ok, Map.get(old, "notification_targets", [])}
   defp bind_targets(tenant, rule, _action, _old), do: Targets.bind(tenant, Map.get(rule, "notification_targets", []))
 
-  defp change_result(%{"request_digest" => digest, "revision" => ref}, %{digest: digest} = ctx),
-    do: result(ctx.principal.tenant, ctx.id, ref, ctx.opts)
+  defp request_digest(request, targets) do
+    targets = if request["action"] == "delete", do: [], else: targets
+    request |> Map.put("notification_targets", targets) |> Canonical.hash()
+  end
 
-  defp change_result(receipt, _ctx) when is_map(receipt), do: {:error, :operation_reused}
+  defp change_result(%{"request_digest" => digest, "revision" => ref}, ctx) do
+    # Preserve the existing digest format, but replay against the committed
+    # bindings, never today's disposable target configuration. Authorization
+    # and exact caller identity still precede returning the saved revision.
+    with {:ok, snapshot} <- revision(ctx.principal.tenant, ctx.id, ref, ctx.opts),
+         true <- request_digest(ctx.request, snapshot["notification_targets"]) == digest do
+      {:ok, Map.put(snapshot, "revision", ref["digest"])}
+    else
+      false -> {:error, :operation_reused}
+      error -> error
+    end
+  end
 
   defp change_result(nil, ctx) do
     if ctx.old && ctx.params["expected_revision"] != ctx.old["revision"]["digest"] do
@@ -164,7 +242,7 @@ defmodule Pulso.Alerting.Repository do
         ctx.old["revision"],
         ctx.params["expected_revision"],
         ctx.params["operation_id"],
-        ctx.digest,
+        ctx.request,
         128,
         ctx.opts
       )
@@ -190,17 +268,33 @@ defmodule Pulso.Alerting.Repository do
   defp mutation_state(_, _), do: :ok
 
   defp publish_change(ctx) do
-    with :ok <- mutation_precondition(ctx.old, ctx.action, ctx.params["expected_revision"]) do
+    with :ok <- mutation_precondition(ctx.old, ctx.action, ctx.params["expected_revision"]),
+         {:ok, targets} <- bind_targets(ctx.principal.tenant, ctx.rule, ctx.action, ctx.old) do
+      ctx = Map.merge(ctx, %{targets: targets, digest: request_digest(ctx.request, targets)})
       generation = generation(ctx.old, ctx.action)
       head = ctx.old || empty(ctx.principal.tenant, ctx.id, generation)
       snapshot = change_snapshot(ctx, head, generation)
       events = reset_events(head, snapshot, ctx.action)
 
       with {:ok, ref} <- immutable(ctx.principal.tenant, ctx.id, generation, "revisions", snapshot, ctx.opts),
-           {:ok, head} <- append_events(head, events, ctx.opts) do
+           {:ok, head} <- append_events(head, events, ctx.opts),
+           {:ok, head} <- retire_recording(head, ctx.opts) do
         next = changed_head(head, snapshot, ref)
         publish_result(write_head(ctx.principal.tenant, ctx.id, next, ctx.etag, ctx.opts), ctx, snapshot, ref)
       end
+    end
+  end
+
+  defp retire_recording(head, opts) do
+    case Map.get(head, "recording_series", []) do
+      [] ->
+        {:ok, head}
+
+      series ->
+        clock = Keyword.get(opts, :clock_ns, fn -> System.system_time(:nanosecond) end)
+        timestamp = max(clock.(), String.to_integer(head["completed_at_ns"]) + 1)
+        head = Map.put(head, "recording_fence_ns", Integer.to_string(timestamp))
+        enqueue_recording(head, Recording.retirement(series, timestamp), opts)
     end
   end
 
@@ -322,10 +416,14 @@ defmodule Pulso.Alerting.Repository do
     end
   end
 
-  defp unique_child(%{"operation_id" => operation, "request_digest" => digest} = snapshot, ref, operation, digest),
-    do: {:ok, Map.put(snapshot, "revision", ref["digest"])}
+  defp unique_child(%{"operation_id" => operation} = snapshot, ref, operation, request) do
+    digest = if is_map(request), do: request_digest(request, snapshot["notification_targets"]), else: request
 
-  defp unique_child(%{"operation_id" => operation}, _ref, operation, _digest), do: {:error, :operation_reused}
+    if snapshot["request_digest"] == digest,
+      do: {:ok, Map.put(snapshot, "revision", ref["digest"])},
+      else: {:error, :operation_reused}
+  end
+
   defp unique_child(_, _, _, _), do: {:error, :conflict}
 
   defp result(tenant, id, ref, opts) do
@@ -333,7 +431,16 @@ defmodule Pulso.Alerting.Repository do
   end
 
   defp authorize_old(_, nil, _), do: :ok
-  defp authorize_old(principal, old, _), do: Principal.authorize(principal, "alert:rules:write", old["classification"])
+
+  defp authorize_old(principal, old, _) do
+    classification =
+      if Map.get(old, "recording_series", []) != [] or Map.get(old, "recording_queue", []) != [],
+        do: Enum.uniq(["alert:record" | old["classification"]]),
+        else: old["classification"]
+
+    Principal.authorize(principal, "alert:rules:write", classification)
+  end
+
   defp find_receipt(nil, _), do: nil
   defp find_receipt(head, id), do: Enum.find(head["operations"], &(&1["operation_id"] == id))
 
@@ -364,7 +471,10 @@ defmodule Pulso.Alerting.Repository do
       "pages" => [],
       "operations" => [],
       "notification_targets" => [],
-      "outboxes" => %{}
+      "outboxes" => %{},
+      "recording_queue" => [],
+      "recording_series" => [],
+      "recording_fence_ns" => "-1"
     }
   end
 
@@ -611,9 +721,28 @@ defmodule Pulso.Alerting.Repository do
       bounded_list?(head["pages"], @page_limit),
       bounded_list?(head["tail"], @tail_limit - 1),
       bounded_list?(head["operations"], @receipt_limit),
-      timestamp?(head["completed_at_ns"])
+      timestamp?(head["completed_at_ns"]),
+      recording_queue?(Map.get(head, "recording_queue", []), tenant, id),
+      recording_series?(Map.get(head, "recording_series", [])),
+      timestamp?(Map.get(head, "recording_fence_ns", "-1"))
     ])
   end
+
+  defp recording_queue?(queue, tenant, id) when is_list(queue) and length(queue) <= 64 do
+    Enum.all?(queue, fn
+      %{"key" => key, "digest" => digest, "bytes" => bytes} when is_binary(key) and is_binary(digest) ->
+        String.starts_with?(key, base(tenant, id) <> "/g/") and
+          Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) and
+          String.ends_with?(key, "/recordings/#{digest}.json") and is_integer(bytes) and bytes in 1..65_536
+
+      _ ->
+        false
+    end)
+  end
+
+  defp recording_queue?(_, _, _), do: false
+
+  defp recording_series?(series), do: bounded_list?(series, 128) and Enum.all?(series, &Rule.labels?/1)
 
   defp valid_generation?(value), do: is_binary(value) and byte_size(value) == 32
   defp nonnegative?(value, minimum), do: is_integer(value) and value >= minimum
