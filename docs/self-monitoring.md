@@ -59,19 +59,29 @@ with count and sum only, without quantiles.
 | `pulso_operations_total` | Counter | `layer`, `operation`, `outcome` | Completed operations; outcomes are `success`, `error`, and `exception` |
 | `pulso_operation_duration_seconds_count`, `_sum` | Summary | Same as above | Operation latency count and sum, including failed operations |
 | `pulso_ingest_records_total` | Counter | `signal`, `outcome` | `accepted`: valid decoded records whose append succeeded; `rejected`: decoder drops; `failed`: valid decoded records whose append failed |
-| `pulso_object_payload_bytes_total` | Counter | `direction` (`read`, `write`) | Successful GET body bytes and PUT payload bytes, including manifests |
+| `pulso_object_payload_bytes_total` | Counter | `direction` (`read`, `write`) | Consumed successful GET body bytes (including keyed-verification mismatches) and PUT payload bytes, including manifests; not provider-billed wire traffic or SDK retries |
+| `pulso_keyed_publication_conflicts_total` | Counter | None | Keyed appends permanently rejected because existing bytes differ; inspect writer compatibility and coherent storage history rather than retrying, overwriting or rotating keys. See [keyed ingestion](keyed-ingestion.md). |
 | `pulso_compaction_segments_total` | Counter | None | Source segments merged by successful compactions |
 | `pulso_compaction_deleted_objects_total` | Counter | None | Retirement deletions confirmed by successful cleanup calls |
 | `pulso_manifest_queue_depth` | Gauge | None | Publication callers, including active flushes, plus manifest-owner mailbox messages |
+| `pulso_alert_evaluation_skips_total` | Counter | `reason` | Native alert/recording ticks deferred without checkpointing; fixed reasons `authority_missing`, `freshness_unavailable`, `capacity`, `timeout`, `budget`, `overrun` |
+
+Alert skip counters do not retain tenant/rule/query/provider details. A missing
+signal manifest, including a never-written signal, is distinct from a failed
+freshness read. Skips preserve the last rule checkpoint and do not imply healthy
+current data. Compare counter rates with the age of each rule's `completed_at_ns`
+through authorized state reads. Counters reset on restart and are not a durable
+progress journal; scrape every evaluator instance. Instance-count overflow instead
+commits `error` health and is not counted as a transient skip.
 
 Operation layers:
 
-- `ingest`: `otlp`, `loki`, `remote_write`. Timing starts before body parsing and
+- `ingest`: `otlp` (logs), `otlp_traces`, `otlp_metrics`, `loki`, `remote_write`. Timing starts before body parsing and
   includes decoding, append, and response preparation. Partial-success responses
   remain successful requests, with decoder drops counted separately.
 - `query`: `http` for compatibility queries/discovery; `mcp` for direct tool
   dispatch; `promql`, `logql_log`, and `logql_metric` for evaluators; and
-  `storage_logs` / `storage_metrics` for scans through the storage dispatcher.
+  `storage_logs` / `storage_metrics` / `storage_traces` for scans through the storage dispatcher.
   These are **different layers of the same query**, not additive query counts.
   Choose one layer for a dashboard or alert. Authorization and validation errors
   count even when no scan starts.
@@ -117,11 +127,14 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 
 Detailed operation labels:
 
-- `kind=ingest`: `otlp`, `loki` (both formats), `remote_write`. HTTP 4xx are
+- `kind=ingest`: `otlp` (logs), `otlp_traces`, `otlp_metrics`, `loki` (both formats), `remote_write`. HTTP 4xx are
   `rejected`; 5xx are `error` or `exception`; successful/partial responses are
   `ok`. Parser failures count before controllers run. Each request counts once.
 - `kind=query`: `http_promql`, `http_logql`, `http_labels`, and tool names
-  `query_logs`, `query_metrics`, `query_logql`, `query_promql`. Tool errors count
+  `query_logs`, `query_metrics`, `query_traces`, `query_logql`, `query_promql`,
+  `discover_metrics`, `get_trace`, `search_traces`, `search_trace_metadata`,
+  `discover_trace_tags`, `discover_trace_tag_values`. Capability-scoped alert tool
+  attempts share the bounded label `alert_tool`, not user-supplied rule/tool names. Tool errors count
   as `error` even when the MCP transport returns HTTP 200. Direct `Tools.call`
   calls collapse unknown names to `unknown_tool`; the MCP dispatcher rejects
   unknown names before dispatch, so they are not tool attempts over MCP. Internal
@@ -146,6 +159,13 @@ Detailed operation labels:
   this detailed family and the retention gauges.
 
 ## Counting boundaries and limitations
+
+For OTLP histograms/summaries, accepted/failed record counts describe **projected
+float samples**, while decoder rejections describe **source points**. One source
+point can produce many accepted rows. Detailed rejected-delivery counts can
+therefore combine source-point rejections and projected failed rows; do not
+interpret accepted-plus-rejected totals as a source-point rejection percentage.
+Inspect the OTLP partial-success count and exporter evidence separately.
 
 Record counters describe attempts, not unique stored records. Retried or
 idempotently acknowledged batches count again. Canonical decoder rejection stays
@@ -236,3 +256,40 @@ Alert on scrape failure (`up == 0`) through the independent monitor. Choose
 latency, queue, rejection-rate, compaction, and retention thresholds from your
 measured load. For retention, alert well before the capacity ratio reaches `1.0`
 and when pending buckets keep growing over several retention intervals. Instrumentation alone establishes neither safe capacity nor readiness.
+
+## Alerts
+
+The Helm chart ships alert rules for these metrics in
+[`charts/pulso/files/alerts.json`](../charts/pulso/files/alerts.json), a
+Prometheus rule file (JSON is valid rule-file YAML):
+
+- With the Prometheus Operator, set `prometheusRule.enabled=true` to install
+  them as a `PrometheusRule`.
+- With Grafana-managed alerting, import the file as Grafana-managed rules (in
+  Grafana 12, **Alerting > Alert rules > Import**) and point it at the
+  datasource holding these metrics.
+
+Every expression runs on Pulso's own PromQL, so the metrics may be stored in
+Pulso. In that case keep them in a dedicated tenant and set the rules'
+no-data and error states to alerting: if Pulso is down, its own rules cannot
+evaluate, and `PulsoMetricsAbsent` only fires through that no-data handling.
+
+| Alert | Fires when |
+| --- | --- |
+| `PulsoIngestFailures` (critical) | Valid records of a signal have failed to append for 10 minutes. |
+| `PulsoIngestRejections` | Records of a signal have been rejected for an hour (invalid data, disabled features, out of retention). |
+| `PulsoIngestVolumeHigh`, `PulsoIngestVolumeLow` | A signal's accepted rate over 12 hours is more than double, or less than half, the previous week's. |
+| `PulsoObjectStoreErrors` (critical) | Over 5% of object-store requests fail for 10 minutes. |
+| `PulsoObjectWritesHigh`, `PulsoObjectRequestsHigh` | Object-store bytes written or requests over 12 hours doubled against the previous week: the storage bill follows. |
+| `PulsoManifestBacklog` | Over 100 callers wait on segment publication for 15 minutes on an instance. |
+| `PulsoCompactionTimeouts` | A compaction operation timed out more than 3 times in an hour. |
+| `PulsoRetentionCapacity`, `PulsoRetentionCapacityCritical` | A retention-managed scope passes 80% (warning) or 95% (critical) of its metadata capacity. |
+| `PulsoKeyedPublicationConflicts` | A keyed append was rejected because stored bytes differ. |
+| `PulsoMetricsAbsent` (critical) | No instance has reported metrics for 10 minutes. |
+| `PulsoRunQueueHigh` | An instance's scheduler run queue stays above 50 for 15 minutes. |
+| `PulsoQueryErrors` | Over 10% of public queries fail for 15 minutes. |
+| `PulsoAlertEvaluationSkips` | Native alert evaluation keeps skipping ticks (native alerting only). |
+
+Thresholds are starting points; tune them to your traffic. Pulso does not
+export series counts (that would need cluster-wide, per-tenant state), so
+volume alerts use accepted samples and stored bytes as the cost signals.
