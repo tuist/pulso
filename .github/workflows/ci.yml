@@ -40,7 +40,9 @@ jobs:
             command: >-
               cargo fmt --manifest-path native/pulso_codec/Cargo.toml -- --check &&
               cargo clippy --manifest-path native/pulso_codec/Cargo.toml --all-targets -- -D warnings &&
-              cargo test --release --manifest-path native/pulso_codec/Cargo.toml
+              cargo test --release --manifest-path native/pulso_codec/Cargo.toml &&
+              cargo fmt --manifest-path native/pulso_grpc/Cargo.toml -- --check &&
+              cargo clippy --manifest-path native/pulso_grpc/Cargo.toml --all-targets -- -D warnings
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +64,7 @@ jobs:
           workspaces: |
             native/pulso_object_store -> target
             native/pulso_codec -> target
+            native/pulso_grpc -> target
           key: ${{ matrix.check.name }}
 
       - name: Cache deps
@@ -118,10 +121,31 @@ jobs:
           helm template pulso charts/pulso "${args[@]}" \
             --set ingress.enabled=true --set ingress.host=pulso.example.com \
             --set serviceMonitor.enabled=true --set ingestLimits.max_records=5000 \
+            --set ingestLimits.max_trace_nodes=123456 --set ingestLimits.max_otlp_nodes=234567 \
+            | tee "$RUNNER_TEMP/pulso-rendered.yaml" \
             | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas
           helm template pulso charts/pulso --set storage.bucket=ci --set storage.region=us-east-1 \
             --set existingSecret=pulso-credentials \
             | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas
+          # OTLP metrics is public; self-monitoring must remain private.
+          grep -A1 '^[[:space:]]*- path: /v1/metrics$' "$RUNNER_TEMP/pulso-rendered.yaml" | grep -q 'pathType: Exact'
+          if grep -q '^[[:space:]]*- path: /metrics$' "$RUNNER_TEMP/pulso-rendered.yaml"; then
+            echo 'private self-monitoring must not be routed through public ingress' >&2
+            exit 1
+          fi
+          # Request-node keys must reach runtime, not just pass validation.
+          grep -A1 'name: PULSO_INGEST_MAX_TRACE_NODES' "$RUNNER_TEMP/pulso-rendered.yaml" | grep -q 'value: "123456"'
+          grep -A1 'name: PULSO_INGEST_MAX_OTLP_NODES' "$RUNNER_TEMP/pulso-rendered.yaml" | grep -q 'value: "234567"'
+          for key in max_trace_nodes max_otlp_nodes; do
+            if helm template pulso charts/pulso "${args[@]}" --set "ingestLimits.${key}=0" > /dev/null 2>&1; then
+              echo "rendering with nonpositive ${key} should fail" >&2
+              exit 1
+            fi
+          done
+          if helm template pulso charts/pulso "${args[@]}" --set ingestLimits.max_unknown_nodes=1 > /dev/null 2>&1; then
+            echo "rendering with an unknown node setting should fail" >&2
+            exit 1
+          fi
           # Required values must fail at render time.
           if helm template pulso charts/pulso > /dev/null 2>&1; then
             echo "rendering without required values should fail" >&2
@@ -166,6 +190,7 @@ jobs:
           workspaces: |
             native/pulso_object_store -> target
             native/pulso_codec -> target
+            native/pulso_grpc -> target
           key: integration
 
       - name: Cache deps

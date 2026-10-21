@@ -29,13 +29,21 @@ defmodule Pulso.Metrics do
   @buckets [5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000]
   @bucket_labels Enum.map(@buckets, &{&1, Float.to_string(&1 / 1_000_000)})
   @operations %{
-    ingest: ["otlp", "loki", "remote_write"],
+    ingest: ["otlp", "otlp_traces", "otlp_metrics", "loki", "remote_write"],
     query: [
       "http_promql",
       "http_logql",
       "http_labels",
       "query_logs",
       "query_metrics",
+      "discover_metrics",
+      "query_traces",
+      "get_trace",
+      "search_traces",
+      "search_trace_metadata",
+      "discover_trace_tags",
+      "discover_trace_tag_values",
+      "alert_tool",
       "query_logql",
       "query_promql",
       "unknown_tool"
@@ -46,6 +54,8 @@ defmodule Pulso.Metrics do
   }
   @http_routes %{
     {"POST", ["v1", "logs"]} => {:ingest, "otlp"},
+    {"POST", ["v1", "traces"]} => {:ingest, "otlp_traces"},
+    {"POST", ["v1", "metrics"]} => {:ingest, "otlp_metrics"},
     {"POST", ["loki", "api", "v1", "push"]} => {:ingest, "loki"},
     {"POST", ["api", "v1", "write"]} => {:ingest, "remote_write"},
     {"GET", ["api", "v1", "query"]} => {:query, "http_promql"},
@@ -149,7 +159,7 @@ defmodule Pulso.Metrics do
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  defp record_counts(signal, accepted, rejected) when signal in [:logs, :metrics] do
+  defp record_counts(signal, accepted, rejected) when signal in [:logs, :metrics, :traces] do
     increment({"pulso_ingest_records_total", [{"signal", to_string(signal)}, {"outcome", "accepted"}]}, accepted)
     increment({"pulso_ingest_records_total", [{"signal", to_string(signal)}, {"outcome", "rejected"}]}, rejected)
   end

@@ -15,6 +15,29 @@ defmodule PulsoWeb.Router do
   # the transport defines its own status codes, so `/mcp` skips `:accepts`.
   # Origin and media-type checks run in `PulsoWeb.MCPRequestGate`.
   scope "/", PulsoWeb do
+    # OTLP responses mirror JSON/protobuf rather than applying JSON Accept negotiation.
+    get "/api/search/tags", TempoController, :tags
+    get "/api/v2/search/tags", TempoController, :tags_v2
+    get "/api/search/tag/:tag_name/values", TempoController, :tag_values
+    get "/api/v2/search/tag/:tag_name/values", TempoController, :tag_values_v2
+    get "/api/search", TempoController, :search
+    get "/api/metrics/query_range", TempoController, :metrics_query_range
+    get "/api/metrics/query", TempoController, :metrics_query
+    get "/api/traces/:trace_id", TempoController, :trace
+    get "/api/v2/traces/:trace_id", TempoController, :trace_v2
+    post "/v1/traces", OTLPTracesController, :create
+    post "/v1/metrics", OTLPMetricsController, :create
+    post "/v1/logs", OTLPController, :logs
+    get "/api/echo", CompatController, :tempo_echo
+    get "/api/status/buildinfo", CompatController, :tempo_buildinfo
+    get "/api/v1/status/buildinfo", CompatController, :prometheus_buildinfo
+    get "/api/v1/metadata", CompatController, :metadata
+    get "/api/v1/query_exemplars", CompatController, :query_exemplars
+    post "/api/v1/query_exemplars", CompatController, :query_exemplars
+    get "/api/v1/format_query", CompatController, :format_query
+    post "/api/v1/format_query", CompatController, :format_query
+    get "/loki/api/v1/status/buildinfo", LokiQueryController, :buildinfo
+    get "/loki/api/v1/tail", LokiQueryController, :tail
     post "/mcp", MCPController, :rpc
     match :*, "/mcp", MCPController, :method_not_allowed
   end
@@ -38,9 +61,14 @@ defmodule PulsoWeb.Router do
     post "/api/v1/alerting/rules/:id/preview", AlertingController, :preview
     post "/api/v1/alerting/rules/:id/evaluate", AlertingController, :evaluate
 
-    post "/v1/logs", OTLPController, :logs
     post "/loki/api/v1/push", LokiController, :push
     post "/api/v1/write", RemoteWriteController, :write
+    get "/api/v1/labels", PrometheusDiscoveryController, :labels
+    post "/api/v1/labels", PrometheusDiscoveryController, :labels
+    get "/api/v1/label/:name/values", PrometheusDiscoveryController, :label_values
+    post "/api/v1/label/:name/values", PrometheusDiscoveryController, :label_values
+    get "/api/v1/series", PrometheusDiscoveryController, :series
+    post "/api/v1/series", PrometheusDiscoveryController, :series
     get "/api/v1/query", PrometheusQueryController, :query
     post "/api/v1/query", PrometheusQueryController, :query
     get "/api/v1/query_range", PrometheusQueryController, :query_range
@@ -51,6 +79,24 @@ defmodule PulsoWeb.Router do
     get "/loki/api/v1/query", LokiQueryController, :query
     post "/loki/api/v1/query", LokiQueryController, :query
     get "/loki/api/v1/labels", LokiQueryController, :labels
+    post "/loki/api/v1/labels", LokiQueryController, :labels
     get "/loki/api/v1/label/:name/values", LokiQueryController, :label_values
+    post "/loki/api/v1/label/:name/values", LokiQueryController, :label_values
+    get "/loki/api/v1/series", LokiQueryController, :series
+    post "/loki/api/v1/series", LokiQueryController, :series
+    get "/loki/api/v1/index/stats", LokiQueryController, :index_stats
+    post "/loki/api/v1/index/stats", LokiQueryController, :index_stats
+    get "/loki/api/v1/index/volume", LokiQueryController, :volume
+    post "/loki/api/v1/index/volume", LokiQueryController, :volume
+    get "/loki/api/v1/index/volume_range", LokiQueryController, :volume_range
+    post "/loki/api/v1/index/volume_range", LokiQueryController, :volume_range
+    get "/loki/api/v1/detected_labels", LokiQueryController, :detected_labels
+    post "/loki/api/v1/detected_labels", LokiQueryController, :detected_labels
+    get "/loki/api/v1/detected_fields", LokiQueryController, :detected_fields
+    post "/loki/api/v1/detected_fields", LokiQueryController, :detected_fields
+    get "/loki/api/v1/detected_field/:name/values", LokiQueryController, :detected_field_values
+    post "/loki/api/v1/detected_field/:name/values", LokiQueryController, :detected_field_values
+    get "/loki/api/v1/patterns", LokiQueryController, :patterns
+    post "/loki/api/v1/patterns", LokiQueryController, :patterns
   end
 end

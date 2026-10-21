@@ -7,7 +7,8 @@
 # Versions here mirror mise.toml (elixir 1.20.4, OTP 29.1) and the Debian
 # base is trixie for both stages, per Phoenix's own recommendation.
 #
-# Pulso's Rust NIFs (native/pulso_codec, native/pulso_object_store) ship
+# Pulso's Rust NIFs (native/pulso_codec, native/pulso_object_store,
+# native/pulso_grpc) ship
 # via rustler_precompiled. In this image we compile them from source
 # (PULSO_NIF_FORCE_BUILD=1) rather than fetching the precompiled tarball
 # from GitHub Releases, so the image can build cleanly for a fresh
@@ -17,7 +18,7 @@
 ARG ELIXIR_VERSION=1.20.4
 ARG OTP_VERSION=29.1
 ARG DEBIAN_VERSION=trixie-20260918-slim
-# Tracks the crate floor in the two Cargo.lock files under native/.
+# Tracks the crate floor in the Cargo.lock files under native/.
 # rustler 0.38 and its transitive deps have been pushing the required
 # rustc up regularly (1.88 for icu_collections, 1.91 for rustler
 # itself), and pinning to a specific minor keeps breaking. ci.yml uses

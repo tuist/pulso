@@ -60,6 +60,24 @@ defmodule Pulso.MetricsTest do
     assert :ets.tab2list(Pulso.Runtime.table(Metrics)) |> Enum.sort() == before
   end
 
+  test "trace tools and capability-scoped alert attempts retain bounded detailed operation labels" do
+    for tool <- [
+          "get_trace",
+          "search_traces",
+          "search_trace_metadata",
+          "discover_trace_tags",
+          "discover_trace_tag_values"
+        ] do
+      before = requests("query", tool, "error")
+      assert {:error, _} = Tools.call(tool, %{})
+      assert requests("query", tool, "error") == before + 1
+    end
+
+    before = requests("query", "alert_tool", "error")
+    assert {:error, _} = Tools.call("list_alert_rules", %{})
+    assert requests("query", "alert_tool", "error") == before + 1
+  end
+
   test "each metric family keeps its headers and samples in one group" do
     Metrics.measure(:query, "query_logs", fn -> :ok end)
     Metrics.measure(:object, "get", fn -> {:ok, "body"} end, fn _ -> %{read: 4} end, "segment")

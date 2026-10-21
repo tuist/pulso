@@ -16,15 +16,20 @@ import Config
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
+alias Pulso.Alerting.GraphPreview
 alias Pulso.Alerting.Principal
 alias Pulso.Alerting.Targets
 alias Pulso.Auth.SharedSecret
+alias Pulso.Loki.Tail
+alias Pulso.PromQL.Evaluator
 alias Pulso.Storage.S3
 
 # Environment variables are read through Pulso.Runtime so tests can evaluate this
 # file against a process-owned environment map instead of mutating the OS
 # environment. Without an installed runtime (every normal boot and release), this
 # is System.get_env/2.
+alias Pulso.Traces.TempoSearch
+
 env_var = fn name, default ->
   if Code.ensure_loaded?(Pulso.Runtime), do: Pulso.Runtime.env(name, default), else: System.get_env(name, default)
 end
@@ -89,7 +94,23 @@ alerting_targets =
 identities = Enum.map(alerting_targets, &{&1["tenant"], &1["id"]})
 if length(Enum.uniq(identities)) != length(identities), do: raise("Duplicate alert notification target IDs")
 
+alerting_source_bindings =
+  case JSON.decode(env_var.("PULSO_ALERTING_SOURCE_BINDINGS_JSON", "[]")) do
+    {:ok, values} ->
+      case GraphPreview.bindings(values) do
+        :ok ->
+          values
+
+        _ ->
+          raise "PULSO_ALERTING_SOURCE_BINDINGS_JSON must contain at most 256 unique tenant/uid native_promql or native_logql bindings"
+      end
+
+    _ ->
+      raise "PULSO_ALERTING_SOURCE_BINDINGS_JSON is not valid JSON"
+  end
+
 config :pulso, Pulso.Alerting,
+  source_bindings: alerting_source_bindings,
   principals: alerting_principals,
   notification_targets: alerting_targets,
   notifications_enabled: env_var.("PULSO_ALERTING_NOTIFICATIONS_ENABLED", "false") in ["1", "true", "yes"],
@@ -102,6 +123,9 @@ end
 
 # Opt in only after all writers understand compaction retirement metadata.
 metrics_compaction_enabled = env_var.("PULSO_METRICS_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
+trace_compaction_enabled = env_var.("PULSO_TRACE_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
+log_compaction_enabled = env_var.("PULSO_LOG_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
+metric_footer_pruning_enabled = env_var.("PULSO_METRICS_FOOTER_PRUNING_ENABLED", "false") in ["1", "true", "yes"]
 
 # Optional node-local unkeyed coalescing; disabled unless explicitly enabled.
 ingest_flush_interval_ms =
@@ -127,7 +151,9 @@ ingest_limits =
         :max_value_bytes,
         :max_attribute_bytes,
         :max_depth,
-        :max_nodes
+        :max_nodes,
+        :max_trace_nodes,
+        :max_otlp_nodes
       ],
       name = "PULSO_INGEST_" <> String.upcase(Atom.to_string(key)),
       raw = env_var.(name, nil),
@@ -136,9 +162,9 @@ ingest_limits =
   end
 
 # Event-time retention (docs/retention.md). Unlimited retention stays the
-# default: both durations are 0 and the background worker is off. Invalid values
+# default: all durations are 0 and the background worker is off. Invalid values
 # fail at startup instead of falling back to unlimited or immediate deletion.
-parse_retention_integer = fn name, default, range ->
+parse_integer = fn name, default, range ->
   case Integer.parse(env_var.(name, Integer.to_string(default))) do
     {value, ""} -> if value in range, do: value, else: raise("#{name} must be an integer in #{inspect(range)}")
     _ -> raise "#{name} must be an integer in #{inspect(range)}"
@@ -154,26 +180,42 @@ retention_mode =
 retention_config =
   [
     retention_enabled: env_var.("PULSO_RETENTION_ENABLED", "false") in ["1", "true", "yes"],
-    logs_retention_days: parse_retention_integer.("PULSO_LOGS_RETENTION_DAYS", 0, 0..3650),
-    metrics_retention_days: parse_retention_integer.("PULSO_METRICS_RETENTION_DAYS", 0, 0..3650),
+    logs_retention_days: parse_integer.("PULSO_LOGS_RETENTION_DAYS", 0, 0..3650),
+    metrics_retention_days: parse_integer.("PULSO_METRICS_RETENTION_DAYS", 0, 0..3650),
+    traces_retention_days: parse_integer.("PULSO_TRACES_RETENTION_DAYS", 0, 0..3650),
     retention_mode: retention_mode,
     # Reader grace before deletion; never zero, so a committed expiry cannot race in-flight reads.
-    retention_delete_grace_ms:
-      parse_retention_integer.("PULSO_RETENTION_DELETE_GRACE_MS", 3_600_000, 60_000..2_592_000_000),
-    retention_interval_ms: parse_retention_integer.("PULSO_RETENTION_INTERVAL_MS", 30_000, 1_000..3_600_000),
-    retention_delete_limit: parse_retention_integer.("PULSO_RETENTION_DELETE_LIMIT", 512, 1..512),
-    retention_timeout_ms: parse_retention_integer.("PULSO_RETENTION_TIMEOUT_MS", 30_000, 1_000..600_000),
-    retention_migration_timeout_ms:
-      parse_retention_integer.("PULSO_RETENTION_MIGRATION_TIMEOUT_MS", 600_000, 30_000..3_600_000),
-    retention_future_skew_ms: parse_retention_integer.("PULSO_RETENTION_FUTURE_SKEW_MS", 600_000, 0..86_400_000)
+    retention_delete_grace_ms: parse_integer.("PULSO_RETENTION_DELETE_GRACE_MS", 3_600_000, 60_000..2_592_000_000),
+    retention_interval_ms: parse_integer.("PULSO_RETENTION_INTERVAL_MS", 30_000, 1_000..3_600_000),
+    retention_delete_limit: parse_integer.("PULSO_RETENTION_DELETE_LIMIT", 512, 1..512),
+    retention_timeout_ms: parse_integer.("PULSO_RETENTION_TIMEOUT_MS", 30_000, 1_000..600_000),
+    retention_migration_timeout_ms: parse_integer.("PULSO_RETENTION_MIGRATION_TIMEOUT_MS", 600_000, 30_000..3_600_000),
+    retention_future_skew_ms: parse_integer.("PULSO_RETENTION_FUTURE_SKEW_MS", 600_000, 0..86_400_000)
   ] ++
     case env_var.("PULSO_RETENTION_SWEEP_HORIZON_DAYS", nil) do
       # Unset keeps the per-root default of 2 * persisted days + 2.
       nil -> []
-      _ -> [retention_sweep_horizon_days: parse_retention_integer.("PULSO_RETENTION_SWEEP_HORIZON_DAYS", 0, 1..7302)]
+      _ -> [retention_sweep_horizon_days: parse_integer.("PULSO_RETENTION_SWEEP_HORIZON_DAYS", 0, 1..7302)]
     end
 
+# Per-query budgets shared by PromQL and LogQL. Log metric queries count each
+# selected log line as a sample and stream it, so these may be raised for log
+# volume; PromQL samples stay bounded by each query's memory ceiling too.
+query_budgets =
+  for {key, name, default, range} <- [
+        {:max_samples, "PULSO_QUERY_MAX_SAMPLES", 100_000, 1..1_000_000_000},
+        {:max_log_samples, "PULSO_QUERY_MAX_LOG_SAMPLES", 5_000_000, 1..1_000_000_000},
+        {:max_work, "PULSO_QUERY_MAX_WORK", 5_000_000, 1..10_000_000_000},
+        {:max_scan_rows, "PULSO_QUERY_MAX_SCAN_ROWS", 1_000_000, 1..1_000_000_000},
+        {:max_scan_bytes, "PULSO_QUERY_MAX_SCAN_BYTES", 134_217_728, 1..1_099_511_627_776}
+      ],
+      env_var.(name, nil) not in [nil, ""],
+      do: {key, parse_integer.(name, default, range)}
+
 config :pulso, Pulso.IngestLimits, ingest_limits
+
+# Wall-clock limit for one query, including object-store reads.
+config :pulso, Pulso.QueryRunner, timeout_ms: parse_integer.("PULSO_QUERY_TIMEOUT_MS", 10_000, 1_000..300_000)
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(env_var.("PORT", "4000"))]
 
 # Browser origins allowed to call POST /mcp, comma-separated
@@ -183,8 +225,32 @@ config :pulso, PulsoWeb.MCPController,
   allowed_origins:
     "PULSO_MCP_ALLOWED_ORIGINS"
     |> env_var.("")
+    # Concurrent Loki live tails per tenant on each instance, and how often an
+    # instance with tails reads the tenant's log manifest for other instances' pushes.
     |> String.split(",", trim: true)
     |> Enum.map(&String.trim/1)
+
+config :pulso, Tail,
+  max_per_tenant: parse_integer.("PULSO_LOKI_TAIL_MAX_PER_TENANT", 10, 1..1000),
+  poll_interval_ms: parse_integer.("PULSO_LOKI_TAIL_POLL_INTERVAL_MS", 1_000, 100..60_000)
+
+if query_budgets != [] do
+  config :pulso, Evaluator, query_budgets
+  config :pulso, Pulso.QueryRunner, Keyword.take(query_budgets, [:max_scan_rows, :max_scan_bytes])
+end
+
+# OTLP/gRPC receiver for logs, metrics and traces. Disabled unless a port is
+# set; 4317 is the conventional OTLP/gRPC port.
+config :pulso, PulsoWeb.OTLPGRPC,
+  enabled: env_var.("PULSO_OTLP_GRPC_PORT", nil) not in [nil, ""],
+  port: parse_integer.("PULSO_OTLP_GRPC_PORT", 4317, 0..65_535),
+  ip: env_var.("PULSO_OTLP_GRPC_IP", "0.0.0.0"),
+  max_message_bytes: parse_integer.("PULSO_OTLP_GRPC_MAX_MESSAGE_BYTES", 16_777_216, 1..268_435_456),
+  max_in_flight: parse_integer.("PULSO_OTLP_GRPC_MAX_IN_FLIGHT", 64, 1..4096),
+  timeout_ms: parse_integer.("PULSO_OTLP_GRPC_TIMEOUT_MS", 30_000, 1..600_000)
+
+# Full retained-context scans are experimental until trace postings exist.
+config :pulso, TempoSearch, enabled: env_var.("PULSO_TEMPO_SEARCH_ENABLED", "false") in ["1", "true", "yes"]
 
 # Log storage adapter. Tests keep the in-memory adapter (see config/test.exs);
 # dev and prod use the S3 adapter against any S3-compatible endpoint. RustFS
@@ -196,7 +262,11 @@ case config_env() do
 
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
+      trace_compaction_enabled: trace_compaction_enabled,
+      log_compaction_enabled: log_compaction_enabled,
+      query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
+      metric_footer_pruning_enabled: metric_footer_pruning_enabled,
       bucket: env_var.("PULSO_S3_BUCKET", "pulso"),
       # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
       # The fallback matches the docker-compose default host port when mise
@@ -253,7 +323,11 @@ case config_env() do
 
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
+      trace_compaction_enabled: trace_compaction_enabled,
+      log_compaction_enabled: log_compaction_enabled,
+      query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
+      metric_footer_pruning_enabled: metric_footer_pruning_enabled,
       bucket: require_env.("PULSO_S3_BUCKET"),
       endpoint: env_var.("PULSO_S3_ENDPOINT", nil),
       region: require_env.("PULSO_S3_REGION"),

@@ -33,15 +33,19 @@ defmodule PulsoWeb.Endpoint do
     plug Phoenix.CodeReloader
   end
 
+  plug PulsoWeb.PathAliases
   plug Plug.RequestId
+  plug PulsoWeb.BasicTenant
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
   # Before Plug.Parsers so MCP requests with a disallowed origin or a
   # non-JSON body are refused before the body is read.
   plug PulsoWeb.MCPRequestGate
+  plug PulsoWeb.TraceRequestLimits
+  plug PulsoWeb.PrometheusDiscoveryRequestGate
 
   plug Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
+    parsers: [:urlencoded, :multipart, PulsoWeb.OTLPJSONParser],
     pass: ["*/*"],
     json_decoder: Phoenix.json_library(),
     # Compressed (on-the-wire) body cap; decompressed size is capped in

@@ -53,6 +53,11 @@ spec:
             - name: http
               containerPort: 4000
               protocol: TCP
+            {{- if .Values.otlpGrpc.enabled }}
+            - name: otlp-grpc
+              containerPort: {{ .Values.otlpGrpc.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: PORT
               value: "4000"
@@ -75,10 +80,28 @@ spec:
               value: {{ .Values.storage.allowHttp | quote }}
             - name: PULSO_METRICS_COMPACTION_ENABLED
               value: {{ .Values.metricsCompaction.enabled | quote }}
+            {{- if .Values.otlpGrpc.enabled }}
+            - name: PULSO_OTLP_GRPC_PORT
+              value: {{ .Values.otlpGrpc.port | int64 | quote }}
+            - name: PULSO_OTLP_GRPC_MAX_MESSAGE_BYTES
+              value: {{ .Values.otlpGrpc.maxMessageBytes | int64 | quote }}
+            - name: PULSO_OTLP_GRPC_MAX_IN_FLIGHT
+              value: {{ .Values.otlpGrpc.maxInFlight | int64 | quote }}
+            {{- end }}
+            - name: PULSO_TEMPO_SEARCH_ENABLED
+              value: {{ .Values.tempoSearch.enabled | quote }}
+            - name: PULSO_METRICS_FOOTER_PRUNING_ENABLED
+              value: {{ .Values.metricsFooterPruning.enabled | quote }}
+            - name: PULSO_TRACE_COMPACTION_ENABLED
+              value: {{ .Values.traceCompaction.enabled | quote }}
+            - name: PULSO_LOG_COMPACTION_ENABLED
+              value: {{ .Values.logCompaction.enabled | quote }}
             - name: PULSO_ALERTING_EVALUATION_ENABLED
               value: {{ .Values.alerting.evaluationEnabled | quote }}
             - name: PULSO_ALERTING_NOTIFICATIONS_ENABLED
               value: {{ .Values.alerting.notificationsEnabled | quote }}
+            - name: PULSO_ALERTING_SOURCE_BINDINGS_JSON
+              value: {{ .Values.alerting.sourceBindings | toJson | quote }}
             - name: PULSO_ALERTING_NOTIFICATION_TARGETS_JSON
               value: {{ .Values.alerting.notificationTargets | toJson | quote }}
             - name: PULSO_ALERTING_POLL_INTERVAL_MS
@@ -93,6 +116,8 @@ spec:
               value: {{ include "pulso.boundedInteger" (list "retention.logsDays" .Values.retention.logsDays 0 3650) | quote }}
             - name: PULSO_METRICS_RETENTION_DAYS
               value: {{ include "pulso.boundedInteger" (list "retention.metricsDays" .Values.retention.metricsDays 0 3650) | quote }}
+            - name: PULSO_TRACES_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.tracesDays" .Values.retention.tracesDays 0 3650) | quote }}
             - name: PULSO_RETENTION_MODE
               value: {{ .Values.retention.mode | quote }}
             - name: PULSO_RETENTION_DELETE_GRACE_MS

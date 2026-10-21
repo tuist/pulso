@@ -6,6 +6,8 @@ defmodule PulsoWeb.SelfMetrics do
   @request_key {__MODULE__, :request}
   @ingest_paths %{
     ["v1", "logs"] => :otlp,
+    ["v1", "traces"] => :otlp_traces,
+    ["v1", "metrics"] => :otlp_metrics,
     ["loki", "api", "v1", "push"] => :loki,
     ["api", "v1", "write"] => :remote_write
   }

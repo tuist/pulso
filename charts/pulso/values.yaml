@@ -51,6 +51,11 @@ storage:
   accessKeyId: ""
   secretAccessKey: ""
 
+# Optional suffix-GET metric exclusion; requires Range and strong If-Match support.
+# Can add up to 2 GETs for candidates needing full scans; does not raise scan capacity.
+metricsFooterPruning:
+  enabled: false
+
 metricsCompaction:
   # Merges small metrics segments in the background. Enable it only once every
   # Pulso version writing to the bucket supports compaction, and turn on
@@ -58,17 +63,98 @@ metricsCompaction:
   # of which objects are live. See docs/configuration.md.
   enabled: false
 
+# Experimental Tempo search recovers complete retained candidate context. Exact
+# resource.service.name equality may use publication-proven service/ID summaries;
+# unknown/legacy sources still read. Metadata/page/heap limits can bind before the
+# hard 8192-ref catalog maximum. Actual GETs keep 1024-input/32MiB/1M-row bounds;
+# small windows do not clip context, late fallback can exhaust budgets, and unread
+# irrelevant objects are not scrubbed. Search capability4/discovery12 artifacts
+# (tuple 2,1,3,4,12) are required on all serving instances; opt in only after capacity
+# validation. No representative postings/client/deployment acceptance claim.
+# Bounded same-span negated regex/status/int64 OR/span-duration search expressions
+# bypass service/ID planning; full-scope limits remain plus 20M prefilter owner/attr/
+# instruction work units per attempt in candidate/context passes. Equal-precedence
+# AND/OR group left-to-right. See docs/trace-query-expressions.md; discovery and
+# window-local search retain narrower grammar.
+# Also enables resource/span/instrumentation/event/link discovery (1M raw rows,
+# 2M owner-plus-attribute work per attempt before filtering, 5000 entries/1MiB).
+# Dense flat scopes can now fail before the old row cap. Names/values accept parent
+# string filters; filtered names are complete conservative hints, NOT matching-key
+# proofs or exact upstream omission/dynamic dedicated-column parity. Default names
+# combine five namespaces plus static v2 suggestions, one 2M-work/5000-scope-name
+# budget (20 intrinsic reservations even for v1). Errors reject whole, not partial
+# suggestions. None values union 3 original owners (not event/link) after optional
+# same-parent resource/span string filters, not Tempo's ignored-query fast path.
+# Types stay distinct, all owners/attrs charge before filtering; old unfiltered
+# callbacks cannot receive queries and windowed-filtered-none needs separate
+# explicit support. Floats (including non-finite classes) and 7 parent-filtered intrinsic strings use
+# stored-data bounds, unlike static vocabulary. event:timeSinceStart additionally
+# returns exact signed int nanoseconds, not duration strings; parent filters are
+# a complete extension versus upstream's empty path. Default event time0 can
+# yield negative offsets; no events invent no value. Event times validate even on
+# nonmatches, parent+all event attrs charge before filtering. Explicit event-time
+# and separate windowed-event-time support is required, never old callbacks. Paired positive windows select
+# retained segment envelopes, not span starts; all header/provider costs remain.
+# Compaction broadens suggestions; excluded payloads are not integrity-scrubbed.
+# Flat/old adapters reject unsupported windows. Matching capability12 required.
+# Root name/service values now select parent traces then recover complete retained
+# roots, never child names/default services. Missing/ambiguous roots fail409 whole:
+# in-flight and retention-straddling traces can make broad/recent dictionaries
+# unusable, not partial suggestions. Entire retained S3 data must fit1024 objects/
+# 32MiB compressed/1M raw rows even for tiny windows; replay decodes all sources.
+# No service/ID planner; 65,536 candidates/16MiB bookkeeping, 2M resource/span/link
+# owner+attr work, 5000 values/independent1MiB dictionary/result bounds. Dedicated
+# root and windowed-root adapters required. Not transparent autocomplete parity.
+# Canonical trace:duration measures full retained bounds without requiring roots:
+# ingestion/retention can grow/shrink it, not exporter duration. Unfiltered int
+# nanos vs filtered Go duration strings (µs), both lexical: separate cached types.
+# Same full-tenant input/replay bounds; 2M resource/span owners+attrs, 65,536 groups/
+# 80B summary charge under16MiB (not total native memory), 5000/1MiB dictionaries/
+# results. Nanosecond cardinality commonly fails422; new duration/window support
+# required. Static duration/span:duration/traceDuration empty vocabularies unchanged.
+# Zero/partial windows, same-key equality shortcuts, intrinsic/nonstring/nested
+# predicates and matching targeted complex values remain unsupported.
+# Explicit static intrinsic names/seven v2 vocabularies use the gate and auth/
+# admission but no storage. They do not establish stored values or TraceQL support.
+tempoSearch:
+  enabled: false
+
+# OTLP/gRPC receiver for logs, metrics and traces (Collector, Alloy and SDK
+# exporters). Uses the same tenancy (`x-scope-orgid` metadata or Basic
+# credentials), auth, limits and storage as OTLP/HTTP on the http port.
+# Plain-text HTTP/2 (h2c): terminate TLS in front of Pulso, as for HTTP.
+otlpGrpc:
+  enabled: false
+  port: 4317
+  # Largest decompressed export message; larger ones fail permanently.
+  maxMessageBytes: 16777216
+  # Admitted calls receiving/ingesting per pod; further calls wait within
+  # their end-to-end deadline (HTTP/2 backpressure).
+  maxInFlight: 64
+
+logCompaction:
+  # Native merges of small log segments, which keep log queries from reading
+  # one object per push. Upgrade all readers/writers/compactors first.
+  enabled: false
+
+traceCompaction:
+  # Experimental native merges. Upgrade all readers/writers/compactors and enable bucket versioning
+  # first. Retention is configured separately under retention.tracesDays.
+  enabled: false
+
 # Experimental event-time retention. Read docs/retention.md before changing any
 # of these. Defaults keep unlimited retention: no durations and no worker.
 retention:
-  # Runs the background retention/cleanup worker even when both durations are
-  # 0. The worker also runs whenever either duration is positive. Set it to
-  # true before returning both durations to 0 while committed cleanup is pending.
+  # Runs the background retention/cleanup worker even when all durations are
+  # 0. The worker also runs whenever any duration is positive. Set it to
+  # true before returning all durations to 0 while committed cleanup is pending.
   enabled: false
   # Whole days of event-time retention per signal, 0..3650. 0 stops advancing
   # the retention floor; it never restores expired data.
   logsDays: 0
   metricsDays: 0
+  # Trace retention uses span START timestamps, not end times or object age.
+  tracesDays: 0
   # observe: preview only, but finish cleanup already committed.
   # enforce: activate the paged manifest format and expire data. Irreversible;
   #          first finish rolling out this image in observe mode.
@@ -106,7 +192,7 @@ ingestBatching:
   flushIntervalMs: 0
 
 alerting:
-  # Experimental native Prometheus thresholds and Slack delivery. Grafana
+  # Experimental native Prometheus/LogQL/mixed thresholds, recordings and Slack delivery. Grafana
   # execution/policy parity is not implemented; do not transfer production paging.
   evaluationEnabled: false
   # Separate explicit opt-in for native Slack outbox delivery.
@@ -114,6 +200,10 @@ alerting:
   # Public bindings: tenant/id/type=slack_webhook/secret_env. Supply the HTTPS
   # webhook via a Secret-backed extraEnv entry named by secret_env, never here.
   notificationTargets: []
+  # Read-only disabled Grafana previews: tenant/uid/type=native_promql or native_logql.
+  # Explicitly maps an original datasource UID to this tenant's Pulso metrics.
+  # No external URLs, automatic residency, recording ordering or enabling imports.
+  sourceBindings: []
   # Poll durable rule heads every 1000..60000 ms. Queries have separate admission.
   pollIntervalMs: 5000
   # Dedicated principals, not tenant-shared credentials. Each item has tenant,
@@ -130,12 +220,18 @@ mcp:
 # defaults. See docs/ingest-limits.md.
 ingestLimits: {}
 #  max_records: 10000
+# OTLP distributions independently cap projected float samples at max_records.
+# Complete source metadata repeats per projection under the fixed 16 MiB cap.
 #  max_attributes: 128
 #  max_key_bytes: 256
 #  max_value_bytes: 16384
 #  max_attribute_bytes: 65536
 #  max_depth: 16
 #  max_nodes: 1024
+#  max_trace_nodes: 262144 # request-wide traces ceiling, independent of per-set max_nodes
+#  max_otlp_nodes: 262144 # request-wide logs ceiling (JSON/protobuf)
+# OTLP logs also have a fixed 16 MiB normalized payload cap and effective depth <=32.
+# Upgrade all readers/writers before rich OTLP logs; see docs/logs.md.
 
 # Additional environment variables for the Pulso container.
 extraEnv: []
@@ -186,10 +282,46 @@ ingress:
   paths:
     - path: /v1/logs
       pathType: Exact
+    - path: /v1/traces
+      pathType: Exact
+    - path: /v1/metrics
+      pathType: Exact
+    # Loki's and Grafana Cloud's OTLP paths.
+    - path: /otlp/v1/logs
+      pathType: Exact
+    - path: /otlp/v1/traces
+      pathType: Exact
+    - path: /otlp/v1/metrics
+      pathType: Exact
+    # Grafana Cloud/Cortex remote-write path (Mimir's /api/v1/push is below).
+    - path: /api/prom/push
+      pathType: Exact
     - path: /loki/api/v1
       pathType: Prefix
     - path: /api/v1
       pathType: Prefix
+    - path: /api/search/tags
+      pathType: Exact
+    - path: /api/v2/search/tags
+      pathType: Exact
+    - path: /api/search/tag
+      pathType: Prefix
+    - path: /api/v2/search/tag
+      pathType: Prefix
+    - path: /api/search
+      pathType: Exact
+    - path: /api/traces
+      pathType: Prefix
+    - path: /api/v2/traces
+      pathType: Prefix
+    # TraceQL metrics (Traces Drilldown).
+    - path: /api/metrics
+      pathType: Prefix
+    # Tempo datasource health checks.
+    - path: /api/echo
+      pathType: Exact
+    - path: /api/status/buildinfo
+      pathType: Exact
     - path: /mcp
       pathType: Exact
 
@@ -199,6 +331,13 @@ serviceMonitor:
   enabled: false
   interval: 15s
   scrapeTimeout: 10s
+  labels: {}
+
+# Self-monitoring alert rules (files/alerts.json) as a Prometheus Operator
+# PrometheusRule. Grafana can import the same file as Grafana-managed rules.
+# See docs/self-monitoring.md.
+prometheusRule:
+  enabled: false
   labels: {}
 
 # Starting points, not measured capacity. Each node runs at most four
