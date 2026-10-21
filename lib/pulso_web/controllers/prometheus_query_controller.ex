@@ -60,6 +60,7 @@ defmodule PulsoWeb.PrometheusQueryController do
              :query_scan_limit,
              :query_work_limit,
              :query_result_limit,
+             :query_intermediate_limit,
              :query_resource_limit,
              :query_timeout
            ] ->

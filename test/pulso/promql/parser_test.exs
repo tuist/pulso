@@ -80,7 +80,12 @@ defmodule Pulso.PromQL.ParserTest do
           "x[5m]",
           "rate(x[5m]) trailing",
           "x offset -1m",
-          "rate(x[5m:1m])",
+          "rate(x[5m:])",
+          "predict_linear(x, 60)",
+          "predict_linear(x[5m], x)",
+          "sum_over_time(vector(1)[5m:0s])",
+          "sum_over_time(time()[5m:1m])",
+          "x[5m:1m]",
           "x @ 123",
           "sumby(job)(x)",
           "x offset1m",
@@ -88,6 +93,15 @@ defmodule Pulso.PromQL.ParserTest do
         ] do
       assert {:error, _} = Parser.parse(query), query
     end
+  end
+
+  test "subqueries have explicit positive resolutions and typed range operands" do
+    assert {:ok, {:call, "rate", [{:subquery, {:selector, _, 0}, 300_000_000_000, 60_000_000_000, 0}]}} =
+             Parser.parse("rate(x[5m:1m])")
+
+    assert {:ok, _} = Parser.parse("predict_linear((max by(job)(x))[3d:30m], 3*86400)")
+    assert {:ok, _} = Parser.parse("sum_over_time((x-y)[6h:5m])")
+    assert {:error, _} = Parser.parse("predict_linear(x[5m], vector(60))")
   end
 
   test "quoted matcher contents do not become syntax" do

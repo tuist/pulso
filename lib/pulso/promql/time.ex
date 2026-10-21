@@ -2,6 +2,11 @@ defmodule Pulso.PromQL.Time do
   @moduledoc "Exact decimal-second parsing at the metrics query boundary."
   @max_ns 9_223_372_036_854_775_807
 
+  # Prometheus stores millisecond timestamps. Avoid a preliminary float
+  # rounding of the much larger ns integer for remote-write-aligned values.
+  def seconds(ns) when rem(ns, 1_000_000) == 0, do: div(ns, 1_000_000) / 1000
+  def seconds(ns), do: ns / 1_000_000_000
+
   def parse_seconds(value) when is_integer(value), do: bounded(value * 1_000_000_000)
   def parse_seconds(value) when is_float(value), do: parse_seconds(Float.to_string(value))
 
@@ -56,6 +61,6 @@ defmodule Pulso.PromQL.Time do
     {:ok, div(coefficient * 2 + divisor, divisor * 2)}
   end
 
-  defp bounded(ns) when abs(ns) <= @max_ns, do: {:ok, ns}
+  defp bounded(ns) when ns >= -@max_ns - 1 and ns <= @max_ns, do: {:ok, ns}
   defp bounded(_), do: {:error, :invalid_timestamp}
 end

@@ -152,12 +152,20 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     end
   end
 
-  test "unsupported histograms and exemplars are explicitly counted without losing float samples", %{conn: conn} do
-    series = encode_series([{"__name__", "mixed"}], [{1.0, 1}]) <> length_delim(3, <<>>) <> length_delim(4, <<>>)
+  test "invalid histograms count as rejected samples; invalid exemplars are dropped without losing samples",
+       %{conn: conn} do
+    # A float histogram whose span claims a bucket it never sends, and an
+    # exemplar with a duplicated label name.
+    histogram = fixed64_field(2, <<1.0::little-float-64>>) <> length_delim(11, <<0x08, 0x00, 0x10, 0x01>>)
+    exemplar = length_delim(1, encode_label("a", "1")) <> length_delim(1, encode_label("a", "2"))
+
+    series =
+      encode_series([{"__name__", "mixed"}], [{1.0, 1}]) <> length_delim(3, exemplar) <> length_delim(4, histogram)
+
     response = post_write(conn, snappy(length_delim(1, series)))
     assert response.status == 204
-    assert get_resp_header(response, "x-pulso-rejected-records") == ["2"]
-    assert {:ok, [%MetricSample{value: 1.0}]} = Storage.query(:metrics, "default")
+    assert get_resp_header(response, "x-pulso-rejected-records") == ["1"]
+    assert {:ok, [%MetricSample{value: 1.0, exemplars: nil}]} = Storage.query(:metrics, "default")
     Pulso.Runtime.put_env(:pulso, Pulso.IngestLimits, max_records: 2)
     response = post_write(build_conn(), snappy(length_delim(1, series)))
     assert response.status == 413
@@ -196,12 +204,12 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     assert json_response(conn, 415) == %{"error" => "unsupported_content_encoding"}
   end
 
-  test "400 when the remote_write version is a non-zero major", %{conn: conn} do
+  test "400 when the remote_write version is an unknown major", %{conn: conn} do
     series = [%{labels: [{"__name__", "x"}], samples: [{1.0, 1}]}]
 
     conn =
       conn
-      |> post_write(body(series), %{"x-prometheus-remote-write-version" => "2.0.0"})
+      |> post_write(body(series), %{"x-prometheus-remote-write-version" => "3.0.0"})
 
     assert json_response(conn, 400) == %{"error" => "unsupported_remote_write_version"}
   end
@@ -285,5 +293,60 @@ defmodule PulsoWeb.RemoteWriteControllerTest do
     assert get_resp_header(response, "x-pulso-rejected-records") == ["3"]
     assert {:ok, [stored]} = Storage.query(:metrics, "default")
     assert stored.value == 3.0
+  end
+end
+
+defmodule PulsoWeb.RemoteWriteMetadataTest do
+  use PulsoWeb.ConnCase, async: true
+
+  import Bitwise
+
+  defp varint(v) when v < 128, do: <<v>>
+  defp varint(v), do: <<(v &&& 0x7F) ||| 0x80>> <> varint(v >>> 7)
+  defp field(n, bytes), do: varint(n <<< 3 ||| 2) <> varint(byte_size(bytes)) <> bytes
+
+  # `MetricMetadata`: type = 1 (enum), metric_family_name = 2, help = 4, unit = 5.
+  defp metadata(type, name, help), do: field(3, <<0x08, type>> <> field(2, name) <> field(4, help) <> field(5, ""))
+
+  defp post_write(conn, tenant, body) do
+    {:ok, compressed} = :snappyer.compress(body)
+
+    conn
+    |> put_req_header("x-scope-orgid", tenant)
+    |> put_req_header("content-type", "application/x-protobuf")
+    |> put_req_header("content-encoding", "snappy")
+    |> put_req_header("x-prometheus-remote-write-version", "0.1.0")
+    |> post("/api/v1/write", compressed)
+  end
+
+  test "metadata-only requests are retained and served by /api/v1/metadata", %{conn: conn} do
+    tenant = "rw-metadata-#{System.unique_integer([:positive])}"
+    body = metadata(1, "http_requests_total", "Requests served.") <> metadata(3, "latency_seconds", "Latency.")
+
+    assert conn |> post_write(tenant, body) |> response(204)
+    assert build_conn() |> post_write(tenant, body) |> response(204)
+
+    response = build_conn() |> put_req_header("x-scope-orgid", tenant) |> get("/api/v1/metadata") |> json_response(200)
+
+    assert response == %{
+             "status" => "success",
+             "data" => %{
+               "http_requests_total" => [%{"type" => "counter", "help" => "Requests served.", "unit" => ""}],
+               "latency_seconds" => [%{"type" => "histogram", "help" => "Latency.", "unit" => ""}]
+             }
+           }
+
+    assert %{"data" => %{"latency_seconds" => [_]} = data} =
+             build_conn()
+             |> put_req_header("x-scope-orgid", tenant)
+             |> get("/api/v1/metadata", %{"metric" => "latency_seconds"})
+             |> json_response(200)
+
+    assert map_size(data) == 1
+
+    assert build_conn()
+           |> put_req_header("x-scope-orgid", tenant)
+           |> get("/api/v1/metadata", %{"limit" => "x"})
+           |> json_response(400)
   end
 end
