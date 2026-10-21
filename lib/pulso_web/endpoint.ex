@@ -44,6 +44,8 @@ defmodule PulsoWeb.Endpoint do
   plug PulsoWeb.TraceRequestLimits
   plug PulsoWeb.PrometheusDiscoveryRequestGate
 
+  plug PulsoWeb.SentryBody
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, PulsoWeb.OTLPJSONParser],
     pass: ["*/*"],

@@ -3,6 +3,8 @@
 use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::{fs::File, path::Path, sync::Arc};
 
 fn main() {
@@ -36,6 +38,10 @@ fn main() {
         fields.clone(),
         columns.clone(),
     );
+    write_amplified(
+        Path::new(&directory).join("legacy_expanded_log.parquet"),
+        fields.clone(),
+    );
     let mut invalid_fields = fields.clone();
     invalid_fields.push(Field::new("otlp", DataType::Int64, true));
     let mut invalid_columns = columns.clone();
@@ -55,6 +61,36 @@ fn main() {
         invalid_columns,
     );
 }
+// Historical ten-column data can expand beyond today's normalized write cap.
+// Keep it tiny on disk while retaining 96 MB of repeated JSON body bytes.
+fn write_amplified(path: std::path::PathBuf, fields: Vec<Field>) {
+    let rows = 32;
+    let body = format!("\"{}\"", "\\u0000".repeat(500_000));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1; rows])),
+        Arc::new(Int64Array::from(vec![None::<i64>; rows])),
+        Arc::new(Int32Array::from(vec![None::<i32>; rows])),
+        Arc::new(StringArray::from(vec![None::<&str>; rows])),
+        Arc::new(StringArray::from(vec!["api"; rows])),
+        Arc::new(StringArray::from(vec![body.as_str(); rows])),
+        Arc::new(StringArray::from(vec![None::<&str>; rows])),
+        Arc::new(StringArray::from(vec![None::<&str>; rows])),
+        Arc::new(StringArray::from(vec!["{}"; rows])),
+        Arc::new(StringArray::from(vec!["{}"; rows])),
+    ];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(4_194_304)
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .set_statistics_enabled(EnabledStatistics::None)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
 fn write(path: std::path::PathBuf, fields: Vec<Field>, columns: Vec<ArrayRef>) {
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
     let mut writer =

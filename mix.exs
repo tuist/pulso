@@ -4,7 +4,7 @@ defmodule Pulso.MixProject do
   def project do
     [
       app: :pulso,
-      version: "1.7.0",
+      version: "1.8.0",
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -43,7 +43,7 @@ defmodule Pulso.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"},
+      {:bandit, "~> 1.13"},
       {:req, "~> 0.5"},
       {:nimble_parsec, "~> 1.4"},
       {:rustler, "~> 0.38.0", optional: true},

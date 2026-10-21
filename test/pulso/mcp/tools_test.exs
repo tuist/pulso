@@ -51,7 +51,7 @@ defmodule Pulso.MCP.ToolsTest do
     assert Enum.at(entry["value"], 1) == "+Inf"
   end
 
-  test "lists query tools and metric discovery" do
+  test "lists log, metric, trace and error query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])
     assert "query_logs" in names
@@ -59,6 +59,10 @@ defmodule Pulso.MCP.ToolsTest do
     assert "discover_metrics" in names
     assert "query_logql" in names
     assert "query_promql" in names
+    assert "query_errors" in names
+    assert "list_error_issues" in names
+    assert "list_error_changes" in names
+    assert "list_indexed_error_issues" in names
 
     query_logs = Enum.find(tools, &(&1["name"] == "query_logs"))
     assert query_logs["inputSchema"]["required"] == ["tenant"]
@@ -73,8 +77,14 @@ defmodule Pulso.MCP.ToolsTest do
   describe "tool contracts" do
     test "discovery declares every query read-only" do
       {:reply, response} = Pulso.MCP.dispatch(MCPMessages.request(1, "tools/list"))
-      tools = Enum.filter(response["result"]["tools"], &String.starts_with?(&1["name"], "query_"))
-      assert length(tools) == 5
+
+      tools =
+        Enum.filter(response["result"]["tools"], fn tool ->
+          String.starts_with?(tool["name"], "query_") or
+            tool["name"] in ~w(list_error_issues list_error_changes list_indexed_error_issues)
+        end)
+
+      assert length(tools) == 9
 
       for tool <- tools do
         assert tool["annotations"] == %{
@@ -218,6 +228,7 @@ defmodule Pulso.MCP.ToolsTest do
       for tool <- query_tools() do
         args = query_arguments(tool["name"])
         required = tool["inputSchema"]["required"]
+        args = if "start_ts_ns" in required, do: Map.merge(args, %{"start_ts_ns" => 0, "end_ts_ns" => 0}), else: args
 
         for {field, _schema} <- tool["inputSchema"]["properties"], field not in required do
           assert {:ok, _} = Tools.call(tool["name"], Map.put(args, field, nil))
@@ -297,7 +308,7 @@ defmodule Pulso.MCP.ToolsTest do
       end
     end
 
-    test "all tools handle signed timestamp boundaries, including native decoding" do
+    test "log and metric tools handle signed timestamp boundaries, including native decoding" do
       minimum = -9_223_372_036_854_775_808
       maximum = 9_223_372_036_854_775_807
       records = for ts <- [minimum, -1, maximum], do: %Log{timestamp_ns: ts, service: "api", body: "entry"}
@@ -316,7 +327,7 @@ defmodule Pulso.MCP.ToolsTest do
         assert {:ok, [_]} = NIF.decode_log_segment_parquet(log_blob, max(ts - 1, minimum), ts, nil, [], [])
         assert {:ok, [_]} = NIF.decode_metric_segment_parquet(metric_blob, max(ts - 1, minimum), ts, [])
 
-        for tool <- query_tools() do
+        for tool <- query_tools(), tool["name"] != "query_errors" do
           assert {:ok, _} =
                    Tools.call(tool["name"], Map.put(query_arguments(tool["name"]), "end_ts_ns", ts))
         end
@@ -391,11 +402,13 @@ defmodule Pulso.MCP.ToolsTest do
       {"query_metrics", %{"tenant" => "acme"}},
       {"query_traces", %{"tenant" => "acme"}},
       {"query_logql", %{"tenant" => "acme", "query" => ~s({service="api"})}},
-      {"query_promql", %{"tenant" => "acme", "query" => "up"}}
+      {"query_promql", %{"tenant" => "acme", "query" => "up"}},
+      {"query_errors", %{"tenant" => "acme", "start_ts_ns" => 0, "end_ts_ns" => 100}},
+      {"list_error_issues", %{"tenant" => "acme", "start_ts_ns" => 0, "end_ts_ns" => 100}}
     ]
 
     test "all advertised query tools declare read-only behavior" do
-      assert length(query_tools()) == 5
+      assert length(query_tools()) == 6
       assert Enum.all?(query_tools(), &(&1["annotations"]["readOnlyHint"] == true))
     end
 

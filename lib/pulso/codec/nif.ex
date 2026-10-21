@@ -189,6 +189,20 @@ defmodule Pulso.Codec.NIF do
 
   def otlp_json_decode(_body), do: :erlang.nif_error(:nif_not_loaded)
 
+  def decode_log_segment_parquet_bounded(_blob, _start_ts, _end_ts, _service, _matchers, _line_filters, _max_records),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_log_segment_parquet_limited(
+        _blob,
+        _start_ts,
+        _end_ts,
+        _service,
+        _matchers,
+        _line_filters,
+        _max_records,
+        _max_decoded_bytes
+      ), do: :erlang.nif_error(:nif_not_loaded)
+
   @doc false
   def otlp_json_decode_scoped(_body, _signal), do: :erlang.nif_error(:nif_not_loaded)
   def otlp_json_negative_zero(_body), do: :erlang.nif_error(:nif_not_loaded)

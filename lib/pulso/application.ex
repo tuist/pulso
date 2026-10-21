@@ -87,7 +87,8 @@ defmodule Pulso.Application do
 
         [ManifestSupervision, {StorageMonitor, config: config}] ++
           CompactionWorker.children(config) ++
-          RetentionWorker.children(config)
+          RetentionWorker.children(config) ++
+          Pulso.Errors.Supervisor.children()
 
       _ ->
         []

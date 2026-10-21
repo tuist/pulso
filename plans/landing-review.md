@@ -537,3 +537,38 @@ listed clock, tail, legacy fencing, protocol, memory and operational limits
 remain open. Nothing was committed, merged, deployed or run against a provider
 or private application.
 
+## Main integration: Sentry and typed telemetry
+
+After draft publication, integrate `origin/main` at `560fc19` (Sentry error
+tracking and the 1.8.0 release). Resolve 18 conflicted files across configuration,
+Helm, documentation, metrics, MCP, manifest metadata and native log decoding.
+Preserve both `log_labels` and `trace_summary`, both tool registries, rich and
+legacy log schemas, cumulative decoded-byte bounds and record limits that count
+identical rows before term sharing.
+
+Fresh error queries use required manifest authority without stale-cache or LIST
+fallback, retaining their existing `:not_found` missing-root result. Four new
+regression cases exercise this public option, bounded rich/legacy metadata,
+malformed present metadata and duplicate-row quotas. A checked-in legacy Parquet
+fixture strengthens the upstream expansion test without relaxing the current
+16 MiB normalized-write ceiling. Its native generator and hash are documented in
+`test/fixtures/logs/README.md`.
+
+The final integration checks, with `PULSO_NIF_FORCE_BUILD=1`, are recorded under
+`/tmp/pulso-main-merge/final-3/`:
+
+- `ERL_FLAGS='+S 4:4' mix precommit --max-cases 4`: **1,608 passed, 1 skipped,
+  37 excluded**, 267.4 seconds; compile-with-warnings-as-errors, dependency and
+  formatter checks passed.
+- Strict Credo: clean across **427 files**.
+- Locked/offline Cargo: **130 codec**, **5 object-store** and **0 gRPC unit tests**;
+  strict all-target Clippy and Rust formatting passed for all three crates.
+- Helm lint and combined Sentry/OTLP-gRPC/Tempo configuration rendering passed.
+
+Earlier failed compiles, timed-out command wrappers and the two integration
+failures remain in the evidence. Missing-authority compatibility and the invalid
+oversized-write test setup were corrected before the final green run. This is
+merge-integration validation, not a fifth independent review or an update to the
+historical fourth-pass archive. No provider, deployment, capacity or optional
+external-client exercise was added; existing limitations remain open.
+

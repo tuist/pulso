@@ -23,7 +23,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     :metric_names,
     :log_services,
     :metric_labels,
-    :trace_summary
+    :trace_summary,
+    :log_labels
   ]
 
   @type t :: %__MODULE__{
@@ -35,7 +36,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           metric_names: [String.t()] | nil,
           log_services: [String.t()] | nil,
           metric_labels: %{String.t() => [String.t()]} | nil,
-          trace_summary: TraceSummary.t() | nil
+          trace_summary: TraceSummary.t() | nil,
+          log_labels: %{String.t() => [String.t()]} | nil
         }
 
   @doc """
@@ -92,6 +94,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
     base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
     base = if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
+    base = if segment.log_labels, do: Map.put(base, "el", segment.log_labels), else: base
     if segment.trace_summary, do: Map.put(base, "t", TraceSummary.to_wire(segment.trace_summary)), else: base
   end
 
@@ -116,7 +119,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        metric_names: valid_names(wire["n"]),
        log_services: valid_services(wire["ls"]),
        metric_labels: MetricLabelSummary.parse(wire["l"]),
-       trace_summary: TraceSummary.parse(wire["t"])
+       trace_summary: TraceSummary.parse(wire["t"]),
+       log_labels: MetricLabelSummary.parse(wire["el"])
      }}
   end
 
@@ -193,7 +197,27 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     services = Enum.reduce_while(records, MapSet.new(), &collect_log_service/2)
 
     services = if services, do: services |> Enum.map(&:binary.copy/1) |> Enum.sort()
-    %{segment | log_services: services}
+
+    # Atom or invalid UTF-8 keys can normalize during JSON encoding; only
+    # summarize maps whose key identity is unchanged at the native boundary.
+    valid_resources? =
+      Enum.all?(records, fn record ->
+        Enum.all?(Map.keys(record.resource || %{}), &(is_binary(&1) and String.valid?(&1)))
+      end)
+
+    labels =
+      Enum.map(records, fn record ->
+        labels =
+          Map.new(~w(error_source error_project), fn name ->
+            # Non-string values stay unknown independently: atoms in
+            # particular become strings at the JSON/native boundary.
+            {name, Map.get(record.resource || %{}, name, "")}
+          end)
+
+        %{labels: labels}
+      end)
+
+    %{segment | log_services: services, log_labels: if(valid_resources?, do: MetricLabelSummary.build(labels))}
   end
 
   defp collect_log_service(%{service: service}, services) when is_binary(service) and byte_size(service) in 1..256 do
@@ -203,10 +227,15 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   defp collect_log_service(_record, _services), do: {:halt, nil}
 
-  @doc "Prune known log services for exact promoted-field selectors; unknown summaries always scan."
-  def matches_log_service?(%__MODULE__{log_services: nil}, _opts), do: true
+  @doc "Prune exact service and error-label selectors only with complete summaries."
+  def matches_log_service?(%__MODULE__{} = segment, opts) do
+    service_matches?(segment.log_services, opts) and
+      MetricLabelSummary.matches?(segment.log_labels, Keyword.get(opts, :matchers, []))
+  end
 
-  def matches_log_service?(%__MODULE__{log_services: services}, opts) do
+  defp service_matches?(nil, _opts), do: true
+
+  defp service_matches?(services, opts) do
     direct = Keyword.get(opts, :service)
     matchers = Keyword.get(opts, :matchers, [])
 

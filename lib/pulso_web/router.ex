@@ -42,6 +42,12 @@ defmodule PulsoWeb.Router do
     match :*, "/mcp", MCPController, :method_not_allowed
   end
 
+  # SDKs may omit Accept/Content-Type or use text/plain to avoid preflight.
+  scope "/api/:project_id", PulsoWeb do
+    post "/envelope", SentryController, :envelope
+    post "/store", SentryController, :store
+  end
+
   scope "/", PulsoWeb do
     pipe_through :api
 

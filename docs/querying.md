@@ -32,6 +32,10 @@ The query tools below are read-only and take the tenant as an argument:
 | `search_traces` | Search distinct traces using bounded original-string resource/span AND selectors in an explicit span-start window. Groups before trace limits; unknown legacy types and all-window group/scan exhaustion fail. Native window-local aggregates, not a Tempo envelope. See [search limits and legacy history](traces.md#search-distinct-traces). |
 | `query_traces` | Lookup spans by trace/span/parent ID or search by start time, service, name, kind, status, duration, roots and query-projection attributes, with optional output projection. See [traces](traces.md#query-spans). |
 | `query_promql` | Evaluate a Prometheus Query Language expression, instant or range. |
+| `query_errors` | Read Sentry error events and scrubbed payloads in a required time window. |
+| `list_error_issues` | Group Sentry errors with exact window-scoped counts and first/last seen; see [error tracking](error-tracking.md). |
+| `list_error_changes` | Poll the separately enabled experimental index for retained-history issue changes and explicit resets; save the cursor durably. |
+| `list_indexed_error_issues` | Read compact deduplicated retained-history summaries and example references from that index; see [error monitoring](error-monitoring.md). |
 
 `tools/list` returns each tool's full input schema. Invalid arguments, such as a
 reversed time range, return an explicit error instead of an empty result.

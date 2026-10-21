@@ -15,6 +15,39 @@ defmodule Pulso.Storage.LogMetadataCodecTest do
     assert log.timestamp_ns == 1_700_000_000_123_456_789
   end
 
+  test "expanded-column budgets preserve legacy and rich log metadata" do
+    legacy = File.read!("test/fixtures/logs/legacy_log.parquet")
+    assert {:ok, [old], old_bytes} = S3.decode_log_segment_bounded(legacy, nil, nil, max_decoded_bytes: 1_048_576)
+    assert old.otlp == nil
+    assert old_bytes > 0
+    record = %Log{timestamp_ns: 1, body: "rich", otlp: %{"body" => %{"stringValue" => "rich"}}}
+    assert {:ok, blob, _, _} = S3.encode_segment(:logs, [record])
+    assert {:ok, [^record], bytes} = S3.decode_log_segment_bounded(blob, nil, nil, max_decoded_bytes: 1_048_576)
+    assert bytes > 0
+    assert {:ok, [^record]} = S3.decode_segment(:logs, blob, nil, nil, max_decoded_bytes: 1_048_576)
+  end
+
+  test "duplicate sharing cannot bypass bounded log record quotas" do
+    record = %Log{timestamp_ns: 1, body: "same", otlp: %{"body" => %{"stringValue" => "same"}}}
+    assert {:ok, blob, _, _} = S3.encode_segment(:logs, [record, record])
+    assert {:error, :query_sample_limit} = S3.decode_segment(:logs, blob, nil, nil, max_records: 1)
+
+    assert {:error, :query_sample_limit} =
+             S3.decode_log_segment_bounded(blob, nil, nil, max_records: 1, max_decoded_bytes: 1_048_576)
+
+    assert {:ok, [^record, ^record], _} =
+             S3.decode_log_segment_bounded(blob, nil, nil, max_records: 2, max_decoded_bytes: 1_048_576)
+  end
+
+  test "bounded log decoding rejects malformed present metadata" do
+    for path <- ~w(invalid_otlp_type invalid_otlp_value) do
+      assert {:error, {:decode_failed, _}} =
+               S3.decode_segment(:logs, File.read!("test/fixtures/logs/#{path}.parquet"), nil, nil,
+                 max_decoded_bytes: 1_048_576
+               )
+    end
+  end
+
   test "a present malformed OTLP column cannot masquerade as a legacy absence" do
     for path <- ~w(invalid_otlp_type invalid_otlp_value) do
       assert {:error, {:decode_failed, _}} =

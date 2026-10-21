@@ -229,6 +229,25 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert {:ok, %{manifest: ^old}} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
   end
 
+  test "fresh error queries share required authority without falling back to a warm cache", ctx do
+    config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
+    Runtime.put_env(:pulso, S3, config)
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    manifest = Manifest.new()
+    assert {:ok, tag} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(manifest)))
+    ManifestCache.put(ctx.tenant, "logs", manifest, tag)
+    assert {:ok, []} = S3.query(:logs, ctx.tenant, [])
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {400, :before, 1}}})
+    assert {:error, :manifest_freshness_unavailable} = S3.query(:logs, ctx.tenant, fresh: true)
+    assert %{etag: ^tag} = ManifestCache.get(ctx.tenant, "logs")
+    assert {:ok, []} = S3.query(:logs, ctx.tenant, [])
+    lists = Agent.get(ctx.agent, & &1.lists)
+    Agent.update(ctx.agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+    assert {:error, :not_found} = S3.query(:logs, ctx.tenant, fresh: true)
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    assert Agent.get(ctx.agent, & &1.lists) == lists
+  end
+
   test "a failed legacy CAS response succeeds only when fresh read-back proves every key visible", ctx do
     key = Manifest.manifest_key(ctx.tenant, "logs")
     Agent.update(ctx.agent, &%{&1 | faults: %{{"PUT", key} => {400, :after, 1}}})

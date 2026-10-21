@@ -43,6 +43,11 @@ defmodule Pulso.IngestLimits do
   end
 
   @doc "Validate a parsed JSON request before expanding it into records."
+  def validate(:sentry, payload) do
+    limits = %{config() | max_value_bytes: 1_048_576, max_attribute_bytes: 1_048_576}
+    payload |> walk(limits, 0, {0, 0}) |> finish()
+  end
+
   def validate(protocol, payload) when protocol in [:otlp, :otlp_traces, :otlp_metrics, :loki] do
     limits = config()
 

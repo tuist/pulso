@@ -20,6 +20,7 @@ alias Pulso.Alerting.GraphPreview
 alias Pulso.Alerting.Principal
 alias Pulso.Alerting.Targets
 alias Pulso.Auth.SharedSecret
+alias Pulso.Errors.Projection
 alias Pulso.Loki.Tail
 alias Pulso.PromQL.Evaluator
 alias Pulso.Storage.S3
@@ -33,6 +34,13 @@ alias Pulso.Traces.TempoSearch
 env_var = fn name, default ->
   if Code.ensure_loaded?(Pulso.Runtime), do: Pulso.Runtime.env(name, default), else: System.get_env(name, default)
 end
+
+# Sentry DSNs are ingest-only and never grant tenant query access.
+sentry_projects =
+  case JSON.decode(env_var.("PULSO_SENTRY_PROJECTS_JSON", "{}")) do
+    {:ok, projects} -> Pulso.Sentry.validate_projects!(projects)
+    _ -> raise "PULSO_SENTRY_PROJECTS_JSON must be a JSON object"
+  end
 
 # Alerting uses separate principal credentials; tenant-shared tokens never grant writes.
 alerting_principals =
@@ -60,6 +68,25 @@ alerting_principals =
     _ ->
       raise "PULSO_ALERTING_PRINCIPALS_JSON must be a JSON array of at most 256 principals"
   end
+
+error_history_days =
+  case Integer.parse(env_var.("PULSO_ERROR_HISTORY_DAYS", "1")) do
+    {value, ""} when value in 1..365 -> value
+    _ -> raise "PULSO_ERROR_HISTORY_DAYS must be an integer in 1..365"
+  end
+
+error_projection_interval =
+  case Integer.parse(env_var.("PULSO_ERROR_PROJECTION_INTERVAL_MS", "5000")) do
+    {value, ""} when value in 1000..60_000 -> value
+    _ -> raise "PULSO_ERROR_PROJECTION_INTERVAL_MS must be an integer in 1000..60000"
+  end
+
+config :pulso, Projection,
+  enabled: env_var.("PULSO_ERROR_PROJECTION_ENABLED", "false") in ["1", "true", "yes"],
+  history_days: error_history_days,
+  interval_ms: error_projection_interval
+
+config :pulso, Pulso.Sentry, projects: sentry_projects
 
 for field <- [:id, :token_hash] do
   keys =

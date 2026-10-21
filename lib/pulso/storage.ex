@@ -56,10 +56,14 @@ defmodule Pulso.Storage do
           | {:end_ts, integer()}
           | {:limit, pos_integer()}
           | {:max_records, non_neg_integer()}
+          # S3 logs: cumulative expanded column-buffer bytes, before row filters.
+          | {:max_decoded_bytes, non_neg_integer()}
           | {:max_scan_segments, pos_integer()}
           | {:max_scan_bytes, pos_integer()}
           | {:max_scan_rows, pos_integer()}
           | {:deadline_ms, integer()}
+          # Require a fresh committed manifest; never serve stale cached data.
+          | {:fresh, boolean()}
           # Logs/traces convenience filter.
           | {:service, String.t()}
           | {:trace_id, String.t()}

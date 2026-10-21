@@ -97,6 +97,10 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
   Tempo-replacement requirements.
 - [OpenTelemetry traces](traces.md): SDK/collector configuration, trace ingestion,
   stored metadata, MCP lookup/search, and compatibility limits.
+- [Error tracking](error-tracking.md): experimental Sentry SDK ingestion,
+  object-backed error events, issue grouping and read-only agent queries.
+- [Error monitoring](error-monitoring.md): separately enabled S3-derived issue
+  summaries and replayable agent changes, with explicit history and gap semantics.
 - [Ingest limits](ingest-limits.md): per-request budgets for records,
   attributes, and payload sizes, and how to tune them.
 - [Self-monitoring](self-monitoring.md): the `/metrics` endpoint, what each

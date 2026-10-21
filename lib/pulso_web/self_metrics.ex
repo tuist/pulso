@@ -62,6 +62,10 @@ defmodule PulsoWeb.SelfMetrics do
   end
 
   defp query_operation(method, path) when method in ["GET", "POST"] and path in @query_paths, do: {:query, :http}
+
+  defp query_operation("POST", ["api", _project, endpoint]) when endpoint in ["envelope", "store"],
+    do: {:ingest, :sentry}
+
   defp query_operation("GET", ["loki", "api", "v1", "labels"]), do: {:query, :http}
   defp query_operation("GET", ["loki", "api", "v1", "label", _name, "values"]), do: {:query, :http}
   defp query_operation(_method, _path), do: nil

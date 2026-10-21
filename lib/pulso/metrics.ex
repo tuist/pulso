@@ -29,7 +29,7 @@ defmodule Pulso.Metrics do
   @buckets [5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000]
   @bucket_labels Enum.map(@buckets, &{&1, Float.to_string(&1 / 1_000_000)})
   @operations %{
-    ingest: ["otlp", "otlp_traces", "otlp_metrics", "loki", "remote_write"],
+    ingest: ["otlp", "otlp_traces", "otlp_metrics", "loki", "remote_write", "sentry"],
     query: [
       "http_promql",
       "http_logql",
@@ -46,6 +46,10 @@ defmodule Pulso.Metrics do
       "alert_tool",
       "query_logql",
       "query_promql",
+      "query_errors",
+      "list_error_issues",
+      "list_error_changes",
+      "list_indexed_error_issues",
       "unknown_tool"
     ],
     object: ["put", "put_if_match", "put_if_none_match", "get", "get_if_none_match", "delete", "list", "list_prefixes"],
@@ -274,6 +278,10 @@ defmodule Pulso.Metrics do
   end
 
   defp label_operation("GET", ["loki", "api", "v1", "label", _name, "values"]), do: {:query, "http_labels"}
+
+  defp label_operation("POST", ["api", _project, endpoint]) when endpoint in ["envelope", "store"],
+    do: {:ingest, "sentry"}
+
   defp label_operation(_method, _path), do: nil
 
   defp http_outcome(:stop, %{conn: %{status: status}}) when status < 400, do: "ok"
