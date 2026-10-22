@@ -26,7 +26,7 @@ profiles, workload identity, or other ambient cloud credentials.
 | --- | --- | --- |
 | `PORT` | `4000` | HTTP listener port. |
 | `PULSO_OTLP_GRPC_PORT` | unset | Enables the [OTLP/gRPC receiver](otlp-grpc.md) on this port (conventionally `4317`). Unset keeps it disabled. |
-| `PULSO_LOKI_TAIL_MAX_PER_TENANT` | `10` | Concurrent [Loki live tails](querying.md#live-tail) per tenant on each instance. Further tails return HTTP 429. |
+| `PULSO_LOKI_TAIL_MAX_PER_TENANT` | `10` | Atomic concurrent [Loki live-tail](querying.md#live-tail) admission per tenant on each instance, including history preparation. Further tails return HTTP 429; connection termination releases its slot. Not a deployment-wide limit. |
 | `PULSO_LOKI_TAIL_POLL_INTERVAL_MS` | `1000` | How often an instance with open [live tails](querying.md#live-tail) reads a tenant's log manifest for pushes other instances received (100 to 60000). |
 | `PULSO_OTLP_GRPC_IP` | `0.0.0.0` | Address the OTLP/gRPC receiver binds. |
 | `PULSO_OTLP_GRPC_MAX_MESSAGE_BYTES` | `16777216` | Largest decompressed OTLP/gRPC message; larger messages fail permanently. |

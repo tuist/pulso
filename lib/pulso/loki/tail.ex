@@ -32,15 +32,21 @@ defmodule Pulso.Loki.Tail do
 
   # Names resolve in the caller, which carries the runtime instance.
   def start_link(_opts \\ []) do
-    names = Enum.map([__MODULE__.Registry, __MODULE__.FollowerRegistry, __MODULE__.Followers], &Runtime.name/1)
+    names =
+      Enum.map(
+        [__MODULE__.Registry, __MODULE__.AdmissionRegistry, __MODULE__.FollowerRegistry, __MODULE__.Followers],
+        &Runtime.name/1
+      )
+
     Supervisor.start_link(__MODULE__, names, name: Runtime.name(__MODULE__))
   end
 
   @impl true
-  def init([registry, follower_registry, followers]) do
+  def init([registry, admission_registry, follower_registry, followers]) do
     Supervisor.init(
       [
         {Registry, keys: :duplicate, name: registry},
+        {Registry, keys: :unique, name: admission_registry},
         {Registry, keys: :unique, name: follower_registry},
         {DynamicSupervisor, strategy: :one_for_one, name: followers}
       ],
@@ -51,30 +57,83 @@ defmodule Pulso.Loki.Tail do
   @doc """
   Register the calling process as one of `tenant`'s tailers on this node,
   unless it already has `max`, and make sure the tenant has a follower.
-  Returns the follower so the tailer can rejoin if it ever exits.
+  Admission uses unique, process-owned slots, so simultaneous joins cannot
+  overrun the limit. Slots are released on leave or caller termination.
+  Returns the follower to monitor; its exit invalidates the live cursor.
   """
-  @spec join(String.t(), pos_integer()) :: {:ok, pid()} | {:error, :too_many_tails}
-  def join(tenant, max) do
-    if length(tailers(tenant)) >= max do
-      {:error, :too_many_tails}
+  @spec join(String.t(), pos_integer()) :: {:ok, pid()} | {:error, :too_many_tails | :tail_unavailable}
+  def join(tenant, max) when is_integer(max) and max > 0 do
+    if self() in tailers(tenant) do
+      join_follower(tenant)
     else
-      {:ok, _} = Registry.register(registry(), {:tailer, tenant}, TailDelivery.new())
-      follower(tenant)
+      with :ok <- reserve(tenant, max) do
+        {:ok, _} = Registry.register(registry(), {:tailer, tenant}, TailDelivery.new())
+        join_follower(tenant)
+      end
+    end
+  rescue
+    ArgumentError -> unavailable(tenant)
+  catch
+    :exit, _reason -> unavailable(tenant)
+  end
+
+  defp join_follower(tenant) do
+    case follower(tenant) do
+      {:ok, _pid} = result -> result
+      {:error, _reason} -> unavailable(tenant)
     end
   end
 
+  defp reserve(tenant, max) do
+    Enum.reduce_while(1..max, {:error, :too_many_tails}, fn slot, error ->
+      case Registry.register(admission_registry(), {tenant, slot}, nil) do
+        {:ok, _} -> {:halt, :ok}
+        {:error, {:already_registered, _pid}} -> {:cont, error}
+      end
+    end)
+  end
+
+  defp unavailable(tenant) do
+    leave(tenant)
+    {:error, :tail_unavailable}
+  end
+
+  defp admission_registry, do: Runtime.name(__MODULE__.AdmissionRegistry)
+
   @doc "Make sure `tenant` has a running follower on this node, returning it."
-  @spec follower(String.t()) :: {:ok, pid()}
+  @spec follower(String.t()) :: {:ok, pid()} | {:error, term()}
   def follower(tenant) do
     case DynamicSupervisor.start_child(Runtime.name(__MODULE__.Followers), {TailFollower, {tenant, Runtime.current()}}) do
       {:ok, pid} -> {:ok, pid}
       {:error, {:already_started, pid}} -> {:ok, pid}
+      {:error, _reason} = error -> error
     end
   end
 
   @doc "Leave `tenant`'s tailers; a no-op for a process that never joined."
   @spec leave(String.t()) :: :ok
-  def leave(tenant), do: Registry.unregister(registry(), {:tailer, tenant})
+  def leave(tenant) do
+    unregister_tailer(tenant)
+    release(tenant)
+  end
+
+  # Either disposable registry may be unavailable during a subtree restart.
+  # Clean up each independently so one missing registry cannot leak the other.
+  defp unregister_tailer(tenant) do
+    Registry.unregister(registry(), {:tailer, tenant})
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp release(tenant) do
+    for {^tenant, _slot} = key <- Registry.keys(admission_registry(), self()) do
+      Registry.unregister(admission_registry(), key)
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
 
   @doc false
   def tailers(tenant), do: for({pid, _} <- Registry.lookup(registry(), {:tailer, tenant}), do: pid)

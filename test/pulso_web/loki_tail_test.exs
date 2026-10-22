@@ -85,6 +85,56 @@ defmodule PulsoWeb.LokiTailTest do
     assert Tail.tailers(ctx.tenant) == []
   end
 
+  test "follower loss closes explicitly and a reconnect receives history and live logs", ctx do
+    {:ok, socket} = tail(ctx, ~s({service_name="api"}))
+    assert %{"streams" => []} = WebSocketClient.next_json(socket)
+    [tailer] = Tail.tailers(ctx.tenant)
+    tailer_ref = Process.monitor(tailer)
+    assert {:ok, follower} = Tail.follower(ctx.tenant)
+    follower_ref = Process.monitor(follower)
+    Process.exit(follower, :kill)
+    assert_receive {:DOWN, ^follower_ref, :process, ^follower, :killed}
+
+    assert {:close, <<1013::16, "tail follower unavailable">>} = WebSocketClient.next_frame(socket, 2_000)
+    WebSocketClient.close(socket)
+    assert_receive {:DOWN, ^tailer_ref, :process, ^tailer, _}, 5_000
+
+    t = now()
+    push(ctx, %{"service_name" => "api"}, [{t, "during reconnect"}])
+    {:ok, reconnected} = tail(ctx, ~s({service_name="api"}))
+    assert %{"streams" => [%{"values" => [[_, "during reconnect"]]}]} = WebSocketClient.next_json(reconnected)
+    push(ctx, %{"service_name" => "api"}, [{t + 1, "live again"}])
+    assert %{"streams" => [%{"values" => [[_, "live again"]]}]} = WebSocketClient.next_json(reconnected)
+    WebSocketClient.close(reconnected)
+  end
+
+  test "registry restart closes existing sockets instead of silently losing membership", ctx do
+    {:ok, socket} = tail(ctx, ~s({service_name="api"}))
+    assert %{"streams" => []} = WebSocketClient.next_json(socket)
+    [tailer] = Tail.tailers(ctx.tenant)
+    ref = Process.monitor(tailer)
+    :ok = Supervisor.stop(Runtime.whereis(Tail.Registry), :shutdown)
+    assert {:close, <<1013::16, "tail follower unavailable">>} = WebSocketClient.next_frame(socket, 2_000)
+    WebSocketClient.close(socket)
+    assert_receive {:DOWN, ^ref, :process, ^tailer, _}, 5_000
+    _ = :sys.get_state(Runtime.whereis(Tail))
+    assert Tail.tailers(ctx.tenant) == []
+
+    {:ok, reconnected} = tail(ctx, ~s({service_name="api"}))
+    assert %{"streams" => []} = WebSocketClient.next_json(reconnected)
+    push(ctx, %{"service_name" => "api"}, [{now(), "after registry restart"}])
+
+    assert %{"streams" => [%{"values" => [[_, "after registry restart"]]}]} =
+             WebSocketClient.next_json(reconnected)
+
+    WebSocketClient.close(reconnected)
+  end
+
+  test "tail supervision unavailability returns HTTP 503 before upgrading", ctx do
+    assert :ok = stop_supervised(Tail)
+    assert {:error, {503, _}} = tail(ctx, ~s({service_name="api"}))
+  end
+
   test "rejects metric queries, plain HTTP and invalid parameters before upgrading", ctx do
     assert {:error, {400, _}} = tail(ctx, ~s<count_over_time({service_name="api"}[1m])>)
     assert {:error, {400, _}} = tail(ctx, ~s({service_name="api"}), limit: "0")

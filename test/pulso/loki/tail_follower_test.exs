@@ -52,9 +52,12 @@ defmodule Pulso.Loki.TailFollowerTest do
     Runtime.put_env(:pulso, S3, config)
     Runtime.put_env(:pulso, Storage, adapter: S3)
     Runtime.put_env(:pulso, Tail, poll_interval_ms: 20)
-    # Configuration is complete before followers start; an immutable context
-    # outlives the test process until supervised children finish shutting down.
+    # Restart the fixture's tail supervisor after its storage dependencies.
+    # Reverse-order shutdown must stop periodic followers before removing the
+    # manifest cache and HTTP store they poll, not just preserve configuration.
+    :ok = stop_supervised(Tail)
     start_supervised!(ManifestSupervision)
+    start_supervised!(Tail)
     {:ok, tenant: "tail-follow-#{System.unique_integer([:positive])}"}
   end
 

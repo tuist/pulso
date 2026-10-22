@@ -393,7 +393,11 @@ large admitted ingest request; no second batch can join it above ordinary credit
 These credits exclude currently processing work, encoded frames and referenced
 request/column arenas, so they are not a bound on total retained memory. A slow
 or oversized stream closes explicitly with WebSocket code **1013**; reconnect
-and query history. A lower configured backlog threshold can still report up to
+and query history. Follower termination or restart also closes affected sockets
+with 1013 instead of silently starting a new live cursor. Reconnecting reads a
+new history window; overlap can repeat entries and does not prove gap-free delivery.
+If local tail supervision is unavailable before upgrade, the request returns
+HTTP **503** and can be retried. A lower configured backlog threshold can still report up to
 100 dropped entries per frame, unfiltered.
 
 Live tail follows segments whose newest event is at most an hour old. A poll
@@ -407,7 +411,10 @@ not a complete changefeed or an exporter-delivery guarantee; query storage for
 durable history and size compaction settle/poll intervals for the workload.
 Entries pushed while no tail is open are not replayed. Each instance accepts
 `PULSO_LOKI_TAIL_MAX_PER_TENANT` concurrent tails per tenant (default 10);
-more return HTTP 429.
+more return HTTP 429. Admission is atomic across simultaneous connections on
+that instance, including connections still preparing history. Slots are released
+when the connection leaves or its process terminates. This is not a deployment-wide
+limit; adding instances increases aggregate tail and object-store polling pressure.
 
 Log queries, live tails and native log-metric scans use the same bounded
 Go/RE2-subset regex policy: ASCII Perl classes/word boundaries, Unicode

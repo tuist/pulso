@@ -7,7 +7,8 @@ defmodule PulsoWeb.LokiTail do
   entries the controller read. Every later frame carries the live entries
   one delivered batch contributed, in Loki's tail shape:
   `{"streams": [...], "dropped_entries": [...] | null}`. If the tenant's
-  follower exits, the socket starts a new one.
+  follower exits, the socket closes with code 1013. A new follower's baseline
+  cannot prove continuity with this socket's previous live cursor.
 
   When more than `:max_backlog` batches wait in the mailbox, batches are
   dropped unfiltered and reported, up to `@max_dropped_reported` per frame,
@@ -56,9 +57,7 @@ defmodule PulsoWeb.LokiTail do
   end
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, %{follower: pid} = state) do
-    {:ok, follower} = Tail.follower(state.tenant)
-    Process.monitor(follower)
-    {:ok, %{state | follower: follower}}
+    {:stop, :normal, {1013, "tail follower unavailable"}, state}
   end
 
   def handle_info(:ping, state) do
