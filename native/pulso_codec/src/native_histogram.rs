@@ -97,8 +97,10 @@ fn doubles(value: &Value, out: &mut Vec<f64>) -> Option<()> {
         Value::Bytes(bytes) if bytes.len() % 8 == 0 => {
             out.extend(
                 bytes
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes(c.try_into().unwrap())),
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_le_bytes(*c)),
             );
             Some(())
         }

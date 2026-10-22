@@ -329,7 +329,7 @@ fn decode_series_v2<'a>(input: &'a [u8], symbols: &[&'a [u8]]) -> Result<SeriesV
         return Err(fail);
     }
     let mut labels = Vec::with_capacity(refs.len() / 2);
-    for pair in refs.chunks_exact(2) {
+    for pair in refs.as_chunks::<2>().0 {
         let name = symbol(pair[0])?;
         if name.is_empty() {
             return Err(fail);

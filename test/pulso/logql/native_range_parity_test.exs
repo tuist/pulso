@@ -106,6 +106,26 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
     assert native_scans >= 80
   end
 
+  test "native literal line filters preserve contains and not-contains results", %{tenant: tenant} do
+    records =
+      for body <- ["hello", "world", "hello world"] do
+        %Log{timestamp_ns: 5 * @second, body: body, resource: %{"app" => "literal-filter"}}
+      end
+
+    assert :ok = Storage.append(:logs, tenant, records)
+
+    end_ts = 30 * @second
+
+    for {filter, expected} <- [{~s/|= "hello"/, 2.0}, {~s/!= "hello"/, 1.0}] do
+      {:ok, ast} = Parser.parse(~s/count_over_time({app="literal-filter"} #{filter} [1m])/)
+
+      assert {:ok, {:vector, [{%{"app" => "literal-filter"}, {^end_ts, ^expected}}]}} =
+               evaluate(MetricEval, ast, tenant, %{end_ts_ns: end_ts})
+
+      assert_received :native_log_metric_scan
+    end
+  end
+
   test "native scans stop at the retained log sample budget", %{tenant: tenant} do
     config = Pulso.Runtime.get_env(:pulso, Evaluator, [])
     Pulso.Runtime.put_env(:pulso, Evaluator, Keyword.put(config, :max_log_samples, 10))

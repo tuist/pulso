@@ -117,12 +117,10 @@ impl<'b> Plan<'b> {
                         .or_insert_with(|| Values::Many(Vec::new()));
                 }
                 (Kind::PackedFixed64 | Kind::PackedDouble, Value::Data(bytes)) => {
-                    for bytes in bytes.chunks_exact(8) {
+                    for bytes in bytes.as_chunks::<8>().0 {
                         self.push(
                             number,
-                            Item::Scalar(Value::Number(u64::from_le_bytes(
-                                bytes.try_into().unwrap(),
-                            ))),
+                            Item::Scalar(Value::Number(u64::from_le_bytes(*bytes))),
                         )?;
                     }
                     // Preserve an explicitly empty repeated field as well.

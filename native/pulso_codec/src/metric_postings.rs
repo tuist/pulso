@@ -262,7 +262,9 @@ fn parse(text: &str) -> Option<Index> {
     }
     let raw: Vec<u8> = text
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let nibble = |b| match b {
                 b'0'..=b'9' => Some(b - b'0'),
@@ -629,7 +631,9 @@ mod tests {
         }
         let mut raw: Vec<u8> = text
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
             .collect();
         let original = raw.clone();

@@ -306,7 +306,9 @@ fn tempo_search_plan_seal<'a>(env: Env<'a>, search: ResourceArc<Search>) -> Term
                 let mut output = rustler::NewBinary::new(env, state.candidates.len() * 32);
                 for (slot, id) in output
                     .as_mut_slice()
-                    .chunks_exact_mut(32)
+                    .as_chunks_mut::<32>()
+                    .0
+                    .iter_mut()
                     .zip(&state.candidates)
                 {
                     slot.copy_from_slice(id.as_bytes());
@@ -340,8 +342,10 @@ fn tempo_search_plan_hashes<'a>(
             }
             let mut prefixes: Vec<_> = hashes
                 .as_slice()
-                .chunks_exact(8)
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_be_bytes(*b))
                 .collect();
             prefixes.sort_unstable();
             prefixes.dedup();
@@ -740,13 +744,13 @@ impl State {
         if let Some(hashes) =
             hashes.filter(|h| !h.is_empty() && h.len() <= 2048 && h.len().is_multiple_of(8))
         {
-            for bytes in hashes.chunks_exact(8) {
+            for bytes in hashes.as_chunks::<8>().0 {
                 if self.plan_probes >= 2_000_000 {
                     return true;
                 }
                 self.plan_probes += 1;
                 if candidates
-                    .binary_search(&u64::from_be_bytes(bytes.try_into().unwrap()))
+                    .binary_search(&u64::from_be_bytes(*bytes))
                     .is_ok()
                 {
                     return true;

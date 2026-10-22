@@ -73,7 +73,9 @@ fn hex(raw: &[u8], width: usize) -> Res<Vec<u8>> {
     {
         return Err(Error::Invalid);
     }
-    raw.chunks_exact(2)
+    raw.as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| {
             u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).map_err(|_| Error::Invalid)
         })
@@ -361,7 +363,7 @@ fn base64(raw: &[u8]) -> Res<Vec<u8>> {
     }
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(raw.len() / 4 * 3);
-    for chunk in raw.chunks_exact(4) {
+    for chunk in raw.as_chunks::<4>().0 {
         let mut n = 0u32;
         let mut padding = 0;
         for b in chunk {

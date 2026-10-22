@@ -112,7 +112,9 @@ pub fn decode_v2<'a>(bytes: &'a [u8], symbols: &[&'a [u8]]) -> Option<Exemplar<'
     }
     let symbol = |r: u64| symbols.get(usize::try_from(r).ok()?).copied();
     let labels = refs
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some((symbol(pair[0])?, symbol(pair[1])?)))
         .collect::<Option<Vec<_>>>()?;
     finish(labels, value, timestamp_ms)

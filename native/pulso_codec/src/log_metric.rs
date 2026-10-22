@@ -94,7 +94,7 @@ enum Filter {
 enum Stage {
     Line {
         negate: bool,
-        finder: Finder<'static>,
+        finder: Box<Finder<'static>>,
     },
     LineRe {
         negate: bool,
@@ -250,7 +250,7 @@ fn stage(term: Term<'_>) -> Res<Stage> {
         let needle = text(parts[1])?.into_bytes();
         Ok(Stage::Line {
             negate: tag == atoms::not_contains(),
-            finder: Finder::new(&needle).into_owned(),
+            finder: Box::new(Finder::new(&needle).into_owned()),
         })
     } else if tag == atoms::match_re() || tag == atoms::not_match_re() {
         Ok(Stage::LineRe {

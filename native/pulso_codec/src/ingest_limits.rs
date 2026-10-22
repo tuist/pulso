@@ -157,7 +157,7 @@ impl Limits {
                 })?;
                 let (mut count, mut bytes) = (0, 0);
                 let symbol = |r: u64| usize::try_from(r).ok().and_then(|i| symbols.get(i));
-                for pair in refs.chunks_exact(2) {
+                for pair in refs.as_chunks::<2>().0 {
                     if let (Some(key), Some(value)) = (symbol(pair[0]), symbol(pair[1])) {
                         self.pair(key, value, &mut count, &mut bytes)?;
                     }
