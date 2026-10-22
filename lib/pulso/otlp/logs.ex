@@ -1,155 +1,200 @@
 defmodule Pulso.OTLP.Logs do
-  @moduledoc """
-  Decode an OTLP/HTTP JSON `ExportLogsServiceRequest` into a flat list of
-  `Pulso.Record.Log`. Follows the JSON encoding described in the OTLP spec:
-  camelCase field names, `AnyValue` wrappers around attribute values, base64
-  for trace and span ids, decimal-string int64 timestamps.
-
-  Only the fields Pulso currently uses are lifted; the rest are dropped. That
-  is intentional for step 1 — the internal record shape is what queriers and
-  the Rust hot path will build on, and adding fields there is cheap.
-  """
-
+  @moduledoc "Decode bounded OTLP JSON/protobuf logs, preserving typed values and resource/scope metadata."
+  alias Pulso.Codec.NIF
+  alias Pulso.OTLP.Traces
+  alias Pulso.OTLP.Value
   alias Pulso.Record.Log
 
-  @doc """
-  Decode a parsed JSON payload.
+  @max_timestamp 9_223_372_036_854_775_807
+  @max_count 4_294_967_295
+  @payload_bytes 16_777_216
 
-  Returns `{records, rejected}`:
-
-    * `records` — the flat list of `Pulso.Record.Log` that survived decoding.
-    * `rejected` — the count of `LogRecord` entries that could not be
-      decoded (missing or malformed `timeUnixNano`, wrong shape, etc.).
-      The OTLP receiver surfaces this to the sender via
-      `ExportLogsPartialSuccess.rejected_log_records` per the OTLP spec so
-      the sender knows some records did not make it into storage.
-  """
-  @spec decode(map()) :: {[Log.t()], non_neg_integer()}
-  def decode(%{"resourceLogs" => resource_logs}) when is_list(resource_logs) do
-    resource_logs
-    |> Enum.reduce({[], 0}, fn rl, {records, rejected} ->
-      {rl_records, rl_rejected} = decode_resource_logs(rl)
-      {[rl_records | records], rejected + rl_rejected}
-    end)
-    |> then(fn {records, rejected} -> {records |> Enum.reverse() |> List.flatten(), rejected} end)
-  end
-
-  # A top-level shape that is not an ExportLogsServiceRequest is not a valid
-  # OTLP body at all — treat every record as rejected (well, zero counted,
-  # since we can't count what we couldn't parse) and return empty.
-  def decode(_), do: {[], 0}
-
-  defp decode_resource_logs(%{"scopeLogs" => scope_logs} = resource_logs) when is_list(scope_logs) do
-    resource_attrs = attributes(resource_logs["resource"])
-    service = resource_attrs["service.name"]
-
-    scope_logs
-    |> Enum.reduce({[], 0}, fn sl, acc -> decode_scope_logs(sl, resource_attrs, service, acc) end)
-    |> then(fn {records, rejected} -> {records |> Enum.reverse() |> List.flatten(), rejected} end)
-  end
-
-  defp decode_resource_logs(_), do: {[], 0}
-
-  defp decode_scope_logs(%{"logRecords" => raw}, resource_attrs, service, {records, rejected}) when is_list(raw) do
-    {sl_records, sl_rejected} =
-      Enum.reduce(raw, {[], 0}, fn record, acc ->
-        decode_and_collect(record, resource_attrs, service, acc)
-      end)
-
-    {[Enum.reverse(sl_records) | records], rejected + sl_rejected}
-  end
-
-  defp decode_scope_logs(_, _, _, acc), do: acc
-
-  defp decode_and_collect(record, resource_attrs, service, {rs, rj}) do
-    case decode_log_record(record, resource_attrs, service) do
-      {:ok, r} -> {[r | rs], rj}
-      :error -> {rs, rj + 1}
+  def decode(%{} = payload) do
+    with :ok <- Pulso.IngestLimits.validate(:otlp, payload),
+         resources when is_list(resources) <- Value.field(payload, "resourceLogs", []),
+         {:ok, records, rejected} <- resources(resources),
+         records = Enum.reverse(records),
+         {:ok, _bytes} <- NIF.log_payload_size(records, @payload_bytes) do
+      {:ok, records, rejected}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_otlp}
     end
   end
 
-  # Per the OTLP logs data model, both `time_unix_nano` and
-  # `observed_time_unix_nano` MAY be absent, and a value of 0 explicitly
-  # means "unknown". The decoder preserves the caller's intent verbatim
-  # (nil for absent or 0). The storage adapter fills a stored timestamp
-  # later so that (a) the caller_content_hash is stable across retries
-  # even when both timestamps are absent, and (b) records with only an
-  # observed time are not lost or misplaced at the Unix epoch.
-  defp decode_log_record(%{} = record, resource_attrs, service) do
-    {:ok,
-     %Log{
-       timestamp_ns: nano_or_nil(record["timeUnixNano"]),
-       observed_timestamp_ns: nano_or_nil(record["observedTimeUnixNano"]),
-       severity_number: record["severityNumber"],
-       severity_text: record["severityText"],
-       service: service,
-       body: any_value(record["body"]),
-       trace_id: nil_if_empty(record["traceId"]),
-       span_id: nil_if_empty(record["spanId"]),
-       attributes: attributes(record),
-       resource: resource_attrs
-     }}
-  end
+  def decode(_), do: {:error, :invalid_otlp}
 
-  defp decode_log_record(_, _, _), do: :error
+  def decode_protobuf(body) do
+    l = Pulso.IngestLimits.config()
 
-  # OTLP: a `*_unix_nano` value of 0 signals "unknown", identical in
-  # meaning to the field being absent. Fold both into nil so downstream
-  # code has one shape to reason about.
-  defp nano_or_nil(nil), do: nil
-  defp nano_or_nil(0), do: nil
-  defp nano_or_nil(value) when is_integer(value), do: value
+    limits =
+      {l.max_records, l.max_attributes, l.max_key_bytes, l.max_value_bytes, l.max_attribute_bytes, min(l.max_depth, 32),
+       l.max_nodes, l.max_otlp_nodes}
 
-  defp nano_or_nil(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {0, ""} -> nil
-      {int, ""} -> int
-      _ -> nil
+    case NIF.decode_otlp_logs(body, limits) do
+      {:ok, payload} -> decode(payload)
+      error -> error
     end
   end
 
-  defp nano_or_nil(_), do: nil
+  @doc false
+  def prepare(records, key) do
+    if key != nil and Enum.any?(records, &is_nil(&1.timestamp_ns)) do
+      {:error, :missing_keyed_timestamp}
+    else
+      now = System.system_time(:nanosecond)
 
-  defp attributes(%{"attributes" => kvs}) when is_list(kvs) do
-    Map.new(kvs, fn
-      %{"key" => key, "value" => value} -> {key, any_value(value)}
-      _ -> {nil, nil}
-    end)
-    |> Map.delete(nil)
-  end
+      records =
+        Enum.map(records, fn
+          %{timestamp_ns: nil} = record ->
+            %{record | timestamp_ns: now, otlp: Map.put(record.otlp, "receivedTimeUnixNano", Integer.to_string(now))}
 
-  defp attributes(_), do: %{}
+          record ->
+            record
+        end)
 
-  defp any_value(nil), do: nil
-  defp any_value(%{"stringValue" => v}), do: v
-  defp any_value(%{"boolValue" => v}), do: v
-  defp any_value(%{"doubleValue" => v}), do: v
-  defp any_value(%{"bytesValue" => v}), do: v
-
-  defp any_value(%{"intValue" => v}) when is_binary(v) do
-    case Integer.parse(v) do
-      {int, ""} -> int
-      _ -> v
+      with {:ok, _} <- NIF.log_payload_size(records, @payload_bytes), do: {:ok, records}
     end
   end
 
-  defp any_value(%{"intValue" => v}), do: v
-
-  defp any_value(%{"arrayValue" => %{"values" => values}}) when is_list(values) do
-    Enum.map(values, &any_value/1)
-  end
-
-  defp any_value(%{"kvlistValue" => %{"values" => kvs}}) when is_list(kvs) do
-    Map.new(kvs, fn
-      %{"key" => key, "value" => value} -> {key, any_value(value)}
-      _ -> {nil, nil}
+  defp resources(resources) do
+    Enum.reduce_while(resources, {:ok, [], 0}, fn resource, acc ->
+      case resource(resource, acc) do
+        {:ok, _, _} = next -> {:cont, next}
+        _ -> {:halt, {:error, :invalid_otlp}}
+      end
     end)
-    |> Map.delete(nil)
   end
 
-  defp any_value(other), do: other
+  defp resource(%{} = owner, acc) do
+    with {:ok, resource, typed} <- metadata(Value.field(owner, "resource", %{}), :resource),
+         {:ok, schema} <- text(Value.field(owner, "schemaUrl", "")),
+         scopes when is_list(scopes) <- Value.field(owner, "scopeLogs", []) do
+      Enum.reduce_while(scopes, acc, &continue_scope(&1, resource, typed, schema, &2))
+    end
+  end
 
-  defp nil_if_empty(nil), do: nil
-  defp nil_if_empty(""), do: nil
-  defp nil_if_empty(value), do: value
+  defp resource(_, _), do: :error
+
+  defp continue_scope(owner, resource, typed, schema, acc) do
+    case scope(owner, resource, typed, schema, acc) do
+      {:ok, _, _} = next -> {:cont, next}
+      _ -> {:halt, :error}
+    end
+  end
+
+  defp scope(%{} = owner, resource, typed, schema, {:ok, records, rejected}) do
+    with {:ok, _scope_attrs, scope} <- metadata(Value.field(owner, "scope", %{}), :scope),
+         {:ok, scope_schema} <- text(Value.field(owner, "schemaUrl", "")),
+         logs when is_list(logs) <- Value.field(owner, "logRecords", []) do
+      base = %Log{
+        resource: resource,
+        service: service(resource["service.name"]),
+        otlp: %{
+          "resource" => typed,
+          "resourceSchemaUrl" => schema,
+          "scope" => scope,
+          "scopeSchemaUrl" => scope_schema
+        }
+      }
+
+      Enum.reduce(logs, {:ok, records, rejected}, &collect(&1, base, &2))
+    end
+  end
+
+  defp scope(_, _, _, _, _), do: :error
+
+  defp metadata(%{} = owner, kind) do
+    with true <- Value.field(owner, "entityRefs", []) == [],
+         {:ok, attrs, typed} <- Value.attributes(owner),
+         {:ok, count} <- Value.integer(Value.field(owner, "droppedAttributesCount", 0), 0, @max_count) do
+      metadata = %{"attributes" => typed, "droppedAttributesCount" => count}
+
+      complete_metadata(kind, owner, attrs, metadata)
+    end
+  end
+
+  defp metadata(_, _), do: :error
+
+  defp complete_metadata(:scope, owner, attrs, metadata) do
+    with {:ok, name} <- text(Value.field(owner, "name", "")),
+         {:ok, version} <- text(Value.field(owner, "version", "")),
+         do: {:ok, attrs, Map.merge(metadata, %{"name" => name, "version" => version})}
+  end
+
+  defp complete_metadata(:resource, _, attrs, metadata), do: {:ok, attrs, metadata}
+
+  defp collect(raw, base, {:ok, records, rejected}) do
+    case record(raw, base) do
+      {:ok, log} -> {:ok, [log | records], rejected}
+      _ -> {:ok, records, rejected + 1}
+    end
+  end
+
+  defp record(%{} = raw, base) do
+    with {:ok, timestamp} <- timestamp(Value.field(raw, "timeUnixNano", 0)),
+         {:ok, observed} <- timestamp(Value.field(raw, "observedTimeUnixNano", 0)),
+         {:ok, severity} <- Value.integer(Value.field(raw, "severityNumber", 0), 0, 24),
+         {:ok, severity_text} <- text(Value.field(raw, "severityText", "")),
+         {:ok, event} <- text(Value.field(raw, "eventName", "")),
+         {:ok, flags} <- Value.integer(Value.field(raw, "flags", 0), 0, @max_count),
+         {:ok, dropped} <- Value.integer(Value.field(raw, "droppedAttributesCount", 0), 0, @max_count),
+         {:ok, trace} <- id(Value.field(raw, "traceId", ""), 32),
+         {:ok, span} <- id(Value.field(raw, "spanId", ""), 16),
+         {:ok, attrs, typed_attrs} <- Value.attributes(raw),
+         {:ok, body, typed_body} <- Value.decode(Value.field(raw, "body", %{})) do
+      otlp =
+        Map.merge(base.otlp, %{
+          "timeUnixNano" => Integer.to_string(timestamp || 0),
+          "observedTimeUnixNano" => Integer.to_string(observed || 0),
+          "traceId" => original_id(Value.field(raw, "traceId", ""), trace),
+          "spanId" => original_id(Value.field(raw, "spanId", ""), span),
+          "body" => typed_body,
+          "attributes" => typed_attrs,
+          "flags" => flags,
+          "droppedAttributesCount" => dropped,
+          "eventName" => event
+        })
+
+      {:ok,
+       %{
+         base
+         | timestamp_ns: timestamp || observed,
+           observed_timestamp_ns: observed,
+           severity_number: severity,
+           severity_text: severity_text,
+           trace_id: trace,
+           span_id: span,
+           attributes: attrs,
+           body: body,
+           otlp: otlp
+       }}
+    end
+  end
+
+  defp record(_, _), do: :error
+
+  defp timestamp(value) do
+    case Value.integer(value, 0, @max_timestamp) do
+      {:ok, 0} -> {:ok, nil}
+      result -> result
+    end
+  end
+
+  defp id("", _length), do: {:ok, nil}
+
+  defp id(value, length) when is_binary(value) do
+    case Traces.id(value, length) do
+      {:ok, _} = ok -> ok
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp id(_, _), do: :error
+  defp original_id(_raw, value) when is_binary(value), do: value
+  defp original_id(raw, nil), do: :binary.copy(raw)
+  defp text(value) when is_binary(value), do: {:ok, :binary.copy(value)}
+  defp text(_), do: :error
+  defp service(value) when is_binary(value), do: value
+  defp service(_), do: nil
 end

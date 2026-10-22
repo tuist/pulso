@@ -1,0 +1,17 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"regexp"
+)
+
+func main() {
+	cases := []map[string]any{}
+	for _, p := range []string{`^\w$`, `(?i)^\w$`, `(?i)^\W$`, `^[\W]$`, `(?i)^[\W]$`, `^\s$`, `^[\S]$`, `^\v$`, `\bfoo\b`, `^.$`, `[\W^a]`, `[^\W^a]`, `[\W^]`, `[^\W^]`, `[a\W-z]`, `^a}*$`, `^\{2}*$`} {
+		for _, v := range []string{"a", "é", "٣", "ſ", "K", "\v", "a\n", "éfooé", "^", "b", "c", "a}}", "{2}}"} {
+			cases = append(cases, map[string]any{"pattern": p, "value": v, "match": regexp.MustCompile(p).MatchString(v)})
+		}
+	}
+	json.NewEncoder(os.Stdout).Encode(cases)
+}

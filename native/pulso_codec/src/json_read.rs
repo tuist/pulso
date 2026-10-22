@@ -7,6 +7,9 @@
 //! range, floats that overflow, lone surrogates, duplicate object keys
 //! (Elixir keeps the first), and nesting deeper than `MAX_DEPTH`.
 //!
+//! Schema-aware callers explicitly opt into integral-lexeme callbacks via
+//! `document_in`; ordinary document/value APIs retain their existing semantics.
+//!
 //! Strings without escapes are handed to the builder as slices of the
 //! input so they can become sub-binaries instead of copies.
 
@@ -29,11 +32,33 @@ pub enum Number {
     Float(f64),
 }
 
+/// Optional schema context. Ordinary JSON never requests integer lexemes.
+pub trait Context: Copy {
+    fn key(self, key: &[u8]) -> Self;
+    // Zero means unknown. Schema-aware callers assign distinct known-field bits.
+    fn field_bit(self, _key: &[u8]) -> u64 {
+        0
+    }
+    fn integer(self) -> bool {
+        false
+    }
+}
+#[derive(Clone, Copy)]
+struct Ordinary;
+impl Context for Ordinary {
+    fn key(self, _: &[u8]) -> Self {
+        self
+    }
+}
+
 pub trait Builder<'a> {
     type Value;
     fn null(&mut self) -> Res<Self::Value>;
     fn boolean(&mut self, v: bool) -> Res<Self::Value>;
     fn number(&mut self, n: Number) -> Res<Self::Value>;
+    fn integer_literal(&mut self, _raw: &'a [u8]) -> Res<Self::Value> {
+        Err(Fallback)
+    }
     fn string(&mut self, s: Cow<'a, [u8]>) -> Res<Self::Value>;
     /// An object key; builders can intern these since keys repeat.
     fn key(&mut self, s: Cow<'a, [u8]>) -> Res<Self::Value> {
@@ -93,8 +118,17 @@ impl<'a> Parser<'a> {
         b: &mut B,
         st: &mut Stacks<B::Value>,
     ) -> Res<B::Value> {
+        self.document_in(b, st, Ordinary)
+    }
+
+    pub fn document_in<B: Builder<'a>, C: Context>(
+        &mut self,
+        b: &mut B,
+        st: &mut Stacks<B::Value>,
+        context: C,
+    ) -> Res<B::Value> {
         self.ws();
-        let v = self.value(b, st)?;
+        let v = self.value_in(b, st, context)?;
         self.ws();
         self.end()?;
         Ok(v)
@@ -139,18 +173,34 @@ impl<'a> Parser<'a> {
     }
 
     pub fn value<B: Builder<'a>>(&mut self, b: &mut B, st: &mut Stacks<B::Value>) -> Res<B::Value> {
+        self.value_in(b, st, Ordinary)
+    }
+
+    fn value_in<B: Builder<'a>, C: Context>(
+        &mut self,
+        b: &mut B,
+        st: &mut Stacks<B::Value>,
+        context: C,
+    ) -> Res<B::Value> {
         match self.peek()? {
             b'{' => {
                 self.enter()?;
                 self.pos += 1;
                 let (k0, v0) = (st.keys.len(), st.values.len());
+                let mut seen = 0u64;
                 if self.object_open()? {
                     loop {
                         let key = self.string()?;
+                        let bit = context.field_bit(&key);
+                        if seen & bit != 0 {
+                            return Err(Fallback);
+                        }
+                        seen |= bit;
+                        let child = context.key(&key);
                         let key = b.key(key)?;
                         st.keys.push(key);
                         self.colon()?;
-                        let value = self.value(b, st)?;
+                        let value = self.value_in(b, st, child)?;
                         st.values.push(value);
                         if !self.object_next()? {
                             break;
@@ -173,7 +223,7 @@ impl<'a> Parser<'a> {
                 } else {
                     loop {
                         self.ws();
-                        let item = self.value(b, st)?;
+                        let item = self.value_in(b, st, context)?;
                         st.values.push(item);
                         self.ws();
                         match self.peek()? {
@@ -208,8 +258,13 @@ impl<'a> Parser<'a> {
                 b.null()
             }
             b'-' | b'0'..=b'9' => {
-                let n = self.number()?;
-                b.number(n)
+                if context.integer() {
+                    let raw = self.number_literal()?;
+                    b.integer_literal(raw)
+                } else {
+                    let n = self.number()?;
+                    b.number(n)
+                }
             }
             _ => Err(Fallback),
         }
@@ -285,6 +340,33 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(fields)
+    }
+
+    /// Top-level array values as validated slices, without materializing trees.
+    pub fn raw_array(&mut self) -> Res<Vec<&'a [u8]>> {
+        self.ws();
+        self.expect(b'[')?;
+        self.ws();
+        let mut values = Vec::new();
+        if self.peek()? == b']' {
+            self.pos += 1;
+            return Ok(values);
+        }
+        loop {
+            values.push(self.skip_value()?);
+            self.ws();
+            match self.peek()? {
+                b']' => {
+                    self.pos += 1;
+                    return Ok(values);
+                }
+                b',' => {
+                    self.pos += 1;
+                    self.ws();
+                }
+                _ => return Err(Fallback),
+            }
+        }
     }
 
     /// Validate a value and return its raw slice.
@@ -377,6 +459,37 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         self.pos - start
+    }
+
+    // Lexical validation only: integral OTLP fields must not first round through f64.
+    fn number_literal(&mut self) -> Res<&'a [u8]> {
+        let start = self.pos;
+        if self.peek()? == b'-' {
+            self.pos += 1;
+        }
+        match self.peek()? {
+            b'0' => self.pos += 1,
+            b'1'..=b'9' => {
+                self.digits();
+            }
+            _ => return Err(Fallback),
+        }
+        if self.buf.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            if self.digits() == 0 {
+                return Err(Fallback);
+            }
+        }
+        if let Some(b'e' | b'E') = self.buf.get(self.pos) {
+            self.pos += 1;
+            if let Some(b'+' | b'-') = self.buf.get(self.pos) {
+                self.pos += 1;
+            }
+            if self.digits() == 0 {
+                return Err(Fallback);
+            }
+        }
+        Ok(&self.buf[start..self.pos])
     }
 
     fn number(&mut self) -> Res<Number> {

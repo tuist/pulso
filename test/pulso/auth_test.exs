@@ -81,5 +81,39 @@ defmodule Pulso.AuthTest do
       assert SharedSecret.verify(conn([{"authorization", "Bearer whatever"}]), "acme") ==
                {:error, :invalid_token}
     end
+
+    test "accepts Basic credentials for the username's tenant", %{token: token} do
+      basic = "Basic " <> Base.encode64("acme:#{token}")
+      assert SharedSecret.verify(conn([{"authorization", basic}]), "acme") == :ok
+      assert SharedSecret.verify(conn([{"authorization", "basic " <> Base.encode64("acme:#{token}")}]), "acme") == :ok
+    end
+
+    test "Basic credentials never authorize another tenant", %{token: token} do
+      basic = "Basic " <> Base.encode64("acme:#{token}")
+      assert SharedSecret.verify(conn([{"authorization", basic}]), "other") == {:error, :invalid_token}
+    end
+
+    test "rejects a wrong or malformed Basic password" do
+      assert SharedSecret.verify(conn([{"authorization", "Basic " <> Base.encode64("acme:nope")}]), "acme") ==
+               {:error, :invalid_token}
+
+      for bad <- ["Basic !!!", "Basic " <> Base.encode64("acme"), "Basic " <> Base.encode64("acme:")] do
+        assert SharedSecret.verify(conn([{"authorization", bad}]), "acme") == {:error, :missing_token}
+      end
+    end
+  end
+
+  describe "PulsoWeb.BasicTenant" do
+    test "names the Basic username as tenant only when no tenant header is present" do
+      basic = {"authorization", "Basic " <> Base.encode64("acme:secret")}
+
+      assert Plug.Conn.get_req_header(PulsoWeb.BasicTenant.call(conn([basic]), []), "x-scope-orgid") == ["acme"]
+
+      explicit = PulsoWeb.BasicTenant.call(conn([basic, {"x-scope-orgid", "beta"}]), [])
+      assert Plug.Conn.get_req_header(explicit, "x-scope-orgid") == ["beta"]
+
+      bearer = PulsoWeb.BasicTenant.call(conn([{"authorization", "Bearer x"}]), [])
+      assert Plug.Conn.get_req_header(bearer, "x-scope-orgid") == []
+    end
   end
 end

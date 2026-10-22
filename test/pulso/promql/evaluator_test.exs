@@ -99,6 +99,8 @@ defmodule Pulso.PromQL.EvaluatorTest do
 
   test "unexpected task crashes are execution failures" do
     Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: Pulso.MissingAdapter)
+    # The crash, not the default 10 s deadline, must end this query under load.
+    Pulso.Runtime.put_env(:pulso, Pulso.QueryRunner, timeout_ms: 60_000)
 
     ExUnit.CaptureLog.capture_log(fn ->
       assert {:error, :query_execution_failed} = instant("m", 1)

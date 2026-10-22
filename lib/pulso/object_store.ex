@@ -31,12 +31,13 @@ defmodule Pulso.ObjectStore do
   def ensure_retention_api! do
     version =
       try do
-        NIF.retention_api_version()
+        {NIF.retention_api_version(), NIF.keyed_publication_api_version(), NIF.snapshot_api_version(),
+         NIF.async_api_version()}
       rescue
         ErlangError -> :unavailable
       end
 
-    if version != 1 do
+    if version != {1, 1, 1, 1} do
       raise "object-store native artifact is incompatible with this Pulso release; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
     end
 
@@ -45,7 +46,7 @@ defmodule Pulso.ObjectStore do
 
   @spec put(config(), String.t(), binary()) :: {:ok, etag()} | {:error, term()}
   def put(config, key, data) when is_map(config) and is_binary(key) and is_binary(data) do
-    observe("put", key, byte_size(data), fn -> normalize(NIF.put(normalize_config(config), key, data)) end)
+    observe("put", key, byte_size(data), fn -> normalize(await(&NIF.put(&1, normalize_config(config), key, data))) end)
   end
 
   # Creates the object only if no object exists at that key (`If-None-Match: *`).
@@ -56,7 +57,7 @@ defmodule Pulso.ObjectStore do
           {:ok, etag()} | {:error, :already_exists | term()}
   def put_if_none_match(config, key, data) when is_map(config) and is_binary(key) and is_binary(data) do
     observe("put_if_none_match", key, byte_size(data), fn ->
-      normalize(NIF.put_if_none_match(normalize_config(config), key, data))
+      normalize(await(&NIF.put_if_none_match(&1, normalize_config(config), key, data)))
     end)
   end
 
@@ -68,18 +69,40 @@ defmodule Pulso.ObjectStore do
   def put_if_match(config, key, data, etag)
       when is_map(config) and is_binary(key) and is_binary(data) and is_binary(etag) do
     observe("put_if_match", key, byte_size(data), fn ->
-      normalize(NIF.put_if_match(normalize_config(config), key, data, etag))
+      normalize(await(&NIF.put_if_match(&1, normalize_config(config), key, data, etag)))
     end)
   end
 
   @spec get(config(), String.t()) :: {:ok, binary()} | {:error, term()}
   def get(config, key) when is_map(config) and is_binary(key) do
     observe("get", key, 0, fn ->
-      case NIF.get(normalize_config(config), key) do
+      case await(&NIF.get(&1, normalize_config(config), key)) do
         {:ok, data} -> {:ok, data}
         other -> normalize(other)
       end
     end)
+  end
+
+  @doc "Verify exact existing object bytes by streaming, without allocating a second body binary."
+  @spec verify(config(), String.t(), binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def verify(config, key, expected, timeout_ms \\ 15_000)
+  def verify(_config, _key, _expected, 0), do: {:error, :timeout}
+
+  def verify(config, key, expected, timeout_ms)
+      when is_map(config) and is_binary(key) and is_binary(expected) and timeout_ms in 1..15_000 do
+    # Measure a provider GET, including consumed bytes on a successful GET
+    # whose content mismatches. This is not provider-billed wire accounting:
+    # header rejection may consume no streamed body but still costs a GET.
+    result =
+      observe("get", key, 0, fn ->
+        normalize(await(&NIF.verify(&1, normalize_config(config), key, expected, timeout_ms)))
+      end)
+
+    case result do
+      {:ok, true, _read} -> :ok
+      {:ok, false, _read} -> {:error, :keyed_content_mismatch}
+      {:error, _} = error -> error
+    end
   end
 
   # Conditional GET. `etag` may be `nil` (or `""`) to force a full read.
@@ -94,7 +117,7 @@ defmodule Pulso.ObjectStore do
     etag_string = etag || ""
 
     observe("get_if_none_match", key, 0, fn ->
-      case NIF.get_if_none_match(normalize_config(config), key, etag_string) do
+      case await(&NIF.get_if_none_match(&1, normalize_config(config), key, etag_string)) do
         {:ok, new_etag, data} -> {:ok, new_etag, data}
         other -> normalize(other)
       end
@@ -104,7 +127,14 @@ defmodule Pulso.ObjectStore do
   @doc "Conditional metadata GET with a native, pre-allocation body limit."
   def get_bounded(config, key, etag, limit) when is_integer(limit) and limit > 0 do
     observe("get_if_none_match", key, 0, fn ->
-      normalize(NIF.get_bounded(normalize_config(config), key, etag || "", limit))
+      normalize(await(&NIF.get_bounded(&1, normalize_config(config), key, etag || "", limit)))
+    end)
+  end
+
+  @doc "Bounded strong-ETag snapshot GET; suffix zero reads the complete matching object."
+  def get_snapshot(config, key, etag, suffix, limit, timeout_ms) do
+    observe("get", key, 0, fn ->
+      normalize(await(&NIF.get_snapshot(&1, normalize_config(config), key, etag || "", suffix, limit, timeout_ms)))
     end)
   end
 
@@ -114,7 +144,7 @@ defmodule Pulso.ObjectStore do
       {:error, :invalid_list_cursor}
     else
       observe("list", prefix, 0, fn ->
-        normalize(NIF.list_page(normalize_config(config), prefix, after_key || "", limit))
+        normalize(await(&NIF.list_page(&1, normalize_config(config), prefix, after_key || "", limit)))
       end)
     end
   end
@@ -122,24 +152,24 @@ defmodule Pulso.ObjectStore do
   @doc "Bounded tenant discovery that jumps over each ASCII managed subtree."
   def discover_tenants(config, after_tenant \\ nil, limit \\ 16) when limit in 1..64 do
     observe("list_prefixes", "tenants/", 0, fn ->
-      normalize(NIF.discover_tenants(normalize_config(config), after_tenant || "", limit))
+      normalize(await(&NIF.discover_tenants(&1, normalize_config(config), after_tenant || "", limit)))
     end)
   end
 
   @doc "Retention DELETE with four native in-flight slots that survive BEAM caller termination."
   def delete_bounded(config, key) do
-    observe("delete", key, 0, fn -> normalize(NIF.delete_bounded(normalize_config(config), key)) end)
+    observe("delete", key, 0, fn -> normalize(await(&NIF.delete_bounded(&1, normalize_config(config), key))) end)
   end
 
   @spec delete(config(), String.t()) :: :ok | {:error, term()}
   def delete(config, key) when is_map(config) and is_binary(key) do
-    observe("delete", key, 0, fn -> normalize(NIF.delete(normalize_config(config), key)) end)
+    observe("delete", key, 0, fn -> normalize(await(&NIF.delete(&1, normalize_config(config), key))) end)
   end
 
   @spec list(config(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
   def list(config, prefix \\ "") when is_map(config) and is_binary(prefix) do
     observe("list", prefix, 0, fn ->
-      case NIF.list(normalize_config(config), prefix) do
+      case await(&NIF.list(&1, normalize_config(config), prefix)) do
         {:ok, keys} -> {:ok, keys}
         other -> normalize(other)
       end
@@ -149,7 +179,27 @@ defmodule Pulso.ObjectStore do
   @doc "List immediate directory prefixes, following provider pagination without materializing descendant object keys."
   @spec list_prefixes(config(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
   def list_prefixes(config, prefix) when is_map(config) and is_binary(prefix) do
-    observe("list_prefixes", prefix, 0, fn -> normalize(NIF.list_prefixes(normalize_config(config), prefix)) end)
+    observe("list_prefixes", prefix, 0, fn ->
+      normalize(await(&NIF.list_prefixes(&1, normalize_config(config), prefix)))
+    end)
+  end
+
+  # Requests run on the native runtime, not on a BEAM scheduler: the NIF starts
+  # one and returns `:ok`, then sends `{ref, result}` here when it completes.
+  # The caller waits in an ordinary receive, so slow providers hold no dirty
+  # scheduler. A fresh reference keeps the receive selective and O(1).
+  defp await(start) do
+    ref = make_ref()
+
+    case start.(ref) do
+      :ok ->
+        receive do
+          {^ref, result} -> result
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp observe(operation, key, write_bytes, fun) do
@@ -168,6 +218,8 @@ defmodule Pulso.ObjectStore do
       fn
         {:ok, _etag, body} when is_binary(body) -> %{read: byte_size(body)}
         {:ok, body} when operation == "get" and is_binary(body) -> %{read: byte_size(body)}
+        {:ok, matched?, bytes} when is_boolean(matched?) and is_integer(bytes) -> %{read: bytes}
+        {:ok, _etag, _size, body} when is_binary(body) -> %{read: byte_size(body)}
         {:ok, _} when operation in ["put", "put_if_match", "put_if_none_match"] -> %{write: write_bytes}
         _ -> %{}
       end,
@@ -184,6 +236,12 @@ defmodule Pulso.ObjectStore do
       case {operation, result} do
         {:get, {:ok, data}} ->
           Pulso.SelfMetrics.object_bytes(:read, byte_size(data))
+
+        {:get, {:ok, _etag, _size, body}} when is_binary(body) ->
+          Pulso.SelfMetrics.object_bytes(:read, byte_size(body))
+
+        {:get, {:ok, matched?, bytes}} when is_boolean(matched?) and is_integer(bytes) ->
+          Pulso.SelfMetrics.object_bytes(:read, bytes)
 
         {:get_if_none_match, {:ok, _etag, data}} ->
           Pulso.SelfMetrics.object_bytes(:read, byte_size(data))

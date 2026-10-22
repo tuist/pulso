@@ -14,10 +14,17 @@ defmodule Pulso.Storage.S3.PagedManifest do
   alias Pulso.Storage.S3.MetadataCache
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.RetentionCatchup
+  alias Pulso.Storage.S3.TraceSummary
 
   @root_bytes 524_288
   @leaf_bytes 65_536
   @index_bytes 524_288
+  # Reserve two worst-case refs for expiry (the tail is at most one leaf),
+  # Owner batches add at most 64 KiB of wire entries; together with the
+  # committed tail they need at most four refs (byte/count chunk boundaries).
+  # Never assume tiny metric refs.
+  @reference_bytes 4096
+  @expiry_reserve 2 * @reference_bytes
   @day_ns 86_400_000_000_000
 
   def nonce, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
@@ -121,7 +128,7 @@ defmodule Pulso.Storage.S3.PagedManifest do
   def migrate(manifest, tenant, signal, days, config) do
     with_budget(config, fn ->
       hour = 3_600_000_000_000
-      window = Retention.window_ns(days, config)
+      window = Retention.window_ns(days, config, signal)
       required_hours = div(window + 508 * hour - 1, 508 * hour)
       width = Map.get(config, :retention_bucket_width_ns, max(1, required_hours) * hour)
       if div(days * @day_ns, width) + 4 > 2048, do: fail(:retention_capacity)
@@ -266,8 +273,9 @@ defmodule Pulso.Storage.S3.PagedManifest do
   end
 
   defp bucket_capacity!(bucket, _root, config) do
-    if Map.get(bucket, "leaf_count", 0) >= 1023 or (bucket["index"] && bucket["index"]["b"] > @index_bytes - 4096),
-      do: fail(:retention_capacity)
+    if Map.get(bucket, "leaf_count", 0) >= 1020 or
+         (bucket["index"] && bucket["index"]["b"] > @index_bytes - @expiry_reserve - 4 * @reference_bytes),
+       do: fail(:retention_capacity)
 
     ensure_mutable!(bucket, config)
   end
@@ -306,9 +314,16 @@ defmodule Pulso.Storage.S3.PagedManifest do
     end
 
     case lookup(root, s, tenant, signal, config) do
-      :active -> refresh_active(root, s, tenant, signal, config)
-      {:retired, ref, entry, bucket} -> revive_retired(root, s, ref, entry, bucket, tenant, signal, config)
-      :absent -> add_inline(root, s)
+      :active ->
+        refresh_active(root, s, tenant, signal, config)
+
+      {:retired, ref, entry, bucket} ->
+        revive_retired(root, s, ref, entry, bucket, tenant, signal, config)
+
+      :absent ->
+        start = bucket_start(root.paging, s.max_ts)
+        bucket_capacity!(Enum.find(root.paging["buckets"], &(&1["start"] == start)), root, config)
+        add_inline(root, s)
     end
   end
 
@@ -365,15 +380,18 @@ defmodule Pulso.Storage.S3.PagedManifest do
   end
 
   def query(root, tenant, signal, opts, config) do
-    # Sparse long ranges may have one index and one leaf per bucket. Keep the
-    # byte budget fixed; allow bounded index fanout without limiting a week of
-    # sparse telemetry to 128 buckets.
+    # Sparse ranges need bounded index fanout. Exact trace lookup additionally
+    # reserves 64 KiB per live overlapping bucket for pruning indexes, capped at
+    # 32 MiB total. Explicit caller configuration is never raised. Maintenance
+    # and all other searches keep the original 8 MiB default.
     config =
       Map.put(
         config,
         :retention_metadata_pages,
         max(Map.get(config, :retention_metadata_pages, 128), 128 + 2 * length(root.paging["buckets"]))
       )
+
+    config = Map.put_new(config, :retention_metadata_scan_bytes, query_metadata_bytes(root, signal, opts))
 
     with_budget(config, fn ->
       Enum.each(root.segments, &validate_segment!(&1, tenant, signal))
@@ -386,7 +404,11 @@ defmodule Pulso.Storage.S3.PagedManifest do
         scan = %{
           start_ts: start_ts,
           end_ts: end_ts,
-          maximum: Keyword.get(opts, :max_scan_segments) || 1024,
+          # Limited trace scans charge objects actually visited. Metadata remains
+          # independently page/byte bounded; do not reject older candidates that
+          # a strict native timestamp boundary can safely skip.
+          maximum: query_maximum(signal, opts),
+          opts: opts,
           match: fn s -> Segment.intersects?(s, start_ts, end_ts) and matches?(s, signal, opts) end
         }
 
@@ -394,6 +416,38 @@ defmodule Pulso.Storage.S3.PagedManifest do
       end
     end)
   end
+
+  defp limited_trace_scan?("traces", opts),
+    do:
+      is_nil(opts[:trace_search]) and is_nil(opts[:tempo_search]) and is_nil(opts[:tempo_discovery]) and
+        is_integer(opts[:limit]) and opts[:limit] in 1..5000
+
+  defp limited_trace_scan?(_signal, _opts), do: false
+
+  defp query_maximum(signal, opts) do
+    cond do
+      signal == "traces" and is_binary(TraceSummary.service_filter(opts[:tempo_search])) ->
+        TraceSummary.plan_catalog_limit()
+
+      limited_trace_scan?(signal, opts) ->
+        nil
+
+      true ->
+        opts[:max_scan_segments] || 1024
+    end
+  end
+
+  defp query_metadata_bytes(root, "traces", opts) do
+    if is_binary(opts[:trace_id]) and byte_size(opts[:trace_id]) == 32 do
+      start = max(floor(root), opts[:start_ts] || floor(root))
+      live = Enum.count(root.paging["buckets"], &(&1["state"] == "live" and intersects?(&1, start, opts[:end_ts])))
+      min(32 * 1024 * 1024, 8 * 1024 * 1024 + live * 64 * 1024)
+    else
+      8 * 1024 * 1024
+    end
+  end
+
+  defp query_metadata_bytes(_root, _signal, _opts), do: 8 * 1024 * 1024
 
   # Reads one index per overlapping live bucket and only overlapping leaves;
   # exceeding the segment budget fails rather than truncating.
@@ -403,16 +457,16 @@ defmodule Pulso.Storage.S3.PagedManifest do
       |> Enum.filter(&(&1["state"] == "live" and intersects?(&1, scan.start_ts, scan.end_ts)))
       |> Enum.reduce(Enum.filter(root.segments, scan.match), &scan_bucket(&1, &2, scan, tenant, signal, config))
 
-    if length(result) > scan.maximum, do: fail(:query_scan_limit)
+    if scan.maximum != nil and length(result) > scan.maximum, do: fail(:query_scan_limit)
     Enum.sort_by(result, & &1.max_ts, :desc)
   end
 
   defp scan_bucket(bucket, rows, scan, tenant, signal, config) do
     index(bucket, tenant, signal, config)["active"]
-    |> Enum.filter(&intersects?(&1, scan.start_ts, scan.end_ts))
+    |> Enum.filter(&(intersects?(&1, scan.start_ts, scan.end_ts) and leaf_matches?(&1, signal, scan.opts)))
     |> Enum.reduce(rows, fn ref, rows ->
       found = ref |> page_segments(bucket, tenant, signal, config) |> Enum.filter(scan.match)
-      if length(rows) + length(found) > scan.maximum, do: fail(:query_scan_limit)
+      if scan.maximum != nil and length(rows) + length(found) > scan.maximum, do: fail(:query_scan_limit)
       found ++ rows
     end)
   end
@@ -566,7 +620,25 @@ defmodule Pulso.Storage.S3.PagedManifest do
         affected ++ extras
       end
 
-    Enum.reduce(starts, root, fn start, r -> spill_bucket(r, bucket!(r, start), tenant, signal, config) end)
+    Enum.reduce(starts, root, fn start, r ->
+      if affected == nil or start in affected do
+        spill_bucket(r, bucket!(r, start), tenant, signal, config)
+      else
+        spill_extra(r, start, tenant, signal, config)
+      end
+    end)
+  end
+
+  defp spill_extra(root, start, tenant, signal, config) do
+    spill_bucket(root, bucket!(root, start), tenant, signal, config)
+  catch
+    {:paged_manifest, :retention_capacity} -> spill_extra_without_summary(root, start, tenant, signal, config)
+  end
+
+  defp spill_extra_without_summary(root, start, tenant, signal, config) do
+    spill_bucket(root, bucket!(root, start), tenant, signal, Map.put(config, :retention_omit_summaries, true))
+  catch
+    {:paged_manifest, :retention_capacity} -> root
   end
 
   def spill_bucket(root, bucket, tenant, signal, config) do
@@ -659,6 +731,7 @@ defmodule Pulso.Storage.S3.PagedManifest do
 
     case Pulso.JSON.decode(body) do
       {:ok, data} ->
+        data = Pulso.JSON.detach(data)
         if limit == @leaf_bytes, do: validate_leaf!(data, name, tenant, signal)
         data
 
@@ -737,29 +810,42 @@ defmodule Pulso.Storage.S3.PagedManifest do
     sha = digest(body)
     key = bucket_prefix(tenant, signal, bucket) <> binary_part(sha, 0, 32) <> "-#{kind}-#{sha}.json"
 
+    summary = pruning_summary(signal, kind, data, config)
+
     case ObjectStore.put_if_none_match(config, key, body) do
       {:ok, _} ->
-        page_written(key, body, sha, kind, data)
+        page_written(key, body, sha, kind, data, summary)
 
       {:error, reason} when reason in [:already_exists, :precondition_failed] ->
-        page_written(key, body, sha, kind, data)
+        page_written(key, body, sha, kind, data, summary)
 
       {:error, reason} ->
         fail(reason)
     end
   end
 
-  # Live index pages keep 2 KiB in reserve for a bucket's final expiry spill.
+  defp pruning_summary("traces", "active", data, config) do
+    if config[:retention_expiry_spill] != true and config[:retention_omit_summaries] != true,
+      do: TraceSummary.page_summary(data)
+  end
+
+  defp pruning_summary(_signal, _kind, _data, _config), do: nil
+
+  # Expiry never needs pruning summaries: the bucket becomes invisible in the
+  # same root transition. This also lets old large-summary roots drain safely.
+  # Live indexes reserve space derived from the enforced reference bound.
   defp page_limit(bucket, "index", config) do
     if bucket["state"] == "live" and config[:retention_expiry_spill] != true,
-      do: @index_bytes - 2048,
+      do: @index_bytes - @expiry_reserve,
       else: @index_bytes
   end
 
   defp page_limit(_bucket, _kind, _config), do: @leaf_bytes
 
-  defp page_written(key, body, sha, kind, data) do
+  defp page_written(key, body, sha, kind, data, summary) do
     ref = page_ref(%{"k" => key, "b" => byte_size(body), "sha" => sha}, kind, data)
+    ref = if summary, do: Map.put(ref, "q", summary), else: ref
+    ref = bounded_reference(ref)
     MetadataCache.put(ref, data)
 
     case Process.get(:pulso_metadata_budget) do
@@ -769,6 +855,14 @@ defmodule Pulso.Storage.S3.PagedManifest do
 
     ref
   end
+
+  defp bounded_reference(ref) do
+    ref = if ref_bytes(ref) > @reference_bytes, do: Map.delete(ref, "q"), else: ref
+    if ref_bytes(ref) > @reference_bytes, do: fail(:retention_capacity)
+    ref
+  end
+
+  defp ref_bytes(ref), do: IO.iodata_length(Pulso.JSON.encode_to_iodata!(ref))
 
   defp page_ref(ref, kind, data) do
     ref =
@@ -813,7 +907,8 @@ defmodule Pulso.Storage.S3.PagedManifest do
   end
 
   def write_index(root, bucket, idx, tenant, signal, config, new_bytes \\ 0) do
-    if length(idx["active"]) + length(idx["retired"]) > 1024, do: fail(:retention_capacity)
+    leaf_limit = if config[:retention_expiry_spill] == true, do: 1024, else: 1023
+    if length(idx["active"]) + length(idx["retired"]) > leaf_limit, do: fail(:retention_capacity)
     mutations = bucket["mutations"] + 1
     written = bucket["written"] + IO.iodata_length(Pulso.JSON.encode_to_iodata!(idx)) + new_bytes
 
@@ -883,7 +978,10 @@ defmodule Pulso.Storage.S3.PagedManifest do
   def bounded(root, config) do
     check_deadline!()
 
-    if length(root.paging["buckets"]) > Map.get(config, :retention_max_buckets, 2048) or
+    tail_bytes = IO.iodata_length(Pulso.JSON.encode_to_iodata!(Enum.map(root.segments, &Segment.to_wire/1)))
+
+    if length(root.segments) > 256 or tail_bytes > @leaf_bytes or
+         length(root.paging["buckets"]) > Map.get(config, :retention_max_buckets, 2048) or
          IO.iodata_length(Manifest.encode(root)) > @root_bytes,
        do: fail(:retention_capacity)
 
@@ -968,6 +1066,9 @@ defmodule Pulso.Storage.S3.PagedManifest do
 
   defp matches?(s, "metrics", opts), do: Segment.matches_metrics?(s, Keyword.get(opts, :matchers, []))
   defp matches?(s, "logs", opts), do: Segment.matches_log_service?(s, opts)
+  defp matches?(s, "traces", opts), do: TraceSummary.matches?(s.trace_summary, opts)
+  defp leaf_matches?(ref, "traces", opts), do: TraceSummary.page_matches?(ref["q"], opts)
+  defp leaf_matches?(_ref, _signal, _opts), do: true
 
   defp intersects?(ref, start, finish),
     do: (start == nil or ref["max"] >= start) and (finish == nil or ref["min"] <= finish)

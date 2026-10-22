@@ -17,6 +17,7 @@ defmodule Pulso.LogQL.QueryValidation do
 
   alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
+  alias Pulso.LogQL.Pipeline.Pattern
 
   @spec validate(struct()) :: :ok | {:error, term()}
   def validate(%AST.LogQuery{selector: sel, stages: stages}) do
@@ -25,21 +26,119 @@ defmodule Pulso.LogQL.QueryValidation do
     end
   end
 
-  def validate(%AST.RangeAgg{inner: inner}), do: validate(inner)
+  def validate(%AST.RangeAgg{inner: inner, op: op, grouping: grouping, at_ns: at, param: param, range_ns: range}) do
+    with :ok <- validate_range_duration(range),
+         :ok <- validate_range_parameter(op, param),
+         :ok <- validate_at(at),
+         :ok <- validate_range_grouping(grouping, op),
+         :ok <- validate_range_unwrap(inner, op),
+         do: validate(inner)
+  end
 
-  def validate(%AST.VectorAgg{inner: inner}), do: validate(inner)
+  def validate(%AST.VectorAgg{inner: inner, op: op, param: param}) do
+    with :ok <- validate_vector_parameter(op, param), do: validate(inner)
+  end
 
-  def validate(%AST.BinaryOp{left: l, right: r}) do
-    with :ok <- validate(l) do
-      validate(r)
-    end
+  def validate(%AST.BinaryOp{left: l, right: r} = binary) do
+    with :ok <- validate_binary(binary), :ok <- validate(l), do: validate(r)
   end
 
   def validate(%AST.NumberLit{}), do: :ok
+  def validate(%AST.VectorLit{}), do: :ok
 
   def validate(other), do: {:error, {:unsupported_expression, other}}
 
   # ---------------------------------------------------------------------------
+
+  @comparisons [:eq, :neq, :lt, :lte, :gt, :gte]
+  defp validate_binary(%AST.BinaryOp{left: left, right: right} = binary) do
+    types = {scalar?(left), scalar?(right)}
+
+    with :ok <- validate_set(binary, types),
+         :ok <- validate_boolean(binary, types),
+         do: validate_matching(binary.matching, types)
+  end
+
+  defp validate_set(%AST.BinaryOp{op: op, bool: bool, matching: matching}, types) when op in [:and, :or, :unless] do
+    if bool or types != {false, false} or (matching != nil and matching.group != nil),
+      do: {:error, :invalid_binary_operation},
+      else: :ok
+  end
+
+  defp validate_set(_, _), do: :ok
+
+  defp validate_boolean(%AST.BinaryOp{bool: true, op: op}, _) when op not in @comparisons,
+    do: {:error, :invalid_binary_operation}
+
+  defp validate_boolean(%AST.BinaryOp{bool: false, op: op}, {true, true}) when op in @comparisons,
+    do: {:error, :invalid_binary_operation}
+
+  defp validate_boolean(_, _), do: :ok
+  defp validate_matching(nil, _), do: :ok
+  defp validate_matching(_, {false, false}), do: :ok
+  defp validate_matching(_, _), do: {:error, :invalid_binary_operation}
+
+  defp scalar?(%AST.NumberLit{}), do: true
+  defp scalar?(%AST.BinaryOp{left: left, right: right}), do: scalar?(left) and scalar?(right)
+  defp scalar?(_), do: false
+
+  defp validate_vector_parameter(op, param) when op in [:topk, :bottomk] and is_integer(param), do: :ok
+  defp validate_vector_parameter(op, _) when op in [:topk, :bottomk], do: {:error, :invalid_aggregation_parameter}
+  defp validate_vector_parameter(_, nil), do: :ok
+  defp validate_vector_parameter(_, _), do: {:error, :invalid_aggregation_parameter}
+
+  defp validate_range_duration(range) when is_integer(range) and range > 0, do: :ok
+  defp validate_range_duration(_), do: {:error, :invalid_range_duration}
+  defp validate_range_parameter(:quantile_over_time, param) when is_number(param), do: :ok
+  defp validate_range_parameter(:quantile_over_time, _), do: {:error, :invalid_range_parameter}
+  defp validate_range_parameter(_, nil), do: :ok
+  defp validate_range_parameter(_, _), do: {:error, :invalid_range_parameter}
+
+  defp validate_at(nil), do: :ok
+  defp validate_at(_), do: {:error, :unsupported_at_modifier}
+  defp validate_range_grouping(nil, _), do: :ok
+
+  defp validate_range_grouping(%AST.Grouping{}, op)
+       when op in [
+              :avg_over_time,
+              :stddev_over_time,
+              :stdvar_over_time,
+              :quantile_over_time,
+              :max_over_time,
+              :min_over_time,
+              :first_over_time,
+              :last_over_time
+            ], do: :ok
+
+  defp validate_range_grouping(_, _), do: {:error, :unsupported_range_grouping}
+  defp validate_range_unwrap(_, :rate_counter), do: {:error, :unsupported_rate_counter}
+
+  defp validate_range_unwrap(%AST.LogQuery{stages: stages}, op) do
+    case Enum.split_while(stages, &(not match?(%AST.Unwrap{}, &1))) do
+      {_, []} -> log_op(op)
+      {_, [_]} -> unwrap_op(op)
+      _ -> {:error, :unsupported_post_unwrap_stage}
+    end
+  end
+
+  defp unwrap_op(op)
+       when op in [
+              :avg_over_time,
+              :sum_over_time,
+              :max_over_time,
+              :min_over_time,
+              :stddev_over_time,
+              :stdvar_over_time,
+              :quantile_over_time,
+              :rate,
+              :absent_over_time,
+              :first_over_time,
+              :last_over_time
+            ], do: :ok
+
+  defp unwrap_op(_), do: {:error, :invalid_range_aggregation}
+  defp log_op(op) when op in [:bytes_over_time, :bytes_rate, :count_over_time, :rate, :absent_over_time], do: :ok
+  defp log_op(_), do: {:error, :invalid_range_aggregation}
 
   defp validate_selector(%AST.Selector{matchers: matchers}) do
     Enum.reduce_while(matchers, :ok, fn m, :ok ->
@@ -59,7 +158,7 @@ defmodule Pulso.LogQL.QueryValidation do
   defp validate_stages(stages) do
     Enum.reduce_while(stages, {:ok, true}, fn stage, {:ok, native?} ->
       case validate_stage(stage, native?) do
-        :ok -> {:cont, {:ok, native? and match?(%AST.LineFilter{}, stage)}}
+        :ok -> {:cont, {:ok, native? and AST.LineFilter.native?(stage)}}
         err -> {:halt, err}
       end
     end)
@@ -71,6 +170,13 @@ defmodule Pulso.LogQL.QueryValidation do
 
   defp validate_stage(%AST.LineFilter{value: {:ip, cidr}}, _native?) do
     {:error, {:unsupported, :ip_line_filter, cidr}}
+  end
+
+  defp validate_stage(%AST.LineFilter{value: {:pattern, pattern}}, _native?) do
+    case Pattern.compile_filter(pattern) do
+      {:ok, _parts} -> :ok
+      {:error, reason} -> {:error, {:invalid_pattern, :line_filter, reason}}
+    end
   end
 
   defp validate_stage(%AST.LineFilter{op: op, value: {:re, pat}}, true) when op in [:match_re, :not_match_re] do
@@ -118,18 +224,17 @@ defmodule Pulso.LogQL.QueryValidation do
   end
 
   defp validate_pattern(source, pattern) do
-    case Regex.compile(pattern) do
-      {:ok, _} -> :ok
-      {:error, {reason, _}} -> {:error, {:invalid_regex, source, pattern, to_string(reason)}}
+    case Pulso.QueryRegex.compile(pattern) do
+      {:ok, _} ->
+        case NIF.validate_log_regex(pattern) do
+          :ok -> :ok
+          :error -> {:error, {:invalid_regex, source, pattern, "unsupported native regular expression"}}
+        end
+
+      {:error, {reason, _}} ->
+        {:error, {:invalid_regex, source, pattern, to_string(reason)}}
     end
   end
 
-  defp validate_native_pattern(source, pattern) do
-    with :ok <- validate_pattern(source, pattern) do
-      case NIF.validate_log_regex(pattern) do
-        :ok -> :ok
-        :error -> {:error, {:invalid_regex, source, pattern, "unsupported native regular expression"}}
-      end
-    end
-  end
+  defp validate_native_pattern(source, pattern), do: validate_pattern(source, pattern)
 end

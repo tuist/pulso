@@ -18,6 +18,9 @@ defmodule Pulso.PromQL.TimeTest do
   test "timestamps and date-time strings share signed nanosecond bounds" do
     assert {:ok, 9_223_372_036_854_775_807} = Time.parse_seconds("9223372036.854775807")
     assert {:error, _} = Time.parse_seconds("9223372036.854775808")
+    assert {:ok, -9_223_372_036_854_775_808} = Time.parse_seconds("-9223372036.854775808")
+    assert {:ok, -9_223_372_036_854_775_808} = Time.parse_seconds("-9223372036854775808e-9")
+    assert {:error, _} = Time.parse_seconds("-9223372036.854775809")
     assert {:ok, 1_790_000_000_001_000_000} = Time.parse_timestamp("2026-09-21T14:13:20.001Z")
 
     for value <- ["9999-12-31T00:00:00Z", "1e300", "bad", nil, %{}, "NaN", "Inf"] do

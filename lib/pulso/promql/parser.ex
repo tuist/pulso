@@ -120,7 +120,8 @@ defmodule Pulso.PromQL.Parser do
     |> optional(offset)
     |> reduce({__MODULE__, :range, []})
 
-  functions = ~w(rate increase irate delta sum_over_time avg_over_time min_over_time max_over_time count_over_time)
+  functions =
+    ~w(rate increase irate delta sum_over_time avg_over_time min_over_time max_over_time count_over_time stddev_over_time stdvar_over_time absent_over_time)
 
   function =
     choice(Enum.map(functions, &(string(&1) |> replace(String.to_existing_atom(&1)))))
@@ -217,6 +218,15 @@ defmodule Pulso.PromQL.Parser do
     |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
     |> reduce({__MODULE__, :special_number, []})
 
+  subquery_suffix =
+    ignore(string("["))
+    |> concat(duration)
+    |> ignore(string(":"))
+    |> concat(duration)
+    |> ignore(string("]"))
+    |> optional(offset)
+    |> wrap()
+
   primary =
     parsec(:ws)
     |> choice([
@@ -230,12 +240,17 @@ defmodule Pulso.PromQL.Parser do
       instant
     ])
     |> parsec(:ws)
+    |> optional(subquery_suffix)
+    |> reduce({__MODULE__, :subquery, []})
+    |> parsec(:ws)
 
   defcombinatorp(:primary, primary)
 
   defcombinatorp(
     :argument,
-    parsec(:ws) |> choice([quoted |> reduce({__MODULE__, :string_argument, []}), parsec(:expression)]) |> parsec(:ws)
+    parsec(:ws)
+    |> choice([range, quoted |> reduce({__MODULE__, :string_argument, []}), parsec(:expression)])
+    |> parsec(:ws)
   )
 
   # Power is right-associative; unary signs bind less tightly than power.
@@ -326,6 +341,9 @@ defmodule Pulso.PromQL.Parser do
     :min_over_time,
     :max_over_time,
     :count_over_time,
+    :stddev_over_time,
+    :stdvar_over_time,
+    :absent_over_time,
     :sum,
     :avg,
     :min,
@@ -345,8 +363,15 @@ defmodule Pulso.PromQL.Parser do
 
   def parse(input) when is_binary(input) and byte_size(input) <= 16_384 do
     case do_parse(input) do
-      {:ok, [expr], "", _, _, _} -> if bounded?(expr), do: validate(expr), else: {:error, :query_expression_limit}
-      _ -> {:error, :invalid_or_unsupported_query}
+      {:ok, [expr], "", _, _, _} ->
+        cond do
+          not bounded?(expr) -> {:error, :query_expression_limit}
+          type(expr) == :range -> {:error, :invalid_range}
+          true -> validate(expr)
+        end
+
+      _ ->
+        {:error, :invalid_or_unsupported_query}
     end
   rescue
     ArgumentError -> {:error, :invalid_or_unsupported_query}
@@ -436,6 +461,10 @@ defmodule Pulso.PromQL.Parser do
   @doc false
   def call([name | args]), do: {:call, name, args}
   @doc false
+  def subquery([inner]), do: inner
+  def subquery([inner, [window, step]]), do: {:subquery, inner, window, step, 0}
+  def subquery([inner, [window, step, offset]]), do: {:subquery, inner, window, step, offset}
+  @doc false
   def parameter_aggregate([op, {:grouping, _, _} = group, parameter, inner]),
     do: {:parameter_aggregate, op, group, parameter, inner}
 
@@ -456,6 +485,8 @@ defmodule Pulso.PromQL.Parser do
   @doc false
   def type({:scalar, _}), do: :scalar
   def type({:string, _}), do: :string
+  def type({:range, _, _, _}), do: :range
+  def type({:subquery, _, _, _, _}), do: :range
   def type({:unary, _, inner}), do: type(inner)
   def type({:call, name, _}) when name in ["time", "scalar"], do: :scalar
 
@@ -468,6 +499,7 @@ defmodule Pulso.PromQL.Parser do
   defp ast_size(_expr, depth) when depth > 64, do: 257
   defp ast_size({:binary, _, _, left, right}, depth), do: 1 + ast_size(left, depth + 1) + ast_size(right, depth + 1)
   defp ast_size({:aggregate, _, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
+  defp ast_size({:subquery, inner, _, _, _}, depth), do: 1 + ast_size(inner, depth + 1)
   defp ast_size({:unary, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
 
   defp ast_size({:parameter_aggregate, _, _, parameter, inner}, depth),
@@ -488,6 +520,12 @@ defmodule Pulso.PromQL.Parser do
   defp validate({:call, name, args} = expr) do
     signatures = %{
       "histogram_quantile" => [:scalar, :vector],
+      "histogram_fraction" => [:scalar, :scalar, :vector],
+      "histogram_count" => [:vector],
+      "histogram_sum" => [:vector],
+      "histogram_avg" => [:vector],
+      "histogram_stddev" => [:vector],
+      "histogram_stdvar" => [:vector],
       "clamp_min" => [:vector, :scalar],
       "clamp_max" => [:vector, :scalar],
       "vector" => [:scalar],
@@ -497,7 +535,24 @@ defmodule Pulso.PromQL.Parser do
       "sort_desc" => [:vector],
       "sort" => [:vector],
       "round" => [:vector],
-      "abs" => [:vector]
+      "abs" => [:vector],
+      "sgn" => [:vector],
+      "floor" => [:vector],
+      "timestamp" => [:vector],
+      "absent" => [:vector],
+      "predict_linear" => [:range, :scalar],
+      "rate" => [:range],
+      "increase" => [:range],
+      "irate" => [:range],
+      "delta" => [:range],
+      "sum_over_time" => [:range],
+      "avg_over_time" => [:range],
+      "min_over_time" => [:range],
+      "max_over_time" => [:range],
+      "count_over_time" => [:range],
+      "stddev_over_time" => [:range],
+      "stdvar_over_time" => [:range],
+      "absent_over_time" => [:range]
     }
 
     expected = if name == "round" and length(args) == 2, do: [:vector, :scalar], else: Map.get(signatures, name)
@@ -544,6 +599,18 @@ defmodule Pulso.PromQL.Parser do
   end
 
   defp validate({:function, _, {:range, matchers, window, _}} = expr) when window > 0 do
+    with :ok <- validate_matchers(matchers), do: {:ok, expr}
+  end
+
+  defp validate({:subquery, inner, window, step, _} = expr) when window > 0 and step > 0 do
+    with {:ok, _} <- validate(inner), true <- type(inner) == :vector do
+      {:ok, expr}
+    else
+      _ -> {:error, :invalid_subquery}
+    end
+  end
+
+  defp validate({:range, matchers, window, _} = expr) when window > 0 do
     with :ok <- validate_matchers(matchers), do: {:ok, expr}
   end
 

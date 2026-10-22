@@ -150,13 +150,12 @@ defmodule Pulso.Storage.S3CodecTest do
     end
 
     test "bounded decoding handles ordinary log rows larger than the Sentry wire cap" do
-      # Loki protobuf can carry this batch below its 16 MiB expanded limit.
-      # JSON escaping produces 3 MB per row in the Parquet body column, while
-      # the dictionary stores that value only once. No Sentry row-size bound
-      # applies, even when an error query will subsequently filter every row.
+      # Historical segments can exceed the new normalized write ceiling.
+      # JSON escaping produces 3 MB per row, dictionary-compressed on disk.
+      # Preserve bounded reads without weakening the 16 MiB encoder limit.
       row = %Log{timestamp_ns: 1, service: "api", body: String.duplicate(<<0>>, 500_000)}
-      records = List.duplicate(row, 32)
-      assert {:ok, payload, 1, 1} = S3.encode_segment(:logs, records)
+      assert {:error, :payload_too_large} = S3.encode_segment(:logs, List.duplicate(row, 32))
+      payload = File.read!(Path.expand("../../fixtures/logs/legacy_expanded_log.parquet", __DIR__))
       assert byte_size(payload) < 10_000
       opts = [max_decoded_bytes: 33_554_432, matchers: [{"error_source", :eq, "sentry"}]]
       assert {:error, :query_decoded_limit} = S3.decode_log_segment_bounded(payload, nil, nil, opts)

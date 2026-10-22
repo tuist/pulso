@@ -23,17 +23,27 @@ defmodule Pulso.ObjectStore.NIF do
     ),
     nif_versions: ~w(2.16)
 
-  def put(_config, _key, _data), do: :erlang.nif_error(:nif_not_loaded)
-  def put_if_none_match(_config, _key, _data), do: :erlang.nif_error(:nif_not_loaded)
-  def put_if_match(_config, _key, _data, _etag), do: :erlang.nif_error(:nif_not_loaded)
-  def get(_config, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def get_if_none_match(_config, _key, _etag), do: :erlang.nif_error(:nif_not_loaded)
+  # Request functions return `:ok` once the request is running and later send
+  # `{reference, result}` to the caller; `Pulso.ObjectStore` waits for it.
+  # Argument validation failures return `{:error, reason}` immediately.
+  def put(_ref, _config, _key, _data), do: :erlang.nif_error(:nif_not_loaded)
+  def put_if_none_match(_ref, _config, _key, _data), do: :erlang.nif_error(:nif_not_loaded)
+  def put_if_match(_ref, _config, _key, _data, _etag), do: :erlang.nif_error(:nif_not_loaded)
+  def get(_ref, _config, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def verify(_ref, _config, _key, _expected, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
+  def keyed_publication_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def snapshot_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def async_api_version, do: :erlang.nif_error(:nif_not_loaded)
+
+  def get_snapshot(_ref, _config, _key, _etag, _suffix, _limit, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def get_if_none_match(_ref, _config, _key, _etag), do: :erlang.nif_error(:nif_not_loaded)
   def retention_api_version, do: :erlang.nif_error(:nif_not_loaded)
-  def get_bounded(_config, _key, _etag, _limit), do: :erlang.nif_error(:nif_not_loaded)
-  def list_page(_config, _prefix, _after, _limit), do: :erlang.nif_error(:nif_not_loaded)
-  def discover_tenants(_config, _after, _limit), do: :erlang.nif_error(:nif_not_loaded)
-  def delete_bounded(_config, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def delete(_config, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def list_prefixes(_config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
-  def list(_config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
+  def get_bounded(_ref, _config, _key, _etag, _limit), do: :erlang.nif_error(:nif_not_loaded)
+  def list_page(_ref, _config, _prefix, _after, _limit), do: :erlang.nif_error(:nif_not_loaded)
+  def discover_tenants(_ref, _config, _after, _limit), do: :erlang.nif_error(:nif_not_loaded)
+  def delete_bounded(_ref, _config, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def delete(_ref, _config, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def list_prefixes(_ref, _config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
+  def list(_ref, _config, _prefix), do: :erlang.nif_error(:nif_not_loaded)
 end

@@ -2,6 +2,9 @@
 use rustler::{Encoder, Env, Term};
 
 pub const STALE_BITS: u64 = 0x7ff0000000000002;
+/// The float value of a row that only carries exemplars: their sample is in
+/// another request. Readers that predate exemplars see an ordinary NaN.
+pub const EXEMPLAR_ONLY_BITS: u64 = 0x7ff0000000000003;
 mod atoms {
     rustler::atoms! { stale, nan, infinity, negative_infinity }
 }

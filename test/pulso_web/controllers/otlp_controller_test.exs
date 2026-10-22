@@ -98,7 +98,7 @@ defmodule PulsoWeb.OTLPControllerTest do
       |> put_req_header("x-scope-orgid", "bad/name")
       |> post(~p"/v1/logs", payload())
 
-    assert json_response(conn, 400) == %{"error" => "invalid_tenant"}
+    assert json_response(conn, 400) == %{"code" => 3, "message" => "invalid_tenant"}
   end
 
   test "POST /v1/logs surfaces rejected records via partialSuccess per the OTLP spec",
@@ -127,7 +127,7 @@ defmodule PulsoWeb.OTLPControllerTest do
       |> post(~p"/v1/logs", payload)
 
     body = json_response(conn, 200)
-    assert %{"partialSuccess" => %{"rejectedLogRecords" => 1}} = body
+    assert %{"partialSuccess" => %{"rejectedLogRecords" => "1"}} = body
   end
 
   test "POST /v1/logs passes the Idempotency-Key header through", %{conn: conn} do
@@ -178,7 +178,7 @@ defmodule PulsoWeb.OTLPControllerTest do
         |> put_req_header("authorization", "Bearer wrong")
         |> post(~p"/v1/logs", payload())
 
-      assert json_response(conn, 401) == %{"error" => "invalid_token"}
+      assert json_response(conn, 401) == %{"code" => 16, "message" => "invalid_token"}
       assert {:ok, []} = Storage.query(:logs, "acme")
     end
 
@@ -190,7 +190,7 @@ defmodule PulsoWeb.OTLPControllerTest do
         |> put_req_header("authorization", "Bearer the-token")
         |> post(~p"/v1/logs", payload())
 
-      assert json_response(conn, 401) == %{"error" => "unknown_tenant"}
+      assert json_response(conn, 401) == %{"code" => 16, "message" => "unknown_tenant"}
     end
 
     test "rejects a request with no authorization header", %{conn: conn} do
@@ -200,7 +200,7 @@ defmodule PulsoWeb.OTLPControllerTest do
         |> put_req_header("x-scope-orgid", "acme")
         |> post(~p"/v1/logs", payload())
 
-      assert json_response(conn, 401) == %{"error" => "missing_token"}
+      assert json_response(conn, 401) == %{"code" => 16, "message" => "missing_token"}
     end
   end
 end

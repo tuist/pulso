@@ -11,10 +11,11 @@ defmodule Pulso.LogQL.AST.RangeAgg do
   uses it).
   """
 
+  alias Pulso.LogQL.AST.Grouping
   alias Pulso.LogQL.AST.LogQuery
 
   @enforce_keys [:op, :inner, :range_ns]
-  defstruct [:op, :inner, :range_ns, offset_ns: nil, at_ns: nil, param: nil]
+  defstruct [:op, :inner, :range_ns, offset_ns: nil, at_ns: nil, param: nil, grouping: nil]
 
   @type op ::
           :rate
@@ -39,6 +40,7 @@ defmodule Pulso.LogQL.AST.RangeAgg do
           range_ns: integer(),
           offset_ns: integer() | nil,
           at_ns: integer() | nil,
-          param: number() | nil
+          param: number() | nil,
+          grouping: Grouping.t() | nil
         }
 end

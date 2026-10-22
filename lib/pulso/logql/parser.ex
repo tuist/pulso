@@ -43,13 +43,24 @@ defmodule Pulso.LogQL.Parser do
   # Public entry point
   # ---------------------------------------------------------------------------
 
+  alias Pulso.LogQL.Limits
+  alias Pulso.LogQL.Quantity
+
   @spec parse(String.t()) ::
           {:ok, AST.LogQuery.t() | AST.RangeAgg.t() | AST.VectorAgg.t() | AST.BinaryOp.t() | AST.NumberLit.t()}
-          | {:error, {non_neg_integer(), non_neg_integer(), term()}}
+          | {:error, term()}
   def parse(input) when is_binary(input) do
+    with :ok <- Limits.input(input), do: parse_bounded(input)
+  catch
+    :invalid_quantity -> {:error, :invalid_quantity}
+  end
+
+  def parse(_), do: {:error, :query_expression_limit}
+
+  defp parse_bounded(input) do
     case do_parse(input) do
       {:ok, [ast], "", _ctx, _line_col, _offset} ->
-        {:ok, ast}
+        with :ok <- Limits.ast(ast), do: {:ok, ast}
 
       {:ok, _acc, rest, _ctx, {line, col}, _offset} ->
         {:error, {line, col, {:trailing_input, String.slice(rest, 0, 40)}}}
@@ -231,40 +242,14 @@ defmodule Pulso.LogQL.Parser do
   defcombinatorp(:duration_literal, duration_literal)
 
   @doc false
-  def sum_ints(list), do: Enum.sum(list)
-
-  @duration_factors %{
-    "ns" => 1,
-    "us" => 1_000,
-    "µs" => 1_000,
-    "ms" => 1_000_000,
-    "s" => 1_000_000_000,
-    "m" => 60 * 1_000_000_000,
-    "h" => 3600 * 1_000_000_000,
-    "d" => 86_400 * 1_000_000_000,
-    "w" => 7 * 86_400 * 1_000_000_000,
-    "y" => 365 * 86_400 * 1_000_000_000
-  }
+  def sum_ints(list), do: quantity_value(Quantity.sum_components(list))
 
   @doc false
-  # Chars have been split as `[digits, ".", digits, unit]` or `[digits, unit]`.
-  # Recombine the numeric portion, parse it, multiply by the unit factor.
-  def duration_component_to_ns(chars) do
-    [unit | rev] = Enum.reverse(chars)
-    num_str = rev |> Enum.reverse() |> IO.iodata_to_binary()
-    trunc(parse_number(num_str) * Map.fetch!(@duration_factors, unit))
-  end
+  def duration_component_to_ns(chars),
+    do: chars |> IO.iodata_to_binary() |> Quantity.duration_literal() |> quantity_value()
 
-  defp parse_number(str) do
-    case Integer.parse(str) do
-      {int, ""} ->
-        int
-
-      _ ->
-        {float, ""} = Float.parse(str)
-        float
-    end
-  end
+  defp quantity_value({:ok, value}), do: value
+  defp quantity_value(:error), do: throw(:invalid_quantity)
 
   # Byte size literal used in label filters: 5MB, 1KiB, 2GB, 100B.
   byte_unit =
@@ -291,27 +276,8 @@ defmodule Pulso.LogQL.Parser do
 
   defcombinatorp(:bytes_literal, bytes_literal)
 
-  @byte_factors %{
-    "B" => 1,
-    "kB" => 1_000,
-    "KB" => 1_000,
-    "MB" => 1_000_000,
-    "GB" => 1_000_000_000,
-    "TB" => 1_000_000_000_000,
-    "PB" => 1_000_000_000_000_000,
-    "KiB" => 1024,
-    "MiB" => 1024 * 1024,
-    "GiB" => 1024 * 1024 * 1024,
-    "TiB" => 1024 * 1024 * 1024 * 1024,
-    "PiB" => 1024 * 1024 * 1024 * 1024 * 1024
-  }
-
   @doc false
-  def bytes_component_to_bytes(chars) do
-    [unit | rev] = Enum.reverse(chars)
-    num_str = rev |> Enum.reverse() |> IO.iodata_to_binary()
-    trunc(parse_number(num_str) * Map.fetch!(@byte_factors, unit))
-  end
+  def bytes_component_to_bytes(chars), do: chars |> IO.iodata_to_binary() |> Quantity.bytes() |> quantity_value()
 
   # ---------------------------------------------------------------------------
   # Selector
@@ -368,6 +334,8 @@ defmodule Pulso.LogQL.Parser do
   # Line filter operator: order matters — `!~` before `!=`, `|~` before `|=`.
   line_filter_op =
     choice([
+      string("|>") |> replace(:match_pattern),
+      string("!>") |> replace(:not_match_pattern),
       string("|~") |> replace(:match_re),
       string("!~") |> replace(:not_match_re),
       string("|=") |> replace(:contains),
@@ -403,6 +371,10 @@ defmodule Pulso.LogQL.Parser do
   # Regex ops keep the value tagged as `:re`; substring ops as `:string`.
   def build_line_filter([op, {:string, s}]) when op in [:match_re, :not_match_re] do
     %AST.LineFilter{op: op, value: {:re, s}}
+  end
+
+  def build_line_filter([op, {:string, s}]) when op in [:match_pattern, :not_match_pattern] do
+    %AST.LineFilter{op: op, value: {:pattern, s}}
   end
 
   def build_line_filter([op, {:string, s}]) do
@@ -921,17 +893,21 @@ defmodule Pulso.LogQL.Parser do
     |> concat(range_body)
     |> concat(parsec(:ws))
     |> ignore(string(")"))
+    |> optional(grouping)
     |> reduce({__MODULE__, :build_range_agg, []})
 
   @doc false
-  def build_range_agg([op, body]) do
+  def build_range_agg([op, body]), do: build_range_agg([op, body, nil])
+
+  def build_range_agg([op, body, grouping]) do
     %AST.RangeAgg{
       op: op,
       inner: body.inner,
       range_ns: body.range,
       offset_ns: body.offset,
       at_ns: body.at,
-      param: body.param
+      param: body.param,
+      grouping: grouping
     }
   end
 
@@ -956,7 +932,7 @@ defmodule Pulso.LogQL.Parser do
   @doc false
   def build_vector_call_body(parts) do
     Enum.reduce(parts, %{param: nil, inner: nil}, fn
-      {:param, p}, acc -> %{acc | param: trunc(p)}
+      {:param, p}, acc -> %{acc | param: if(p == trunc(p), do: trunc(p), else: p)}
       inner, acc -> %{acc | inner: inner}
     end)
   end
@@ -1161,6 +1137,14 @@ defmodule Pulso.LogQL.Parser do
       |> parsec(:metric_expr)
       |> concat(parsec(:ws))
       |> ignore(string(")")),
+      ignore(string("vector"))
+      |> concat(parsec(:ws))
+      |> ignore(string("("))
+      |> concat(parsec(:ws))
+      |> parsec(:number_literal)
+      |> concat(parsec(:ws))
+      |> ignore(string(")"))
+      |> map({__MODULE__, :wrap_vector, []}),
       parsec(:number_literal) |> map({__MODULE__, :wrap_number, []})
     ])
 
@@ -1168,6 +1152,9 @@ defmodule Pulso.LogQL.Parser do
 
   @doc false
   def wrap_number(n), do: %AST.NumberLit{value: n}
+
+  @doc false
+  def wrap_vector(n), do: %AST.VectorLit{value: n}
 
   # --- Vector matching modifier --------------------------------------------
 

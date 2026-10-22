@@ -1,7 +1,7 @@
 defmodule Pulso.RemoteWrite.Push do
   @moduledoc """
-  Decode a Prometheus remote_write v1 `WriteRequest` body into
-  `[%Pulso.Record.MetricSample{}]`.
+  Decode a Prometheus remote_write body (v1 `WriteRequest` or Remote Write
+  2.0 `io.prometheus.write.v2.Request`) into `[%Pulso.Record.MetricSample{}]`.
 
   The on-wire body is **Snappy-compressed** (block format, not frame)
   protobuf, with `Content-Type: application/x-protobuf` and
@@ -15,8 +15,11 @@ defmodule Pulso.RemoteWrite.Push do
 
   Semantic errors inside a series (invalid labels, out-of-range
   timestamp) are counted in `rejected` rather than failing the whole
-  request — the same contract as `Pulso.Loki.Push`. Native histogram samples
-  and exemplars are counted as rejected until their storage models exist.
+  request — the same contract as `Pulso.Loki.Push`. Native histograms become
+  samples with `histogram` set (`Pulso.Record.NativeHistogram`); invalid ones
+  count as rejected. Each exemplar is stored on its series' sample nearest to
+  it in time, keeping its own timestamp; invalid exemplars are dropped, as in
+  Prometheus.
   Stale markers and IEEE-754 non-finite values are preserved using a closed
   atom vocabulary rather than unsupported Erlang floats. A wire-level
   corruption fails the whole request with a typed error.
@@ -34,28 +37,105 @@ defmodule Pulso.RemoteWrite.Push do
   @spec decode_protobuf(binary(), pos_integer()) ::
           {:ok, [MetricSample.t()], non_neg_integer()} | {:error, atom()}
   def decode_protobuf(body, max_decompressed) when is_binary(body) and is_integer(max_decompressed) do
-    case NIF.decode_remote_write_limited(body, max_decompressed, Pulso.IngestLimits.native_options()) do
-      {:ok, series, rejected} ->
-        samples = Enum.flat_map(series, &expand_series/1)
-        {:ok, samples, rejected}
+    with {:ok, samples, rejected, _metadata} <- decode_with_metadata(body, max_decompressed),
+         do: {:ok, samples, rejected}
+  end
+
+  @doc """
+  Like `decode_protobuf/2`, also returning the request's metric metadata as
+  `{metric, type, help, unit}` entries (`Pulso.MetricMetadata`). `version`
+  selects the message: `:v1` (`prometheus.WriteRequest`) or `:v2` (Remote
+  Write 2.0 `io.prometheus.write.v2.Request`, labels and metadata resolved
+  through its symbol table, metadata attached per series).
+  """
+  @spec decode_with_metadata(binary(), pos_integer(), :v1 | :v2) ::
+          {:ok, [MetricSample.t()], non_neg_integer(), [Pulso.MetricMetadata.entry()]} | {:error, atom()}
+  def decode_with_metadata(body, max_decompressed, version \\ :v1)
+      when is_binary(body) and is_integer(max_decompressed) do
+    limits = Pulso.IngestLimits.native_options()
+
+    decoded =
+      case version do
+        :v1 -> NIF.decode_remote_write_limited(body, max_decompressed, limits)
+        :v2 -> NIF.decode_remote_write_v2_limited(body, max_decompressed, limits)
+      end
+
+    case decoded do
+      {:ok, series, rejected, metadata} ->
+        samples = series |> merge_series() |> Enum.flat_map(&expand_series/1)
+        {:ok, samples, rejected, metadata}
 
       {:error, reason} when is_atom(reason) ->
         {:error, reason}
     end
   end
 
-  # Each series: `{labels_map, [{ts_ms, value}, ...], series_id}`.
-  # Fan out one `%MetricSample{}` per sample. The label map is shared
-  # across samples in the same series — Elixir maps are immutable so
+  # Senders send a series' samples, histograms and exemplars in separate
+  # entries; join entries with the same labels so exemplars find samples.
+  defp merge_series(series) do
+    series
+    |> Enum.group_by(&elem(&1, 0))
+    |> Enum.map(fn
+      {_labels, [single]} ->
+        single
+
+      {labels, [{_, _, series_id, _, _} | _] = entries} ->
+        {labels, Enum.flat_map(entries, &elem(&1, 1)), series_id, Enum.flat_map(entries, &elem(&1, 3)),
+         Enum.flat_map(entries, &elem(&1, 4))}
+    end)
+  end
+
+  # Each series: `{labels_map, [{ts_ms, value}], series_id, [{ts_ms, histogram}], [exemplar]}`.
+  # Fan out one `%MetricSample{}` per sample or histogram. The label map is
+  # shared across samples in the same series — Elixir maps are immutable so
   # the per-sample struct holds a reference to the one allocation.
-  defp expand_series({labels, samples, series_id}) when is_map(labels) and is_list(samples) and is_integer(series_id) do
-    Enum.map(samples, fn {ts_ms, value} ->
-      %MetricSample{
-        series_id: series_id,
-        timestamp_ns: ts_ms * 1_000_000,
-        value: value,
-        labels: labels
-      }
+  defp expand_series({labels, samples, series_id, histograms, exemplars})
+       when is_map(labels) and is_list(samples) and is_integer(series_id) do
+    floats = Enum.map(samples, fn {ts_ms, value} -> sample(labels, series_id, ts_ms, value: value) end)
+    natives = Enum.map(histograms, fn {ts_ms, h} -> sample(labels, series_id, ts_ms, histogram: h) end)
+
+    case floats ++ natives do
+      # The series' samples arrived in another request: keep the exemplars on
+      # a row without a value, which queries skip.
+      [] ->
+        exemplars = Enum.sort_by(exemplars, & &1.timestamp_ns)
+
+        [
+          %MetricSample{
+            series_id: series_id,
+            timestamp_ns: hd(exemplars).timestamp_ns,
+            labels: labels,
+            exemplars: exemplars
+          }
+        ]
+
+      samples ->
+        attach_exemplars(samples, exemplars)
+    end
+  end
+
+  defp sample(labels, series_id, ts_ms, fields),
+    do: struct!(MetricSample, [series_id: series_id, timestamp_ns: ts_ms * 1_000_000, labels: labels] ++ fields)
+
+  # Every sample of a series has its labels, so an exemplar goes to the one
+  # nearest in time (the earlier one on ties).
+  defp attach_exemplars(samples, []), do: samples
+
+  defp attach_exemplars(samples, exemplars) do
+    indexed = samples |> Enum.sort_by(& &1.timestamp_ns) |> Enum.with_index()
+
+    hosts =
+      Enum.group_by(exemplars, fn exemplar ->
+        indexed
+        |> Enum.min_by(fn {sample, i} -> {abs(sample.timestamp_ns - exemplar.timestamp_ns), i} end)
+        |> elem(1)
+      end)
+
+    Enum.map(indexed, fn {sample, i} ->
+      case Map.fetch(hosts, i) do
+        {:ok, attached} -> %{sample | exemplars: Enum.sort_by(attached, & &1.timestamp_ns)}
+        :error -> sample
+      end
     end)
   end
 end

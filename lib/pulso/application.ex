@@ -6,7 +6,9 @@ defmodule Pulso.Application do
   use Application
 
   alias Pulso.Alerting.Subscriptions
+  alias Pulso.Codec.NIF
   alias Pulso.Health.StorageMonitor
+  alias Pulso.Loki.Tail
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
   alias Pulso.Storage.Memory
@@ -17,6 +19,10 @@ defmodule Pulso.Application do
 
   @impl true
   def start(_type, _args) do
+    :ok = NIF.ensure_log_metadata_api!()
+    :ok = NIF.ensure_metric_metadata_api!()
+    :ok = NIF.ensure_trace_metadata_api!()
+
     children =
       [
         Pulso.SelfMetrics,
@@ -28,8 +34,9 @@ defmodule Pulso.Application do
         {Registry, keys: :unique, name: QuerySlots},
         Subscriptions,
         {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
-        {Phoenix.PubSub, name: Pulso.PubSub}
-      ] ++ storage_children() ++ Pulso.Alerting.Supervisor.children() ++ [PulsoWeb.Endpoint]
+        {Phoenix.PubSub, name: Pulso.PubSub},
+        Tail
+      ] ++ storage_children() ++ Pulso.Alerting.Supervisor.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
@@ -43,6 +50,15 @@ defmodule Pulso.Application do
   def config_change(changed, _new, removed) do
     PulsoWeb.Endpoint.config_change(changed, removed)
     :ok
+  end
+
+  # The OTLP/gRPC listener starts after the endpoint, only when configured.
+  defp otlp_grpc_children do
+    config = Application.get_env(:pulso, PulsoWeb.OTLPGRPC, [])
+
+    if Keyword.get(config, :enabled, false),
+      do: [{PulsoWeb.OTLPGRPC, config |> Keyword.delete(:enabled) |> Keyword.put(:name, PulsoWeb.OTLPGRPC)}],
+      else: []
   end
 
   # `Memory` only runs when it is the configured adapter — in `mix test` no

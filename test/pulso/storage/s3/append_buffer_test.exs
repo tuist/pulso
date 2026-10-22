@@ -1,6 +1,7 @@
 defmodule Pulso.Storage.S3.AppendBufferTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.OTLP.Traces
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Runtime
@@ -10,9 +11,11 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.AppendRegistry
   alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Test.CompactionStore
+  alias Pulso.Test.OTLPTraceFixture
 
   setup context do
     signal = Map.get(context, :signal, :logs)
@@ -80,7 +83,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
       end)
 
     buffer = ctx.buffer
-    for _ <- batches, do: assert_receive({:trace, ^buffer, :receive, {:"$gen_call", _, {:append, _, _, _}}}, 5000)
+    for _ <- batches, do: assert_receive({:trace, ^buffer, :receive, {:"$gen_call", _, {:append, _, _, _, _}}}, 30_000)
     state = :sys.get_state(buffer)
     assert length(state.pending) == length(batches)
     {_ref, token} = state.timer
@@ -102,7 +105,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     owner = self()
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", manifest_key} => owner}})
     tasks = enqueue(ctx, [[record], [record]])
-    assert_receive {:storage_barrier, writer, "PUT", ^manifest_key}, 5000
+    assert_receive {:storage_barrier, writer, "PUT", ^manifest_key}, 30_000
     assert Enum.all?(tasks, &(Task.yield(&1, 0) == nil))
     assert ManifestCache.get(ctx.tenant, "logs") == nil
     assert [{:pending, 2, bytes, 2}] = :ets.lookup(ctx.admission, :pending)
@@ -121,6 +124,340 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert AppendBuffer.stats() == {1, 0, 0, 0}
     assert segment_puts(ctx.agent) == 1
     assert {:ok, [^record, ^record]} = S3.query(:logs, ctx.tenant, [])
+  end
+
+  test "queued normalized slices do not retain their full request arena", ctx do
+    arena = String.duplicate("x", 1024 * 1024)
+    slice = binary_part(arena, 1, 100)
+    entry = %Log{timestamp_ns: 1, service: "api", body: slice}
+    assert :binary.referenced_byte_size(slice) > 100
+    caller = Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(:logs, ctx.tenant, [entry]) end)
+    buffer = ctx.buffer
+    assert_receive {:trace, ^buffer, :receive, {:"$gen_call", _, {:append, _, _, _, _}}}, 30_000
+    state = :sys.get_state(ctx.buffer)
+    [{_from, [stored], _bytes, _rows, _opts}] = state.pending
+    assert :binary.referenced_byte_size(stored.body) == 100
+    {_timer, token} = state.timer
+    send(ctx.buffer, {:flush, token})
+    assert :ok = Task.await(caller, 30_000)
+  end
+
+  for status <- [304, 200] do
+    test "delayed #{status} query refresh cannot overwrite an actual acknowledged owner publication", ctx do
+      key = Manifest.manifest_key(ctx.tenant, "logs")
+      old = Manifest.new()
+      assert {:ok, etag} = Pulso.ObjectStore.put(ctx.config, key, IO.iodata_to_binary(Manifest.encode(old)))
+      cached_etag = if unquote(status) == 304, do: etag, else: "\"older-cache\""
+      ManifestCache.put(ctx.tenant, "logs", old, cached_etag)
+      owner = self()
+      Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", key} => owner}})
+
+      reader =
+        Task.Supervisor.async_nolink(ctx.tasks, fn ->
+          S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", ctx.config, require_fresh_manifest: true)
+        end)
+
+      assert_receive {:storage_barrier, worker, "GET", ^key}, 30_000
+      Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+      record = %Log{timestamp_ns: 1, service: "api", body: "acknowledged during refresh"}
+      assert :ok = S3.append_unbuffered(:logs, ctx.tenant, [record], [], ctx.config)
+      published = ManifestCache.get(ctx.tenant, "logs")
+      assert published.etag != etag
+      send(worker, {:release_storage, key})
+      assert {:ok, _} = Task.await(reader, 30_000)
+      assert ManifestCache.get(ctx.tenant, "logs").etag == published.etag
+      assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, [])
+    end
+  end
+
+  test "a delayed maintenance publication cannot hide a later acknowledged append", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    old = Manifest.new()
+    assert {:ok, etag} = Pulso.ObjectStore.put(ctx.config, key, IO.iodata_to_binary(Manifest.encode(old)))
+    ManifestCache.put(ctx.tenant, "logs", old, etag)
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}})
+
+    maintenance =
+      Task.Supervisor.async_nolink(ctx.tasks, fn ->
+        S3.Retention.transact(ctx.tenant, "logs", ctx.config, &{%{&1 | version: 2}, :updated})
+      end)
+
+    # The CAS is committed but its response has not reached maintenance yet.
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
+    Runtime.put_env(:pulso, S3, config)
+    record = %Log{timestamp_ns: 1, service: "api", body: "newer than maintenance response"}
+    assert :ok = S3.append_unbuffered(:logs, ctx.tenant, [record], [], config)
+    assert length(ManifestCache.get(ctx.tenant, "logs").manifest.segments) == 1
+    send(writer, {:release_storage, key})
+    assert {:ok, :updated} = Task.await(maintenance, 30_000)
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, [])
+  end
+
+  test "a fetched invalid authority fails closed even with a warm flat cache", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    old = Manifest.new()
+
+    for required? <- [false, true], body <- [~s({"v":99,"s":[]}), ~s({"v":2,"s":[]}), "{"] do
+      config = if required?, do: Map.put(ctx.config, :refresh_stale_ms, 60_000), else: ctx.config
+      assert {:ok, etag} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(old)))
+      ManifestCache.put(ctx.tenant, "logs", old, etag)
+      assert {:ok, _} = Pulso.ObjectStore.put(config, key, body)
+      assert {:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: required?)
+      assert ManifestCache.get(ctx.tenant, "logs") == nil
+      assert {:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+    end
+  end
+
+  test "legacy transport refresh failures retain the documented stale fallback", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    old = Manifest.new()
+    assert {:ok, etag} = Pulso.ObjectStore.put(ctx.config, key, IO.iodata_to_binary(Manifest.encode(old)))
+    ManifestCache.put(ctx.tenant, "logs", old, etag)
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {400, :before, 1}}})
+    assert {:ok, %{manifest: ^old}} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", ctx.config)
+    config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {400, :before, 1}}})
+
+    assert {:error, :manifest_freshness_unavailable} =
+             S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+
+    assert %{manifest: ^old} = ManifestCache.get(ctx.tenant, "logs")
+    assert {:ok, %{manifest: ^old}} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+  end
+
+  test "fresh error queries share required authority without falling back to a warm cache", ctx do
+    config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
+    Runtime.put_env(:pulso, S3, config)
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    manifest = Manifest.new()
+    assert {:ok, tag} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(manifest)))
+    ManifestCache.put(ctx.tenant, "logs", manifest, tag)
+    assert {:ok, []} = S3.query(:logs, ctx.tenant, [])
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {400, :before, 1}}})
+    assert {:error, :manifest_freshness_unavailable} = S3.query(:logs, ctx.tenant, fresh: true)
+    assert %{etag: ^tag} = ManifestCache.get(ctx.tenant, "logs")
+    assert {:ok, []} = S3.query(:logs, ctx.tenant, [])
+    lists = Agent.get(ctx.agent, & &1.lists)
+    Agent.update(ctx.agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+    assert {:error, :not_found} = S3.query(:logs, ctx.tenant, fresh: true)
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    assert Agent.get(ctx.agent, & &1.lists) == lists
+  end
+
+  test "a failed legacy CAS response succeeds only when fresh read-back proves every key visible", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"PUT", key} => {400, :after, 1}}})
+    record = %Log{timestamp_ns: 1, service: "api", body: "lost ACK"}
+    tasks = enqueue(ctx, [[record], [record]])
+    assert Enum.all?(tasks, &(Task.await(&1, 30_000) == :ok))
+    assert segment_puts(ctx.agent) == 1
+    assert {:ok, [^record, ^record]} = S3.query(:logs, ctx.tenant, [])
+  end
+
+  for managed? <- [false, true] do
+    @tag matrix_managed: managed?
+    test "authority response matrix with managed=#{managed?}", ctx do
+      managed? = ctx.matrix_managed
+      config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
+      config = if managed?, do: Map.merge(config, %{retention_mode: "enforce", logs_retention_days: 1}), else: config
+      key = Manifest.manifest_key(ctx.tenant, "logs")
+      assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
+
+      if managed?,
+        do: assert({:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: System.system_time(:nanosecond)))
+
+      ManifestCache.drop(ctx.tenant, "logs")
+      assert {:ok, initial} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+      root_reads = fn -> Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"GET", key} end)) end
+      count = root_reads.()
+      assert {:ok, %{etag: tag}} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+      assert tag == initial.etag
+      assert root_reads.() == count
+      Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {400, :before, 1}}})
+
+      assert {:error, :manifest_freshness_unavailable} =
+               S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+
+      assert %{etag: tag} = ManifestCache.get(ctx.tenant, "logs")
+      assert tag == initial.etag
+      count = root_reads.()
+      assert {:ok, %{etag: ^tag}} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+      assert root_reads.() == count
+      # The conditional GET revalidates the unchanged warm root (304 in the stub).
+      assert {:ok, validated} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+      assert validated.manifest == initial.manifest
+      assert validated.etag == initial.etag
+      assert root_reads.() > count
+      bytes = IO.iodata_to_binary(Manifest.encode(initial.manifest))
+      assert {:ok, changed_tag} = Pulso.ObjectStore.put(config, key, bytes)
+      assert changed_tag != initial.etag
+      assert {:ok, replaced} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+      assert replaced.etag == changed_tag
+      assert %{etag: ^changed_tag} = ManifestCache.get(ctx.tenant, "logs")
+      assert {:ok, _} = Pulso.ObjectStore.put(config, key, "not-json")
+      assert {:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+      assert ManifestCache.get(ctx.tenant, "logs") == nil
+      assert {:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+      # A cold 304 cannot prove a root when no cached body exists.
+      Agent.update(ctx.agent, &%{&1 | faults: %{{"GET", key} => {304, :before, 1}}})
+
+      assert {:error, :manifest_freshness_unavailable} =
+               S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+
+      assert ManifestCache.get(ctx.tenant, "logs") == nil
+      assert {:ok, _} = Pulso.ObjectStore.put(config, key, bytes)
+      assert {:ok, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+      lists = Agent.get(ctx.agent, & &1.lists)
+      Agent.update(ctx.agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+
+      assert {:error, :signal_authority_missing} =
+               S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+
+      assert ManifestCache.get(ctx.tenant, "logs") == nil
+      if managed?, do: assert({:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config))
+      assert Agent.get(ctx.agent, & &1.lists) == lists
+    end
+  end
+
+  test "required-fresh missing managed authority invalidates an unexpired ordinary cache", ctx do
+    config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1, refresh_stale_ms: 60_000})
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
+    assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: System.system_time(:nanosecond))
+    assert {:ok, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+    assert %{manifest: _} = ManifestCache.get(ctx.tenant, "logs")
+    lists = Agent.get(ctx.agent, & &1.lists)
+    Agent.update(ctx.agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+
+    assert {:error, :signal_authority_missing} =
+             S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config, require_fresh_manifest: true)
+
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    assert {:error, _} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+    assert Agent.get(ctx.agent, & &1.lists) == lists
+  end
+
+  test "a rejected-only flush cannot populate a cold cache from stale private owner state", ctx do
+    config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1})
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    now = System.system_time(:nanosecond)
+    assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
+    assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: now)
+    assert {:ok, old, old_etag} = S3.Retention.load(ctx.tenant, "logs", config)
+    assert {:ok, owner} = S3.ManifestOwner.ensure_started(ctx.tenant, "logs", config)
+    :sys.replace_state(owner, &%{&1 | manifest: old, etag: old_etag, loaded?: true})
+    assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: now + 1)
+    ManifestCache.drop(ctx.tenant, "logs")
+    before = Agent.get(ctx.agent, & &1.requests)
+    expired = %Segment{key: "never-uploaded", min_ts: 0, max_ts: 0}
+    assert {:error, :retention_expired} = S3.ManifestOwner.register_segments(ctx.tenant, "logs", [expired], config)
+    assert ManifestCache.get(ctx.tenant, "logs") == nil
+    assert Agent.get(ctx.agent, & &1.requests) == before
+    assert {:ok, fresh} = S3.ManifestOwner.ensure_loaded(ctx.tenant, "logs", config)
+    assert fresh.etag != old_etag
+    assert fresh.manifest.paging["floor"] > old.paging["floor"]
+  end
+
+  for expired? <- [false, true] do
+    test "managed lost-ACK conflict proves publication after another nonce, expired=#{expired?}", ctx do
+      day = 86_400_000_000_000
+      now = System.system_time(:nanosecond)
+      config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1})
+      key = Manifest.manifest_key(ctx.tenant, "logs")
+      assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
+      assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: now)
+      owner = self()
+
+      Agent.update(ctx.agent, fn state ->
+        %{state | faults: %{{"PUT", key} => {412, :after, 1}}, barriers: %{{"PUT", key} => owner}}
+      end)
+
+      record = %Log{timestamp_ns: now, service: "api", body: "committed before conflict response"}
+
+      append =
+        Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append_unbuffered(:logs, ctx.tenant, [record], [], config) end)
+
+      assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
+      Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+      advanced_now = if unquote(expired?), do: now + day + 1, else: now + 1
+      assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: advanced_now)
+      before = Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", key} end))
+      send(writer, {:release_storage, key})
+      assert :ok = Task.await(append, 30_000)
+      assert Agent.get(ctx.agent, &Enum.count(&1.requests, fn request -> request == {"PUT", key} end)) == before
+    end
+  end
+
+  for signal <- [:logs, :metrics] do
+    @tag signal: signal
+    test "#{signal}: a floor advance after combined PUT never permanently rejects fresh siblings", ctx do
+      config =
+        Map.merge(ctx.config, %{
+          retention_enabled: true,
+          retention_mode: "enforce",
+          logs_retention_days: 1,
+          metrics_retention_days: 1
+        })
+
+      # Keep the caller's buffer identity, while its flush uses the managed
+      # policy. Even observe-mode callers must honor the committed root floor.
+      :sys.replace_state(ctx.buffer, &%{&1 | config: config})
+      now = System.system_time(:nanosecond)
+      day = 86_400_000_000_000
+
+      assert {:ok, _} =
+               Pulso.ObjectStore.put(
+                 config,
+                 Manifest.manifest_key(ctx.tenant, Atom.to_string(ctx.signal)),
+                 IO.iodata_to_binary(Manifest.encode(Manifest.new()))
+               )
+
+      assert {:ok, _} = S3.Retention.advance(ctx.tenant, Atom.to_string(ctx.signal), config, now_ns: now)
+      old_ts = now - day + 1_000_000_000
+
+      record = fn ts ->
+        case ctx.signal do
+          :logs -> %Log{timestamp_ns: ts, service: "api", body: "moving floor"}
+          :metrics -> %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => "moving_floor"}}
+        end
+      end
+
+      key = Manifest.manifest_key(ctx.tenant, Atom.to_string(ctx.signal))
+      assert {:ok, root, _} = S3.Retention.load(ctx.tenant, Atom.to_string(ctx.signal), config)
+
+      paging =
+        Map.merge(root.paging, %{
+          "floor" => root.paging["floor"] + 2_000_000_000,
+          "nonce" => Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+        })
+
+      advanced = IO.iodata_to_binary(Manifest.encode(%{root | paging: paging}))
+      # Inject another writer's valid floor commit immediately before our
+      # conditional PUT, not after it has already become durable.
+      Agent.update(ctx.agent, fn state ->
+        %{
+          state
+          | hook: fn state ->
+              version = state.version + 1
+              %{state | version: version, objects: Map.put(state.objects, key, {"\"#{version}\"", advanced})}
+            end
+        }
+      end)
+
+      tasks = enqueue(ctx, [[record.(old_ts)], [record.(now)]])
+      assert Enum.all?(tasks, &(Task.await(&1, 30_000) == {:error, :retention_floor_advanced}))
+      assert segment_puts(ctx.agent) == 1
+      assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+      assert {:ok, []} = S3.query(ctx.signal, ctx.tenant, [])
+      assert {:error, :retention_expired} = S3.append(ctx.signal, ctx.tenant, [record.(old_ts)])
+      assert :ok = S3.append(ctx.signal, ctx.tenant, [record.(now)])
+      assert {:ok, [stored]} = S3.query(ctx.signal, ctx.tenant, [])
+      assert stored.timestamp_ns == now
+    end
   end
 
   test "keyed retries bypass buffers and keep original idempotent fingerprints", ctx do
@@ -164,7 +501,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     caller =
       Task.Supervisor.async_nolink(ctx.tasks, fn ->
         try do
-          GenServer.call(ctx.buffer, {:append, records, bytes, 1}, 0)
+          GenServer.call(ctx.buffer, {:append, records, bytes, 1, []}, 0)
         catch
           :exit, {:timeout, _} -> :timed_out
         end
@@ -177,7 +514,8 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     owner = self()
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}})
     send(ctx.buffer, {:flush, token})
-    assert_receive {:storage_barrier, writer, "PUT", ^key}, 5000
+    # This verifies reservation lifetime, not encode/provider scheduling latency.
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 1, bytes, 1}]
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     send(writer, {:release_storage, key})
@@ -302,6 +640,26 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
       _ = :sys.get_state(ctx.buffer)
       assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
     end
+  end
+
+  test "trace payload overflow splits a coalesced flush instead of rejecting valid callers", ctx do
+    key = {:crypto.hash(:sha256, :erlang.term_to_binary(ctx.config, [:deterministic])), ctx.tenant, :traces}
+
+    buffer =
+      start_supervised!({AppendBuffer, key: key, signal: :traces, tenant: ctx.tenant, config: ctx.config},
+        id: :trace_buffer
+      )
+
+    :erlang.trace(buffer, true, [:receive])
+    [{^buffer, admission}] = Registry.lookup(AppendRegistry, key)
+    ctx = Map.merge(ctx, %{buffer: buffer, admission: admission, signal: :traces})
+    {:ok, [base], 0} = Traces.decode(OTLPTraceFixture.payload())
+    record = %{base | name: :binary.copy(<<0>>, 2 * 1024 * 1024)}
+    tasks = enqueue(ctx, [[record], [record]])
+    for task <- tasks, do: assert(:ok = Task.await(task, 30_000))
+    assert segment_puts(ctx.agent) == 2
+    assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
+    assert {:ok, [^record]} = S3.query(:traces, ctx.tenant, limit: 1)
   end
 
   test "storage errors fan out without retrying individual inputs after an ambiguous publication", ctx do

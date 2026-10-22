@@ -54,7 +54,7 @@ crash on boot.
 {{- if not .Values.storage.region }}
 {{- fail "storage.region is required" }}
 {{- end }}
-{{- $knownLimits := list "max_records" "max_attributes" "max_key_bytes" "max_value_bytes" "max_attribute_bytes" "max_depth" "max_nodes" }}
+{{- $knownLimits := list "max_records" "max_attributes" "max_key_bytes" "max_value_bytes" "max_attribute_bytes" "max_depth" "max_nodes" "max_trace_nodes" "max_otlp_nodes" }}
 {{- range $key, $value := .Values.ingestLimits }}
 {{- if not (has $key $knownLimits) }}
 {{- fail (printf "ingestLimits: unknown setting %q (expected one of %s)" $key (join ", " $knownLimits)) }}
@@ -166,6 +166,7 @@ before the release would crash on boot.
 {{- end }}
 {{- $_ := include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650) }}
 {{- $_ := include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650) }}
+{{- $_ := include "pulso.boundedInteger" (list "retention.tracesDays" $r.tracesDays 0 3650) }}
 {{- $_ := include "pulso.boundedInteger" (list "retention.deleteGraceMs" $r.deleteGraceMs 60000 2592000000) }}
 {{- $_ := include "pulso.boundedInteger" (list "retention.intervalMs" $r.intervalMs 1000 3600000) }}
 {{- $_ := include "pulso.boundedInteger" (list "retention.deleteLimit" $r.deleteLimit 1 512) }}
@@ -186,11 +187,12 @@ manifest conversion), and a 15-second drain margin, because stopping a node does
 {{- define "pulso.terminationGracePeriodSeconds" -}}
 {{- $configured := int64 .Values.terminationGracePeriodSeconds }}
 {{- $r := .Values.retention }}
-{{- if or $r.enabled (gt (int64 (include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650))) 0) (gt (int64 (include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650))) 0) }}
+{{- if or $r.enabled (gt (int64 (include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650))) 0) (gt (int64 (include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650))) 0) (gt (int64 (include "pulso.boundedInteger" (list "retention.tracesDays" $r.tracesDays 0 3650))) 0) }}
 {{- $logsDays := int64 (include "pulso.boundedInteger" (list "retention.logsDays" $r.logsDays 0 3650)) }}
 {{- $metricsDays := int64 (include "pulso.boundedInteger" (list "retention.metricsDays" $r.metricsDays 0 3650)) }}
+{{- $tracesDays := int64 (include "pulso.boundedInteger" (list "retention.tracesDays" $r.tracesDays 0 3650)) }}
 {{- $operationMs := int64 (include "pulso.boundedInteger" (list "retention.timeoutMs" $r.timeoutMs 1000 600000)) }}
-{{- if and (eq (toString $r.mode) "enforce") (or (gt $logsDays 0) (gt $metricsDays 0)) }}
+{{- if and (eq (toString $r.mode) "enforce") (or (gt $logsDays 0) (gt $metricsDays 0) (gt $tracesDays 0)) }}
 {{- $operationMs = max $operationMs (int64 (include "pulso.boundedInteger" (list "retention.migrationTimeoutMs" $r.migrationTimeoutMs 30000 3600000))) }}
 {{- end }}
 {{- $timeoutSeconds := div (add $operationMs 999) 1000 }}

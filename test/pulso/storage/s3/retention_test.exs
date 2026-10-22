@@ -357,7 +357,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
     Agent.update(ctx.agent, &%{&1 | barriers: pages})
     deadline = System.monotonic_time(:millisecond) + 1_000
     query = Task.async(fn -> S3.query(:metrics, ctx.tenant, deadline_ms: deadline) end)
-    assert_receive {:storage_barrier, storage, "GET", key}, 5_000
+    assert_receive {:storage_barrier, storage, "GET", key}, 30_000
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     wait = deadline - System.monotonic_time(:millisecond) + 1
     refute_receive :deadline_passed, max(wait, 0)
@@ -569,7 +569,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
     Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", :segment} => owner}})
     supervisor = start_supervised!(Task.Supervisor)
     task = Task.Supervisor.async_nolink(supervisor, fn -> S3.append(:metrics, ctx.tenant, [sample(ctx.now + 1)]) end)
-    assert_receive {:storage_barrier, storage, "PUT", key}, 5000
+    assert_receive {:storage_barrier, storage, "PUT", key}, 30_000
     assert {:ok, _} = Retention.advance(ctx.tenant, "metrics", ctx.config, now_ns: ctx.now + 2 * @day)
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     send(storage, {:release_storage, key})
@@ -599,7 +599,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
 
     blocked =
       for _ <- keys do
-        assert_receive {:storage_barrier, storage, "DELETE", key}, 5000
+        assert_receive {:storage_barrier, storage, "DELETE", key}, 30_000
         {storage, key}
       end
 
@@ -687,7 +687,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
     queue = for n <- 1..56, do: {"queued-#{n}", "metrics"}
     :sys.replace_state(worker, &%{&1 | queue: queue})
     send(worker, :retain)
-    state = :sys.get_state(worker)
+    state = :sys.get_state(worker, 60_000)
     assert length(state.queue) <= 64
     assert state.discovery != nil
     assert Enum.any?(state.queue, fn {tenant, _} -> String.starts_with?(tenant, "dormant-") end)

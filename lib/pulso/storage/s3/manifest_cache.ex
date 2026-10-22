@@ -8,11 +8,10 @@ defmodule Pulso.Storage.S3.ManifestCache do
   concurrent queries never contend with each other or with the
   ManifestOwner that owns writes.
 
-  Writes come only from `Pulso.Storage.S3.ManifestOwner`. Only one owner
-  process exists per `(tenant, signal)` (a Registry singleton), so there
-  is no need for `write_concurrency: true` — every write serializes
-  through the owner already, and enabling `write_concurrency` would pay
-  for a striping that helps nothing here.
+  Refreshes replace only their starting ETag. Publications also compare their
+  starting ETag, invalidating on an intervening snapshot rather than guessing
+  an order for opaque tags. Delayed reads and maintenance responses must not
+  overwrite a newer acknowledged publication. Both paths remain lock-free.
 
   The entry shape carries the manifest struct, the ETag it was fetched
   with (used on the next conditional GET to short-circuit an unchanged
@@ -52,21 +51,97 @@ defmodule Pulso.Storage.S3.ManifestCache do
   """
   @spec get(String.t(), String.t()) :: entry() | nil
   def get(tenant, signal) when is_binary(tenant) and is_binary(signal) do
+    {entry, _token} = snapshot(tenant, signal)
+    entry
+  end
+
+  @doc false
+  def snapshot(tenant, signal) do
     case :ets.lookup(table(), {tenant, signal}) do
-      [{_, entry}] -> entry
-      [] -> nil
+      [{_, %{invalidated?: true, token: token}}] -> {nil, token}
+      [{_, entry}] -> {entry, entry.token}
+      [] -> {nil, nil}
     end
   end
 
+  @doc "Install a read only if its exact cache generation is still current."
+  def put_snapshot(tenant, signal, manifest, etag, token) do
+    object = {{tenant, signal}, entry(tenant, signal, manifest, etag)}
+
+    if token == nil do
+      :ets.insert_new(table(), object)
+    else
+      :ets.select_replace(table(), [{{{tenant, signal}, %{token: token}}, [], [{:const, object}]}])
+    end
+
+    :ok
+  end
+
   @doc """
-  Store a manifest entry. Called only by `ManifestOwner` after a
-  successful load or CAS.
+  Seed a manifest entry unconditionally. Production refresh/publication paths
+  use the conditional APIs below; this is useful for owned fixtures.
   """
   @spec put(String.t(), String.t(), Manifest.t(), String.t()) :: :ok
   def put(tenant, signal, manifest, etag) when is_binary(tenant) and is_binary(signal) and is_binary(etag) do
+    :ets.insert(table(), {{tenant, signal}, entry(tenant, signal, manifest, etag)})
+    :ok
+  end
+
+  @doc "Cache a reader snapshot only if no other publication replaced its starting ETag."
+  def put_if_current(tenant, signal, manifest, etag, expected_etag) do
+    object = {{tenant, signal}, entry(tenant, signal, manifest, etag)}
+
+    if is_nil(expected_etag) do
+      :ets.insert_new(table(), object)
+    else
+      :ets.select_replace(table(), [{{{tenant, signal}, %{etag: expected_etag}}, [], [{:const, object}]}])
+    end
+
+    :ok
+  end
+
+  @doc "Install against the predecessor ETag and pre-I/O publication_base generation, or invalidate."
+  def publish(tenant, signal, manifest, etag, expected_etag, base) do
+    object = {{tenant, signal}, entry(tenant, signal, manifest, etag)}
+
+    replaced =
+      case base do
+        {:warm, token} ->
+          :ets.select_replace(table(), [
+            {{{tenant, signal}, %{etag: expected_etag, token: token}}, [], [{:const, object}]}
+          ])
+
+        {:cold, _token} ->
+          0
+      end
+
+    # Cold publications may install only the exact empty generation observed
+    # BEFORE their CAS, never an absence created by another writer afterwards.
+    if replaced == 0 and not install_cold(object, base), do: drop(tenant, signal)
+    :ok
+  end
+
+  @doc false
+  def publication_base(tenant, signal) do
+    case snapshot(tenant, signal) do
+      {nil, token} -> {:cold, token}
+      {_entry, token} -> {:warm, token}
+    end
+  end
+
+  defp install_cold(object, {:cold, nil}), do: :ets.insert_new(table(), object)
+
+  defp install_cold({key, _entry} = object, {:cold, token}) do
+    :ets.select_replace(table(), [{{key, %{invalidated?: true, token: token}}, [], [{:const, object}]}]) == 1
+  end
+
+  defp install_cold(_object, {:warm, _token}), do: false
+
+  defp entry(tenant, signal, manifest, etag) do
     entry = %{
       manifest: manifest,
       etag: etag,
+      token: make_ref(),
       refreshed_at_mono: System.monotonic_time(:millisecond)
     }
 
@@ -85,8 +160,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
         entry
       end
 
-    :ets.insert(table(), {{tenant, signal}, entry})
-    :ok
+    entry
   end
 
   @doc "Small node-local summaries for fixed-cardinality retention gauges, without storage I/O."
@@ -125,7 +199,9 @@ defmodule Pulso.Storage.S3.ManifestCache do
   @doc "Drop a cached entry — used on tenant deletion or forced cache flush."
   @spec drop(String.t(), String.t()) :: :ok
   def drop(tenant, signal) when is_binary(tenant) and is_binary(signal) do
-    :ets.delete(table(), {tenant, signal})
+    # Keep a generation fence, not a manifest. Deleting the key would allow
+    # a cold reader or delayed publisher from before the ACK to reinsert it.
+    :ets.insert(table(), {{tenant, signal}, %{invalidated?: true, token: make_ref()}})
     :ok
   end
 

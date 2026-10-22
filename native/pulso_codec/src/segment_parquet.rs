@@ -66,6 +66,7 @@ mod atoms {
         span_id,
         attributes,
         resource,
+        otlp,
     }
 }
 
@@ -110,9 +111,32 @@ struct Row {
     // JSON-encoded map, always populated (empty map is `"{}"`).
     attributes: Vec<u8>,
     resource: Vec<u8>,
+    otlp: Option<Vec<u8>>,
 }
 
-pub fn encode<'a>(env: Env<'a>, records: Term<'a>) -> Enc<(Vec<u8>, Bounds)> {
+pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+pub fn payload_size<'a>(env: Env<'a>, records: Term<'a>, limit: usize) -> Enc<usize> {
+    use crate::out::Sink;
+    let mut counter = crate::out::Counter::new(limit);
+    let enc = JsonEncoder::new(env, limit);
+    crate::segment::encode(
+        env,
+        &mut counter,
+        records,
+        crate::segment::Mode::Storage,
+        crate::segment::Framing::Array,
+        &enc,
+    )?;
+    if counter.len() > limit {
+        return Err(EncodeError::TooBig);
+    }
+    Ok(counter.len())
+}
+
+pub fn encode<'a>(env: Env<'a>, records: Term<'a>) -> Enc<(Binary<'a>, Bounds)> {
+    // Prove total escaped JSON expansion before allocating any row buffers.
+    payload_size(env, records, MAX_PAYLOAD)?;
     let len = records.list_length().map_err(|_| EncodeError::Fallback)?;
     let items: ListIterator = records.decode().map_err(|_| EncodeError::Fallback)?;
     let struct_key = atoms::struct_key().encode(env);
@@ -158,14 +182,15 @@ pub fn encode<'a>(env: Env<'a>, records: Term<'a>) -> Enc<(Vec<u8>, Bounds)> {
     // Rough starting size: 64 B header + 32 B per row. Zstd will shrink
     // it further; growing the Vec is cheap enough that under-sizing is
     // fine, but starting large avoids the first few reallocs.
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + rows.len() * 32);
+    let mut buf =
+        crate::out::BinaryWriter(crate::out::BinSink::with_capacity(64 + rows.len() * 32));
     let props = writer_properties();
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Fallback)?;
     writer.write(&batch).map_err(|_| EncodeError::Fallback)?;
     writer.close().map_err(|_| EncodeError::Fallback)?;
 
-    Ok((buf, bounds))
+    Ok((buf.0.finish(env), bounds))
 }
 
 fn extract_row<'a>(
@@ -196,6 +221,19 @@ fn extract_row<'a>(
     let span_id = extract_binary(record, atoms::span_id().encode(env), enc)?;
     let attributes = extract_map_as_json(record, atoms::attributes().encode(env), enc, scratch)?;
     let resource = extract_map_as_json(record, atoms::resource().encode(env), enc, scratch)?;
+    let otlp_term = record
+        .map_get(atoms::otlp().encode(env))
+        .map_err(|_| EncodeError::Fallback)?;
+    let otlp = if otlp_term == atom::nil().encode(env) {
+        None
+    } else {
+        Some(extract_map_as_json(
+            record,
+            atoms::otlp().encode(env),
+            enc,
+            scratch,
+        )?)
+    };
 
     // The caller-supplied `timestamp_ns` maps `nil` to `0`, matching the
     // NDJSON path in `Pulso.Storage.S3.caller_ts_bounds/1`.
@@ -215,6 +253,7 @@ fn extract_row<'a>(
         span_id,
         attributes,
         resource,
+        otlp,
     })
 }
 
@@ -290,6 +329,7 @@ fn parquet_schema() -> SchemaRef {
         Field::new("span_id", DataType::Utf8, true),
         Field::new("attributes", DataType::Utf8, false),
         Field::new("resource", DataType::Utf8, false),
+        Field::new("otlp", DataType::Utf8, true),
     ]))
 }
 
@@ -309,6 +349,7 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut span_id = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
     let mut attributes = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
     let mut resource = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+    let mut otlp = StringBuilder::with_capacity(rows.len(), rows.len() * 64);
 
     for row in rows {
         ts.append_option(row.timestamp_ns);
@@ -321,6 +362,7 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
         append_opt_bytes(&mut span_id, row.span_id.as_deref());
         append_bytes(&mut attributes, &row.attributes);
         append_bytes(&mut resource, &row.resource);
+        append_opt_bytes(&mut otlp, row.otlp.as_deref());
     }
 
     RecordBatch::try_new(
@@ -336,6 +378,7 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
             Arc::new(span_id.finish()),
             Arc::new(attributes.finish()),
             Arc::new(resource.finish()),
+            Arc::new(otlp.finish()),
         ],
     )
 }
@@ -451,7 +494,12 @@ pub fn decode<'a>(
         // Ordinary logs can share these segments and exceed the Sentry wire
         // cap after JSON escaping. Count actual repeated string lengths with
         // the low-level reader before Arrow expands dictionaries into Utf8.
-        if builder.schema().fields() != parquet_schema().fields() {
+        let schema = builder.schema();
+        let expected = parquet_schema();
+        let fields = schema.fields();
+        let valid = fields == expected.fields()
+            || (fields.len() == 10 && fields.iter().eq(expected.fields().iter().take(10)));
+        if !valid {
             return Err(Fallback.into());
         }
         let batch_size = preflight_expansion(bytes, &surviving, max)?;
@@ -494,8 +542,8 @@ pub fn decode<'a>(
 // Keep the normal post-decode buffer charge: lengths do not account for every
 // Arrow offset, validity bit or allocation capacity.
 fn preflight_expansion(bytes: Bytes, groups: &[usize], max: usize) -> Result<usize, DecodeError> {
-    // The fixed schema needs 20 scalar bytes, 28 offset bytes and validity
-    // bits per row. Reserve extra space for per-buffer alignment/capacity.
+    // Both legacy and rich schemas fit 20 scalar bytes, up to 32 offset
+    // bytes and validity bits per row. Reserve extra alignment/capacity.
     const ROW_BYTES: usize = 64;
     const BATCH_PADDING: usize = 2048;
 
@@ -614,14 +662,14 @@ fn row_group_matches_time(rg: &RowGroupMetaData, ts_col: Option<usize>, filter: 
 // deliberately independent — sub-binaries returned from `sub_binary`
 // carry only `'a`, so the batch can be dropped at the end of each
 // materialise loop iteration while the returned terms outlive it.
-struct StringArena<'a, 'b> {
+pub(crate) struct StringArena<'a, 'b> {
     arena: Option<Binary<'a>>,
     offsets: &'b [i32],
     array: &'b StringArray,
 }
 
 impl<'a, 'b> StringArena<'a, 'b> {
-    fn from(env: Env<'a>, col: &'b StringArray) -> Self {
+    pub(crate) fn from(env: Env<'a>, col: &'b StringArray) -> Self {
         let bytes = col.value_data();
         let arena = if bytes.is_empty() {
             None
@@ -683,6 +731,13 @@ fn materialize<'a>(
     let span_id = StringArena::from(env, span_id_col);
     let attributes = StringArena::from(env, attributes_col);
     let resource = StringArena::from(env, resource_col);
+    // Absence is the legacy ten-column schema. A present column with the
+    // wrong Arrow type is corruption, not permission to discard metadata.
+    let otlp = if batch.column_by_name("otlp").is_some() {
+        Some(StringArena::from(env, downcast_string(batch, "otlp")?))
+    } else {
+        None
+    };
 
     let nil = atom::nil().encode(env);
     let empty_map = rustler::types::map::map_new(env);
@@ -690,7 +745,7 @@ fn materialize<'a>(
     let log = atoms::log().encode(env);
     let keys = field_atoms(env);
 
-    let mut all_keys: Vec<Term<'a>> = Vec::with_capacity(11);
+    let mut all_keys: Vec<Term<'a>> = Vec::with_capacity(12);
     all_keys.push(struct_key);
     all_keys.extend_from_slice(&keys);
 
@@ -707,7 +762,8 @@ fn materialize<'a>(
     let mut previous_resource: Option<(&[u8], Term<'a>)> = None;
     // Share the fixed flat-map key tuple and unchanged field terms across
     // records. Keep only one previous record; never conflate differing rows.
-    let mut previous_record: Option<(Term<'a>, [Term<'a>; 11])> = None;
+    let mut previous_record: Option<(Term<'a>, [Term<'a>; 12])> = None;
+    let mut previous_row: Option<usize> = None;
 
     for i in 0..batch.num_rows() {
         // Apply per-row filters before building any Erlang terms so the
@@ -736,12 +792,19 @@ fn materialize<'a>(
             continue;
         }
 
-        // Count only matching rows, and reject before allocating another record.
-        // The caller passes the remaining allowance across all scanned segments.
+        // Count duplicates too, before sharing a previously materialized term.
         if filter.max_records.is_some_and(|max| out.len() >= max) {
             return Err(DecodeError::TooManyRecords);
         }
 
+        // Share duplicates only after byte-exact Arrow comparison, including
+        // JSON columns. BEAM equality alone loses signed-zero distinctions.
+        if let (Some(previous), Some((term, _))) = (previous_row, previous_record) {
+            if identical_row(batch, previous, i) {
+                out.push(term);
+                continue;
+            }
+        }
         let ts_term = int_term(env, ts_col, i, nil);
         let observed_term = int_term(env, observed_col, i, nil);
         let sev_num_term = int32_term(env, sev_num_col, i, nil);
@@ -779,6 +842,13 @@ fn materialize<'a>(
             }
         };
 
+        let otlp_term = match &otlp {
+            Some(arena) => json_term(env, arena, i, nil, &mut stacks, &mut interned_keys)?,
+            None => nil,
+        };
+        if otlp_term != nil && otlp_term.get_type() != rustler::TermType::Map {
+            return Err(Fallback.into());
+        }
         // Field order matches `field_atoms/1`.
         let values = [
             log,
@@ -792,17 +862,22 @@ fn materialize<'a>(
             span_id_term,
             ts_term,
             trace_id_term,
+            otlp_term,
         ];
         let term = match previous_record {
             Some((mut term, previous_values)) => {
-                for ((key, value), previous) in all_keys
+                for (index, ((key, value), previous)) in all_keys
                     .iter()
                     .zip(values.iter())
                     .zip(previous_values.iter())
+                    .enumerate()
                 {
-                    // Atom, immediate and already-shared terms need no FFI
-                    // comparison. Distinct terms still use exact equality.
-                    if value.as_c_arg() != previous.as_c_arg() && value != previous {
+                    // Pointer-identical terms can be shared. Do not use BEAM
+                    // numeric equality for distinct JSON terms: it conflates
+                    // +0.0 and -0.0 inside bodies, attributes and metadata.
+                    let json_field = matches!(index, 1 | 2 | 4 | 11);
+                    if value.as_c_arg() != previous.as_c_arg() && (json_field || value != previous)
+                    {
                         term = term.map_update(*key, *value).map_err(|_| Fallback)?;
                     }
                 }
@@ -811,9 +886,33 @@ fn materialize<'a>(
             None => Term::map_from_arrays(env, &all_keys, &values).map_err(|_| Fallback)?,
         };
         previous_record = Some((term, values));
+        previous_row = Some(i);
         out.push(term);
     }
     Ok(())
+}
+
+fn identical_row(batch: &RecordBatch, left: usize, right: usize) -> bool {
+    batch.columns().iter().all(|column| {
+        if column.is_null(left) || column.is_null(right) {
+            return column.is_null(left) == column.is_null(right);
+        }
+        match column.data_type() {
+            DataType::Int64 => column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .is_some_and(|a| a.value(left) == a.value(right)),
+            DataType::Int32 => column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .is_some_and(|a| a.value(left) == a.value(right)),
+            DataType::Utf8 => column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .is_some_and(|a| a.value(left).as_bytes() == a.value(right).as_bytes()),
+            _ => false,
+        }
+    })
 }
 
 // Evaluate every matcher against the row's `resource` JSON, plus the
@@ -899,7 +998,7 @@ fn line_filters_pass(line_filters: &[LineFilter], body: &StringArena, i: usize) 
 
 // Same column order + atom order as `segment.rs` uses so the returned
 // maps are indistinguishable from the NDJSON path's output.
-fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 10] {
+fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 11] {
     [
         atoms::attributes(),
         atoms::body(),
@@ -911,6 +1010,7 @@ fn field_atoms<'a>(env: Env<'a>) -> [Term<'a>; 10] {
         atoms::span_id(),
         atoms::timestamp_ns(),
         atoms::trace_id(),
+        atoms::otlp(),
     ]
     .map(|a| a.encode(env))
 }
@@ -970,7 +1070,7 @@ fn sub_term<'a>(
     Ok(arena.sub_binary(i)?.encode(env))
 }
 
-fn json_term<'a>(
+pub(crate) fn json_term<'a>(
     env: Env<'a>,
     arena: &StringArena<'a, '_>,
     i: usize,
@@ -1133,3 +1233,240 @@ mod tests {
         assert_eq!(strings.value(1), hi);
     }
 }
+
+// -- compaction ----------------------------------------------------------
+
+/// Why a log compaction cannot produce a replacement segment.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompactError {
+    Invalid,
+    TooMany,
+    PayloadTooLarge,
+}
+
+/// A merged log segment: payload, encoder-compatible bounds, row count, and
+/// the complete nonempty service set (`None` when unknown).
+pub type Compacted<'a> = (Binary<'a>, Bounds, Option<Vec<String>>);
+
+/// Merge log segments natively, never building Erlang terms for records.
+///
+/// Every source must have the encoder's schema; legacy ten-column segments
+/// gain a null `otlp` column, which decodes exactly as the legacy layout.
+/// Rows are re-sorted by `(service, timestamp_ns)` with nulls first, the
+/// encoder's order, and written with the encoder's writer properties. The
+/// service summary follows `Segment.summarize_logs/2`: complete when every
+/// row has a nonempty service of at most 256 bytes and there are at most
+/// 128 distinct services, unknown otherwise.
+pub fn compact<'a>(
+    env: Env<'a>,
+    blobs: Term<'a>,
+    max_rows: usize,
+) -> Result<Compacted<'a>, CompactError> {
+    use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch, SortColumn};
+    use std::collections::BTreeSet;
+
+    let schema = parquet_schema();
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    let mut string_bytes = 0usize;
+    let mut bounds = Bounds {
+        min_ts: i128::MAX,
+        max_ts: i128::MIN,
+        count: 0,
+    };
+    let mut services = Some(BTreeSet::new());
+
+    for term in blobs
+        .decode::<ListIterator>()
+        .map_err(|_| CompactError::Invalid)?
+    {
+        let blob: Binary = term.decode().map_err(|_| CompactError::Invalid)?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(crate::erlang_bytes::from_binary(blob))
+                .map_err(|_| CompactError::Invalid)?;
+        let declared = usize::try_from(builder.metadata().file_metadata().num_rows())
+            .map_err(|_| CompactError::Invalid)?;
+        if rows.checked_add(declared).is_none_or(|n| n > max_rows) {
+            return Err(CompactError::TooMany);
+        }
+        let legacy = builder.schema().fields().len() + 1 == schema.fields().len()
+            && builder
+                .schema()
+                .fields()
+                .iter()
+                .zip(schema.fields())
+                .all(|(a, b)| a == b);
+        if !legacy && builder.schema().fields() != schema.fields() {
+            return Err(CompactError::Invalid);
+        }
+        for batch in builder
+            .with_batch_size(8192)
+            .build()
+            .map_err(|_| CompactError::Invalid)?
+        {
+            let batch = batch.map_err(|_| CompactError::Invalid)?;
+            let batch = if legacy {
+                let mut columns = batch.columns().to_vec();
+                columns.push(arrow::array::new_null_array(
+                    &DataType::Utf8,
+                    batch.num_rows(),
+                ));
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+                    .map_err(|_| CompactError::Invalid)?
+            } else {
+                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+                    .map_err(|_| CompactError::Invalid)?
+            };
+            rows += batch.num_rows();
+            if rows > max_rows {
+                return Err(CompactError::TooMany);
+            }
+            for column in batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+                    string_bytes += strings.value_data().len();
+                }
+            }
+            if string_bytes > 2 * MAX_PAYLOAD {
+                return Err(CompactError::PayloadTooLarge);
+            }
+            let ts = downcast_int64(&batch, "timestamp_ns").map_err(|_| CompactError::Invalid)?;
+            let service = downcast_string(&batch, "service").map_err(|_| CompactError::Invalid)?;
+            for i in 0..batch.num_rows() {
+                let value = if ts.is_null(i) {
+                    0
+                } else {
+                    i128::from(ts.value(i))
+                };
+                bounds.min_ts = bounds.min_ts.min(value);
+                bounds.max_ts = bounds.max_ts.max(value);
+                bounds.count += 1;
+                services = services.and_then(|mut set| {
+                    let name = (!service.is_null(i)).then(|| service.value(i));
+                    match name {
+                        Some(name) if !name.is_empty() && name.len() <= 256 => {
+                            set.insert(name.to_owned());
+                            (set.len() <= 128).then_some(set)
+                        }
+                        _ => None,
+                    }
+                });
+            }
+            batches.push(batch);
+        }
+    }
+
+    if bounds.count == 0 {
+        bounds.min_ts = 0;
+        bounds.max_ts = 0;
+    }
+    let merged = concat_batches(&schema, &batches).map_err(|_| CompactError::Invalid)?;
+    drop(batches);
+    let sort: Vec<SortColumn> = ["service", "timestamp_ns"]
+        .iter()
+        .map(|name| SortColumn {
+            values: merged
+                .column_by_name(name)
+                .expect("log schema column")
+                .clone(),
+            options: None,
+        })
+        .collect();
+    let indices = lexsort_to_indices(&sort, None).map_err(|_| CompactError::Invalid)?;
+    let sorted = take_record_batch(&merged, &indices).map_err(|_| CompactError::Invalid)?;
+    drop(merged);
+
+    let mut buf = crate::out::BinaryWriter(crate::out::BinSink::with_capacity(64 + rows * 32));
+    let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(writer_properties()))
+        .map_err(|_| CompactError::Invalid)?;
+    writer.write(&sorted).map_err(|_| CompactError::Invalid)?;
+    writer.close().map_err(|_| CompactError::Invalid)?;
+    let services = services.map(|set| set.into_iter().collect());
+    Ok((buf.0.finish(env), bounds, services))
+}
+
+// -- streaming decode ------------------------------------------------------
+
+/// A log segment decoded a bounded chunk of records at a time, so callers
+/// that fold records never hold a whole (possibly compacted, 100k-row)
+/// segment as Erlang terms. Filters and row-group pruning are `decode`'s.
+pub struct Reader {
+    reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    start: Option<i128>,
+    end: Option<i128>,
+    service: Option<Vec<u8>>,
+    matchers: Vec<Matcher>,
+    line_filters: Vec<LineFilter>,
+}
+
+impl Reader {
+    pub fn new(blob: &Binary<'_>, filter: Filter<'_>) -> Res<Option<Self>> {
+        let bytes = Bytes::copy_from_slice(blob.as_slice());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| Fallback)?;
+        let metadata = builder.metadata().clone();
+        let ts_col = metadata
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.name() == "timestamp_ns");
+        let time_filter = filter.start.is_some() || filter.end.is_some();
+        let surviving: Vec<usize> = (0..metadata.num_row_groups())
+            .filter(|&i| {
+                !time_filter || row_group_matches_time(metadata.row_group(i), ts_col, &filter)
+            })
+            .collect();
+        if surviving.is_empty() {
+            return Ok(None);
+        }
+        let reader = builder
+            .with_row_groups(surviving)
+            .with_batch_size(STREAM_BATCH_ROWS)
+            .build()
+            .map_err(|_| Fallback)?;
+        Ok(Some(Reader {
+            reader,
+            start: filter.start,
+            end: filter.end,
+            service: filter.service.map(<[u8]>::to_vec),
+            matchers: filter.matchers,
+            line_filters: filter.line_filters,
+        }))
+    }
+
+    /// Decode batches until at least `min_records` records survive the
+    /// filters or the segment ends. `None` once nothing remains.
+    pub fn next<'a>(&mut self, env: Env<'a>, min_records: usize) -> Res<Option<Vec<Term<'a>>>> {
+        let filter = Filter {
+            start: self.start,
+            end: self.end,
+            service: self.service.as_deref(),
+            matchers: std::mem::take(&mut self.matchers),
+            line_filters: std::mem::take(&mut self.line_filters),
+            max_records: None,
+            max_decoded_bytes: None,
+        };
+        let mut out = Vec::new();
+        let mut exhausted = true;
+        let result = (|| {
+            for batch in self.reader.by_ref() {
+                let batch = batch.map_err(|_| Fallback)?;
+                materialize(env, &batch, &filter, &mut out).map_err(|_| Fallback)?;
+                if out.len() >= min_records {
+                    exhausted = false;
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        self.matchers = filter.matchers;
+        self.line_filters = filter.line_filters;
+        result?;
+        Ok(if out.is_empty() && exhausted {
+            None
+        } else {
+            Some(out)
+        })
+    }
+}
+
+const STREAM_BATCH_ROWS: usize = 4096;

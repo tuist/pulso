@@ -31,6 +31,20 @@ defmodule Pulso.Auth do
     module().verify(conn, tenant)
   end
 
+  @doc "Decoded HTTP Basic credentials, or `:error` when the request has none."
+  @spec basic_credentials(Conn.t()) :: {:ok, String.t(), String.t()} | :error
+  def basic_credentials(conn) do
+    with [header] <- Conn.get_req_header(conn, "authorization"),
+         [scheme, encoded] <- String.split(header, " ", parts: 2),
+         "basic" <- String.downcase(scheme),
+         {:ok, decoded} <- Base.decode64(String.trim(encoded)),
+         [username, password] when username != "" and password != "" <- :binary.split(decoded, ":") do
+      {:ok, username, password}
+    else
+      _ -> :error
+    end
+  end
+
   @spec module() :: module()
   def module do
     case Runtime.get_env(:pulso, __MODULE__) do

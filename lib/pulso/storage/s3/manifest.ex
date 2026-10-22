@@ -205,14 +205,17 @@ defmodule Pulso.Storage.S3.Manifest do
          not Map.has_key?(manifest.retired, replacement.key) do
       retired = Enum.reduce(source_keys, manifest.retired, &Map.put(&2, &1, Retirement.new(delete_after)))
       remaining = Enum.reject(manifest.segments, &MapSet.member?(sources, &1.key))
+
       {:ok, merge(%{manifest | version: 2, segments: remaining, retired: retired}, [replacement])}
     else
       {:error, :compaction_conflict}
     end
   end
 
+  # Manifests outlive the GET that read them (cache, owners, retries), so
+  # their strings must not stay sub-binaries of the response body.
   defp safe_decode(binary) do
-    {:ok, Pulso.JSON.decode!(binary)}
+    {:ok, binary |> Pulso.JSON.decode!() |> Pulso.JSON.detach()}
   rescue
     e -> {:error, {:decode_failed, e}}
   end
@@ -335,8 +338,15 @@ defmodule Pulso.Storage.S3.Manifest do
     deduped = new_segments |> Enum.reject(&Map.has_key?(manifest.retired, &1.key)) |> Enum.uniq_by(& &1.key)
     new_sorted = sort_by_max_ts_desc(deduped)
     merged = merge_sorted(new_sorted, existing, [], MapSet.new(Enum.map(new_sorted, & &1.key)))
+    # Complete hash sets are only a paged-leaf construction aid. Flat point
+    # lookups use adaptive/canonical blooms; don't retain/rewrite unused hashes
+    # indefinitely. Migration safely treats these absent sets as unknown.
+    merged = if manifest.version < 3, do: Enum.map(merged, &thin_flat_trace_summary/1), else: merged
     %{manifest | segments: merged, retired: retired}
   end
+
+  defp thin_flat_trace_summary(%{trace_summary: nil} = segment), do: segment
+  defp thin_flat_trace_summary(segment), do: %{segment | trace_summary: %{segment.trace_summary | lookup_hashes: nil}}
 
   defp retry_retired(segment, retired) do
     case Map.fetch(retired, segment.key) do

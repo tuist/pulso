@@ -8,7 +8,9 @@
 pub enum Value<'a> {
     Varint(u64),
     Bytes(&'a [u8]),
-    Fixed,
+    /// A fixed64 payload (`double`, `fixed64`, `sfixed64`), little-endian.
+    Fixed64([u8; 8]),
+    Fixed32,
 }
 
 pub struct Reader<'a> {
@@ -34,6 +36,16 @@ impl<'a> Reader<'a> {
         None
     }
 
+    /// Whether every byte has been read.
+    pub fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
+
+    /// The next bare varint, as in a packed repeated scalar field.
+    pub fn read_varint(&mut self) -> Option<u64> {
+        self.varint()
+    }
+
     fn skip(&mut self, n: usize) -> Option<()> {
         self.pos = self.pos.checked_add(n).filter(|p| *p <= self.buf.len())?;
         Some(())
@@ -50,8 +62,9 @@ impl<'a> Reader<'a> {
         let value = match key & 7 {
             0 => Value::Varint(self.varint()?),
             1 => {
+                let start = self.pos;
                 self.skip(8)?;
-                Value::Fixed
+                Value::Fixed64(self.buf[start..self.pos].try_into().ok()?)
             }
             2 => {
                 let len = usize::try_from(self.varint()?).ok()?;
@@ -61,7 +74,7 @@ impl<'a> Reader<'a> {
             }
             5 => {
                 self.skip(4)?;
-                Value::Fixed
+                Value::Fixed32
             }
             // 3/4 are deprecated groups; nothing in Loki's schema uses them.
             _ => return None,

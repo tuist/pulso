@@ -57,8 +57,18 @@ defmodule PulsoWeb.LokiController do
     opts = append_opts(conn)
 
     with :ok <- validate_tenant(tenant),
-         :ok <- Auth.verify(conn, tenant),
-         {:ok, records, rejected, conn} <- decode_body(conn, params),
+         :ok <- Auth.verify(conn, tenant) do
+      case decode_body(conn, params) do
+        {:ok, records, rejected, conn} -> finish(conn, tenant, opts, {:ok, records, rejected})
+        {:error, reason, conn} -> finish(conn, tenant, opts, {:error, reason, conn})
+      end
+    else
+      {:error, _} = error -> finish(conn, tenant, opts, error)
+    end
+  end
+
+  defp finish(conn, tenant, opts, decoded) do
+    with {:ok, records, rejected} <- decoded,
          :ok <- Pulso.Metrics.append(:logs, tenant, records, rejected, opts) do
       conn
       |> put_rejected_header(rejected)
@@ -98,6 +108,9 @@ defmodule PulsoWeb.LokiController do
         conn
         |> put_status(:unauthorized)
         |> json(%{error: to_string(reason)})
+
+      {:error, :keyed_content_mismatch} ->
+        conn |> put_status(:conflict) |> json(%{error: "keyed_content_mismatch"})
 
       {:error, {:encode_failed, _}} ->
         conn
@@ -152,16 +165,29 @@ defmodule PulsoWeb.LokiController do
         end
 
       :protobuf ->
-        with :ok <- validate_protobuf_encoding(conn),
-             {:ok, body, conn} <- read_full_body(conn),
-             {:ok, records, rejected} <- Push.decode_protobuf(body, @max_decompressed_bytes) do
-          {:ok, records, rejected, conn}
-        else
+        case validate_protobuf_encoding(conn) do
+          :ok -> decode_protobuf(conn)
           {:error, reason} -> {:error, reason, conn}
         end
 
       :unsupported ->
         {:error, :unsupported_content_type, conn}
+    end
+  end
+
+  defp decode_protobuf(conn) do
+    case read_full_body(conn) do
+      {:ok, body, conn} ->
+        case Push.decode_protobuf(body, @max_decompressed_bytes) do
+          {:ok, records, rejected} -> {:ok, records, rejected, conn}
+          {:error, reason} -> {:error, reason, conn}
+        end
+
+      {:error, reason, conn} ->
+        {:error, reason, conn}
+
+      {:error, reason} ->
+        {:error, reason, conn}
     end
   end
 
@@ -216,13 +242,13 @@ defmodule PulsoWeb.LokiController do
       {:ok, body, conn} ->
         {:ok, body, conn}
 
-      {:more, _chunk, _conn} ->
+      {:more, _chunk, conn} ->
         # Plug returns `:more` only when a single read filled its
         # `length` window — i.e. the compressed body is above our cap.
         # A snappy-compressed Loki push above this cap has no
         # legitimate shape, so refuse rather than buffer arbitrary
         # amounts.
-        {:error, :payload_too_large}
+        {:error, :payload_too_large, conn}
 
       {:error, _} = err ->
         err

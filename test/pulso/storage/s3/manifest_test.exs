@@ -153,3 +153,26 @@ defmodule Pulso.Storage.S3.ManifestTest do
     assert {:error, :invalid_manifest} = Manifest.decode(~s({"v":1,"s":[],"retired":{"a":"soon"}}))
   end
 end
+
+defmodule Pulso.Storage.S3.ManifestDetachTest do
+  # Decoded manifests are cached and read by heap-capped ingest processes
+  # whose caps include shared binaries. Keys must not stay sub-binaries of the
+  # manifest body, or each one counts the whole body against the cap.
+  use Pulso.Test.Case, async: true
+
+  alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Manifest.Segment
+
+  test "decoded segment keys do not reference the manifest body" do
+    segments =
+      for i <- 1..200 do
+        key = "tenants/t/v4/signal=traces/date=2026-10-19/hour=10/#{i}-#{i + 1}-#{String.duplicate("a", 40)}.parquet"
+        Segment.build(key, i, i + 1, 1)
+      end
+
+    body = %Manifest{version: 1, segments: segments} |> Manifest.encode() |> IO.iodata_to_binary()
+    {:ok, decoded} = Manifest.decode(body)
+
+    assert Enum.all?(decoded.segments, &(:binary.referenced_byte_size(&1.key) == byte_size(&1.key)))
+  end
+end

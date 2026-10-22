@@ -38,6 +38,7 @@ defmodule Pulso.MCP.Arguments do
   defp validate_type(value, "array", _path) when is_list(value), do: :ok
   defp validate_type(value, "string", _path) when is_binary(value), do: :ok
   defp validate_type(value, "integer", _path) when is_integer(value), do: :ok
+  defp validate_type(value, "boolean", _path) when is_boolean(value), do: :ok
   defp validate_type(_value, type, path), do: invalid("#{path} must be #{type}")
 
   defp validate_constraints(value, schema, path) do
@@ -68,16 +69,43 @@ defmodule Pulso.MCP.Arguments do
 
   defp validate_bounds(_value, _schema, _path), do: :ok
 
-  defp validate_length(value, %{"minLength" => minimum}, path) when is_binary(value) do
-    if String.length(value) >= minimum,
+  defp validate_length(value, schema, path) when is_binary(value) do
+    length = codepoint_length(value, 0)
+
+    cond do
+      length == :invalid ->
+        invalid("#{path} must contain valid UTF-8")
+
+      Map.has_key?(schema, "minLength") and length < schema["minLength"] ->
+        invalid("#{path} must contain at least #{schema["minLength"]} characters")
+
+      Map.has_key?(schema, "maxLength") and length > schema["maxLength"] ->
+        invalid("#{path} must contain at most #{schema["maxLength"]} characters")
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_length(value, %{"maxItems" => maximum}, path) when is_list(value) do
+    if length(Enum.take(value, maximum + 1)) <= maximum,
       do: :ok,
-      else: invalid("#{path} must contain at least #{minimum} characters")
+      else: invalid("#{path} must contain at most #{maximum} items")
   end
 
   defp validate_length(_value, _schema, _path), do: :ok
 
+  # JSON Schema lengths count code points, not grapheme clusters. Walk
+  # without allocating a charlist proportional to an untrusted string.
+  defp codepoint_length(<<>>, count), do: count
+  defp codepoint_length(<<_::utf8, rest::binary>>, count), do: codepoint_length(rest, count + 1)
+  defp codepoint_length(_invalid, _count), do: :invalid
+
   defp validate_children(value, %{"type" => "object"} = schema, path) do
-    with :ok <- validate_required(value, schema, path) do
+    with :ok <- validate_required(value, schema, path),
+         :ok <- validate_object_bounds(value, schema, path),
+         :ok <- validate_property_names(value, schema, path),
+         :ok <- validate_additional_properties(value, schema, path) do
       Enum.reduce_while(schema["properties"] || %{}, :ok, fn {key, child_schema}, :ok ->
         continue(validate_property(value, key, child_schema, path))
       end)
@@ -93,6 +121,40 @@ defmodule Pulso.MCP.Arguments do
   end
 
   defp validate_children(_value, _schema, _path), do: :ok
+
+  defp validate_additional_properties(value, %{"additionalProperties" => false} = schema, path) do
+    properties = schema["properties"] || %{}
+
+    case Enum.find(Map.keys(value), &(not Map.has_key?(properties, &1))) do
+      nil -> :ok
+      unknown -> invalid("#{path}.#{unknown} is not supported")
+    end
+  end
+
+  defp validate_additional_properties(value, %{"additionalProperties" => child_schema} = schema, path)
+       when is_map(child_schema) do
+    properties = schema["properties"] || %{}
+
+    Enum.reduce_while(value, :ok, fn {key, child}, :ok ->
+      if Map.has_key?(properties, key),
+        do: {:cont, :ok},
+        else: continue(validate(child, child_schema, "#{path}.#{key}"))
+    end)
+  end
+
+  defp validate_additional_properties(_value, _schema, _path), do: :ok
+
+  defp validate_object_bounds(value, %{"maxProperties" => maximum}, path) do
+    if map_size(value) <= maximum, do: :ok, else: invalid("#{path} must contain at most #{maximum} properties")
+  end
+
+  defp validate_object_bounds(_value, _schema, _path), do: :ok
+
+  defp validate_property_names(value, %{"propertyNames" => schema}, path) do
+    Enum.reduce_while(Map.keys(value), :ok, fn key, :ok -> continue(validate(key, schema, "#{path} property name")) end)
+  end
+
+  defp validate_property_names(_value, _schema, _path), do: :ok
 
   defp validate_required(value, schema, path) do
     case Enum.find(schema["required"] || [], &(not Map.has_key?(value, &1))) do

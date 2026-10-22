@@ -72,8 +72,12 @@ The ones you are most likely to change:
 | `existingSecret` | Use a Secret you manage instead of chart-rendered credentials. |
 | `ingress.*` | Expose ingestion and queries outside the cluster. |
 | `serviceMonitor.enabled` | Create a Prometheus Operator `ServiceMonitor` for self-monitoring. |
+| `prometheusRule.enabled` | Create a Prometheus Operator `PrometheusRule` with the [self-monitoring alerts](self-monitoring.md#alerts). |
+| `metricsFooterPruning.enabled` | Disabled by default. Footer-first exclusion for ordinary metric queries, not metadata discovery. Requires strong ETags, suffix Range and GET If-Match; matching sources can add GETs and hit budgets earlier. See [prerequisites and limits](metric-footer-pruning.md). |
 | `metricsCompaction.enabled` | Merge small metrics segments. Read [the prerequisites](configuration.md#metrics-compaction) first. |
-| `retention.*` | Experimental event-time retention: `enabled` (keep the worker running with zero durations), `logsDays`, `metricsDays`, `mode` (`observe`, `enforce`, `paused`), grace, cadence, deletion limit, timeout, migration timeout, future skew and sweep horizon. Defaults keep data indefinitely. Read [retention](retention.md) first; enforcing is irreversible. |
+| `retention.*` | Experimental event-time retention: `enabled`, `logsDays`, `metricsDays`, `tracesDays`, `mode` (`observe`, `enforce`, `paused`), grace, cadence, deletion limit, timeout, migration timeout, future skew and sweep horizon. Defaults keep data indefinitely. Read [retention](retention.md) first; enforcing is irreversible. |
+| `tempoSearch.enabled` | Disabled by default. Experimental complete-retained-context Tempo search and five-scope discovery (parent-string-filtered names/values; names are complete hints, not matching-key proofs, 2M owner-plus-attribute work units per attempt before filtering, reducing dense flat-scope capacity); complete-context search can use publication-proven exact-service candidate pruning then conservative ID context recovery, never time clipping. Unknown/legacy sources read. Metadata/page/heap limits can bind before the hard 8192-ref catalog maximum; actual GETs retain cumulative 1024-input / 32 MiB / 1M-raw-row bounds. Probe fallback can exhaust limits late; unread irrelevant sources are not integrity-scrubbed. Requires metadata2/export3/search4/discovery12, tuple `{2,1,3,4,12}`, across every serving artifact; no representative posting/capacity/client acceptance. Bounded negated-regex/status/int64 OR/span-duration search expressions disable the service planner and add a 20M prefilter work ceiling per attempt; see [expression semantics](trace-query-expressions.md). Discovery retains its own all-source header/provider scan and does not use service/ID planning. Default names combine five namespaces plus v2 static suggestions under one global work/dictionary budget (20 intrinsic reservations also before v1 flattening); all errors fail whole. Unscoped values union three original owners after optional bounded same-parent resource/span string filters, a complete extension rather than Tempo's ignored-query fast path. Same-key equality and unsupported filters reject; matching complex targets/unknown legacy/corruption never become partial results. Query-aware unscoped and separately window-aware filtered-unscoped adapter support is required; old callbacks never receive new modes. Floats (including non-finite classes) and seven parent-filtered stored intrinsic strings plus event:timeSinceStart exact signed int nanoseconds use normal storage/work bounds. Event-time filters are a complete extension versus upstream's empty filtered path; no event invents no value, default time0 may yield negative offsets. Invalid requested event times fail even on nonmatches; explicit event-time and separate windowed-event-time support fence old callbacks (paired windows select whole retention-visible segment envelopes, not point-time filtering or indexed I/O; compaction can broaden suggestions, all source header/provider bounds still apply; require matching capability-12 artifacts on every serving instance). Root name/service dictionaries recover complete retained candidate context, not a matching child's fields. Missing/ambiguous roots or missing original string root service fail409 whole; in-flight and retention-straddling/multi-root traces can make broad/recent autocomplete unusable. No skip/default invention. All retained root S3 data must fit1024 objects/32MiB compressed/1M raw rows even for narrow windows; no service/ID planning, replay decodes all sources with header/body agreement. 65,536 candidates/16MiB bookkeeping and2M resource/span/link owner+attr work plus existing dictionary/result limits; dedicated root/window execution required. Not transparent autocomplete parity. Canonical trace:duration now measures full retained envelopes without requiring roots; it can grow on ingest/shrink on retention, not exporter duration. No filters emits int nanoseconds, supported filters emit Go duration strings (µs), both lexical; caches must separate those vocabularies. Same whole-tenant input/replay bounds,2M resource/span owner+attr work,65,536 groups/80B-per-summary charge within16MiB (not total native memory),5000/1MiB dictionary/result limits; broad high-cardinality queries commonly fail422. New duration/window adapters required; static empty duration/span:duration/traceDuration remain unchanged. Also enables authenticated/admitted static intrinsic vocabulary without storage reads; it is not stored-data evidence. Check cardinality, memory and provider limits before opting in; see [Tempo search](traces.md#experimental-tempo-search). |
+| `traceCompaction.enabled` | Experimental native trace merges. Requires all bucket readers/writers/compactors upgraded and bucket versioning; see [traces](traces.md#optional-native-compaction). |
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
@@ -85,6 +89,7 @@ The ones you are most likely to change:
 | `alerting.evaluationEnabled` | Opt-in experimental native evaluation, default `false`. Grafana execution remains unsupported; native delivery has a separate opt-in. |
 | `alerting.notificationsEnabled` | Opt-in native Slack delivery, default `false`; not Grafana routing/template parity. |
 | `alerting.notificationTargets` | Public target descriptors; reference webhook environment secrets supplied through `extraEnv`, never inline URLs. |
+| `alerting.sourceBindings` | Explicit tenant/original-UID/native-promql or native-logql mappings for read-only disabled graph previews, default `[]`; no URLs or implicit source residency. See [graph previews](alerting.md#preview-an-imported-expression-graph). |
 | `alerting.pollIntervalMs` | Durable rule discovery interval (`1000..60000` ms), default `5000`; benchmark read cost before lowering it. |
 | `resources` | CPU and memory. The defaults are starting points, not measured capacity. |
 
@@ -109,7 +114,10 @@ changes; run `kubectl rollout restart deployment/pulso` after updating it.
 
 Pulso serves plain HTTP on port 4000 and expects TLS to terminate in front of
 it, at an ingress controller, load balancer, or service mesh. In-cluster
-collectors can talk to the Service directly.
+collectors can talk to the Service directly. When the
+[OTLP/gRPC receiver](otlp-grpc.md) is enabled (`otlpGrpc.enabled`), it listens
+on its own port (4317 by default), also in plain text; expose it through a
+gRPC-capable load balancer or ingress.
 
 The same listener serves ingestion, queries, the Model Context Protocol, health
 probes, and the unauthenticated self-monitoring endpoint `/metrics`. Never expose
@@ -118,8 +126,19 @@ the whole listener publicly. The chart's ingress routes only these paths:
 | Path | Type | Serves |
 | --- | --- | --- |
 | `/v1/logs` | Exact | OpenTelemetry logs |
+| `/v1/traces` | Exact | OpenTelemetry traces |
+| `/v1/metrics` | Exact | OpenTelemetry metrics |
+| `/otlp/v1/logs`, `/otlp/v1/traces`, `/otlp/v1/metrics` | Exact | OpenTelemetry signals at Loki's and Grafana Cloud's paths |
+| `/api/prom/push` | Exact | Prometheus remote write at the Grafana Cloud/Cortex path |
 | `/loki/api/v1` | Prefix | Loki push and queries |
 | `/api/v1` | Prefix | Prometheus remote write and queries |
+| `/api/search/tags`, `/api/v2/search/tags` | Exact | Experimental default/combined or explicitly scoped names, optionally parent-string-filtered complete hints (not exact upstream omission parity), or static intrinsic vocabulary; same default-off gate |
+| `/api/search/tag`, `/api/v2/search/tag` | Prefix | Experimental scoped string/int64/bool/float values (nonfinite classes included), parent-filtered leading-dot three-owner values, stored intrinsic strings and exact integer event-time offsets; same default-off gate |
+| `/api/search` | Exact | Experimental Tempo search; disabled by default (`tempoSearch.enabled`) |
+| `/api/traces` | Prefix | Experimental Tempo v1 exact-ID trace lookup |
+| `/api/v2/traces` | Prefix | Experimental Tempo v2 exact-ID trace lookup |
+| `/api/metrics` | Prefix | TraceQL metrics (`query_range`, `query`); same default-off gate as Tempo search |
+| `/api/echo`, `/api/status/buildinfo` | Exact | Tempo datasource health checks |
 | `/mcp` | Exact | Model Context Protocol |
 
 Requests for any other path, including `/metrics`, `/healthz`, and `/readyz`,
@@ -232,28 +251,80 @@ forward instead.
 
 ### Native library compatibility
 
-Pulso's object-storage client is a native library that must come from the same
+Pulso's object-storage client and telemetry codec are native libraries that must come from the same
 release as the rest of the application. The container image compiles it from
 source, so this only matters if you build Pulso yourself with precompiled
 native artifacts: each release publishes artifacts built from its own source.
 With the S3 backend, a node whose native library predates the storage
 operations this release needs refuses to start and names the mismatch, instead
-of failing ingest later. Rebuild with `PULSO_NIF_FORCE_BUILD=1` or install the
+of failing ingest later. Every node also refuses a codec artifact that cannot
+preserve rich OTLP log/metric metadata, validate typed OTLP trace metadata or
+run bounded native trace-level search and Tempo v1/v2 trace export. Rebuild with `PULSO_NIF_FORCE_BUILD=1` or install the
 artifacts that match the release.
+
+### Immutable keyed ingestion upgrade
+
+New S3 applications require object-store native API `{1,1,1,1}` (retention, keyed publication, snapshot GET,
+asynchronous requests). Upgrade or drain **every writer**, including recording evaluators
+and instances in other serving pools, before relying on create-only keyed
+uploads. Local startup checks and Helm Recreate cannot fence old unconditional
+writers. Byte-different retries now fail permanently with HTTP409 rather than
+overwriting; this is not semantic cross-encoder recovery. Conflicts can block a
+recording queue and mixed/incoherent old writers can leave
+`segment_summary_mismatch` compaction failures. Read
+[keyed ingestion](keyed-ingestion.md) before upgrading encoder dependencies or
+attempting recovery; preserve coherent backups and do not rotate retry keys.
+
+### Typed trace metadata compatibility
+
+Before enriched/non-finite trace writes, pause ingress, drain legacy and
+byte-service keyed retries and
+upgrade every reader, writer and compactor sharing the bucket, including
+independent instances and other Helm releases. Read the complete
+[trace upgrade boundary](traces.md#typed-metadata-upgrade-boundary). A startup
+check rejects stale codec artifacts but cannot fence already running old nodes.
+`Recreate` only orders pods within its own rollout.
+
+The physical Parquet columns are unchanged, but new trace payloads contain both
+query-friendly attributes and a typed envelope. This roughly doubles attribute
+bytes plus tag/pair overhead. Previously near-ceiling batches can receive permanent
+413 responses, and compaction/full query limits are reached sooner. Reduce and
+measure hard-capped collector batches; halving alone is not a safety proof.
+
+Retain compatible images/native artifacts for rollback and coherent backups of
+segments/manifests/pages. Old decode/re-encode paths can erase typed metadata;
+an incompatible rollback after rich writes is not supported. Legacy type identity
+cannot be backfilled by guessing from base64 strings.
 
 ## Sending telemetry
 
 Every request carries the tenant's bearer token and, for HTTP ingestion, the
-`X-Scope-OrgID` header. The receivers speak existing protocols, so collectors
+`X-Scope-OrgID` header, or Basic credentials of the form `<tenant>:<token>`. The receivers speak existing protocols, so collectors
 need only a destination change.
 
 | Signal | Endpoint | Formats |
 | --- | --- | --- |
 | Logs | `POST /loki/api/v1/push` | Loki protobuf (Snappy) or JSON, optionally gzip |
-| Logs | `POST /v1/logs` | OpenTelemetry Protocol over HTTP, JSON encoding only, optionally gzip |
-| Metrics | `POST /api/v1/write` | Prometheus remote write 1.0 |
+| Logs | `POST /v1/logs` | OpenTelemetry Protocol over HTTP, protobuf or JSON, optionally gzip. Also served at `/otlp/v1/logs` (Loki's and Grafana Cloud's OTLP path), as are `/otlp/v1/metrics` and `/otlp/v1/traces`. See [typed logs, collector bridging and upgrades](logs.md). |
+| Traces | `POST /v1/traces` | OpenTelemetry Protocol over HTTP, protobuf or JSON, optionally gzip. See [trace collector configuration and limits](traces.md). |
+| Metrics | `POST /api/v1/write` | Prometheus remote write 1.0 and 2.0 (chosen by the `Content-Type` `proto` parameter). Also served at `/api/prom/push` (Grafana Cloud, Cortex) and `/api/v1/push` (Mimir). |
+| Metrics | `POST /v1/metrics` | OTLP/HTTP JSON/protobuf, optionally gzip. Gauges, cumulative sums, cumulative explicit histograms and summaries; see [supported metrics and collector configuration](metrics.md). |
 
-Traces and OpenTelemetry metrics are not supported yet.
+OTLP/gRPC for logs, metrics and traces is available on a separate, opt-in port; see [OTLP over gRPC](otlp-grpc.md).
+All OTLP receivers additionally require matching application/native artifacts
+with shared **OTLP wire capability 3** for bounded message merging, exact quoted/
+unquoted integer forms and receiver-scoped duplicate JSON validation. Fractional timestamps can no longer underflow into an
+unknown-time/receive-time fallback. Known duplicate JSON fields now return 400
+instead of silently selecting the first field; unknown fields stay ignored in
+the receiving signal's schema. Upgrade every serving ingress pair before relying on those forms;
+there is no storage-format change in this wire increment. See [wire upgrade and
+rollback](otlp-wire.md#upgrade-and-rollback).
+
+For delta or exponential-histogram workloads, keep a compatible metric backend. Upgrade every serving ingress app/native pair to OTLP decoder capability 2 before relying on explicit histograms/summaries; an older pool rejects those points. Both source-point and expanded-sample limits apply, and repeated full source envelopes still obey the fixed 16 MiB metadata ceiling. See [distribution behavior and batching](metrics.md#histograms-and-summaries).
+Upgrade all metric readers, writers and compactors before metadata-bearing OTLP
+metric writes; see [metrics upgrade and rollback](metrics.md#upgrade-and-rollback).
+Rich OTLP log writes require all readers/writers upgraded and pending legacy
+keyed retries drained first; see [log storage compatibility](logs.md#upgrade-and-rollback).
 
 [Grafana Alloy](https://grafana.com/docs/alloy/latest/) example, using the
 in-cluster Service:
@@ -276,6 +347,36 @@ prometheus.remote_write "pulso" {
 }
 ```
 
+Alloy's `prometheus.remote_write` sends metric metadata (type, help, unit) only
+over Remote Write 2.0, and only for scrapes with `honor_metadata = true`. Both
+are experimental in Alloy, so run it with `--stability.level=experimental`:
+
+```alloy
+prometheus.scrape "app" {
+  // ...
+  honor_metadata = true
+  forward_to     = [prometheus.remote_write.pulso.receiver]
+}
+
+prometheus.remote_write "pulso" {
+  endpoint {
+    url              = "http://pulso.observability.svc:4000/api/v1/write"
+    protobuf_message = "io.prometheus.write.v2.Request"
+    headers          = { "X-Scope-OrgID" = "production" }
+    bearer_token     = sys.env("PULSO_TOKEN")
+  }
+}
+```
+
+Over Remote Write 2.0, Pulso answers with the
+`X-Prometheus-Remote-Write-*-Written` counts. A request with invalid series or
+invalid histograms stores its valid series and answers 400 (as Prometheus
+does), so the sender counts the rest as failed; invalid exemplars are dropped
+and left out of the written count. Prometheus itself sends metadata over both
+versions. To send native histograms and exemplars, set `send_native_histograms`
+and `send_exemplars` on the remote write (Prometheus, Alloy's
+`prometheus.remote_write`) and scrape native histograms at the source.
+
 OpenTelemetry Collector example for logs:
 
 ```yaml
@@ -293,6 +394,16 @@ Pulso rejects a whole batch with `413` when it exceeds the
 happens. When adding Pulso next to an existing backend, give each destination
 its own retry queue so a problem with one does not hold back the other.
 
+To check that Pulso answers like the existing backend while both receive the
+same data, run `mix pulso.parity` from a Pulso checkout. It takes Grafana
+dashboard JSON exports, Grafana alert rule exports or a plain list of queries,
+runs every PromQL and LogQL query over several windows (default 1h, 6h, 24h,
+7d) against both backends with identical step-aligned bounds, and reports
+series or streams that differ, values beyond a relative tolerance (default
+1e-9) and errors on either side, exiting non-zero if any. Credentials go in
+`PULSO_PARITY_REFERENCE_HEADERS` and `PULSO_PARITY_CANDIDATE_HEADERS` (one
+`Name: value` per line); `mix help pulso.parity` lists the options.
+
 ## Querying
 
 - **Model Context Protocol**: point an agent at `https://<host>/mcp` with the
@@ -302,6 +413,10 @@ its own retry queue so a problem with one does not hold back the other.
 - **Prometheus API**: `GET|POST /api/v1/query` and `/api/v1/query_range`, with
   the same token and tenant header. Grafana can use it as a Prometheus data
   source for the [supported query subset](querying.md#prometheus-api).
+  Bounded label/value/series discovery is also available through `/api/v1/labels`,
+  `/api/v1/label/<name>/values` and `/api/v1/series`; see [metadata API limits](metric-discovery.md).
+  Serving app/native pairs require metric codec `{1,2,1,1,1}` (including footer planning). These routes do not
+  establish complete Grafana datasource/client compatibility.
 - **Loki API**: `/loki/api/v1/query`, `query_range`, `labels`, and
   `label/<name>/values`.
 

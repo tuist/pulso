@@ -4,9 +4,9 @@ defmodule Pulso.OTLP.LogsTest do
   alias Pulso.OTLP.Logs
   alias Pulso.Record.Log
 
-  test "returns {[], 0} for a payload without resourceLogs" do
-    assert Logs.decode(%{}) == {[], 0}
-    assert Logs.decode(%{"resourceLogs" => "not-a-list"}) == {[], 0}
+  test "accepts an empty request but rejects malformed containers" do
+    assert Logs.decode(%{}) == {:ok, [], 0}
+    assert Logs.decode(%{"resourceLogs" => "not-a-list"}) == {:error, :invalid_otlp}
   end
 
   test "decodes a full record with resource, attributes, and body" do
@@ -32,8 +32,8 @@ defmodule Pulso.OTLP.LogsTest do
                   "attributes" => [
                     %{"key" => "user.id", "value" => %{"stringValue" => "u1"}}
                   ],
-                  "traceId" => "abc",
-                  "spanId" => "def"
+                  "traceId" => String.duplicate("a", 32),
+                  "spanId" => String.duplicate("d", 16)
                 }
               ]
             }
@@ -42,7 +42,8 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[
+    assert {:ok,
+            [
               %Log{
                 timestamp_ns: 1_700_000_000_000_000_000,
                 observed_timestamp_ns: 1_700_000_000_000_000_001,
@@ -50,8 +51,8 @@ defmodule Pulso.OTLP.LogsTest do
                 severity_text: "INFO",
                 service: "api",
                 body: "hello",
-                trace_id: "abc",
-                span_id: "def",
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                span_id: "dddddddddddddddd",
                 attributes: %{"user.id" => "u1"},
                 resource: %{"service.name" => "api", "deploy.env" => "prod"}
               }
@@ -73,7 +74,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}], 0} =
+    assert {:ok, [%Log{timestamp_ns: nil, observed_timestamp_ns: nil, body: "no ts"}], 0} =
              Logs.decode(payload)
   end
 
@@ -95,7 +96,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 42, body: "only observed"}], 0} =
+    assert {:ok, [%Log{timestamp_ns: 42, observed_timestamp_ns: 42, body: "only observed"}], 0} =
              Logs.decode(payload)
   end
 
@@ -121,7 +122,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{timestamp_ns: nil, observed_timestamp_ns: 1_700_000_000_000_000_000}], 0} =
+    assert {:ok, [%Log{timestamp_ns: 1_700_000_000_000_000_000, observed_timestamp_ns: 1_700_000_000_000_000_000}], 0} =
              Logs.decode(payload)
   end
 
@@ -143,7 +144,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{body: "ok"}], 1} = Logs.decode(payload)
+    assert {:ok, [%Log{body: "ok"}], 1} = Logs.decode(payload)
   end
 
   test "decodes AnyValue variants in attributes" do
@@ -185,7 +186,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {[%Log{attributes: attrs}], 0} = Logs.decode(payload)
+    assert {:ok, [%Log{attributes: attrs}], 0} = Logs.decode(payload)
     assert attrs["s"] == "x"
     assert attrs["i"] == 42
     assert attrs["b"] == true
@@ -215,7 +216,7 @@ defmodule Pulso.OTLP.LogsTest do
       ]
     }
 
-    assert {records, 0} = Logs.decode(payload)
+    assert {:ok, records, 0} = Logs.decode(payload)
     assert length(records) == 4
     assert Enum.map(records, & &1.service) == ["a", "a", "a", "b"]
     assert Enum.map(records, & &1.timestamp_ns) == [1, 2, 3, 4]

@@ -51,11 +51,12 @@ defmodule Pulso.MCP.ToolsTest do
     assert Enum.at(entry["value"], 1) == "+Inf"
   end
 
-  test "lists log, metric and error query tools" do
+  test "lists log, metric, trace and error query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])
     assert "query_logs" in names
     assert "query_metrics" in names
+    assert "discover_metrics" in names
     assert "query_logql" in names
     assert "query_promql" in names
     assert "query_errors" in names
@@ -83,7 +84,7 @@ defmodule Pulso.MCP.ToolsTest do
             tool["name"] in ~w(list_error_issues list_error_changes list_indexed_error_issues)
         end)
 
-      assert length(tools) == 8
+      assert length(tools) == 9
 
       for tool <- tools do
         assert tool["annotations"] == %{
@@ -225,7 +226,7 @@ defmodule Pulso.MCP.ToolsTest do
 
     test "optional nulls preserve defaults while required nulls are rejected" do
       for tool <- query_tools() do
-        args = %{"tenant" => "acme", "query" => expression(tool["name"])}
+        args = query_arguments(tool["name"])
         required = tool["inputSchema"]["required"]
         args = if "start_ts_ns" in required, do: Map.merge(args, %{"start_ts_ns" => 0, "end_ts_ns" => 0}), else: args
 
@@ -328,11 +329,7 @@ defmodule Pulso.MCP.ToolsTest do
 
         for tool <- query_tools(), tool["name"] != "query_errors" do
           assert {:ok, _} =
-                   Tools.call(tool["name"], %{
-                     "tenant" => "acme",
-                     "query" => expression(tool["name"]),
-                     "end_ts_ns" => ts
-                   })
+                   Tools.call(tool["name"], Map.put(query_arguments(tool["name"]), "end_ts_ns", ts))
         end
 
         assert {:ok, [%{"text" => text}]} =
@@ -379,11 +376,22 @@ defmodule Pulso.MCP.ToolsTest do
   end
 
   defp assert_supported_schema(schema) do
-    supported = ~w(type properties required items enum minimum maximum minLength description)
+    supported =
+      ~w(type properties required items enum minimum maximum minLength maxLength maxItems maxProperties propertyNames description additionalProperties)
+
+    case schema["additionalProperties"] do
+      child when is_map(child) -> assert_supported_schema(child)
+      value -> assert value in [nil, true, false]
+    end
+
+    if schema["propertyNames"], do: assert_supported_schema(schema["propertyNames"])
     assert Map.keys(schema) -- supported == []
     for {_name, child} <- schema["properties"] || %{}, do: assert_supported_schema(child)
     if schema["items"], do: assert_supported_schema(schema["items"])
   end
+
+  defp query_arguments("query_traces"), do: %{"tenant" => "acme"}
+  defp query_arguments(name), do: %{"tenant" => "acme", "query" => expression(name)}
 
   defp expression("query_logql"), do: ~s({service="api"})
   defp expression(_), do: "up"
@@ -392,6 +400,7 @@ defmodule Pulso.MCP.ToolsTest do
     @queries [
       {"query_logs", %{"tenant" => "acme"}},
       {"query_metrics", %{"tenant" => "acme"}},
+      {"query_traces", %{"tenant" => "acme"}},
       {"query_logql", %{"tenant" => "acme", "query" => ~s({service="api"})}},
       {"query_promql", %{"tenant" => "acme", "query" => "up"}},
       {"query_errors", %{"tenant" => "acme", "start_ts_ns" => 0, "end_ts_ns" => 100}},
@@ -399,7 +408,7 @@ defmodule Pulso.MCP.ToolsTest do
     ]
 
     test "all advertised query tools declare read-only behavior" do
-      assert length(query_tools()) == 5
+      assert length(query_tools()) == 6
       assert Enum.all?(query_tools(), &(&1["annotations"]["readOnlyHint"] == true))
     end
 
@@ -490,11 +499,18 @@ defmodule Pulso.MCP.ToolsTest do
       end
     end
 
-    test "accepts equal time bounds, empty matchers, and additional properties" do
+    test "accepts equal bounds and empty matchers; only open schemas allow additional properties" do
       for {name, args} <- @queries do
-        args = Map.merge(args, %{"start_ts_ns" => 10, "end_ts_ns" => 10, "extension" => true})
+        args = Map.merge(args, %{"start_ts_ns" => 10, "end_ts_ns" => 10})
         args = if name == "query_promql", do: Map.put(args, "step_ms", 1), else: args
         assert {:ok, _} = Tools.call(name, args)
+        extended = Map.put(args, "extension", true)
+
+        if name == "query_traces" do
+          assert {:error, {:invalid_arguments, "arguments.extension is not supported"}} = Tools.call(name, extended)
+        else
+          assert {:ok, _} = Tools.call(name, extended)
+        end
       end
 
       assert {:ok, _} = Tools.call("query_metrics", %{"tenant" => "acme", "matchers" => []})

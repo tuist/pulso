@@ -19,26 +19,32 @@ defmodule PulsoWeb.RemoteWriteController do
   @max_compressed_bytes 4 * 1024 * 1024
 
   @doc """
-  Prometheus remote_write v1 receiver at `POST /api/v1/write`.
+  Prometheus Remote Write receiver at `POST /api/v1/write`, for both 1.0
+  (`prometheus.WriteRequest`) and 2.0 (`io.prometheus.write.v2.Request`).
 
   Protocol contract (what Alloy / Grafana Agent / vanilla Prometheus
   will send unmodified):
 
-    * `Content-Type: application/x-protobuf` (required, 415 otherwise).
+    * `Content-Type: application/x-protobuf` (required, 415 otherwise). Its
+      `proto` parameter selects the message: absent or
+      `prometheus.WriteRequest` is 1.0, `io.prometheus.write.v2.Request` is
+      2.0, anything else is 415.
     * `Content-Encoding: snappy` (required, 415 otherwise — the
       Prometheus spec is stricter than Loki's push here: an absent
       content-encoding is NOT treated as snappy).
-    * `X-Prometheus-Remote-Write-Version: 0.1.0` (treated as advisory —
-      we accept any `0.*` or missing header; a non-zero major is
-      rejected with 400 since the wire shape is version-locked).
+    * `X-Prometheus-Remote-Write-Version` (advisory: missing, `0.*`, `1.*`
+      and `2.*` are accepted; another major is rejected with 400).
     * `X-Scope-OrgID: <tenant>` (optional; defaults to `"default"`).
     * `Idempotency-Key: <token>` (optional; propagated to storage).
 
   Status codes:
 
-    * `204 No Content` on success. Prometheus retries on anything else.
+    * `204 No Content` on success; 5xx and optionally 429 are retryable,
+      other 4xx are permanent.
     * `400` on invalid snappy, invalid protobuf, or invalid tenant name.
     * `401` on auth failures.
+    * `409` on existing keyed bytes differing (`keyed_content_mismatch`);
+      preserve storage evidence rather than retrying or overwriting.
     * `413` if the body, record count, or attributes exceed ingest budgets.
     * `415` on wrong `Content-Type` or `Content-Encoding`.
     * `429` on storage backpressure (`:owner_overloaded`) — Prometheus
@@ -47,6 +53,13 @@ defmodule PulsoWeb.RemoteWriteController do
 
   Rejected-sample count is surfaced in `X-Pulso-Rejected-Records` to
   mirror the Loki push convention.
+
+  2.0 responses also carry `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written`.
+  As in Prometheus's receiver, a 2.0 request with rejected series or invalid
+  histograms stores what is valid and answers 400, so senders count the rest
+  as failed instead of retrying it. Invalid exemplars are dropped and missing
+  from the written count. A 1.0 request keeps answering 204 with the rejected
+  count.
   """
   def write(conn, _params) do
     tenant = tenant_from(conn)
@@ -54,15 +67,34 @@ defmodule PulsoWeb.RemoteWriteController do
 
     with :ok <- validate_tenant(tenant),
          :ok <- Auth.verify(conn, tenant),
-         :ok <- validate_content_type(conn),
+         {:ok, version} <- message_version(conn),
          :ok <- validate_content_encoding(conn),
-         :ok <- validate_version_header(conn),
-         {:ok, body, conn} <- read_full_body(conn),
-         {:ok, samples, rejected} <- Push.decode_protobuf(body, @max_decompressed_bytes),
-         :ok <- Pulso.Metrics.append(:metrics, tenant, samples, rejected, opts) do
+         :ok <- validate_version_header(conn) do
+      case read_full_body(conn) do
+        {:ok, body, conn} ->
+          finish(conn, tenant, opts, version, Push.decode_with_metadata(body, @max_decompressed_bytes, version))
+
+        {:error, reason, conn} ->
+          finish(conn, tenant, opts, version, {:error, reason})
+
+        {:error, _} = error ->
+          finish(conn, tenant, opts, version, error)
+      end
+    else
+      {:error, _} = error -> finish(conn, tenant, opts, :v1, error)
+    end
+  end
+
+  defp finish(conn, tenant, opts, version, decoded) do
+    # Metadata publishes first: if it fails, nothing is stored and the
+    # sender's retry of the whole request cannot duplicate samples.
+    with {:ok, samples, rejected, metadata} <- decoded,
+         :ok <- Pulso.MetricMetadata.record(tenant, metadata),
+         :ok <- append_samples(tenant, samples, rejected, opts) do
       conn
       |> put_rejected_header(rejected)
-      |> send_resp(:no_content, "")
+      |> put_written_headers(version, samples)
+      |> written(version, rejected)
     else
       {:error, :unsupported_content_type} ->
         conn |> put_status(:unsupported_media_type) |> json(%{error: "unsupported_content_type"})
@@ -98,6 +130,9 @@ defmodule PulsoWeb.RemoteWriteController do
         # right surface.
         conn |> put_status(:too_many_requests) |> json(%{error: "backpressure"})
 
+      {:error, :keyed_content_mismatch} ->
+        conn |> put_status(:conflict) |> json(%{error: "keyed_content_mismatch"})
+
       {:error, {:encode_failed, _}} ->
         conn |> put_status(:bad_request) |> json(%{error: "encode_failed"})
 
@@ -112,18 +147,55 @@ defmodule PulsoWeb.RemoteWriteController do
     end
   end
 
-  defp validate_content_type(conn) do
-    case Plug.Conn.get_req_header(conn, "content-type") do
-      [] ->
-        {:error, :unsupported_content_type}
+  defp written(conn, :v2, rejected) when rejected > 0 do
+    conn |> put_status(:bad_request) |> json(%{error: "rejected_records", rejected: rejected})
+  end
 
-      [ct | _] ->
-        if protobuf?(ct), do: :ok, else: {:error, :unsupported_content_type}
+  defp written(conn, _version, _rejected), do: send_resp(conn, :no_content, "")
+
+  # Remote Write 2.0 senders treat a 2xx without these as a 1.0-only receiver.
+  defp put_written_headers(conn, :v1, _samples), do: conn
+
+  defp put_written_headers(conn, :v2, samples) do
+    floats = Enum.count(samples, &(not is_nil(&1.value)))
+    histograms = Enum.count(samples, & &1.histogram)
+    exemplars = Enum.reduce(samples, 0, &(length(&1.exemplars || []) + &2))
+
+    conn
+    |> Plug.Conn.put_resp_header("x-prometheus-remote-write-samples-written", Integer.to_string(floats))
+    |> Plug.Conn.put_resp_header("x-prometheus-remote-write-histograms-written", Integer.to_string(histograms))
+    |> Plug.Conn.put_resp_header("x-prometheus-remote-write-exemplars-written", Integer.to_string(exemplars))
+  end
+
+  # Metadata-only requests (senders send metadata apart from samples) store no samples.
+  defp append_samples(_tenant, [], 0, _opts), do: :ok
+
+  defp append_samples(tenant, samples, rejected, opts),
+    do: Pulso.Metrics.append(:metrics, tenant, samples, rejected, opts)
+
+  # `application/x-protobuf[;proto=<message>]`, as both protocol versions send it.
+  defp message_version(conn) do
+    with [content_type | _] <- Plug.Conn.get_req_header(conn, "content-type"),
+         [media | params] <- content_type |> String.split(";") |> Enum.map(&String.trim/1),
+         "application/x-protobuf" <- String.downcase(media) do
+      params
+      |> Enum.find_value(&proto_param/1)
+      |> case do
+        nil -> {:ok, :v1}
+        "prometheus.WriteRequest" -> {:ok, :v1}
+        "io.prometheus.write.v2.Request" -> {:ok, :v2}
+        _ -> {:error, :unsupported_content_type}
+      end
+    else
+      _ -> {:error, :unsupported_content_type}
     end
   end
 
-  defp protobuf?(ct) do
-    ct |> String.downcase() |> String.starts_with?("application/x-protobuf")
+  defp proto_param(param) do
+    case String.split(param, "=", parts: 2) do
+      [key, value] -> if String.downcase(String.trim(key)) == "proto", do: value |> String.trim() |> String.trim("\"")
+      _ -> nil
+    end
   end
 
   # The Prometheus remote_write v1 spec requires `Content-Encoding: snappy`.
@@ -136,24 +208,24 @@ defmodule PulsoWeb.RemoteWriteController do
     end
   end
 
-  # `X-Prometheus-Remote-Write-Version: 0.1.0`. We accept any `0.*`
-  # (and an absent header, since older forwarders omit it); a non-zero
-  # major is a different wire shape so refuse rather than silently
-  # mis-parse. Future v2 (OpenMetrics) support will key off this value.
+  # `X-Prometheus-Remote-Write-Version`: 1.0 senders send `0.1.0`, 2.0 senders
+  # `2.0.0` (older forwarders omit it). The message type comes from the
+  # Content-Type, so the header is advisory; an unknown major is refused
+  # rather than risk mis-parsing a future wire shape.
   defp validate_version_header(conn) do
     case Plug.Conn.get_req_header(conn, "x-prometheus-remote-write-version") do
       [] ->
         :ok
 
       [v | _] ->
-        if String.starts_with?(v, "0."), do: :ok, else: {:error, :unsupported_remote_write_version}
+        if String.starts_with?(v, ["0.", "1.", "2."]), do: :ok, else: {:error, :unsupported_remote_write_version}
     end
   end
 
   defp read_full_body(conn) do
     case Plug.Conn.read_body(conn, length: @max_compressed_bytes) do
       {:ok, body, conn} -> {:ok, body, conn}
-      {:more, _, _} -> {:error, :payload_too_large}
+      {:more, _, conn} -> {:error, :payload_too_large, conn}
       {:error, _} = err -> err
     end
   end

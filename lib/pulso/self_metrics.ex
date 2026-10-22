@@ -12,12 +12,16 @@ defmodule Pulso.SelfMetrics do
 
   @table __MODULE__
   @operations %{
-    ingest: [:otlp, :loki, :remote_write, :sentry],
-    query: [:storage_logs, :storage_metrics, :promql, :logql_log, :logql_metric, :mcp, :http],
+    ingest: [:otlp, :otlp_traces, :otlp_metrics, :loki, :remote_write, :sentry],
+    query: [:storage_logs, :storage_metrics, :storage_traces, :promql, :logql_log, :logql_metric, :mcp, :http],
     object: [:put, :put_if_match, :put_if_none_match, :get, :get_if_none_match, :delete, :list, :list_prefixes],
     compaction: [:compact, :cleanup, :worker_merge, :worker_cleanup, :worker_discovery]
   }
+  @alert_skip_reasons [:authority_missing, :freshness_unavailable, :capacity, :timeout, :budget, :overrun]
   @definitions [
+    {"pulso_keyed_publication_conflicts_total", "counter",
+     "Keyed appends rejected because existing object bytes differ."},
+    {"pulso_alert_evaluation_skips_total", "counter", "Native alert ticks not published, by bounded reason."},
     {"pulso_operations_total", "counter", "Completed operations by layer and outcome."},
     {"pulso_operation_duration_seconds", "summary", "Operation latency; count and sum only, no quantiles."},
     {"pulso_ingest_records_total", "counter", "Decoded records accepted, rejected, or failed at publication."},
@@ -48,7 +52,12 @@ defmodule Pulso.SelfMetrics do
       end
     end
 
-    for signal <- [:logs, :metrics], outcome <- [:accepted, :rejected, :failed], do: records(signal, outcome, 0)
+    for signal <- [:logs, :metrics, :traces],
+        outcome <- [:accepted, :rejected, :failed],
+        do: records(signal, outcome, 0)
+
+    for reason <- @alert_skip_reasons, do: increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 0)
+    increment("pulso_keyed_publication_conflicts_total", "", 0)
     for direction <- [:read, :write], do: object_bytes(direction, 0)
     compaction(:compact, {:ok, %{merged: 0}})
     compaction(:cleanup, {:ok, 0})
@@ -112,7 +121,7 @@ defmodule Pulso.SelfMetrics do
   end
 
   def records(signal, outcome, count)
-      when signal in [:logs, :metrics] and outcome in [:accepted, :rejected, :failed] and is_integer(count) and
+      when signal in [:logs, :metrics, :traces] and outcome in [:accepted, :rejected, :failed] and is_integer(count) and
              count >= 0 do
     increment("pulso_ingest_records_total", ~s(signal="#{signal}",outcome="#{outcome}"), count)
   end
@@ -130,6 +139,16 @@ defmodule Pulso.SelfMetrics do
   end
 
   def compaction(_operation, _result), do: :ok
+
+  @doc "Count a byte-conflicting keyed append without retaining tenant/key/content data."
+  def keyed_publication_conflict, do: increment("pulso_keyed_publication_conflicts_total", "", 1)
+
+  @doc "Record a skipped native tick without retaining tenant/rule/query/provider data."
+  def alert_evaluation_skip(reason) when reason in @alert_skip_reasons do
+    increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 1)
+  end
+
+  def alert_evaluation_skip(_), do: :ok
 
   defp increment(name, labels, value) do
     :ets.update_counter(table(), {name, labels}, {2, value}, {{name, labels}, 0})

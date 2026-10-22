@@ -12,34 +12,42 @@ defmodule Pulso.LogQL.Entry do
       `level`, `detected_level`) derived from the typed struct fields,
       so `{service_name="api"}` and `{service="api"}` both match
       regardless of which ingest path produced the record.
+    * `base_labels` — immutable resource/promoted stream-name provenance.
+      Structured attributes stay overridable by parser output. Manual entries
+      without provenance treat all initial labels as stream labels; use
+      `from_record/1` to distinguish structured attributes.
   """
 
   alias Pulso.Record.Log
 
   @enforce_keys [:timestamp_ns, :line, :labels]
-  defstruct [:timestamp_ns, :line, :labels]
+  defstruct [:timestamp_ns, :line, :labels, :base_labels]
 
   @type t :: %__MODULE__{
           timestamp_ns: non_neg_integer() | nil,
           line: String.t(),
-          labels: %{optional(String.t()) => String.t()}
+          labels: %{optional(String.t()) => String.t()},
+          base_labels: map() | nil
         }
 
   @spec from_record(Log.t()) :: t()
   def from_record(%Log{} = record) do
-    labels =
+    # Resource + promoted fields define Pulso's stream labels, just as detected
+    # fields do. Structured attributes remain overridable by parser output.
+    base_labels =
       (record.resource || %{})
-      |> Map.merge(record.attributes || %{})
-      |> stringify_values()
       |> maybe_put("service", record.service)
       |> maybe_put("service_name", record.service)
       |> maybe_put("level", record.severity_text)
       |> maybe_put("detected_level", record.severity_text)
 
+    labels = base_labels |> Map.merge(record.attributes || %{}) |> stringify_values()
+
     %__MODULE__{
       timestamp_ns: record.timestamp_ns,
       line: to_line(record.body),
-      labels: labels
+      labels: labels,
+      base_labels: base_labels
     }
   end
 

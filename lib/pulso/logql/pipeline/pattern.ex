@@ -39,6 +39,73 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
     do_compile(tail, [token | acc])
   end
 
+  @doc """
+  Compile a `|>` / `!>` line filter pattern: literals and unnamed `<_>`
+  wildcards. Like Loki, a placeholder needs an identifier (`<name>`), other
+  `<...>` text is literal, and named or consecutive wildcards are invalid.
+  """
+  @spec compile_filter(String.t()) :: {:ok, [{:literal, binary()} | :skip]} | {:error, term()}
+  def compile_filter(pattern) when is_binary(pattern) do
+    parts =
+      pattern
+      |> compile()
+      |> Enum.map(fn
+        {:capture, name} ->
+          if Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*\z/, name),
+            do: {:capture, name},
+            else: {:literal, "<" <> name <> ">"}
+
+        part ->
+          part
+      end)
+      |> merge_literals([])
+
+    cond do
+      Enum.any?(parts, &match?({:capture, _}, &1)) -> {:error, :named_capture}
+      parts |> Enum.chunk_every(2, 1, :discard) |> Enum.member?([:skip, :skip]) -> {:error, :consecutive_captures}
+      true -> {:ok, parts}
+    end
+  end
+
+  defp merge_literals([], acc), do: Enum.reverse(acc)
+
+  defp merge_literals([{:literal, b} | rest], [{:literal, a} | acc]),
+    do: merge_literals(rest, [{:literal, a <> b} | acc])
+
+  defp merge_literals([part | rest], acc), do: merge_literals(rest, [part | acc])
+
+  @doc """
+  Whether `line` matches a compiled filter pattern, with Loki's semantics:
+  literals occur in order, a wildcard matches at least one byte, and the line
+  must end where the pattern does (a trailing wildcard needs remaining text).
+  An empty line matches only an empty pattern.
+  """
+  @spec filter_match?([{:literal, binary()} | :skip], binary()) :: boolean()
+  def filter_match?([], line), do: line == ""
+  def filter_match?(_parts, ""), do: false
+
+  def filter_match?(parts, line) do
+    result =
+      parts
+      |> Enum.with_index()
+      |> Enum.reduce_while(0, fn
+        {:skip, _i}, off ->
+          {:cont, off}
+
+        {{:literal, lit}, i}, off ->
+          case :binary.match(line, lit, scope: {off, byte_size(line) - off}) do
+            :nomatch -> {:halt, :nomatch}
+            {pos, _len} when i != 0 and pos == off -> {:halt, :nomatch}
+            {pos, len} -> {:cont, pos + len}
+          end
+      end)
+
+    case result do
+      :nomatch -> false
+      off -> List.last(parts) == :skip == (off != byte_size(line))
+    end
+  end
+
   @spec match(template(), String.t()) :: {:ok, %{optional(String.t()) => String.t()}} | :nomatch
   def match(template, line) when is_binary(line) do
     match_template(template, line, %{})

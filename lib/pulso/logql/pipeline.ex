@@ -14,11 +14,14 @@ defmodule Pulso.LogQL.Pipeline do
   runs exactly the stages Rust does not.
   """
 
+  alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Entry
   alias Pulso.LogQL.Pipeline.Logfmt
   alias Pulso.LogQL.Pipeline.Pattern
   alias Pulso.LogQL.Pipeline.Template
+  alias Pulso.LogQL.Quantity
+  alias Pulso.LogQL.StreamMatchers
 
   @type stage :: struct()
   @type result :: {:keep, Entry.t()} | :drop
@@ -42,12 +45,17 @@ defmodule Pulso.LogQL.Pipeline do
   def run(compiled, entries) do
     entries
     |> Stream.transform(:ok, fn entry, acc ->
-      case run_stages(compiled, entry) do
+      case __MODULE__.apply(compiled, entry) do
         {:keep, e} -> {[e], acc}
         :drop -> {[], acc}
       end
     end)
   end
+
+  @doc "Apply every compiled stage to one entry; stages are stateless."
+  @spec apply([term()], Entry.t()) :: result()
+  def apply(compiled, %Entry{} = entry),
+    do: run_stages(compiled, %{entry | base_labels: entry.base_labels || entry.labels})
 
   defp run_stages([], entry), do: {:keep, entry}
 
@@ -79,8 +87,7 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp compile_stage(%AST.RegexpParser{pattern: pattern}) do
-    {:ok, regex} = Regex.compile(pattern)
-    {:regexp, regex}
+    {:regexp, compile_regex(pattern)}
   end
 
   defp compile_stage(%AST.PatternParser{pattern: pattern}) do
@@ -117,6 +124,12 @@ defmodule Pulso.LogQL.Pipeline do
 
   defp compile_line_filter_value({:string, s}), do: {:string, s}
   defp compile_line_filter_value({:re, pat}), do: {:re, compile_regex(pat)}
+
+  defp compile_line_filter_value({:pattern, pattern}) do
+    {:ok, parts} = Pattern.compile_filter(pattern)
+    {:pattern, parts}
+  end
+
   # IP line filters are rejected by `Pulso.LogQL.QueryValidation` before
   # the pipeline compiles, so this clause exists only as a safety net.
   defp compile_line_filter_value({:ip, _cidr}) do
@@ -124,22 +137,26 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp compile_regex(pat) do
-    {:ok, re} = Regex.compile(pat)
+    {:ok, re} = NIF.compile_log_regex(pat)
     re
   end
+
+  # Label matchers (filters, drop/keep) match whole values, as in Loki;
+  # line filters and the regexp parser stay unanchored searches.
+  defp compile_label_regex(pat), do: pat |> StreamMatchers.anchor() |> compile_regex()
 
   defp compile_drop_entry({name, :any}), do: {name, :any}
   defp compile_drop_entry({name, {:eq, v}}), do: {name, {:eq, v}}
   defp compile_drop_entry({name, {:neq, v}}), do: {name, {:neq, v}}
-  defp compile_drop_entry({name, {:re, pat}}), do: {name, {:re, compile_regex(pat)}}
-  defp compile_drop_entry({name, {:nre, pat}}), do: {name, {:nre, compile_regex(pat)}}
+  defp compile_drop_entry({name, {:re, pat}}), do: {name, {:re, compile_label_regex(pat)}}
+  defp compile_drop_entry({name, {:nre, pat}}), do: {name, {:nre, compile_label_regex(pat)}}
 
   # Label-filter tree: recursively compile so leaf regexes precompile once.
   defp compile_label_filter({:and, l, r}), do: {:and, compile_label_filter(l), compile_label_filter(r)}
   defp compile_label_filter({:or, l, r}), do: {:or, compile_label_filter(l), compile_label_filter(r)}
 
   defp compile_label_filter({:cmp, name, op, {:re, pat}}) do
-    {:cmp, name, op, {:re, compile_regex(pat)}}
+    {:cmp, name, op, {:re, compile_label_regex(pat)}}
   end
 
   defp compile_label_filter({:cmp, name, op, value}) do
@@ -162,7 +179,7 @@ defmodule Pulso.LogQL.Pipeline do
     case decode_json(e.line) do
       {:ok, map} when is_map(map) ->
         extracted = extract_json_fields(map, fields)
-        {:keep, %{e | labels: Map.merge(e.labels, extracted)}}
+        {:keep, extract_labels(e, extracted)}
 
       _ ->
         {:keep, e}
@@ -172,17 +189,17 @@ defmodule Pulso.LogQL.Pipeline do
   defp apply_stage({:logfmt, fields, keep_empty?}, %Entry{} = e) do
     pairs = Logfmt.parse(e.line, keep_empty?)
     extracted = extract_logfmt_fields(pairs, fields)
-    {:keep, %{e | labels: Map.merge(e.labels, extracted)}}
+    {:keep, extract_labels(e, extracted)}
   end
 
   defp apply_stage({:regexp, regex}, %Entry{} = e) do
-    captures = Regex.named_captures(regex, e.line) || %{}
-    {:keep, %{e | labels: Map.merge(e.labels, captures)}}
+    captures = NIF.log_regex_named_captures(regex, e.line) || %{}
+    {:keep, extract_labels(e, captures)}
   end
 
   defp apply_stage({:pattern, tmpl}, %Entry{} = e) do
     case Pattern.match(tmpl, e.line) do
-      {:ok, caps} -> {:keep, %{e | labels: Map.merge(e.labels, caps)}}
+      {:ok, caps} -> {:keep, extract_labels(e, caps)}
       :nomatch -> {:keep, e}
     end
   end
@@ -193,7 +210,7 @@ defmodule Pulso.LogQL.Pipeline do
         {new_line, extras} = Map.pop(map, "_entry", e.line)
         new_line = if is_binary(new_line), do: new_line, else: Pulso.JSON.encode!(new_line)
         stringified = Map.new(extras, fn {k, v} -> {k, to_string_val(v)} end)
-        {:keep, %{e | line: new_line, labels: Map.merge(e.labels, stringified)}}
+        {:keep, extract_labels(%{e | line: new_line}, stringified)}
 
       _ ->
         {:keep, e}
@@ -207,8 +224,14 @@ defmodule Pulso.LogQL.Pipeline do
   defp apply_stage({:label_format, entries}, %Entry{} = e) do
     labels =
       Enum.reduce(entries, e.labels, fn
-        {name, {:template, t}}, acc -> Map.put(acc, name, Template.render(t, acc))
-        {name, {:rename, src}}, acc -> acc |> Map.put(name, Map.get(acc, src, "")) |> Map.delete(src)
+        {name, {:template, t}}, acc ->
+          Map.put(acc, name, Template.render(t, acc))
+
+        {name, {:rename, src}}, acc ->
+          case Map.fetch(acc, src) do
+            {:ok, value} -> acc |> Map.delete(src) |> Map.put(name, value)
+            :error -> acc
+          end
       end)
 
     {:keep, %{e | labels: labels}}
@@ -252,8 +275,10 @@ defmodule Pulso.LogQL.Pipeline do
 
   defp line_matches?(:contains, {:string, s}, line), do: String.contains?(line, s)
   defp line_matches?(:not_contains, {:string, s}, line), do: not String.contains?(line, s)
-  defp line_matches?(:match_re, {:re, re}, line), do: Regex.match?(re, line)
-  defp line_matches?(:not_match_re, {:re, re}, line), do: not Regex.match?(re, line)
+  defp line_matches?(:match_re, {:re, re}, line), do: NIF.match_log_regex(re, line)
+  defp line_matches?(:not_match_re, {:re, re}, line), do: not NIF.match_log_regex(re, line)
+  defp line_matches?(:match_pattern, {:pattern, parts}, line), do: Pattern.filter_match?(parts, line)
+  defp line_matches?(:not_match_pattern, {:pattern, parts}, line), do: not Pattern.filter_match?(parts, line)
 
   defp eval_label_filter({:and, l, r}, labels), do: eval_label_filter(l, labels) and eval_label_filter(r, labels)
   defp eval_label_filter({:or, l, r}, labels), do: eval_label_filter(l, labels) or eval_label_filter(r, labels)
@@ -265,8 +290,8 @@ defmodule Pulso.LogQL.Pipeline do
 
   defp eval_cmp(:eq, actual, {:string, v}), do: actual == v
   defp eval_cmp(:neq, actual, {:string, v}), do: actual != v
-  defp eval_cmp(:re, actual, {:re, re}), do: Regex.match?(re, actual)
-  defp eval_cmp(:nre, actual, {:re, re}), do: not Regex.match?(re, actual)
+  defp eval_cmp(:re, actual, {:re, re}), do: NIF.match_log_regex(re, actual)
+  defp eval_cmp(:nre, actual, {:re, re}), do: not NIF.match_log_regex(re, actual)
 
   defp eval_cmp(op, actual, {:number, n}) when op in [:eq, :neq, :lt, :lte, :gt, :gte] do
     case parse_number(actual) do
@@ -302,18 +327,31 @@ defmodule Pulso.LogQL.Pipeline do
   defp drop_matches?(_, nil), do: false
   defp drop_matches?({:eq, v}, actual), do: actual == v
   defp drop_matches?({:neq, v}, actual), do: actual != v
-  defp drop_matches?({:re, re}, actual), do: Regex.match?(re, actual)
-  defp drop_matches?({:nre, re}, actual), do: not Regex.match?(re, actual)
+  defp drop_matches?({:re, re}, actual), do: NIF.match_log_regex(re, actual)
+  defp drop_matches?({:nre, re}, actual), do: not NIF.match_log_regex(re, actual)
 
   defp keep_matches?(:any, _), do: true
   defp keep_matches?({:eq, v}, actual), do: actual == v
   defp keep_matches?({:neq, v}, actual), do: actual != v
-  defp keep_matches?({:re, re}, actual), do: Regex.match?(re, actual)
-  defp keep_matches?({:nre, re}, actual), do: not Regex.match?(re, actual)
+  defp keep_matches?({:re, re}, actual), do: NIF.match_log_regex(re, actual)
+  defp keep_matches?({:nre, re}, actual), do: not NIF.match_log_regex(re, actual)
 
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
+
+  # The original bag is shared, not copied. Parser-to-parser overwrites remain
+  # allowed; only names present before the pipeline receive one suffix, even
+  # after drop/rename. Do not recursively invent unused suffix names.
+  defp extract_labels(entry, extracted) do
+    labels =
+      Enum.reduce(extracted, entry.labels, fn {name, value}, acc ->
+        target = if Map.has_key?(entry.base_labels, name), do: name <> "_extracted", else: name
+        Map.put(acc, target, value)
+      end)
+
+    %{entry | labels: labels}
+  end
 
   defp decode_json(""), do: :error
 
@@ -368,62 +406,8 @@ defmodule Pulso.LogQL.Pipeline do
     end
   end
 
-  defp parse_duration_ns(str) do
-    # Reuse the LogQL grammar's duration lexer indirectly via parsing a
-    # wrapped label-filter expression. Simpler: implement the same
-    # sub-set (int + unit, no fractions) here.
-    parse_duration(str, 0)
-  end
-
-  defp parse_duration("", acc) when acc > 0, do: {:ok, acc}
-  defp parse_duration("", _), do: :error
-
-  defp parse_duration(str, acc) do
-    case Integer.parse(str) do
-      {n, rest} ->
-        {factor, tail} = split_duration_unit(rest)
-        if factor == 0, do: :error, else: parse_duration(tail, acc + n * factor)
-
-      :error ->
-        :error
-    end
-  end
-
-  defp split_duration_unit("ns" <> rest), do: {1, rest}
-  defp split_duration_unit("us" <> rest), do: {1_000, rest}
-  defp split_duration_unit("µs" <> rest), do: {1_000, rest}
-  defp split_duration_unit("ms" <> rest), do: {1_000_000, rest}
-  defp split_duration_unit("s" <> rest), do: {1_000_000_000, rest}
-  defp split_duration_unit("m" <> rest), do: {60 * 1_000_000_000, rest}
-  defp split_duration_unit("h" <> rest), do: {3_600 * 1_000_000_000, rest}
-  defp split_duration_unit("d" <> rest), do: {86_400 * 1_000_000_000, rest}
-  defp split_duration_unit(_), do: {0, ""}
-
-  defp parse_bytes(str) do
-    case Integer.parse(str) do
-      {n, rest} ->
-        case split_bytes_unit(rest) do
-          0 -> :error
-          f -> {:ok, n * f}
-        end
-
-      :error ->
-        :error
-    end
-  end
-
-  defp split_bytes_unit(""), do: 1
-  defp split_bytes_unit("B"), do: 1
-  defp split_bytes_unit("kB"), do: 1_000
-  defp split_bytes_unit("KB"), do: 1_000
-  defp split_bytes_unit("MB"), do: 1_000_000
-  defp split_bytes_unit("GB"), do: 1_000_000_000
-  defp split_bytes_unit("TB"), do: 1_000_000_000_000
-  defp split_bytes_unit("KiB"), do: 1024
-  defp split_bytes_unit("MiB"), do: 1024 * 1024
-  defp split_bytes_unit("GiB"), do: 1024 * 1024 * 1024
-  defp split_bytes_unit("TiB"), do: 1024 * 1024 * 1024 * 1024
-  defp split_bytes_unit(_), do: 0
+  defp parse_duration_ns(str), do: Quantity.duration(str)
+  defp parse_bytes(str), do: Quantity.bytes(str)
 
   # Strip ANSI CSI sequences: ESC[ ... final-byte (a byte in 0x40-0x7E).
   defp strip_ansi(line) do

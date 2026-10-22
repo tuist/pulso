@@ -66,7 +66,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
 
     queue = Enum.uniq(state.queue ++ chosen)
     # Never advance durable discovery past scopes that did not fit in the queue.
-    slots = min(16, div(64 - length(queue), 2))
+    slots = min(16, div(64 - length(queue), length(Retention.signals())))
 
     discovery =
       if slots == 0,
@@ -75,7 +75,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
 
     case discovery do
       {:ok, tenants, cursor} ->
-        discovered = for tenant <- tenants, signal <- ["logs", "metrics"], do: {tenant, signal}
+        discovered = for tenant <- tenants, signal <- Retention.signals(), do: {tenant, signal}
         queue = Enum.uniq(queue ++ discovered)
         state = %{state | discovery: cursor, local_cursor: local_cursor, queue: queue}
         maintain(state, 8, System.monotonic_time(:millisecond) + Map.get(state.config, :retention_timeout_ms, 30_000))
@@ -122,6 +122,27 @@ defmodule Pulso.Storage.S3.RetentionWorker do
 
   # Every stage runs, in order, even when an earlier one fails.
   defp run_stages(tenant, signal, config) do
+    if Retention.days(config, signal) == 0 do
+      # Cold flat scopes may still contain pending compaction cleanup. Inspect
+      # once, not four times; never skip a durable managed scope after disabling
+      # its configured duration, or abandon flat retirement work on restart.
+      maintain_unconfigured(tenant, signal, config)
+    else
+      run_managed_stages(tenant, signal, config)
+    end
+  end
+
+  defp maintain_unconfigured(tenant, signal, config) do
+    with {:ok, root, _} <- Retention.load(tenant, signal, config) do
+      cond do
+        root.version == 3 -> run_managed_stages(tenant, signal, config)
+        map_size(root.retired) > 0 -> Retention.cleanup_retired(tenant, signal, config)
+        true -> :ok
+      end
+    end
+  end
+
+  defp run_managed_stages(tenant, signal, config) do
     results = [
       Retention.advance(tenant, signal, config),
       Retention.cleanup(tenant, signal, config),

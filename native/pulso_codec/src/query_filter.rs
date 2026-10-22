@@ -225,6 +225,60 @@ pub fn line_bytes_for_match(body: &[u8]) -> Cow<'_, [u8]> {
 /// (`{"key":"value","key2":"value2"}`); nested objects and arrays are
 /// skipped correctly so subsequent keys still parse.
 pub fn find_label<'a>(input: &'a [u8], key: &[u8]) -> Option<Cow<'a, [u8]>> {
+    let mut found = None;
+    walk_string_pairs(input, false, |name, value| {
+        if decoded(name).as_ref() == key {
+            found = Some(decoded(value));
+            false
+        } else {
+            true
+        }
+    })?;
+    found
+}
+
+/// A decoded `(key, value)` label, borrowed when it had no escapes.
+pub type LabelPair<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
+
+/// Every top-level string-valued `(key, value)` pair of a flat JSON object,
+/// in source order, with escapes decoded. Non-string values are skipped, as
+/// they are for `find_label`. `None` means the input is not an object.
+pub fn string_pairs(input: &[u8]) -> Option<Vec<LabelPair<'_>>> {
+    let mut pairs = Vec::new();
+    walk_string_pairs(input, false, |name, value| {
+        pairs.push((decoded(name), decoded(value)));
+        true
+    })?;
+    Some(pairs)
+}
+
+/// Like `string_pairs`, but `None` when any value is not a string, so the
+/// caller never has to reproduce another runtime's stringification.
+pub fn strict_string_pairs(input: &[u8]) -> Option<Vec<LabelPair<'_>>> {
+    let mut pairs = Vec::new();
+    walk_string_pairs(input, true, |name, value| {
+        pairs.push((decoded(name), decoded(value)));
+        true
+    })?;
+    Some(pairs)
+}
+
+// Raw (still escaped) JSON string contents.
+fn decoded(raw: &[u8]) -> Cow<'_, [u8]> {
+    if has_escapes(raw) {
+        Cow::Owned(unescape_json_string(raw))
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
+// Visit each top-level string-valued pair as raw escaped slices until the
+// visitor returns false. `None` for a malformed or non-object input.
+fn walk_string_pairs<'a>(
+    input: &'a [u8],
+    strict: bool,
+    mut visit: impl FnMut(&'a [u8], &'a [u8]) -> bool,
+) -> Option<()> {
     let mut i = 0;
     let n = input.len();
 
@@ -241,25 +295,19 @@ pub fn find_label<'a>(input: &'a [u8], key: &[u8]) -> Option<Cow<'a, [u8]>> {
         while i < n && matches!(input[i], b' ' | b'\t' | b'\n' | b'\r' | b',') {
             i += 1;
         }
-        if i >= n || input[i] == b'}' {
+        if i >= n {
             return None;
+        }
+        if input[i] == b'}' {
+            return Some(());
         }
         if input[i] != b'"' {
             return None;
         }
         i += 1;
         let key_start = i;
-        while i < n && input[i] != b'"' {
-            if input[i] == b'\\' && i + 1 < n {
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        if i >= n {
-            return None;
-        }
-        let key_end = i;
+        i = string_end(input, i)?;
+        let key = &input[key_start..i];
         i += 1;
         // Skip whitespace, expect ':'.
         while i < n && matches!(input[i], b' ' | b'\t' | b'\n' | b'\r') {
@@ -276,46 +324,36 @@ pub fn find_label<'a>(input: &'a [u8], key: &[u8]) -> Option<Cow<'a, [u8]>> {
             return None;
         }
 
-        // Match key?
-        let name_matches = if has_escapes(&input[key_start..key_end]) {
-            unescape_json_string(&input[key_start..key_end]) == key
-        } else {
-            &input[key_start..key_end] == key
-        };
-
         if input[i] == b'"' {
             i += 1;
             let val_start = i;
-            let mut has_escape = false;
-            while i < n && input[i] != b'"' {
-                if input[i] == b'\\' && i + 1 < n {
-                    has_escape = true;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            if i >= n {
-                return None;
-            }
-            let val_end = i;
+            i = string_end(input, i)?;
+            let value = &input[val_start..i];
             i += 1;
-            if name_matches {
-                let raw = &input[val_start..val_end];
-                return if has_escape {
-                    Some(Cow::Owned(unescape_json_string(raw)))
-                } else {
-                    Some(Cow::Borrowed(raw))
-                };
+            if !visit(key, value) {
+                return Some(());
             }
+        } else if strict {
+            return None;
         } else {
-            // Non-string value — skip its extent. Since we only ever
-            // return string values, and callers use this only to find
-            // string label matches, walking the extent so we can move
-            // to the next key is enough.
+            // Non-string value: only string labels are visited, so walking
+            // its extent to reach the next key is enough.
             i = skip_value(input, i)?;
         }
     }
+}
+
+// Position of the closing quote of a string whose contents start at `i`.
+fn string_end(input: &[u8], mut i: usize) -> Option<usize> {
+    let n = input.len();
+    while i < n && input[i] != b'"' {
+        if input[i] == b'\\' && i + 1 < n {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (i < n).then_some(i)
 }
 
 fn has_escapes(bytes: &[u8]) -> bool {

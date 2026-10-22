@@ -1,0 +1,107 @@
+defmodule Pulso.PromQL.OracleTest do
+  use Pulso.Test.Case, async: true
+
+  alias Pulso.PromQL.Evaluator
+  alias Pulso.Record.MetricSample
+  alias Pulso.Storage.Memory
+  alias Pulso.Test.NativeQueryStorage
+
+  @directory Path.expand("../../fixtures/promql", __DIR__)
+
+  setup do
+    bytes = File.read!(Path.join(@directory, "conformance.json"))
+    fixture = JSON.decode!(bytes)
+    verified = Path.join(@directory, "verified-results.json") |> File.read!() |> JSON.decode!()
+    assert verified["oracle"] == "Prometheus promtool 3.5.0"
+    assert verified["fixture_sha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    for series <- fixture["series"] do
+      records =
+        series["values"]
+        |> Enum.with_index()
+        |> Enum.flat_map(fn
+          {"_", _} ->
+            []
+
+          {value, index} ->
+            [
+              %MetricSample{
+                labels: series["labels"],
+                value: value(value),
+                timestamp_ns: index * fixture["interval_seconds"] * 1_000_000_000
+              }
+            ]
+        end)
+
+      :ok = Memory.append(:metrics, "oracle", records)
+    end
+
+    {:ok, cases: verified["cases"]}
+  end
+
+  for adapter <- [Memory, NativeQueryStorage] do
+    test "independently verified numerical, label, offset and stale cases through #{inspect(adapter)}", ctx do
+      Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: unquote(adapter))
+      assert length(ctx.cases) == 780
+
+      for test <- ctx.cases do
+        assert {:ok, result} = Evaluator.query(test["expr"], "oracle", %{end_ts_ns: test["seconds"] * 1_000_000_000})
+        assert result["data"] == test["data"], "#{test["expr"]} at #{test["seconds"]}s"
+      end
+    end
+  end
+
+  test "subquery steps and materialized points share query budgets" do
+    assert {:error, :query_work_limit} =
+             Evaluator.query("sum_over_time(gauge[1d:1s])", "oracle", %{end_ts_ns: 600_000_000_000})
+
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 2)
+
+    assert {:error, :query_intermediate_limit} =
+             Evaluator.query("sum_over_time(gauge[5m:30s])", "oracle", %{end_ts_ns: 600_000_000_000})
+  end
+
+  test "large epoch timestamp and time comparisons use exact millisecond conversion" do
+    ns = 1_700_000_000_123_000_000
+
+    :ok =
+      Memory.append(:metrics, "epoch", [%MetricSample{labels: %{"__name__" => "epoch"}, value: 1.0, timestamp_ns: ns}])
+
+    for expression <- ["timestamp(epoch)", "time()", "timestamp(epoch) == 1700000000.123"] do
+      assert {:ok, result} = Evaluator.query(expression, "epoch", %{end_ts_ns: ns})
+      data = result["data"]
+      points = if data["resultType"] == "scalar", do: [data["result"]], else: Enum.map(data["result"], & &1["value"])
+      assert [[1_700_000_000.123, "1700000000.123"]] = points
+    end
+  end
+
+  test "metric-name removal merges disjoint lifetimes but rejects simultaneous label collisions" do
+    for {name, time, value} <- [{"a", 0, 1.0}, {"a", 30, :stale}, {"b", 30, 2.0}] do
+      :ok =
+        Memory.append(:metrics, "rename", [
+          %MetricSample{labels: %{"__name__" => name, "job" => "api"}, value: value, timestamp_ns: time * 1_000_000_000}
+        ])
+    end
+
+    assert {:ok, %{"data" => %{"result" => [%{"metric" => %{"job" => "api"}, "values" => [[+0.0, "1"], [30.0, "2"]]}]}}} =
+             Evaluator.query("floor({__name__=~\"a|b\"})", "rename", %{
+               start_ts_ns: 0,
+               end_ts_ns: 30_000_000_000,
+               step_ns: 30_000_000_000
+             })
+
+    :ok =
+      Memory.append(:metrics, "rename", [
+        %MetricSample{labels: %{"__name__" => "b", "job" => "api"}, value: 2.0, timestamp_ns: 0}
+      ])
+
+    assert {:error, :duplicate_result_label_sets} =
+             Evaluator.query("timestamp({__name__=~\"a|b\"})", "rename", %{end_ts_ns: 0})
+  end
+
+  defp value("stale"), do: :stale
+  defp value("NaN"), do: :nan
+  defp value("Inf"), do: :infinity
+  defp value("-Inf"), do: :negative_infinity
+  defp value(number), do: number * 1.0
+end

@@ -2,7 +2,7 @@
 
 An open-source, headless observability backend built for AI agents as much as for humans.
 
-Pulso accepts logs and metrics over the protocols your collectors already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores them as Parquet in an S3-compatible bucket, and lets agents investigate them through a native [Model Context Protocol](https://modelcontextprotocol.io/) interface. Prometheus- and Loki-compatible query APIs keep existing dashboards working.
+Pulso accepts logs, metrics, and traces over the protocols your collectors already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores them as Parquet in an S3-compatible bucket, and lets agents investigate them through a native [Model Context Protocol](https://modelcontextprotocol.io/) interface. Prometheus- and Loki-compatible query APIs keep existing dashboards working.
 
 Experimental [error tracking](docs/error-tracking.md) accepts Sentry SDK JSON errors
 into the same object storage and exposes error events and issue groups through MCP.
@@ -11,13 +11,13 @@ retained-history summaries and replayable changes without gating ingestion.
 
 ## Why Pulso
 
-- **One system instead of three.** Logs and metrics (and, later, traces and alerting) share one ingest path, one storage format, and one query surface.
+- **One system instead of three.** Logs, metrics, and traces share one ingest path, one storage format, and one query surface.
 - **Object storage is the source of truth.** No database, no local disks to back up, no consensus service. Nodes are disposable.
 - **Agent-native.** Diagnosis tools are part of the server, not a wrapper bolted on afterwards, and they stay read-only by design.
 - **No UI.** Bring your own dashboards, or your own agent.
 
 > [!WARNING]
-> Pulso is early software. Logs and metrics work end to end; traces, alerting, and retention are not implemented yet. Expect breaking changes between releases.
+> Pulso is early software. Logs, metrics, and OTLP/HTTP traces work end to end. Native alerting and opt-in trace lifecycle policies are experimental; bounded Tempo lookup/search/discovery are experimental, while full TraceQL and deployed Tempo-client parity are not implemented yet. Bounded catalogs require explicit event-time retention; unlimited-retention catalogs remain unbounded. Expect breaking changes between releases.
 
 ## Try it locally
 

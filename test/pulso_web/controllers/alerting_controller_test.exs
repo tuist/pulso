@@ -8,8 +8,10 @@ defmodule PulsoWeb.AlertingControllerTest do
   alias Pulso.Alerting.Resources
   alias Pulso.Alerting.Worker
   alias Pulso.MCP.Tools
+  alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Runtime.Task
+  alias Pulso.Test.BlockingMetricStorage
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.MCPMessages
   alias Pulso.Test.RuntimePlug
@@ -55,7 +57,7 @@ defmodule PulsoWeb.AlertingControllerTest do
 
     Pulso.Runtime.put_env(:pulso, Pulso.Alerting, principals: [actor], store_config: config)
 
-    %{config: config, actor: actor}
+    %{config: config, actor: actor, agent: agent}
   end
 
   defp rule,
@@ -101,6 +103,145 @@ defmodule PulsoWeb.AlertingControllerTest do
   test "unauthorized calls fail before malformed rule validation" do
     response = request(:post, "/api/v1/alerting/rules/backup", %{"rule" => "malformed"}, "wrong") |> json_response(401)
     assert response == %{"error" => "unauthorized"}
+  end
+
+  test "imported previews expose unsupported and budget failures distinctly in HTTP and MCP", ctx do
+    configured =
+      Pulso.Runtime.get_env(:pulso, Pulso.Alerting, [])
+      |> Keyword.put(:source_bindings, [
+        %{"tenant" => ctx.actor.tenant, "uid" => "native", "type" => "native_promql"},
+        %{"tenant" => ctx.actor.tenant, "uid" => "native-logs", "type" => "native_logql"}
+      ])
+
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting, configured)
+    conn = build_conn() |> put_req_header("authorization", "Bearer admin-token")
+
+    for {id, uid, model, code, mcp_reason} <- [
+          {"unbound", "missing", %{"instant" => true, "expr" => "vector(1)"}, "unsupported_graph_source",
+           :unsupported_graph_source},
+          {"bad-model", "native", "malformed", "unsupported_graph_source", :unsupported_graph_source},
+          {"macro", "native", %{"instant" => true, "expr" => "rate(m[$__rate_interval])"}, "unsupported_source_query",
+           :invalid_or_unsupported_query},
+          {"log-macro", "native-logs", %{"queryType" => "instant", "expr" => "$__interval"}, "unsupported_source_query",
+           :invalid_logql},
+          {"log-stream", "native-logs", %{"queryType" => "instant", "expr" => ~s'{service="api"}'},
+           "unsupported_source_query", :unsupported_source_query}
+        ] do
+      original = %{
+        "uid" => id,
+        "condition" => "A",
+        "data" => [%{"refId" => "A", "datasourceUid" => uid, "model" => model}]
+      }
+
+      body = %{
+        "operation_id" => id,
+        "reason" => "Preview only",
+        "rule" => %{"kind" => "grafana", "original" => original}
+      }
+
+      assert request(:post, "/api/v1/alerting/rules/#{id}", body) |> json_response(200)
+      assert request(:post, "/api/v1/alerting/rules/#{id}/preview") |> json_response(422) == %{"error" => code}
+
+      assert {:error, ^mcp_reason} =
+               Tools.call("preview_alert_rule", %{"tenant" => ctx.actor.tenant, "id" => id}, %{conn: conn})
+    end
+
+    original = %{
+      "uid" => "bounded",
+      "condition" => "A",
+      "data" => [
+        %{"refId" => "A", "datasourceUid" => "native", "model" => %{"instant" => true, "expr" => "vector(1)+vector(2)"}}
+      ]
+    }
+
+    assert request(:post, "/api/v1/alerting/rules/bounded", %{
+             "operation_id" => "bounded",
+             "reason" => "Preview",
+             "rule" => %{"kind" => "grafana", "original" => original}
+           })
+           |> json_response(200)
+
+    Pulso.Runtime.put_env(:pulso, Pulso.PromQL.Evaluator, max_result_points: 1)
+
+    assert request(:post, "/api/v1/alerting/rules/bounded/preview") |> json_response(422) == %{
+             "error" => "query_result_limit"
+           }
+
+    Pulso.Runtime.put_env(:pulso, Pulso.PromQL.Evaluator, [])
+    Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: BlockingMetricStorage)
+    # Scalar vector(1) has no storage reads; use the normal native threshold
+    # route to exercise the same shared deadline classification.
+    assert request(:post, "/api/v1/alerting/rules/timeout", params("timeout")) |> json_response(200)
+    Pulso.Runtime.put_env(:pulso, BlockingMetricStorage, {:error, :query_timeout})
+
+    assert request(:post, "/api/v1/alerting/rules/timeout/preview") |> json_response(504) == %{
+             "error" => "query_timeout"
+           }
+  end
+
+  test "mixed native source previews use HTTP/MCP authorization and never write state", ctx do
+    configured =
+      Pulso.Runtime.get_env(:pulso, Pulso.Alerting, [])
+      |> Keyword.put(:source_bindings, [
+        %{"tenant" => ctx.actor.tenant, "uid" => "logs", "type" => "native_logql"},
+        %{"tenant" => ctx.actor.tenant, "uid" => "prom", "type" => "native_promql"}
+      ])
+
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting, configured)
+
+    original = %{
+      "uid" => "mixed",
+      "condition" => "C",
+      "data" => [
+        %{
+          "refId" => "A",
+          "datasourceUid" => "logs",
+          "model" => %{"queryType" => "instant", "expr" => ~s'sum(count_over_time({service="transport-api"}[1m]))'}
+        },
+        %{"refId" => "B", "datasourceUid" => "prom", "model" => %{"instant" => true, "expr" => "vector(1)"}},
+        %{
+          "refId" => "C",
+          "datasourceUid" => "__expr__",
+          "model" => %{"type" => "math", "expression" => "$A > 0 && $B > 0"}
+        }
+      ]
+    }
+
+    assert :ok =
+             Pulso.Storage.append(:logs, ctx.actor.tenant, [
+               %Log{timestamp_ns: System.system_time(:nanosecond), service: "transport-api", body: "hello"}
+             ])
+
+    assert request(:post, "/api/v1/alerting/rules/mixed", %{
+             "operation_id" => "mixed",
+             "reason" => "Preview",
+             "rule" => %{"kind" => "grafana", "original" => original}
+           })
+           |> json_response(200)
+
+    assert {:ok, before, _} = Repository.load(ctx.actor.tenant, "mixed")
+    objects = Agent.get(ctx.agent, & &1.objects)
+    http = request(:post, "/api/v1/alerting/rules/mixed/preview") |> json_response(200)
+    assert http["result"]["frames"] == [%{"labels" => %{}, "value" => "1.0"}]
+    assert http["executable"] == false
+    conn = build_conn() |> put_req_header("authorization", "Bearer admin-token")
+
+    assert {:ok, [%{"text" => text}]} =
+             Tools.call("preview_alert_rule", %{"tenant" => ctx.actor.tenant, "id" => "mixed"}, %{conn: conn})
+
+    assert Pulso.JSON.decode!(text)["result"] == http["result"]
+
+    assert {:error, :unauthorized} =
+             Tools.call("preview_alert_rule", %{"tenant" => "other", "id" => "mixed"}, %{conn: conn})
+
+    assert request(:post, "/api/v1/alerting/rules/mixed/preview", %{}, "wrong") |> json_response(401)
+    assert {:ok, after_preview, _} = Repository.load(ctx.actor.tenant, "mixed")
+    assert before == after_preview
+    assert objects == Agent.get(ctx.agent, & &1.objects)
+    state = request(:get, "/api/v1/alerting/rules/mixed/state") |> json_response(200)
+    assert state["state"] == "disabled"
+    assert state["instances"] == %{}
+    assert {:error, :rule_disabled} = Evaluator.evaluate(ctx.actor, "mixed")
   end
 
   test "native evaluation works on stored metrics, and preview makes no writes", ctx do

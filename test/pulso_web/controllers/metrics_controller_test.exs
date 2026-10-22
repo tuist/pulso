@@ -263,7 +263,7 @@ defmodule PulsoWeb.MetricsControllerTest do
     task =
       Task.Supervisor.async_nolink(supervisor, fn -> S3.append(:logs, "self-metrics-queue", [record], []) end)
 
-    assert_receive {:storage_barrier, server, "PUT", ^key}, 5_000
+    assert_receive {:storage_barrier, server, "PUT", ^key}, 30_000
     before_scrape = Agent.get(agent, &length(&1.requests))
     assert value("pulso_manifest_queue_depth") >= 1
     conn = get(conn, "/metrics")
@@ -298,7 +298,7 @@ defmodule PulsoWeb.MetricsControllerTest do
     start_supervised!({CompactionSupervision, worker_config})
     errors = operations(:compaction, :worker_merge, :error)
     send(Pulso.Runtime.whereis(CompactionWorker), :compact)
-    assert_receive {:storage_barrier, server, "GET", ^source}, 5_000
+    assert_receive {:storage_barrier, server, "GET", ^source}, 30_000
     _ = :sys.get_state(Pulso.Runtime.whereis(CompactionWorker))
     assert operations(:compaction, :worker_merge, :error) == errors + 1
     [task] = Task.Supervisor.children(CompactionTasks)

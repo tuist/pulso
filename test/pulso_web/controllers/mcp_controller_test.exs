@@ -19,7 +19,7 @@ defmodule PulsoWeb.MCPControllerTest do
             &1["name"] in ~w(list_error_issues list_error_changes list_indexed_error_issues))
       )
 
-    assert length(queries) == 8
+    assert length(queries) == 9
     assert Enum.all?(queries, &(&1["annotations"]["readOnlyHint"] == true))
     create = Enum.find(tools, &(&1["name"] == "create_alert_rule"))
     assert create["annotations"]["readOnlyHint"] == false
@@ -48,7 +48,7 @@ defmodule PulsoWeb.MCPControllerTest do
     Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
     for name <-
-          ~w(query_logs query_metrics query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
+          ~w(get_trace query_logs query_metrics query_traces query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
       response =
         request(conn, "tools/call", %{
           "name" => name,
@@ -95,7 +95,7 @@ defmodule PulsoWeb.MCPControllerTest do
     Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
 
     for name <-
-          ~w(query_logs query_metrics query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
+          ~w(get_trace query_logs query_metrics query_traces query_logql query_promql query_errors list_error_issues list_error_changes list_indexed_error_issues) do
       response =
         request(conn, "tools/call", %{
           "name" => name,

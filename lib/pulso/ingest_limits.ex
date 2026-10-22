@@ -16,7 +16,9 @@ defmodule Pulso.IngestLimits do
     max_value_bytes: 16_384,
     max_attribute_bytes: 65_536,
     max_depth: 16,
-    max_nodes: 1_024
+    max_nodes: 1_024,
+    max_trace_nodes: 262_144,
+    max_otlp_nodes: 262_144
   }
 
   def config do
@@ -46,11 +48,13 @@ defmodule Pulso.IngestLimits do
     payload |> walk(limits, 0, {0, 0}) |> finish()
   end
 
-  def validate(protocol, payload) when protocol in [:otlp, :loki] do
+  def validate(protocol, payload) when protocol in [:otlp, :otlp_traces, :otlp_metrics, :loki] do
     limits = config()
 
     case protocol do
       :otlp -> validate_otlp(payload, limits)
+      :otlp_traces -> validate_traces(payload, limits)
+      :otlp_metrics -> validate_metrics(payload, limits)
       :loki -> validate_loki(payload, limits)
     end
   end
@@ -79,9 +83,15 @@ defmodule Pulso.IngestLimits do
   defp loki_metadata(_, _), do: :ok
 
   defp validate_otlp(payload, limits) do
-    field(payload, "resourceLogs")
-    |> reduce_list({0, 0}, &otlp_resource(&1, limits, &2))
-    |> finish()
+    # Typed kvlists add several JSON levels per logical AnyValue level. Keep
+    # the normalized envelope below the native JSON reader's fixed ceiling.
+    limits = %{limits | max_depth: min(limits.max_depth, 32)}
+
+    with :ok <- otlp_nodes(payload, limits.max_otlp_nodes) do
+      field(payload, "resourceLogs")
+      |> reduce_list({0, 0}, &otlp_resource(&1, limits, &2))
+      |> finish()
+    end
   end
 
   defp otlp_resource(resource, limits, {records, groups}) do
@@ -104,6 +114,141 @@ defmodule Pulso.IngestLimits do
          :ok <- body_structure(field(record, "body"), limits) do
       {:ok, {count + 1, groups}}
     end
+  end
+
+  defp validate_metrics(payload, limits) do
+    limits = %{limits | max_depth: min(limits.max_depth, 32)}
+
+    with :ok <- otlp_nodes(payload, limits.max_otlp_nodes) do
+      field(payload, "resourceMetrics")
+      |> reduce_list({0, 0, 0}, &metric_resource(&1, limits, &2))
+      |> finish()
+    end
+  end
+
+  defp metric_resource(owner, limits, {count, groups, exemplars}) do
+    with :ok <- metric_group_limit(groups + 1, limits),
+         :ok <- attributes(field(field(owner, "resource"), "attributes"), limits, true) do
+      reduce_list(field(owner, "scopeMetrics"), {count, groups + 1, exemplars}, &metric_scope(&1, limits, &2))
+    end
+  end
+
+  defp metric_scope(owner, limits, {count, groups, exemplars}) do
+    with :ok <- metric_group_limit(groups + 1, limits),
+         :ok <- attributes(field(field(owner, "scope"), "attributes"), limits, true) do
+      reduce_list(field(owner, "metrics"), {count, groups + 1, exemplars}, &metric_descriptor(&1, limits, &2))
+    end
+  end
+
+  defp metric_descriptor(owner, limits, {count, groups, exemplars}) do
+    with :ok <- metric_group_limit(groups + 1, limits),
+         :ok <- attributes(field(owner, "metadata"), limits, true),
+         :ok <- descriptor_strings(owner, limits) do
+      reduce_list(~w(gauge sum histogram exponentialHistogram summary), {count, groups + 1, exemplars}, fn kind,
+                                                                                                           state ->
+        reduce_list(field(field(owner, kind), "dataPoints"), state, &metric_point(&1, limits, &2))
+      end)
+    end
+  end
+
+  defp descriptor_strings(owner, limits) do
+    Enum.reduce_while(~w(name description unit), :ok, fn key, :ok ->
+      case walk(field(owner, key), limits, 0, {0, 0}) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp metric_point(owner, limits, {count, groups, exemplars}) do
+    with :ok <- record_limit(count + 1, limits),
+         :ok <- attributes(field(owner, "attributes"), limits, true),
+         {:ok, exemplars} <- metric_exemplars(field(owner, "exemplars"), limits, exemplars),
+         :ok <- metric_double(field(owner, "asDouble"), limits) do
+      {:ok, {count + 1, groups, exemplars}}
+    end
+  end
+
+  defp metric_exemplars(values, limits, count) do
+    reduce_list(values, count, fn owner, count ->
+      with :ok <- record_limit(count + 1, limits),
+           :ok <- attributes(field(owner, "filteredAttributes"), limits, true),
+           :ok <- metric_double(field(owner, "asDouble"), limits),
+           do: {:ok, count + 1}
+    end)
+  end
+
+  defp metric_double(value, limits), do: value |> walk_double(limits, 0, {0, 0}) |> finish()
+  defp metric_group_limit(count, limits), do: record_limit(count, %{limits | max_records: 3 * limits.max_records})
+
+  # Protobuf enforces this before constructing intermediate maps; JSON also
+  # counts the supplied tree, including unknown fields and duplicate pairs.
+  defp validate_traces(payload, limits) do
+    with {:ok, _remaining} <- trace_nodes(payload, limits.max_trace_nodes) do
+      field(payload, "resourceSpans")
+      |> reduce_list({0, 0, 0, 0}, &trace_resource(&1, limits, &2))
+      |> finish()
+    end
+  end
+
+  defp otlp_nodes(payload, limit) do
+    case trace_nodes(payload, limit) do
+      {:ok, _} -> :ok
+      {:error, :too_many_trace_nodes} -> {:error, :too_many_otlp_nodes}
+    end
+  end
+
+  defp trace_nodes(_, 0), do: {:error, :too_many_trace_nodes}
+
+  defp trace_nodes(value, remaining) when is_map(value) do
+    reduce_list_value(value, remaining - 1, fn {_key, child}, left -> trace_nodes(child, left) end)
+  end
+
+  defp trace_nodes(value, remaining) when is_list(value) do
+    reduce_list_value(value, remaining - 1, &trace_nodes/2)
+  end
+
+  defp trace_nodes(_, remaining), do: {:ok, remaining - 1}
+
+  defp reduce_list_value(values, remaining, fun) do
+    Enum.reduce_while(values, {:ok, remaining}, fn child, {:ok, left} ->
+      case fun.(child, left) do
+        {:ok, next} -> {:cont, {:ok, next}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp trace_resource(resource, limits, {count, groups, events, links}) do
+    with :ok <- otlp_group_limit(groups + 1, limits),
+         :ok <- attributes(field(field(resource, "resource"), "attributes"), limits, true) do
+      reduce_list(field(resource, "scopeSpans"), {count, groups + 1, events, links}, &trace_scope(&1, limits, &2))
+    end
+  end
+
+  defp trace_scope(scope, limits, {count, groups, events, links}) do
+    with :ok <- otlp_group_limit(groups + 1, limits),
+         :ok <- attributes(field(field(scope, "scope"), "attributes"), limits, true) do
+      reduce_list(field(scope, "spans"), {count, groups + 1, events, links}, &trace_span(&1, limits, &2))
+    end
+  end
+
+  defp trace_span(span, limits, {count, groups, events, links}) do
+    with :ok <- record_limit(count + 1, limits),
+         :ok <- attributes(field(span, "attributes"), limits, true),
+         {:ok, events} <- trace_children(field(span, "events"), limits, events),
+         {:ok, links} <- trace_children(field(span, "links"), limits, links) do
+      {:ok, {count + 1, groups, events, links}}
+    end
+  end
+
+  defp trace_children(children, limits, count) do
+    reduce_list(children, count, fn child, count ->
+      with :ok <- record_limit(count + 1, limits),
+           :ok <- attributes(field(child, "attributes"), limits, true) do
+        {:ok, count + 1}
+      end
+    end)
   end
 
   defp field(map, key) when is_map(map), do: Map.get(map, key)
@@ -169,7 +314,26 @@ defmodule Pulso.IngestLimits do
 
   defp walk_attribute_key(key, limits, depth, state), do: walk(key, limits, depth, state)
 
-  defp walk_otlp(value, limits, depth, {_, nodes} = state) do
+  defp walk_otlp(value, limits, depth, state) when is_map(value) do
+    # Invalid JSON oneofs must not hide oversized supplied members behind the
+    # first recognized key. Protobuf preflight likewise visits every member.
+    fields = Map.take(value, ~w(stringValue boolValue intValue doubleValue bytesValue arrayValue kvlistValue))
+    assigned = Enum.reject(fields, fn {_key, value} -> is_nil(value) end)
+
+    case assigned do
+      [] ->
+        walk_otlp_member(if(map_size(fields) > 0, do: %{}, else: value), limits, depth, state)
+
+      _ ->
+        reduce_list_value(assigned, state, fn {key, member}, state ->
+          walk_otlp_member(%{key => member}, limits, depth, state)
+        end)
+    end
+  end
+
+  defp walk_otlp(value, limits, depth, state), do: walk_otlp_member(value, limits, depth, state)
+
+  defp walk_otlp_member(value, limits, depth, {_, nodes} = state) do
     with :ok <- structure_limit(limits, depth, nodes) do
       case value do
         %{"stringValue" => v} ->
@@ -179,7 +343,7 @@ defmodule Pulso.IngestLimits do
           walk(v, limits, depth, state)
 
         %{"doubleValue" => v} ->
-          walk(v, limits, depth, state)
+          walk_double(v, limits, depth, state)
 
         %{"bytesValue" => v} ->
           walk(v, limits, depth, state)
@@ -199,6 +363,11 @@ defmodule Pulso.IngestLimits do
       end
     end
   end
+
+  defp walk_double(value, _limits, _depth, _state) when is_binary(value) and byte_size(value) > 1024,
+    do: {:error, :attributes_too_large}
+
+  defp walk_double(value, limits, depth, state), do: walk(value, limits, depth, state)
 
   defp attribute_count(value, limits) when is_map(value) do
     if map_size(value) <= limits.max_attributes, do: :ok, else: {:error, :attributes_too_large}

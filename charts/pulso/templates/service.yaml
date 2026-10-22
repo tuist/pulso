@@ -17,3 +17,10 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
+    {{- if .Values.otlpGrpc.enabled }}
+    - name: otlp-grpc
+      port: {{ .Values.otlpGrpc.port }}
+      targetPort: otlp-grpc
+      protocol: TCP
+      appProtocol: grpc
+    {{- end }}
