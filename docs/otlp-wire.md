@@ -81,7 +81,11 @@ canonicalize and resend a failed keyed request as a way around admission.
 Known integral OTLP fields accept **unquoted** decimal/exponent JSON numbers
 when they denote an exact, in-range integer, including times, int64 values,
 uint64 counts/bucket arrays and numeric 32-bit fields. Integer fields using the
-shared string decoder also accept exact quoted forms. Examples:
+shared string decoder also accept exact quoted forms, including trace uint32
+counts and fixed32 flags at resource, scope, span, event and link owners.
+Trace counts/flags must be in `0..4294967295`. Trace enums remain numeric JSON
+tokens (`kind` in `0..5`, status `code` in `0..2`): quoted digits such as
+`"2"` and named enum strings are rejected. Examples:
 
 | JSON spelling | Normalized integer |
 | --- | --- |
@@ -114,8 +118,8 @@ public ProtoJSON reference. Some were previously accepted as extensions. Correct
 producers rather than rewriting retry keys or sending a keyed rejected subset.
 Previously stored canonical values remain readable.
 
-This is **not full OTLP JSON conformance**. Quoted trace 32-bit counts/flags,
-remaining null/presence behavior and Resource entity references remain separate
+This is **not full OTLP JSON conformance**. Remaining null/presence behavior
+and Resource entity references remain separate
 gaps. Numeric token parsing does not expand the accepted semantic enum vocabulary
 or add an unsupported metric type. Repeated-field null elements and unsupported
 message shapes are not made valid by duplicate detection.
@@ -132,6 +136,14 @@ spellings, interpret an underflowed fractional timestamp as unknown/zero time,
 or silently choose the first duplicate JSON field. Duplicate rejection is input
 tightening: fix the producer instead of rewriting keys or sending a failed
 keyed subset. Rolling back ingress can reopen the previous first-key behavior.
+
+Quoted trace counts/flags require the updated ingress application on every
+serving instance before producers use them. Existing capability-3 native artifacts
+already preserve these strings; this acceptance change does not bump the native
+ABI. Older ingress applications reject the containing span (or the whole request
+for resource/scope counts). Unkeyed requests can therefore report partial success
+in a mixed pool; keyed requests fail whole. Rollback narrows input acceptance but
+can still read the canonical integers already stored.
 
 There is no Parquet schema, metadata-envelope or scalar keyed-byte format change
 in this wire increment. Earlier rich-metadata reader/writer/compactor upgrade
@@ -153,7 +165,11 @@ randomized exact integers and fallback cases. Separate [field fixtures](../test/
 add 704 actual public duplicate/unknown-field decisions across 35 message/field
 contexts, enumerating all fields of those owners with public descriptors. Receiver
 scope, unknown-root handling, gzip rejection and cross-instance S3 replay are also
-exercised. Unsupported signal/message semantics remain unsupported.
+exercised. Dedicated [quoted trace integer fixtures](../test/fixtures/otlp/trace_integers/README.md)
+add 451 actual public decisions across all 11 trace uint32/fixed32/enum fields,
+plus complete quoted JSON/canonical JSON/protobuf keyed replay. Generic ProtoJSON
+accepts named enums, unlike OTLP; quoted numeric enum strings reject in both.
+Unsupported signal/message semantics remain unsupported.
 
 Ordinary replay uses only the native project toolchain. Optional Go reproduction
 is file-only preparation, not a runtime dependency or network exporter. Public
