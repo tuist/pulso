@@ -2,6 +2,37 @@
 
 Status: implementation started. Deployment and replacement gates remain open. Based on the repositories inspected on October 2, 2026.
 
+## Current continuation checkpoint
+
+The broad protocol/storage increment landed in PR #34 (`f7a3ebe`). The milestone
+baseline and early validation notes below are historical, not an up-to-date
+unsupported-feature list. Use [protocol coverage](../docs/protocol-coverage.md),
+[protocol follow-ups](protocol-breadth.md) and the signal-specific operator pages
+for the current implementation boundary.
+
+The next reliability increment adds atomic per-instance live-tail admission,
+explicit retryable closure on follower loss, safe startup failure responses and
+correct test-owned follower/storage shutdown ordering. It does not make tails a
+complete changefeed or satisfy a production gate. Its full test run passes
+1,618 tests; the preceding compaction-peer startup timeout remains diagnostically
+open despite successful same-seed replay. Details and evidence limits are in the
+[follow-up checkpoint](protocol-breadth.md#live-tail-reliability-follow-up).
+
+**Tuist cutover remains blocked on acceptance, not just missing endpoints:**
+
+- Workload-shaped selective query/index capacity and aggregate ingest/provider
+  pressure, including cold history and multiple serving instances.
+- Actual retained client/collector pipelines, retry queues, MCP transport and
+  tenant authorization through their deployed gateways.
+- Required alert/recording dependencies, lifecycle and delivery contracts,
+  alongside explicit decisions for retained external sources and incident tooling.
+- Authorized dual shipping, completeness/query/alert comparisons, provider fault
+  recovery, coherent restore, compatible rollout/rollback and measured cost.
+
+Continue with bounded Pulso-local implementation and reproducible acceptance
+harnesses. Companion deployments, production routing and paging moves require
+separate authorization and evidence; passing local tests does not authorize them.
+
 ## Execution progress
 
 - Validation for the metrics compatibility slice: `mix precommit` with Prometheus 3.5.0 conformance enabled passed 677 tests (33 real-provider integration tests excluded); strict Credo, the codec's 59 Rust tests, Rust formatting, Helm lint, the documented `Recreate` render, and whitespace checks passed. Claude's adversarial review reproduced eight defects covering parser backtracking, metric names, rollout/rollback guidance, compensated sums, histogram bounds/counts, ranking parameters, and keyword/literal parsing. All are fixed with regressions; two focused follow-ups also verified fixes for cross-metric histogram grouping and negative ranking parameters, with no remaining material defect. Storage iteration can still cause last-bit or extreme-overflow differences in floating sums; NaN histogram boundaries are not meaningful supported instrumentation. This is local compatibility evidence, not a production rollout gate. Crossing the non-finite storage compatibility boundary requires the documented non-overlapping upgrade and a compatible reader for rollback.

@@ -1088,6 +1088,15 @@ column. Stop old readers/writers and drain pending legacy keyed OTLP retries
 before rich writes; the richer content changes old reduced-projection hashes.
 Legacy/Loki nil-envelope fingerprints stay unchanged. See [logs](logs.md).
 
+Live-tail admission uses unique process-owned registry slots per tenant on each
+instance; concurrent joins cannot exceed that instance's configured limit, and
+caller termination releases a slot. No durable or cluster-visible admission state
+is added. Follower loss closes affected WebSockets with 1013, rather than silently
+replacing a cursor whose continuity cannot be proved. A reconnect queries fresh
+history and starts a new best-effort stream. Local supervision unavailability
+before upgrade returns HTTP503. These limits do not bound aggregate deployment
+polling pressure or make live tail a complete changefeed.
+
 New segment manifest entries optionally carry `ls`, a complete set of at most
 128 nonempty promoted service values, each at most 256 bytes. Exact `service`
 and `service_name` matchers and the direct service filter prune known irrelevant

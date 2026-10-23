@@ -11,7 +11,12 @@ Keep a versioned contract matrix with supported forms, explicit rejections,
 semantic references, bounds and operational qualifications. The operator-facing
 current boundary is [protocol coverage](../docs/protocol-coverage.md).
 
-## Pause point: land the current PR before further feature expansion
+## Historical pause point: landed protocol increment
+
+The implementation below landed in `f7a3ebe` (PR #34). Work has resumed with
+explicitly requested, bounded follow-ups. The original landing constraint and
+its validation caveats are preserved here; landing did not satisfy operational
+or Tuist cutover gates.
 
 Pause new protocol/storage/alerting feature increments and prepare the existing
 implementation for review and landing. The backlog below is follow-up work, not
@@ -30,7 +35,50 @@ failed/successful validation, review coverage limits and explicit open findings.
 Resume from [Remaining protocol work](#remaining-protocol-work-independent-of-application-usage),
 including the storage/scale and operational follow-ups, after this PR lands.
 
-## Latest completed increment: exponential projection correctness
+## Live-tail reliability follow-up
+
+- Replace count-then-register admission with unique process-owned slots, retaining
+  the per-tenant, per-instance cap during concurrent connection/history startup.
+  Leave, caller death and failed follower startup release reservations.
+- Close existing sockets with WebSocket1013 on follower loss, including a tail
+  supervision restart. Never silently establish a replacement cursor after losing
+  dedupe/baseline state or tailer memberships. Before upgrade, unavailable local
+  supervision returns retryable HTTP503 instead of a request-process crash.
+- Reconnection queries history and resumes best-effort delivery; it does not
+  establish continuity, deduplicate across sockets or turn polling into a journal.
+  Independent instances still multiply provider pressure. No storage/ABI/keyed-byte
+  changes, new durable authority or rollout are involved.
+- The old configuration-ETS traceback points to a test-owned shared table expiring;
+  the current follower fixture already captures immutable configuration. A new
+  full run reproduced a different teardown error: a periodic follower accessed
+  its manifest cache after storage supervision stopped. Starting tail supervision
+  after its storage dependencies now ensures followers stop first. No exception
+  suppression was added to storage polling. This does not independently resolve
+  the old shared-configuration failure or broader lifecycle/capacity acceptance.
+
+Validation for this follow-up (logs in `/tmp/pulso-tail-lifecycle/`):
+
+- Before production changes, regressions failed on non-idempotent rejoin and a
+  missing close frame after follower loss. The concurrency control passed on that
+  run; the count-then-register race is a source finding, not a reproduced overflow.
+- `ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mix precommit --max-cases 4 --seed 432996`:
+  **1,618 passed, 1 skipped, 37 excluded**; strict compile, dependency and format
+  checks included. Strict Credo is clean across 428 files. No native sources or
+  storage formats changed; native crates were built, not separately unit-tested.
+- Four focused tail files: **30 passed** on each of 11 consecutive runs using
+  `--repeat-until-failure 10`; no tail ETS/manifest-cache teardown error in these
+  runs or the final full run. Loopback WebSockets exercise follower death,
+  orderly registry-supervisor restart, explicit 1013/503 and history/live reconnect.
+  This does not establish abrupt registry-kill storms or provider acceptance.
+- The first full run failed on a compaction peer's 30s application-start timeout,
+  alongside acceptor teardown diagnostics and the manifest-cache error above.
+  The exact failing peer test and full suite pass on same-seed replay, but the
+  peer/acceptor root causes remain open. Existing compaction timeout warnings
+  also remain; a later green run is not diagnostic closure. The intentional
+  gRPC handler-crash test still emits its expected error log.
+- No deployment, provider exercise, private application change, commit or cutover.
+
+## Completed increment: exponential projection correctness
 
 The working tree already contains exponential/delta receivers and other protocol
 extensions beyond the historical checkpoints below. This increment hardens that

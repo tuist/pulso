@@ -462,6 +462,14 @@ defmodule PulsoWeb.LokiQueryController do
       {:error, :too_many_tails} ->
         error_json(conn, :too_many_requests, "too_many_tails", "The tenant has reached its live tail limit.")
 
+      {:error, :tail_unavailable} ->
+        error_json(
+          conn,
+          :service_unavailable,
+          "tail_unavailable",
+          "Live tail is temporarily unavailable. Reconnect and query history."
+        )
+
       err ->
         :ok = Tail.leave(tenant)
         render_error(conn, err)
