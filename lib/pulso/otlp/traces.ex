@@ -5,7 +5,6 @@ defmodule Pulso.OTLP.Traces do
   alias Pulso.Record.Span
 
   @max_timestamp 9_223_372_036_854_775_807
-  @max_count 4_294_967_295
 
   def decode(%{} = payload) do
     with :ok <- shape(payload),
@@ -27,11 +26,13 @@ defmodule Pulso.OTLP.Traces do
     res = Map.get(resource, "resource", %{})
     attrs = attributes(res)
     typed = typed_attributes(res)
+    # Resource/scope counts have already passed whole-request metadata validation.
+    {:ok, dropped} = u32(Map.get(res, "droppedAttributesCount", 0))
 
     base = %Span{
       resource: attrs,
       service: string_service(typed),
-      resource_dropped_attributes_count: count!(Map.get(res, "droppedAttributesCount", 0)),
+      resource_dropped_attributes_count: dropped,
       resource_schema_url: Map.get(resource, "schemaUrl", ""),
       otlp: %{"version" => 1, "resource" => typed}
     }
@@ -122,6 +123,10 @@ defmodule Pulso.OTLP.Traces do
          {:ok, finish} <- timestamp(Map.get(raw, "endTimeUnixNano", 0)),
          true <- finish >= start,
          true <- valid_span?(raw),
+         {:ok, flags} <- u32(Map.get(raw, "flags", 0)),
+         {:ok, dropped_attributes} <- u32(Map.get(raw, "droppedAttributesCount", 0)),
+         {:ok, dropped_events} <- u32(Map.get(raw, "droppedEventsCount", 0)),
+         {:ok, dropped_links} <- u32(Map.get(raw, "droppedLinksCount", 0)),
          {:ok, events} <- events(Map.get(raw, "events", [])),
          {:ok, links} <- links(Map.get(raw, "links", [])) do
       {:ok,
@@ -133,7 +138,7 @@ defmodule Pulso.OTLP.Traces do
            span_id: span_id,
            parent_span_id: parent,
            trace_state: Map.get(raw, "traceState", ""),
-           flags: count!(Map.get(raw, "flags", 0)),
+           flags: flags,
            name: Map.get(raw, "name", ""),
            kind: int_zero(Map.get(raw, "kind", 0)),
            status:
@@ -141,9 +146,9 @@ defmodule Pulso.OTLP.Traces do
            attributes: attributes(raw),
            events: events,
            links: links,
-           dropped_attributes_count: count!(Map.get(raw, "droppedAttributesCount", 0)),
-           dropped_events_count: count!(Map.get(raw, "droppedEventsCount", 0)),
-           dropped_links_count: count!(Map.get(raw, "droppedLinksCount", 0)),
+           dropped_attributes_count: dropped_attributes,
+           dropped_events_count: dropped_events,
+           dropped_links_count: dropped_links,
            otlp:
              Map.merge(base.otlp, %{
                "attributes" => typed_attributes(raw),
@@ -172,11 +177,7 @@ defmodule Pulso.OTLP.Traces do
     is_binary(Map.get(raw, "name", "")) and is_binary(Map.get(raw, "traceState", "")) and
       int_zero(Map.get(raw, "kind", 0)) in 0..5 and is_map(status) and int_zero(Map.get(status, "code", 0)) in 0..2 and
       is_binary(Map.get(status, "message", "")) and
-      valid_attributes?(raw) and
-      Enum.all?(
-        ["flags", "droppedAttributesCount", "droppedEventsCount", "droppedLinksCount"],
-        &valid_count?(Map.get(raw, &1, 0))
-      )
+      valid_attributes?(raw)
   end
 
   def id(value, length) when is_binary(value) and byte_size(value) == length do
@@ -197,13 +198,14 @@ defmodule Pulso.OTLP.Traces do
       %{} = e ->
         with {:ok, ts} <- timestamp(Map.get(e, "timeUnixNano", 0)),
              true <- is_binary(Map.get(e, "name", "")),
-             true <- valid_attributes?(e) and valid_count?(Map.get(e, "droppedAttributesCount", 0)) do
+             true <- valid_attributes?(e),
+             {:ok, dropped} <- u32(Map.get(e, "droppedAttributesCount", 0)) do
           {:ok,
            %{
              "timestamp_ns" => ts,
              "name" => Map.get(e, "name", ""),
              "attributes" => attributes(e),
-             "dropped_attributes_count" => count!(Map.get(e, "droppedAttributesCount", 0))
+             "dropped_attributes_count" => dropped
            }}
         else
           _ -> :error
@@ -221,17 +223,17 @@ defmodule Pulso.OTLP.Traces do
       %{} = link ->
         with {:ok, tid} <- id(link["traceId"], 32),
              {:ok, sid} <- id(link["spanId"], 16),
-             true <-
-               valid_attributes?(link) and valid_count?(Map.get(link, "droppedAttributesCount", 0)) and
-                 valid_count?(Map.get(link, "flags", 0)) and is_binary(Map.get(link, "traceState", "")) do
+             true <- valid_attributes?(link) and is_binary(Map.get(link, "traceState", "")),
+             {:ok, dropped} <- u32(Map.get(link, "droppedAttributesCount", 0)),
+             {:ok, flags} <- u32(Map.get(link, "flags", 0)) do
           {:ok,
            %{
              "trace_id" => tid,
              "span_id" => sid,
              "trace_state" => Map.get(link, "traceState", ""),
              "attributes" => attributes(link),
-             "dropped_attributes_count" => count!(Map.get(link, "droppedAttributesCount", 0)),
-             "flags" => count!(Map.get(link, "flags", 0))
+             "dropped_attributes_count" => dropped,
+             "flags" => flags
            }}
         else
           _ -> :error
@@ -258,11 +260,13 @@ defmodule Pulso.OTLP.Traces do
   end
 
   defp decode_scope(scope) when is_map(scope) do
+    {:ok, dropped} = u32(Map.get(scope, "droppedAttributesCount", 0))
+
     %{
       "name" => Map.get(scope, "name", ""),
       "version" => Map.get(scope, "version", ""),
       "attributes" => attributes(scope),
-      "dropped_attributes_count" => count!(Map.get(scope, "droppedAttributesCount", 0))
+      "dropped_attributes_count" => dropped
     }
   end
 
@@ -270,15 +274,8 @@ defmodule Pulso.OTLP.Traces do
 
   defp int_zero(v) when is_float(v) and v == 0.0, do: 0
   defp int_zero(v), do: v
-  defp valid_count?(value), do: match?({:ok, _}, Value.integer(value, 0, @max_count))
-
-  # Invariant: this exact value has passed valid_count?/1. Normalize only at
-  # record construction, after admission has examined the original supplied terms.
-  # Keep enum kind/status on int_zero/1, not the quoted-integer count path.
-  defp count!(value) do
-    {:ok, count} = Value.integer(value, 0, @max_count)
-    count
-  end
+  defp u32(v), do: Value.integer(v, 0, 4_294_967_295)
+  defp valid_count?(v), do: match?({:ok, _}, u32(v))
 
   defp valid_attributes?(value) do
     pairs = Map.get(value, "attributes", [])

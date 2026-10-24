@@ -28,9 +28,9 @@ and unquoted schema-scoped decimal/exponent integer forms without float rounding
 or fractional underflow. Receiver-scoped JSON rejects duplicate known fields,
 including escaped/null-valued duplicates, while ignoring unknown names/objects and
 foreign signal roots. JSON objects with multiple populated oneof members still
-reject. Trace dropped counts and flags accept exact quoted decimal/exponent integers
-in the unsigned 32-bit range, with unchanged admission and stored formats.
-Remaining null/presence behavior and entity references remain gaps. Named enum strings and snake_case keys are invalid OTLP
+reject. Trace uint32 counts and fixed32 flags accept exact quoted forms too;
+enums still require numeric JSON tokens, not quoted digits. Remaining
+null/presence behavior and entity references remain gaps. Named enum strings and snake_case keys are invalid OTLP
 spellings, not missing generic ProtoJSON features. Shared wire capability **3**
 is required across serving ingress app/native pairs.
 

@@ -82,6 +82,57 @@ defmodule PulsoWeb.OTLPWireTest do
     end
   end
 
+  test "quoted trace uint32 fields replay exact keyed S3 bytes across instances and protobuf" do
+    {runtime, peer} = s3_instances()
+    directory = "test/fixtures/otlp/trace_integers"
+
+    for {instance, name, format} <- [
+          {runtime, "traces-input.json", :json},
+          {peer, "traces-canonical.json", :json},
+          {peer, "traces.protobuf", :protobuf}
+        ] do
+      response =
+        Runtime.with(instance, fn ->
+          request("traces", format, :zlib.gzip(File.read!(Path.join(directory, name))), [
+            {"content-encoding", "gzip"},
+            {"idempotency-key", "quoted-trace-u32"}
+          ])
+        end)
+
+      assert response.status == 200
+    end
+
+    assert {:ok, [span]} = Storage.query(:traces, "default")
+    assert span.flags == 4_294_967_295
+    assert span.resource_dropped_attributes_count == 1
+    assert span.scope["dropped_attributes_count"] == 2
+    assert [%{"dropped_attributes_count" => 4}] = span.events
+    assert [%{"flags" => 257, "dropped_attributes_count" => 5}] = span.links
+  end
+
+  test "invalid quoted trace integers never publish keyed subsets and preserve unkeyed partial success" do
+    source = File.read!("test/fixtures/otlp/trace_integers/traces-canonical.json") |> JSON.decode!(:traces)
+    path = ["resourceSpans", Access.at(0), "scopeSpans", Access.at(0), "spans"]
+    [valid] = get_in(source, path)
+
+    for literal <- ["1e-1000", "4294967296", "01", "+1", " 1"] do
+      payload = put_in(source, path, [Map.put(valid, "flags", literal), valid])
+      body = Pulso.JSON.encode!(payload)
+
+      assert request("traces", :json, :zlib.gzip(body), [
+               {"content-encoding", "gzip"},
+               {"idempotency-key", "never-a-quoted-subset"}
+             ]).status == 400
+
+      assert {:ok, []} = Storage.query(:traces, "default")
+    end
+
+    body = source |> put_in(path, [Map.put(valid, "flags", "1e-1000"), valid]) |> Pulso.JSON.encode!()
+    response = request("traces", :json, body, [])
+    assert json_response(response, 200)["partialSuccess"]["rejectedSpans"] == "1"
+    assert {:ok, [_]} = Storage.query(:traces, "default")
+  end
+
   test "quoted trace uint32 fields replay public JSON/protobuf bytes across keyed S3 instances" do
     {runtime, peer} = s3_instances()
     directory = "test/fixtures/otlp/trace_uint32"

@@ -81,7 +81,11 @@ canonicalize and resend a failed keyed request as a way around admission.
 Known integral OTLP fields accept **unquoted** decimal/exponent JSON numbers
 when they denote an exact, in-range integer, including times, int64 values,
 uint64 counts/bucket arrays and numeric 32-bit fields. Integer fields using the
-shared string decoder also accept exact quoted forms. Examples:
+shared string decoder also accept exact quoted forms, including trace uint32
+counts and fixed32 flags at resource, scope, span, event and link owners.
+Trace counts/flags must be in `0..4294967295`. Trace enums remain numeric JSON
+tokens (`kind` in `0..5`, status `code` in `0..2`): quoted digits such as
+`"2"` and named enum strings are rejected. Examples:
 
 | JSON spelling | Normalized integer |
 | --- | --- |
@@ -114,21 +118,18 @@ public ProtoJSON reference. Some were previously accepted as extensions. Correct
 producers rather than rewriting retry keys or sending a keyed rejected subset.
 Previously stored canonical values remain readable.
 
-Trace **uint32 dropped counts and fixed32 flags** accept the same exact quoted
-forms, from `0` through `4294967295`, at resource, instrumentation scope, span,
-event and link owners where those fields exist. They normalize to the same
-stored integers as numeric JSON and protobuf. Admission examines the original
-supplied terms before normalization; node, record, attribute and body ceilings
-are unchanged. Count/flag strings and numeric scalars each consume one request
-node. Their byte lengths are bounded by the request body limit, not the separate
-attribute-value byte limit. Invalid resource/scope counts reject the
-request; invalid span/event/link counts or flags reject the containing span.
-Keyed requests with any rejected span fail whole, never publishing a valid subset.
+Trace counts and flags normalize to the same stored integers as numeric JSON
+and protobuf. Admission examines the original supplied terms before normalization;
+node, record, attribute and body ceilings are unchanged. Count/flag strings and
+numeric scalars each consume one request node. Their byte lengths are bounded by
+the request body limit, not the separate attribute-value byte limit. Invalid
+resource/scope counts reject the request; invalid span/event/link counts or flags
+reject the containing span. Keyed requests with any rejected span fail whole,
+never publishing a valid subset.
 
-This is **not full OTLP JSON conformance**. Remaining null/presence behavior and
-Resource entity references remain separate gaps. Quoted enum values (numeric
-strings as well as names) remain unsupported by the trace decoder; use JSON
-numbers for `kind` and `status.code`. Numeric token parsing does not expand the accepted semantic enum vocabulary
+This is **not full OTLP JSON conformance**. Remaining null/presence behavior
+and Resource entity references remain separate
+gaps. Numeric token parsing does not expand the accepted semantic enum vocabulary
 or add an unsupported metric type. Repeated-field null elements and unsupported
 message shapes are not made valid by duplicate detection.
 OTLP context IDs use hex, not generic Google ProtoJSON's base64 byte spelling.
@@ -146,9 +147,12 @@ tightening: fix the producer instead of rewriting keys or sending a failed
 keyed subset. Rolling back ingress can reopen the previous first-key behavior.
 
 Quoted trace counts/flags require the updated ingress application on every
-serving instance. Older applications reject these strings; rolling back can
-therefore reject requests accepted by the updated pool. The native wire parser
-and its capability are unchanged for this extension.
+serving instance before producers use them. Existing capability-3 native artifacts
+already preserve these strings; this acceptance change does not bump the native
+ABI. Older ingress applications reject the containing span (or the whole request
+for resource/scope counts). Unkeyed requests can therefore report partial success
+in a mixed pool; keyed requests fail whole. Rollback narrows input acceptance but
+can still read the canonical integers already stored.
 
 There is no Parquet schema, metadata-envelope or scalar keyed-byte format change
 in this wire increment. Earlier rich-metadata reader/writer/compactor upgrade
@@ -170,7 +174,11 @@ randomized exact integers and fallback cases. Separate [field fixtures](../test/
 add 704 actual public duplicate/unknown-field decisions across 35 message/field
 contexts, enumerating all fields of those owners with public descriptors. Receiver
 scope, unknown-root handling, gzip rejection and cross-instance S3 replay are also
-exercised. The [trace uint32 fixtures](../test/fixtures/otlp/trace_uint32/README.md)
+exercised. Dedicated [quoted trace integer fixtures](../test/fixtures/otlp/trace_integers/README.md)
+add 451 actual public decisions across all 11 trace uint32/fixed32/enum fields,
+plus complete quoted JSON/canonical JSON/protobuf keyed replay. Generic ProtoJSON
+accepts named enums, unlike OTLP; quoted numeric enum strings reject in both.
+The separate [trace uint32 fixtures](../test/fixtures/otlp/trace_uint32/README.md)
 add 306 public quoted-integer decisions across all nine trace count/flag fields,
 plus canonical JSON/protobuf, native Parquet and cross-instance gzip keyed replay.
 Unsupported signal/message semantics remain unsupported.
