@@ -78,6 +78,44 @@ Validation for this follow-up (logs in `/tmp/pulso-tail-lifecycle/`):
   gRPC handler-crash test still emits its expected error log.
 - No deployment, provider exercise, private application change, commit or cutover.
 
+## Completed increment: quoted trace uint32 counts and flags
+
+- Accept exact quoted decimal/exponent integers in all nine trace uint32/fixed32
+  fields: resource/scope/span/event/link dropped counts and span/link flags.
+  Normalize only after admission; no new tree walk, schema, mutable state or
+  native interface. Existing native numeric-token and Parquet paths stay intact.
+- Preserve the unsigned 32-bit range, malformed/fractional/overflow rejection,
+  numeric-only trace enums and original string attributes. Resource/scope errors
+  fail whole; invalid span/event/link fields reject their containing span, with
+  keyed requests always failing whole instead of publishing a valid neighbor.
+- Freeze 306 public OTLP1.9.0/Google1.36.11 quoted-integer decisions across the
+  nine fields, plus original/canonical JSON and actual public protobuf. Replay
+  native/reference/direct-map parity, native Parquet and gzip keyed S3 publication
+  across owned independent runtime instances. No Go dependency in normal replay.
+- Upgrade every serving ingress application before producers use these forms.
+  Native wire capability3 and all stored formats/keyed bytes remain unchanged;
+  older applications reject newly accepted strings. This does not close the
+  remaining null/presence/entity-reference or deployed-client/capacity gaps.
+
+Validation for this increment:
+
+- Five focused wire/JSON/controller files: **46 passed**, including the 306 public
+  decisions, 50 randomized all-owner requests and native Parquet/keyed S3 replay.
+- `ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mix precommit --max-cases 4`:
+  **1,627 passed, 1 skipped, 37 excluded**. Existing compaction timeout warnings
+  remain diagnostic follow-ups, not resolved by this passing run.
+- Strict Credo: **429 files, no issues**. No Rust source/ABI changed; the native
+  crates were built, not separately unit-tested for this app-only increment.
+- A local, sequential 20-sample/1,000-span decoder check alternated baseline and
+  updated modules after warmup: numeric sparse medians **10,328/10,302 µs** and
+  numeric dense **14,534/14,569 µs**. These are noisy component checks showing no
+  material numeric hot-path regression, not concurrent capacity/provider proof.
+- Claude design iteration rejected early native string rewriting because it
+  would reclassify admission terms. Adversarial source review found no blocking
+  defect; clarify count-field body-vs-attribute byte bounds and the prevalidated
+  construction invariant. Retain raw public captures rather than reserialize
+  away their provenance; regeneration whitespace differences stay documented.
+
 ## Completed increment: exponential projection correctness
 
 The working tree already contains exponential/delta receivers and other protocol
@@ -150,8 +188,9 @@ current extension by inspection.
   cases and three full raw-number/canonical-JSON/protobuf request sets. Prove
   native Parquet fidelity and gzip keyed publication across independent runtimes
   sharing an owned local S3 stub. Ordinary replay needs no Go or network.
-- Quoted trace32-bit integer/null/entity-ref forms, other metric types and actual
-  deployment/capacity acceptance remain independent gaps. The earlier generic
+- The quoted trace32-bit count/flag gap is superseded by the completed increment
+  above. Null/entity-ref forms, other metric types and actual deployment/capacity
+  acceptance remain independent gaps. The earlier generic
   named-enum/alias assumptions are corrected by the OTLP-specific contract above.
 
 ## Completed checkpoint: shared OTLP wire semantics
@@ -168,8 +207,9 @@ limitations are superseded by the capability-2 increment above.
   materialization, without refunding replaced metadata.
 - Accept exact quoted decimal/exponent integer forms without float rounding or
   exponent-sized bignums. Reject noncanonical leading-zero/plus spellings that
-  were previously extensions. Broader unquoted forms and trace 32-bit string
-  handling remain open, not inferred from this component.
+  were previously extensions. Later completed increments above add broader
+  unquoted forms and trace 32-bit count/flag strings; neither was inferred from
+  this component.
 - Fence matching native artifacts with shared OTLP wire capability 1, separate
   from unchanged log/metric/trace storage/search capabilities. Upgrade every
   serving ingress pair; there is no Parquet, envelope or keyed scalar format change.
@@ -218,8 +258,8 @@ not a second mutable authority or dangling point-reference store.
    policies; broader native-histogram/exemplar query/export and remote-write2/
    metadata acceptance beyond their current working-tree implementations. Projection must
    not silently mix incompatible original instruments or invent counter resets.
-3. **OTLP wire breadth:** entity references, remaining quoted trace 32-bit integers,
-   null/presence/request-shape and unsupported-message validation, broader OTLP
+3. **OTLP wire breadth:** entity references, remaining null/presence/request-shape
+   and unsupported-message validation, broader OTLP
    conformance and broader direct-gRPC client/default-policy acceptance. Keep shared auth, tenant boundaries, budgets and partial-success
    semantics across transports. Validate public independent producers, not only
    hand-built encoders.

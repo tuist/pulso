@@ -214,8 +214,13 @@ source times are supported without float rounding or fractional underflow; numer
 32-bit fields also retain their exact integral token values. Shared OTLP wire
 capability 3 is required. Known duplicate JSON fields reject the whole request,
 including escaped/null-valued fields; unknown fields remain ignored in the traces
-schema. Remaining quoted 32-bit integers and null/presence handling are separate
-gaps; enum-name strings are not valid OTLP JSON spellings.
+schema. Dropped counts and flags also accept exact quoted decimal/exponent
+integers in the unsigned 32-bit range, including resource/scope/event/link
+owners. Their stored values match numeric JSON/protobuf; invalid owner counts
+reject the request and invalid span/event/link fields reject their containing
+span. Keyed requests never publish a valid subset. Quoted enum values remain
+unsupported; use JSON numbers for kind/status code. Null/presence handling
+remains incomplete; enum-name strings are not valid OTLP JSON spellings.
 See [wire semantics and upgrade rules](otlp-wire.md). Resource entity references
 remain unsupported.
 

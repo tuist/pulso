@@ -82,6 +82,74 @@ defmodule PulsoWeb.OTLPWireTest do
     end
   end
 
+  test "quoted trace uint32 fields replay public JSON/protobuf bytes across keyed S3 instances" do
+    {runtime, peer} = s3_instances()
+    directory = "test/fixtures/otlp/trace_uint32"
+
+    for {instance, name, format} <- [
+          {runtime, "input.json", :json},
+          {peer, "canonical.json", :json},
+          {peer, "request.protobuf", :protobuf},
+          {runtime, "input.json", :json}
+        ] do
+      body = File.read!(Path.join(directory, name))
+
+      response =
+        Runtime.with(instance, fn ->
+          request("traces", format, :zlib.gzip(body), [
+            {"content-encoding", "gzip"},
+            {"idempotency-key", "quoted-uint32"}
+          ])
+        end)
+
+      assert response.status == 200
+    end
+
+    assert {:ok, expected, 0} = Traces.decode_protobuf(File.read!(Path.join(directory, "request.protobuf")))
+    assert {:ok, ^expected} = Storage.query(:traces, "default")
+    assert Runtime.with(peer, fn -> Storage.query(:traces, "default") end) == {:ok, expected}
+  end
+
+  test "invalid quoted uint32 fields never publish a keyed valid neighbor and retain unkeyed rejection counts" do
+    base = "test/fixtures/otlp/trace_uint32/canonical.json" |> File.read!() |> JSON.decode!(:traces)
+    resource = ["resourceSpans", Access.at(0), "resource"]
+    scope = ["resourceSpans", Access.at(0), "scopeSpans", Access.at(0)]
+    span = scope ++ ["spans", Access.at(0)]
+
+    paths = [
+      {resource ++ ["droppedAttributesCount"], true},
+      {scope ++ ["scope", "droppedAttributesCount"], true},
+      {span ++ ["droppedAttributesCount"], false},
+      {span ++ ["droppedEventsCount"], false},
+      {span ++ ["droppedLinksCount"], false},
+      {span ++ ["flags"], false},
+      {span ++ ["events", Access.at(0), "droppedAttributesCount"], false},
+      {span ++ ["links", Access.at(0), "droppedAttributesCount"], false},
+      {span ++ ["links", Access.at(0), "flags"], false}
+    ]
+
+    for {{path, whole?}, index} <- Enum.with_index(paths) do
+      bad = put_in(base, path, "4294967296")
+      mixed = %{"resourceSpans" => base["resourceSpans"] ++ bad["resourceSpans"]}
+      body = mixed |> Pulso.JSON.encode!() |> :zlib.gzip()
+      tenant = "uint32-#{index}"
+      headers = [{"x-scope-orgid", tenant}, {"content-encoding", "gzip"}]
+
+      assert request("traces", :json, body, [{"idempotency-key", "no-subset"} | headers]).status == 400
+      assert {:ok, []} = Storage.query(:traces, tenant)
+
+      response = request("traces", :json, body, headers)
+
+      if whole? do
+        assert response.status == 400
+        assert {:ok, []} = Storage.query(:traces, tenant)
+      else
+        assert json_response(response, 200)["partialSuccess"]["rejectedSpans"] == "1"
+        assert {:ok, [_span]} = Storage.query(:traces, tenant)
+      end
+    end
+  end
+
   test "fractional timestamps cannot underflow into unknown-time fallback or a keyed subset" do
     for {signal, name, _count} <- @signals do
       body =

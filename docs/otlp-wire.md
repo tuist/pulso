@@ -114,9 +114,21 @@ public ProtoJSON reference. Some were previously accepted as extensions. Correct
 producers rather than rewriting retry keys or sending a keyed rejected subset.
 Previously stored canonical values remain readable.
 
-This is **not full OTLP JSON conformance**. Quoted trace 32-bit counts/flags,
-remaining null/presence behavior and Resource entity references remain separate
-gaps. Numeric token parsing does not expand the accepted semantic enum vocabulary
+Trace **uint32 dropped counts and fixed32 flags** accept the same exact quoted
+forms, from `0` through `4294967295`, at resource, instrumentation scope, span,
+event and link owners where those fields exist. They normalize to the same
+stored integers as numeric JSON and protobuf. Admission examines the original
+supplied terms before normalization; node, record, attribute and body ceilings
+are unchanged. Count/flag strings and numeric scalars each consume one request
+node. Their byte lengths are bounded by the request body limit, not the separate
+attribute-value byte limit. Invalid resource/scope counts reject the
+request; invalid span/event/link counts or flags reject the containing span.
+Keyed requests with any rejected span fail whole, never publishing a valid subset.
+
+This is **not full OTLP JSON conformance**. Remaining null/presence behavior and
+Resource entity references remain separate gaps. Quoted enum values (numeric
+strings as well as names) remain unsupported by the trace decoder; use JSON
+numbers for `kind` and `status.code`. Numeric token parsing does not expand the accepted semantic enum vocabulary
 or add an unsupported metric type. Repeated-field null elements and unsupported
 message shapes are not made valid by duplicate detection.
 OTLP context IDs use hex, not generic Google ProtoJSON's base64 byte spelling.
@@ -132,6 +144,11 @@ spellings, interpret an underflowed fractional timestamp as unknown/zero time,
 or silently choose the first duplicate JSON field. Duplicate rejection is input
 tightening: fix the producer instead of rewriting keys or sending a failed
 keyed subset. Rolling back ingress can reopen the previous first-key behavior.
+
+Quoted trace counts/flags require the updated ingress application on every
+serving instance. Older applications reject these strings; rolling back can
+therefore reject requests accepted by the updated pool. The native wire parser
+and its capability are unchanged for this extension.
 
 There is no Parquet schema, metadata-envelope or scalar keyed-byte format change
 in this wire increment. Earlier rich-metadata reader/writer/compactor upgrade
@@ -153,7 +170,10 @@ randomized exact integers and fallback cases. Separate [field fixtures](../test/
 add 704 actual public duplicate/unknown-field decisions across 35 message/field
 contexts, enumerating all fields of those owners with public descriptors. Receiver
 scope, unknown-root handling, gzip rejection and cross-instance S3 replay are also
-exercised. Unsupported signal/message semantics remain unsupported.
+exercised. The [trace uint32 fixtures](../test/fixtures/otlp/trace_uint32/README.md)
+add 306 public quoted-integer decisions across all nine trace count/flag fields,
+plus canonical JSON/protobuf, native Parquet and cross-instance gzip keyed replay.
+Unsupported signal/message semantics remain unsupported.
 
 Ordinary replay uses only the native project toolchain. Optional Go reproduction
 is file-only preparation, not a runtime dependency or network exporter. Public
