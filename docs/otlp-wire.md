@@ -118,6 +118,15 @@ public ProtoJSON reference. Some were previously accepted as extensions. Correct
 producers rather than rewriting retry keys or sending a keyed rejected subset.
 Previously stored canonical values remain readable.
 
+Trace counts and flags normalize to the same stored integers as numeric JSON
+and protobuf. Admission examines the original supplied terms before normalization;
+node, record, attribute and body ceilings are unchanged. Count/flag strings and
+numeric scalars each consume one request node. Their byte lengths are bounded by
+the request body limit, not the separate attribute-value byte limit. Invalid
+resource/scope counts reject the request; invalid span/event/link counts or flags
+reject the containing span. Keyed requests with any rejected span fail whole,
+never publishing a valid subset.
+
 This is **not full OTLP JSON conformance**. Remaining null/presence behavior
 and Resource entity references remain separate
 gaps. Numeric token parsing does not expand the accepted semantic enum vocabulary
@@ -169,6 +178,9 @@ exercised. Dedicated [quoted trace integer fixtures](../test/fixtures/otlp/trace
 add 451 actual public decisions across all 11 trace uint32/fixed32/enum fields,
 plus complete quoted JSON/canonical JSON/protobuf keyed replay. Generic ProtoJSON
 accepts named enums, unlike OTLP; quoted numeric enum strings reject in both.
+The separate [trace uint32 fixtures](../test/fixtures/otlp/trace_uint32/README.md)
+add 306 public quoted-integer decisions across all nine trace count/flag fields,
+plus canonical JSON/protobuf, native Parquet and cross-instance gzip keyed replay.
 Unsupported signal/message semantics remain unsupported.
 
 Ordinary replay uses only the native project toolchain. Optional Go reproduction

@@ -214,6 +214,9 @@ source times are supported without float rounding or fractional underflow; numer
 32-bit fields also retain their exact integral token values. Trace uint32 counts
 and fixed32 flags accept exact quoted forms in `0..4294967295` at every owner.
 Enums still require numeric JSON tokens: quoted digits and names reject.
+Stored counts/flags match numeric JSON/protobuf. Invalid resource/scope counts
+reject the request; invalid span/event/link fields reject their containing span.
+Keyed requests never publish a valid subset.
 Shared OTLP wire capability 3 is required, with the updated ingress application
 on every serving instance before producers use quoted trace counts/flags.
 Known duplicate JSON fields reject the whole request, including escaped/null-valued

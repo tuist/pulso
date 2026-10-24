@@ -120,6 +120,40 @@ current extension by inspection.
   trace metadata normalization changes; no native ABI, format or keyed-byte
   change. Upgrade all ingress applications before relying on accepted forms.
 
+### Additional trace uint32 validation
+
+The branch's independent corpus retains 306 public OTLP1.9.0/Google1.36.11
+quoted-integer decisions across the nine count/flag fields, plus original and
+canonical JSON and actual public protobuf. It adds native/reference/direct-map
+parity, 50 randomized all-owner requests, native Parquet and gzip keyed S3 replay
+across owned independent runtime instances. Both corpora remain replayable without
+Go or network access.
+
+Before merging the independently landed implementation:
+
+- Five focused wire/JSON/controller files: **46 passed**.
+- `ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mix precommit --max-cases 4`:
+  **1,627 passed, 1 skipped, 37 excluded**. Existing compaction timeout warnings
+  remain diagnostic follow-ups, not resolved by this passing run.
+- Strict Credo: **429 files, no issues**. No Rust source/ABI changed; the native
+  crates were built, not separately unit-tested for this app-only increment.
+- A local, sequential 20-sample/1,000-span decoder check alternated the original
+  baseline and branch implementation after warmup: numeric sparse medians
+  **10,328/10,302 µs** and numeric dense **14,534/14,569 µs**. These historical
+  component checks are not concurrent capacity/provider proof or measurements
+  of the combined implementation.
+- Claude design iteration rejected early native string rewriting because it
+  would reclassify admission terms. Adversarial source review found no blocking
+  defect; count-field body-vs-attribute byte bounds and the prevalidated
+  construction invariant were clarified. Raw public captures retain their
+  provenance; regeneration whitespace differences stay documented.
+
+The merge retains the landed parse-once span/event/link decoder and both
+independent fixture and regression-test sets, without changing admission,
+numeric-only enums, storage formats or keyed fail-whole behavior. Combined
+validation: six focused OTLP files **55 passed**; full precommit **1,637 passed,
+1 skipped, 37 excluded**. Existing compaction timeout diagnostics remain open.
+
 ## Completed checkpoint: receiver-scoped duplicate JSON fields
 
 - Reject recognized duplicate JSON fields before any append, across scalar,
