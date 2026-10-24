@@ -623,7 +623,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
     assert Enum.uniq(first ++ next) == first ++ next
   end
 
-  test "offline conversion explicitly bounds large roots and memory", ctx do
+  test "offline conversion rejects missing budgets and oversized legacy roots", ctx do
     start_supervised!({Task.Supervisor, name: RetentionTasks, max_children: 1})
     key = Manifest.manifest_key(ctx.tenant, "metrics")
     body = String.duplicate(" ", 16_777_217) <> IO.iodata_to_binary(Manifest.encode(Manifest.new()))
@@ -632,6 +632,15 @@ defmodule Pulso.Storage.S3.RetentionTest do
 
     assert {:error, :response_too_large} =
              Retention.convert_offline(ctx.tenant, "metrics", ctx.config, max_legacy_bytes: 16_777_216)
+  end
+
+  # A task may reply before its supervisor removes it. Independent budget
+  # scenarios must not contend for the same single-child conversion slot.
+  test "offline conversion accepts a large root within explicit byte and heap budgets", ctx do
+    start_supervised!({Task.Supervisor, name: RetentionTasks, max_children: 1})
+    key = Manifest.manifest_key(ctx.tenant, "metrics")
+    body = String.duplicate(" ", 16_777_217) <> IO.iodata_to_binary(Manifest.encode(Manifest.new()))
+    Agent.update(ctx.agent, &%{&1 | objects: Map.put(&1.objects, key, {"\"legacy-large\"", body})})
 
     assert {:ok, _} = Retention.convert_offline(ctx.tenant, "metrics", ctx.config, max_legacy_bytes: 20_000_000)
     assert root(ctx).version == 3
