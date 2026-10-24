@@ -68,12 +68,15 @@ defmodule Pulso.PromQL.EvaluatorTest do
     Enum.each([beta | workers], &send(&1, {:release, {:ok, []}}))
     for _ <- 1..3, do: assert_receive({:finished_metric_query, {:ok, _}}, 5_000)
     # A result reaches the caller before its worker necessarily exits.
-    # Observe worker termination before asserting that slots are released.
     for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal}, 5_000)
     slots = Pulso.Runtime.name(QuerySlots)
-    _ = :sys.get_state(slots)
-    assert Registry.lookup(slots, {"acme", 0}) == []
-    assert Registry.lookup(slots, {"acme", 1}) == []
+
+    # Registry partitions clean up asynchronously after worker termination.
+    # Registration, used by admission, synchronously reclaims dead owners.
+    for slot <- 0..1 do
+      assert {:ok, _} = Registry.register(slots, {"acme", slot}, nil)
+      Registry.unregister(slots, {"acme", slot})
+    end
   end
 
   test "one tenant cannot occupy every node slot" do

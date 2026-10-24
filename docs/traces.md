@@ -211,11 +211,14 @@ Repeated singular protobuf messages merge recursively under cumulative owner
 budgets, without silently overwriting nested metadata or refunding discarded
 attribute contents. Exact quoted and unquoted decimal/exponent int64 values and
 source times are supported without float rounding or fractional underflow; numeric
-32-bit fields also retain their exact integral token values. Shared OTLP wire
-capability 3 is required. Known duplicate JSON fields reject the whole request,
-including escaped/null-valued fields; unknown fields remain ignored in the traces
-schema. Remaining quoted 32-bit integers and null/presence handling are separate
-gaps; enum-name strings are not valid OTLP JSON spellings.
+32-bit fields also retain their exact integral token values. Trace uint32 counts
+and fixed32 flags accept exact quoted forms in `0..4294967295` at every owner.
+Enums still require numeric JSON tokens: quoted digits and names reject.
+Shared OTLP wire capability 3 is required, with the updated ingress application
+on every serving instance before producers use quoted trace counts/flags.
+Known duplicate JSON fields reject the whole request, including escaped/null-valued
+fields; unknown fields remain ignored in the traces schema. Remaining
+null/presence handling is a separate gap.
 See [wire semantics and upgrade rules](otlp-wire.md). Resource entity references
 remain unsupported.
 

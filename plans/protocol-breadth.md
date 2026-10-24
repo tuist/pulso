@@ -105,6 +105,21 @@ current extension by inspection.
   and drain retries. Exact-byte409 remains permanent; never evade it by key
   mutation, overwrite, unkeyed/subset resend or metadata reconstruction.
 
+## Completed increment: quoted trace counts and flags
+
+- Accept exact quoted uint32 dropped counts and fixed32 flags at every trace
+  owner, matching public OTLP v1.9.0/Google protobuf v1.36.11 decisions without
+  float rounding or exponent-sized integers. Preserve whole-request metadata
+  rejection, per-span partial success and keyed fail-whole publication.
+- Keep enums as numeric JSON tokens. The dedicated public corpus proves quoted
+  enum digits reject; generic ProtoJSON named enums remain invalid OTLP forms.
+- Freeze 451 actual quoted-field decisions plus complete public JSON/protobuf
+  requests. Native/reference JSON, Parquet and cross-instance gzip keyed S3 replay
+  establish component behavior, not deployed-client/provider/capacity acceptance.
+- Existing Rust decoding/preflight/storage stays in place. Only application-side
+  trace metadata normalization changes; no native ABI, format or keyed-byte
+  change. Upgrade all ingress applications before relying on accepted forms.
+
 ## Completed checkpoint: receiver-scoped duplicate JSON fields
 
 - Reject recognized duplicate JSON fields before any append, across scalar,
@@ -150,8 +165,9 @@ current extension by inspection.
   cases and three full raw-number/canonical-JSON/protobuf request sets. Prove
   native Parquet fidelity and gzip keyed publication across independent runtimes
   sharing an owned local S3 stub. Ordinary replay needs no Go or network.
-- Quoted trace32-bit integer/null/entity-ref forms, other metric types and actual
-  deployment/capacity acceptance remain independent gaps. The earlier generic
+- Remaining null/entity-ref forms, other metric types and actual
+  deployment/capacity acceptance remain independent gaps. Quoted trace counts/flags
+  are now covered by the dedicated increment above; enums require numeric tokens. The earlier generic
   named-enum/alias assumptions are corrected by the OTLP-specific contract above.
 
 ## Completed checkpoint: shared OTLP wire semantics
@@ -168,8 +184,9 @@ limitations are superseded by the capability-2 increment above.
   materialization, without refunding replaced metadata.
 - Accept exact quoted decimal/exponent integer forms without float rounding or
   exponent-sized bignums. Reject noncanonical leading-zero/plus spellings that
-  were previously extensions. Broader unquoted forms and trace 32-bit string
-  handling remain open, not inferred from this component.
+  were previously extensions. Broader unquoted forms and trace count/flag strings
+  were addressed by the later dedicated increments above, not inferred from this
+  component; enum strings remain invalid.
 - Fence matching native artifacts with shared OTLP wire capability 1, separate
   from unchanged log/metric/trace storage/search capabilities. Upgrade every
   serving ingress pair; there is no Parquet, envelope or keyed scalar format change.
@@ -218,7 +235,7 @@ not a second mutable authority or dangling point-reference store.
    policies; broader native-histogram/exemplar query/export and remote-write2/
    metadata acceptance beyond their current working-tree implementations. Projection must
    not silently mix incompatible original instruments or invent counter resets.
-3. **OTLP wire breadth:** entity references, remaining quoted trace 32-bit integers,
+3. **OTLP wire breadth:** entity references, remaining
    null/presence/request-shape and unsupported-message validation, broader OTLP
    conformance and broader direct-gRPC client/default-policy acceptance. Keep shared auth, tenant boundaries, budgets and partial-success
    semantics across transports. Validate public independent producers, not only
@@ -263,6 +280,25 @@ not a second mutable authority or dangling point-reference store.
 - Frozen ordinary replay without external tools/network; optional live exercises
   fail explicitly when opted into without prepared tools.
 - Documentation synchronized with implemented behavior and remaining gaps.
+
+## Quoted trace integer validation checkpoint
+
+- `ERL_FLAGS='+S 4:4' mix precommit --max-cases 4 --seed 432996`:
+  **1,627 passed, 1 skipped, 37 excluded**, 81.1s; strict application compile,
+  unused-dependency and formatting checks included. Strict Credo is clean across
+  429 source files. Native crates were built; no native sources/ABI changed and
+  native unit tests were not separately rerun for this application-only increment.
+- Dedicated corpus: 451 actual public decisions and 102 randomized/explicit-boundary
+  normalization cases, native/reference JSON parity, faithful native Parquet and
+  gzip HTTP exact-byte keyed replay across independent owned S3 runtime instances.
+  The pinned optional Go producer passed offline generation, vet and build.
+- Claude reviewed the design and implementation adversarially. No blocking
+  implementation findings; corrected the randomized zero generator and added
+  explicit zero/uint32-max cases. Public evidence also corrected the initial
+  assumption that enum numeric strings should be accepted: they must reject.
+- Logs in `.sc/trace-integers/` retain compaction timeout/conflict and manifest-CAS
+  diagnostics. The passing suite does not close earlier reliability findings or
+  establish capacity. No provider/deployed-client/rollout or commit is implied.
 
 ## Current exponential-boundary validation checkpoint
 
