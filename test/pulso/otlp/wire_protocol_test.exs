@@ -155,7 +155,7 @@ defmodule Pulso.OTLP.WireProtocolTest do
     assert :ok = NIF.ensure_otlp_wire_api!()
     assert NIF.log_metadata_api_version() == 1
     assert NIF.trace_metadata_api_version() == 2
-    assert NIF.metric_metadata_api_version() == 1
+    assert NIF.metric_metadata_api_version() == 2
     assert NIF.otlp_metrics_api_version() == 2
   end
 

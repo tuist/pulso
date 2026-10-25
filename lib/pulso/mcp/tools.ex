@@ -899,6 +899,7 @@ defmodule Pulso.MCP.Tools do
       "labels" => s.labels,
       "otlp" => s.otlp
     }
+    |> put_present("start_timestamp_ms", s.start_timestamp_ms)
     |> put_present("histogram", s.histogram && encode_histogram(s.histogram))
     |> put_present("exemplars", s.exemplars && Enum.map(s.exemplars, &Map.from_struct/1))
   end

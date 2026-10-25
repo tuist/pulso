@@ -26,16 +26,22 @@ defmodule Pulso.Record.MetricSample do
   (Prometheus remote_write v1 and OTLP metrics) express timestamps in
   milliseconds and nanoseconds respectively; conversion happens at the
   wire boundary so the storage path only ever sees nanoseconds.
+
+  `start_timestamp_ms` retains a Remote Write 2.0 source start/created time,
+  or is nil when unset. It stays in signed int64 milliseconds to preserve the
+  complete wire domain without nanosecond overflow. It is not a sample time,
+  series label, retention bound or instruction to synthesize a zero sample.
   """
 
   alias Pulso.Record.Exemplar
   alias Pulso.Record.NativeHistogram
 
-  defstruct [:series_id, :timestamp_ns, :value, :otlp, :histogram, :exemplars, labels: %{}]
+  defstruct [:series_id, :timestamp_ns, :value, :otlp, :histogram, :exemplars, :start_timestamp_ms, labels: %{}]
 
   @type t :: %__MODULE__{
           series_id: non_neg_integer() | nil,
           timestamp_ns: integer() | nil,
+          start_timestamp_ms: integer() | nil,
           value: number() | :stale | :nan | :infinity | :negative_infinity | nil,
           labels: %{optional(String.t()) => String.t()},
           otlp: map() | nil,

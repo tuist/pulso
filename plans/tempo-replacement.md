@@ -5,8 +5,9 @@
 This application-specific track is compatibility evidence, not Pulso's product
 boundary. Generic full public-protocol breadth is tracked in
 [protocol breadth](protocol-breadth.md). The latest independent metrics increment
-adds cumulative explicit histograms/summaries and advances the metric artifact
-tuple to `{1,2,1,1,1}`; trace `{2,1,3,4,12}` and object-store `{1,1,1}` remain unchanged.
+retains remote-write 2.0 source starts and advances the metric artifact tuple to
+`{2,2,1,1,1}`; trace `{2,1,3,4,12}` is unchanged. See the generic workstream for
+the current object-store tuple and fleet-wide upgrade requirements.
 Older metric tuples below describe historical checkpoints.
 
 Replace Tempo for Tuist's tracing workload without weakening acknowledged-write durability, tenant isolation, bounded admission, or query completeness. API compatibility and native MCP diagnosis are separate acceptance surfaces. Passing synthetic tests is not a cutover approval.

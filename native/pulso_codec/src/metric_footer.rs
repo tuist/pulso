@@ -104,7 +104,13 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use parquet::arrow::ArrowWriter;
         use std::sync::Arc;
-        for optional in [None, Some("histogram"), Some("exemplars"), Some("otlp")] {
+        for optional in [
+            None,
+            Some("histogram"),
+            Some("exemplars"),
+            Some("otlp"),
+            Some("start_timestamp_ms"),
+        ] {
             let mut fields = vec![
                 Field::new("series_id", DataType::Int64, false),
                 Field::new("timestamp_ns", DataType::Int64, false),

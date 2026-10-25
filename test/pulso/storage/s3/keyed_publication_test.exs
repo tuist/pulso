@@ -6,6 +6,7 @@ defmodule Pulso.Storage.S3.KeyedPublicationTest do
   alias Pulso.OTLP.Traces
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
+  alias Pulso.RemoteWrite.Push
   alias Pulso.Runtime
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
@@ -240,6 +241,54 @@ defmodule Pulso.Storage.S3.KeyedPublicationTest do
     assert {:ok, _} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
     refute Agent.get(ctx.agent, &Map.has_key?(&1.objects, key))
     assert S3.query(:metrics, ctx.tenant, []) == before
+  end
+
+  test "source starts survive independent instances, restart, exact keyed replay and compaction", ctx do
+    fixtures = Path.expand("../../../fixtures/metrics/remote_write_start", __DIR__)
+    cases = File.read!(Path.join(fixtures, "prometheus-3.8.0.json")) |> JSON.decode!()
+
+    records =
+      for c <- [Enum.at(cases, 1), Enum.at(cases, 8)], reduce: [] do
+        rows ->
+          assert {:ok, decoded, 0, []} = Push.decode_with_metadata(Base.decode64!(c["snappy_base64"]), 16_777_216, :v2)
+          rows ++ decoded
+      end
+
+    peer = %{Runtime.current() | instance: __MODULE__.StartPeer}
+
+    Runtime.with(peer, fn ->
+      start_supervised!(Supervisor.child_spec(ManifestSupervision, id: :start_peer_manifests))
+    end)
+
+    assert :ok = S3.append(:metrics, ctx.tenant, records, idempotency_key: "key")
+    original_key = key(ctx, :metrics, records)
+    original = object(ctx, original_key)
+    assert :ok = Runtime.with(peer, fn -> S3.append(:metrics, ctx.tenant, records, idempotency_key: "key") end)
+    assert object(ctx, original_key) == original
+    assert {:ok, before} = Runtime.with(peer, fn -> S3.query(:metrics, ctx.tenant, []) end)
+    assert Enum.sort(before) == Enum.sort(records)
+
+    # Add legacy rows to exercise nulls in a mixed compacted segment.
+    [%MetricSample{} = first | _] = records
+
+    assert :ok =
+             S3.append(
+               :metrics,
+               ctx.tenant,
+               [%{first | timestamp_ns: first.timestamp_ns + 1, start_timestamp_ms: nil}],
+               idempotency_key: "plain"
+             )
+
+    assert {:ok, expected} = S3.query(:metrics, ctx.tenant, [])
+    assert :ok = stop_supervised(ManifestSupervision)
+    start_supervised!(ManifestSupervision)
+    assert :ok = S3.append(:metrics, ctx.tenant, records, idempotency_key: "key")
+    assert {:ok, %{merged: 2}} = MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+    assert {:ok, _} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    assert :ok = Runtime.with(peer, fn -> S3.append(:metrics, ctx.tenant, records, idempotency_key: "key") end)
+    assert S3.query(:metrics, ctx.tenant, []) == {:ok, expected}
+    assert Runtime.with(peer, fn -> S3.query(:metrics, ctx.tenant, []) end) == {:ok, expected}
+    assert {:ok, %{segments: [_]}} = load(ctx, :metrics)
   end
 
   defp rows(:logs), do: [%Log{timestamp_ns: 100, service: "api", body: "zero\0µ"}]

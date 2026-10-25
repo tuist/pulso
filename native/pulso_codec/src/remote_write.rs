@@ -45,13 +45,14 @@ use crate::wire::{Reader, Value};
 pub struct Sample {
     pub value: f64,
     pub timestamp_ms: i64,
+    pub start_timestamp_ms: Option<i64>,
 }
 
 pub struct Series<'a> {
     pub labels: Vec<(&'a [u8], &'a [u8])>,
     pub samples: Vec<Sample>,
     /// Native histograms with their millisecond timestamps.
-    pub histograms: Vec<(Histogram, i64)>,
+    pub histograms: Vec<(Histogram, i64, Option<i64>)>,
     pub exemplars: Vec<Exemplar<'a>>,
 }
 
@@ -151,9 +152,9 @@ fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
                 let label = decode_label(bytes).ok_or(parts.total.max(1))?;
                 labels.push(label);
             }
-            Some((2, Value::Bytes(bytes))) => parts.sample(bytes)?,
+            Some((2, Value::Bytes(bytes))) => parts.sample(bytes, None)?,
             Some((3, Value::Bytes(bytes))) => parts.exemplar(exemplar::decode_v1(bytes)),
-            Some((4, Value::Bytes(bytes))) => parts.histogram(bytes),
+            Some((4, Value::Bytes(bytes))) => parts.histogram(bytes, None),
             _ => {}
         }
     }
@@ -170,22 +171,25 @@ fn decode_series(input: &[u8]) -> Result<(Series<'_>, u64), u64> {
 #[derive(Default)]
 struct Parts<'a> {
     samples: Vec<Sample>,
-    histograms: Vec<(Histogram, i64)>,
+    histograms: Vec<(Histogram, i64, Option<i64>)>,
     exemplars: Vec<Exemplar<'a>>,
     total: u64,
     rejected: u64,
 }
 
 impl<'a> Parts<'a> {
-    fn sample(&mut self, bytes: &[u8]) -> Result<(), u64> {
+    fn sample(&mut self, bytes: &[u8], start: Option<i64>) -> Result<(), u64> {
         self.total = self.total.saturating_add(1);
-        self.samples.push(decode_sample(bytes).ok_or(self.total)?);
+        let mut sample = decode_sample(bytes).ok_or(self.total)?;
+        sample.start_timestamp_ms = start;
+        self.samples.push(sample);
         Ok(())
     }
 
-    fn histogram(&mut self, bytes: &[u8]) {
+    fn histogram(&mut self, bytes: &[u8], start: Option<i64>) {
         self.total = self.total.saturating_add(1);
-        match native_histogram::decode_wire(bytes) {
+        let decoded = native_histogram::decode_wire(bytes).map(|(h, ts)| (h, ts, start));
+        match decoded {
             Some(histogram) => self.histograms.push(histogram),
             None => self.rejected = self.rejected.saturating_add(1),
         }
@@ -272,7 +276,7 @@ pub fn decode_v2(input: &[u8]) -> Option<Decoded<'_>> {
             continue;
         };
         match decode_series_v2(bytes, &symbols) {
-            Ok((series, rejected, metadata)) => {
+            Ok(Some((series, rejected, metadata))) => {
                 decoded.series.push(series);
                 decoded.rejected = decoded.rejected.saturating_add(rejected);
                 if let Some(m) = metadata {
@@ -281,6 +285,7 @@ pub fn decode_v2(input: &[u8]) -> Option<Decoded<'_>> {
                     }
                 }
             }
+            Ok(None) => return None,
             Err(rejected) => decoded.rejected = decoded.rejected.saturating_add(rejected),
         }
     }
@@ -289,14 +294,23 @@ pub fn decode_v2(input: &[u8]) -> Option<Decoded<'_>> {
 
 type SeriesV2<'a> = (Series<'a>, u64, Option<Metadata<'a>>);
 
-fn decode_series_v2<'a>(input: &'a [u8], symbols: &[&'a [u8]]) -> Result<SeriesV2<'a>, u64> {
+// None is wire corruption and fails the request; Err counts semantic rejects.
+// Do not rely on admission preflight alone for malformed start atomicity.
+fn decode_series_v2<'a>(
+    input: &'a [u8],
+    symbols: &[&'a [u8]],
+) -> Result<Option<SeriesV2<'a>>, u64> {
     let mut reader = Reader::new(input);
     let mut refs: Vec<u64> = Vec::new();
     let mut metadata: &[u8] = &[];
     let mut parts = Parts::default();
+    let mut created_timestamp = None;
 
     loop {
-        match reader.next_field().ok_or(parts.total.max(1))? {
+        let Some(field) = reader.next_field() else {
+            return Ok(None);
+        };
+        match field {
             None => break,
             // Repeated scalars may arrive packed or one varint per element.
             Some((1, Value::Bytes(packed))) => {
@@ -308,12 +322,39 @@ fn decode_series_v2<'a>(input: &'a [u8], symbols: &[&'a [u8]]) -> Result<SeriesV
                 }
             }
             Some((1, Value::Varint(r))) => refs.push(r),
-            Some((2, Value::Bytes(bytes))) => parts.sample(bytes)?,
-            Some((3, Value::Bytes(bytes))) => parts.histogram(bytes),
+            Some((2, Value::Bytes(bytes))) => {
+                let Some(start) = start_timestamp(bytes, 3) else {
+                    return Ok(None);
+                };
+                parts.sample(bytes, start)?;
+            }
+            Some((3, Value::Bytes(bytes))) => {
+                let Some(start) = start_timestamp(bytes, 17) else {
+                    return Ok(None);
+                };
+                parts.histogram(bytes, start);
+            }
             Some((4, Value::Bytes(bytes))) => parts.exemplar(exemplar::decode_v2(bytes, symbols)),
             Some((5, Value::Bytes(bytes))) => metadata = bytes,
+            // rc.3 (Prometheus <=3.7): per-series created timestamp. rc.4+
+            // reserves this field and moves it onto each sample/histogram.
+            Some((6, Value::Varint(v))) => created_timestamp = Some(v as i64),
+            Some((6, _)) => return Ok(None),
             _ => {}
         }
+    }
+
+    // Preserve the full signed int64 wire domain in milliseconds. Do not
+    // rescale to ns, clamp, synthesize zero rows or consult node-local history.
+    // A present modern field wins, including explicit zero (unset).
+    for sample in &mut parts.samples {
+        sample.start_timestamp_ms = sample
+            .start_timestamp_ms
+            .or(created_timestamp)
+            .filter(|v| *v != 0);
+    }
+    for (_, _, start) in &mut parts.histograms {
+        *start = start.or(created_timestamp).filter(|v| *v != 0);
     }
 
     let fail = parts.total.max(1);
@@ -381,7 +422,7 @@ fn decode_series_v2<'a>(input: &'a [u8], symbols: &[&'a [u8]]) -> Result<SeriesV
             help,
             unit,
         });
-    Ok((series, rejected, entry))
+    Ok(Some((series, rejected, entry)))
 }
 
 // The metric family a series belongs to, cutting the suffix its type
@@ -481,7 +522,24 @@ fn decode_sample(input: &[u8]) -> Option<Sample> {
     Some(Sample {
         value: f64::from_bits(value_bits),
         timestamp_ms,
+        start_timestamp_ms: None,
     })
+}
+
+// Proto3 singular int64: last occurrence wins; retain presence until legacy
+// fallback is resolved, since an explicit modern zero overrides rc.3 data.
+fn start_timestamp(input: &[u8], number: u64) -> Option<Option<i64>> {
+    let mut reader = Reader::new(input);
+    let mut start = None;
+    while let Some((field, value)) = reader.next_field()? {
+        if field == number {
+            let Value::Varint(value) = value else {
+                return None;
+            };
+            start = Some(value as i64);
+        }
+    }
+    Some(start)
 }
 
 fn read_tag(buf: &[u8], pos: usize) -> Option<(u32, u8, usize)> {
@@ -677,6 +735,27 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn v2_malformed_starts_fail_the_request_even_without_admission_preflight() {
+        let good = series_v2(&[1, 2], false, 1, &[0x08, 1]);
+        let refs = bytes_field(0x0a, &[1, 2]);
+        let mut legacy = sample(1);
+        legacy.extend(bytes_field(0x32, b"bad"));
+        for point in [
+            bytes_field(
+                0x12,
+                &[0x09, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0x10, 1, 0x1a, 0],
+            ),
+            bytes_field(0x1a, &[0x08, 1, 0x78, 1, 0x8a, 1, 0]),
+            bytes_field(0x12, &[0x18, 0x80]),
+            bytes_field(0x1a, &[0x88, 1, 0x80]),
+            legacy,
+        ] {
+            let bad = bytes_field(0x2a, &[refs.clone(), point].concat());
+            assert!(decode_v2(&request_v2(&[good.clone(), bad])).is_none());
+        }
     }
 
     #[test]

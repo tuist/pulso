@@ -9,7 +9,7 @@ defmodule Pulso.Storage.MetricMetadataCodecTest do
   @directory Path.expand("../../fixtures/metrics", __DIR__)
 
   test "native metric metadata API is required and legacy six-column files remain readable" do
-    assert NIF.metric_metadata_api_version() == 1
+    assert NIF.metric_metadata_api_version() == 2
     assert NIF.otlp_metrics_api_version() == 2
     assert NIF.metric_postings_api_version() == 1
     assert :ok = NIF.ensure_metric_metadata_api!()
@@ -69,6 +69,11 @@ defmodule Pulso.Storage.MetricMetadataCodecTest do
     assert {:ok, a} = S3.caller_content_hash(:metrics, [%{sample | otlp: %{"type" => "int"}}])
     assert {:ok, b} = S3.caller_content_hash(:metrics, [%{sample | otlp: %{"type" => "double"}}])
     assert a != b
+    assert {:ok, c} = S3.caller_content_hash(:metrics, [%{sample | start_timestamp_ms: -1}])
+    assert {:ok, d} = S3.caller_content_hash(:metrics, [%{sample | start_timestamp_ms: 1}])
+    assert c != d
+    assert c != expected
+    assert d != expected
   end
 
   test "normal compaction-sized scalar batches do not acquire the raw result-text cap" do

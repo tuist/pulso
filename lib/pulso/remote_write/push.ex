@@ -7,11 +7,11 @@ defmodule Pulso.RemoteWrite.Push do
   protobuf, with `Content-Type: application/x-protobuf` and
   `Content-Encoding: snappy`. The Rust NIF (`Pulso.Codec.NIF.decode_remote_write`)
   decompresses, parses the protobuf, computes a Prometheus-compatible
-  `StableHash` fingerprint per series, and returns a flat list of
-  `{labels_map, samples_list, series_id}` triples where each sample is
-  `{ts_ms, value}` — timestamps in **milliseconds**, matching the
-  Prometheus wire unit. This module expands each triple into
-  per-sample `%MetricSample{}` structs with `timestamp_ns` rescaled.
+  `StableHash` fingerprint per series, and returns series envelopes carrying
+  labels, samples, histograms and exemplars. V1 points are `{ts_ms, value}`;
+  v2 points add a third `start_timestamp_ms | nil` element. Both timestamps
+  use wire **milliseconds**. This module expands points into `%MetricSample{}`
+  structs, rescaling only sample time to `timestamp_ns`, never source starts.
 
   Semantic errors inside a series (invalid labels, out-of-range
   timestamp) are counted in `rejected` rather than failing the whole
@@ -85,14 +85,15 @@ defmodule Pulso.RemoteWrite.Push do
     end)
   end
 
-  # Each series: `{labels_map, [{ts_ms, value}], series_id, [{ts_ms, histogram}], [exemplar]}`.
+  # Each series: `{labels_map, samples, series_id, histograms, exemplars}`.
+  # Samples/histograms have timestamp/value pairs (v1) or timestamp/value/start triples (v2).
   # Fan out one `%MetricSample{}` per sample or histogram. The label map is
   # shared across samples in the same series — Elixir maps are immutable so
   # the per-sample struct holds a reference to the one allocation.
   defp expand_series({labels, samples, series_id, histograms, exemplars})
        when is_map(labels) and is_list(samples) and is_integer(series_id) do
-    floats = Enum.map(samples, fn {ts_ms, value} -> sample(labels, series_id, ts_ms, value: value) end)
-    natives = Enum.map(histograms, fn {ts_ms, h} -> sample(labels, series_id, ts_ms, histogram: h) end)
+    floats = Enum.map(samples, &expand_sample(&1, labels, series_id, :value))
+    natives = Enum.map(histograms, &expand_sample(&1, labels, series_id, :histogram))
 
     case floats ++ natives do
       # The series' samples arrived in another request: keep the exemplars on
@@ -113,6 +114,11 @@ defmodule Pulso.RemoteWrite.Push do
         attach_exemplars(samples, exemplars)
     end
   end
+
+  defp expand_sample({ts_ms, value}, labels, series_id, field), do: sample(labels, series_id, ts_ms, [{field, value}])
+
+  defp expand_sample({ts_ms, value, start}, labels, series_id, field),
+    do: sample(labels, series_id, ts_ms, [{field, value}, {:start_timestamp_ms, start}])
 
   defp sample(labels, series_id, ts_ms, fields),
     do: struct!(MetricSample, [series_id: series_id, timestamp_ns: ts_ms * 1_000_000, labels: labels] ++ fields)

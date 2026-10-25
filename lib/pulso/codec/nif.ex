@@ -145,10 +145,10 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {1, 2, 1, 1, 1},
+    if version != {2, 2, 1, 1, 1},
       do:
         raise(
-          "codec native artifact cannot preserve OTLP metric metadata, encode metric postings, discover metric labels and plan metric footer reads; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+          "codec native artifact cannot preserve metric metadata and remote-write start timestamps, encode metric postings, discover metric labels and plan metric footer reads; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
         )
 
     :ok
@@ -269,7 +269,8 @@ defmodule Pulso.Codec.NIF do
 
   def decode_remote_write_limited(_compressed, _max_decompressed_bytes, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
-  # Remote Write 2.0 `io.prometheus.write.v2.Request`, with the same result shape.
+  # Remote Write 2.0 `io.prometheus.write.v2.Request`: same series envelope,
+  # but samples/histograms are `{timestamp_ms, value, start_timestamp_ms | nil}`.
   def decode_remote_write_v2_limited(_compressed, _max_decompressed_bytes, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 

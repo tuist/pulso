@@ -58,6 +58,7 @@ mod atoms {
         metric_sample = "Elixir.Pulso.Record.MetricSample",
         series_id,
         timestamp_ns,
+        start_timestamp_ms,
         value,
         labels,
         otlp,
@@ -104,6 +105,7 @@ pub struct Filter<'f> {
 struct Row {
     series_id: i64,
     timestamp_ns: i64,
+    start_timestamp_ms: Option<i64>,
     value: f64,
     labels: Rc<EncodedLabels>,
     otlp: Option<Vec<u8>>,
@@ -276,6 +278,14 @@ fn extract_row<'a>(
     } else {
         ts_term.decode().map_err(|_| EncodeError::BadInput)?
     };
+    let start_timestamp_ms: Option<i64> = sample
+        .map_get(atoms::start_timestamp_ms())
+        .unwrap_or(nil)
+        .decode()
+        .map_err(|_| EncodeError::BadInput)?;
+    if start_timestamp_ms == Some(0) {
+        return Err(EncodeError::BadInput);
+    }
 
     let exemplars_term = sample.map_get(atoms::exemplars()).unwrap_or(nil);
     let exemplars = if exemplars_term.as_c_arg() == nil.as_c_arg() {
@@ -340,6 +350,7 @@ fn extract_row<'a>(
     Ok(Row {
         series_id,
         timestamp_ns,
+        start_timestamp_ms,
         value,
         labels,
         otlp,
@@ -442,16 +453,19 @@ fn hex_nibble(n: u8) -> u8 {
     }
 }
 
-// `histogram` and `exemplars` exist only in segments with rows that carry
+// `histogram`, `exemplars` and `start_timestamp_ms` exist only in segments with rows that carry
 // them, so segments of plain samples keep their exact earlier bytes (keyed
 // retries compare bytes) and readers that predate them keep working.
-fn schema(histograms: bool, exemplars: bool) -> SchemaRef {
+fn schema(histograms: bool, exemplars: bool, starts: bool) -> SchemaRef {
     let mut fields = base_fields();
     if histograms {
         fields.push(Field::new("histogram", DataType::Binary, true));
     }
     if exemplars {
         fields.push(Field::new("exemplars", DataType::Binary, true));
+    }
+    if starts {
+        fields.push(Field::new("start_timestamp_ms", DataType::Int64, true));
     }
     Arc::new(Schema::new(fields))
 }
@@ -534,7 +548,13 @@ fn build_batch(rows: &[Row]) -> Result<RecordBatch, arrow::error::ArrowError> {
             rows.iter().map(|r| r.exemplars.as_deref()),
         )));
     }
-    RecordBatch::try_new(schema(histograms, exemplars), columns)
+    let starts = rows.iter().any(|r| r.start_timestamp_ms.is_some());
+    if starts {
+        columns.push(Arc::new(Int64Array::from_iter(
+            rows.iter().map(|r| r.start_timestamp_ms),
+        )));
+    }
+    RecordBatch::try_new(schema(histograms, exemplars, starts), columns)
 }
 
 fn optional_binary<'r>(values: impl Iterator<Item = Option<&'r [u8]>> + Clone) -> BinaryArray {
@@ -670,7 +690,7 @@ impl<'a> BinaryArena<'a> {
 
 // Shared by full decoding and footer-only negative proofs. Never let pruning
 // turn an invalid projected schema into a successful empty result.
-pub(super) fn optional_columns(schema: &Schema) -> Result<[Option<usize>; 3], DecodeError> {
+pub(super) fn optional_columns(schema: &Schema) -> Result<[Option<usize>; 4], DecodeError> {
     let fields = schema.fields();
     for (i, kind) in [
         (0, DataType::Int64),
@@ -682,11 +702,12 @@ pub(super) fn optional_columns(schema: &Schema) -> Result<[Option<usize>; 3], De
             return Err(DecodeError::Reader);
         }
     }
-    let mut columns = [None; 3];
+    let mut columns = [None; 4];
     for (slot, (name, kind)) in [
         ("otlp", DataType::Utf8),
         ("histogram", DataType::Binary),
         ("exemplars", DataType::Binary),
+        ("start_timestamp_ms", DataType::Int64),
     ]
     .into_iter()
     .enumerate()
@@ -719,7 +740,8 @@ pub fn decode<'a>(
     // and metadata unchanged, including legacy fixture schemas.
     let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
         .map_err(|_| DecodeError::Reader)?;
-    let [otlp_column, histogram_column, exemplars_column] = optional_columns(metadata.schema())?;
+    let [otlp_column, histogram_column, exemplars_column, start_column] =
+        optional_columns(metadata.schema())?;
     let mut fields = metadata.schema().fields().to_vec();
     let labels_field = fields.get(4).ok_or(DecodeError::Reader)?;
     if labels_field.data_type() != &DataType::Binary {
@@ -771,6 +793,7 @@ pub fn decode<'a>(
     let otlp_index = place(otlp_column);
     let histogram_index = place(histogram_column);
     let exemplars_index = place(exemplars_column);
+    let start_index = place(start_column);
     let projection = parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), projected);
 
     // Row-group pruning: when a time filter is set, consult each row
@@ -803,6 +826,7 @@ pub fn decode<'a>(
         atoms::otlp().encode(env),
         atoms::histogram().encode(env),
         atoms::exemplars().encode(env),
+        atoms::start_timestamp_ms().encode(env),
     ];
     let struct_name = atoms::metric_sample().encode(env);
     // Arrow reconstructs array wrappers across batches, but dictionary
@@ -823,6 +847,9 @@ pub fn decode<'a>(
             .transpose()?;
         let exemplars_arr = exemplars_index
             .map(|i| col::<BinaryArray>(&batch, i))
+            .transpose()?;
+        let start_arr = start_index
+            .map(|i| col::<Int64Array>(&batch, i))
             .transpose()?;
         let otlp_arena =
             otlp_arr.map(|array| crate::segment_parquet::StringArena::from(env, array));
@@ -880,7 +907,7 @@ pub fn decode<'a>(
         // Updating a fixed-key flat map shares its key tuple, unlike
         // constructing one from arrays for every row. Compare exact terms
         // so unchanged fields (and duplicate samples) require no update.
-        let mut previous_record: Option<(Term<'a>, [Term<'a>; 8])> = None;
+        let mut previous_record: Option<(Term<'a>, [Term<'a>; 9])> = None;
         let mut previous_raw = None;
 
         for row in 0..batch.num_rows() {
@@ -965,6 +992,12 @@ pub fn decode<'a>(
             }
             let histogram_bytes = present(histogram_arr, row);
             let exemplar_bytes = present(exemplars_arr, row);
+            let start = start_arr
+                .filter(|array| !array.is_null(row))
+                .map(|array| array.value(row));
+            if start == Some(0) {
+                return Err(DecodeError::Reader);
+            }
             let raw = (
                 series_id,
                 ts_arr.value(row),
@@ -979,6 +1012,7 @@ pub fn decode<'a>(
                 }),
                 histogram_bytes,
                 exemplar_bytes,
+                start,
             );
             // A histogram row's float value is the stale marker kept for
             // older readers; its sample value is the histogram. A row that only
@@ -1013,6 +1047,7 @@ pub fn decode<'a>(
                 metadata,
                 histogram_term,
                 exemplars_term,
+                start.encode(env),
             ];
             let record = match previous_record {
                 Some((record, _)) if previous_raw == Some(raw) => record,
@@ -1202,6 +1237,7 @@ mod tests {
         Row {
             series_id,
             timestamp_ns,
+            start_timestamp_ms: None,
             value: 1.0,
             otlp: None,
             histogram: None,
