@@ -104,6 +104,17 @@ defmodule Pulso.PromQL.ParserTest do
     assert {:error, _} = Parser.parse("predict_linear(x[5m], vector(60))")
   end
 
+  test "basic math functions require exactly one instant vector" do
+    for name <- ~w(ceil sqrt exp ln log2 log10) do
+      assert {:ok, {:call, ^name, [_]}} = Parser.parse("#{name}(x)")
+      assert {:ok, _} = Parser.parse("sum(#{name}(vector(2)))")
+
+      for argument <- ["", "1", "x[5m]", "x, 1", ~s("x")] do
+        assert {:error, _} = Parser.parse("#{name}(#{argument})")
+      end
+    end
+  end
+
   test "quoted matcher contents do not become syntax" do
     assert {:ok, {:selector, [_, {"job", :eq, "a\"}b"}], 0}} = Parser.parse(~S(x{job="a\"}b"}))
     assert {:ok, _} = Parser.parse(~S(x{job=~`api\d+`}))

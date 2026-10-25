@@ -96,6 +96,20 @@ defmodule Pulso.PromQL.NativeHistogramQueryTest do
     assert {:ok, %{"data" => %{"result" => []}}} = instant("abs(latency_seconds)", tenant)
     assert {:ok, %{"data" => %{"result" => []}}} = instant("latency_seconds > 1", tenant)
 
+    for {name, expected} <- [
+          {"ceil", "1"},
+          {"sqrt", "1"},
+          {"exp", "2.718281828459045"},
+          {"ln", "0"},
+          {"log2", "0"},
+          {"log10", "0"}
+        ] do
+      assert {:ok, %{"data" => %{"result" => []}}} = instant("#{name}(latency_seconds)", tenant)
+
+      assert {:ok, %{"data" => %{"result" => [%{"metric" => %{}, "value" => [60.0, ^expected]}]}}} =
+               instant(~s<#{name}({__name__=~"latency_seconds|up"})>, tenant)
+    end
+
     assert {:ok, %{"data" => %{"result" => [%{"value" => [60.0, "4"]}, _]}}} =
              instant("count_over_time(latency_seconds[1m])", tenant)
 

@@ -334,8 +334,9 @@ not a second mutable authority or dangling point-reference store.
    conformance and broader direct-gRPC client/default-policy acceptance. Keep shared auth, tenant boundaries, budgets and partial-success
    semantics across transports. Validate public independent producers, not only
    hand-built encoders.
-4. **Query languages:** expand PromQL and LogQL against public semantic engines,
-   then full TraceQL types, structural/spanset operations and discovery. Preserve
+4. **Query languages:** expand the remaining PromQL functions/modifiers and
+   LogQL against public semantic engines, then full TraceQL types,
+   structural/spanset operations and discovery. Preserve
    independent time contracts, same-parent ownership, complete retained context,
    original-type proofs, native accounting and whole-query failure.
 5. **Alert compatibility:** native and imported rule/lifecycle semantics, missing
@@ -374,6 +375,60 @@ not a second mutable authority or dangling point-reference store.
 - Frozen ordinary replay without external tools/network; optional live exercises
   fail explicitly when opted into without prepared tools.
 - Documentation synchronized with implemented behavior and remaining gaps.
+
+## Completed increment: PromQL basic math
+
+- Add `ceil`, `sqrt`, `exp`, `ln`, `log2`, and `log10` using Prometheus 3.5.0's
+  one-instant-vector contract. Histograms are omitted, metric names removed and
+  other labels retained. Negative domains return NaN; logarithm zero returns
+  negative infinity; signed zeros survive. `exp` and `log2` reproduce Go 1.24.5
+  arm64 reduction/scaling, including its early exponential underflow, rather
+  than promising universal libm or correctly rounded mathematical results.
+- Extend the existing offline conformance corpus with 166 independently
+  promtool-verified cases, including adjacent overflow inputs, subnormal values,
+  staleness and signed-zero reciprocals. The complete 946-case snapshot remains
+  linked to its exact input SHA-256; it contains verified Pulso answers, not
+  captured upstream API responses. Finite math replay allows one ULP for
+  platform differences; 780 exact boolean checks independently establish
+  NaN/zero/infinity classes and zero signs, without fuzzy comparison.
+- Import 30 verbatim Mimir query-engine integration evaluations, with pinned
+  source ranges and AGPL/Apache notices, covering nested calls, histogram
+  omission, metric-name collisions and disjoint range-series lifetimes.
+  This is a selected suite, not Mimir's Docker/service integration suite.
+- Preserve the existing query sample/work/materialization bounds and shared
+  HTTP/MCP evaluator. No new state, native ABI, stored format or keyed encoder
+  bytes. Every query-serving application must upgrade before callers rely on
+  these functions. This closes the basic-math slice, not full PromQL, provider,
+  deployed-client or capacity acceptance.
+
+Validation:
+
+- The new parser and IEEE regression tests failed on the unchanged application
+  with `invalid_function_arguments`, then passed with the implementation.
+- Adversarial review found near-one `log2` cancellation, Go arm64 `exp`
+  underflow differences, and fuzzy verification accepting classification
+  errors. Source-compatible arithmetic and exact classification checks fix
+  these sampled mismatches. Regression failed before the fix; an isolated
+  mutation passed fuzzy comparison but failed the new exact classifier.
+- Promtool 3.5.0 verified all 946 cases, 780 exact math classifications and
+  four exact epoch checks. A separate 4,303-value sweep concentrated on
+  adjacent-to-one logs and exponential boundaries: finite answers within
+  one ULP, zero/infinity classes exact. This is sampled arm64 validation,
+  not an all-input or cross-architecture proof. The
+  previous 780 stored oracle cases are unchanged. Focused PromQL/HTTP/MCP tests:
+  174 passed, one optional live conformance test skipped. All 30 imported Mimir
+  evaluations pass on memory and native S3/Parquet storage: 114 HTTP endpoint
+  checks including instant cases replayed as one-step ranges.
+- An owned loopback S3 stub exercised all 156 stored math cases through an
+  independent runtime, exact-key retries, compaction/cleanup and reader restart.
+  MCP, tenant isolation, authorization denial and work-budget rejection passed.
+  This earlier temporary validation was removed; the imported upstream replay
+  now permanently covers the native S3/Parquet HTTP path.
+- `ERL_FLAGS='+S 4:4' mix precommit --max-cases 4`: 1,654 passed, one skipped,
+  37 excluded; strict compile, dependency and format checks included. Existing
+  compaction timeout/conflict diagnostics remain open; the passing suite does
+  not establish provider capacity or close those reliability findings. Strict
+  Credo is clean across 433 source files.
 
 ## Quoted trace integer validation checkpoint
 

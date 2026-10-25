@@ -136,6 +136,34 @@ cases =
     nan_mask <> "    - expr: #{JSON.encode!(expr)}\n      eval_time: #{seconds}s\n" <> expected
   end
 
+# Fuzzy comparison accepts adjacent encodings across zero/subnormal and
+# maximum-finite/infinity boundaries. Independently verify classifications
+# as exact 0/1 predicates, including the sign of every zero result.
+classification_cases =
+  for test <- results,
+      test["expr"] in Enum.map(~w(ceil sqrt exp ln log2 log10), &"#{&1}(math_input)"),
+      {predicate, classify} <- [
+        {"(#{test["expr"]}) != bool (#{test["expr"]})", &(&1 == "NaN")},
+        {"(#{test["expr"]}) == bool 0", &(&1 in ["0", "-0"])},
+        {"(#{test["expr"]}) == bool Inf", &(&1 == "+Inf")},
+        {"(#{test["expr"]}) == bool -Inf", &(&1 == "-Inf")},
+        {"((#{test["expr"]}) == bool 0) * ((1 / (#{test["expr"]})) == bool -Inf)", &(&1 == "-0")}
+      ] do
+    samples = test["data"]["result"]
+
+    expected =
+      if samples == [],
+        do: "      exp_samples: []",
+        else:
+          "      exp_samples:\n" <>
+            Enum.map_join(samples, "\n", fn sample ->
+              value = if classify.(Enum.at(sample["value"], 1)), do: 1, else: 0
+              "        - labels: #{JSON.encode!(labels.(sample["metric"]))}\n          value: #{value}"
+            end)
+
+    "    - expr: #{JSON.encode!(predicate)}\n      eval_time: #{test["seconds"]}s\n" <> expected
+  end
+
 yaml =
   "rule_files: []\nfuzzy_compare: true\nevaluation_interval: #{interval}s\ntests:\n  - interval: #{interval}s\n    input_series:\n" <>
     inputs <> "\n    promql_expr_test:\n" <> Enum.join(cases, "\n") <> "\n"
@@ -151,6 +179,20 @@ try do
     artifact = System.get_env("PULSO_CONFORMANCE_ARTIFACT")
     if artifact, do: File.write!(artifact, yaml)
     raise "promtool found numerical/label mismatches (#{length(cases)} cases)"
+  end
+
+  classification_yaml =
+    "rule_files: []\nevaluation_interval: #{interval}s\ntests:\n  - interval: #{interval}s\n    input_series:\n" <>
+      inputs <> "\n    promql_expr_test:\n" <> Enum.join(classification_cases, "\n") <> "\n"
+
+  File.write!(path, classification_yaml)
+  {classification_output, classification_status} = System.cmd(promtool, ["test", "rules", path], stderr_to_stdout: true)
+  IO.write(classification_output)
+
+  if classification_status != 0 do
+    artifact = System.get_env("PULSO_CONFORMANCE_ARTIFACT")
+    if artifact, do: File.write!(artifact, classification_yaml)
+    raise "promtool found an exact math classification mismatch"
   end
 
   # A huge test interval keeps this exact large-epoch check to two ticks.
@@ -198,7 +240,10 @@ try do
     )
   end
 
-  IO.puts("Independent Prometheus conformance: #{length(cases)} cases plus 4 exact epoch checks passed")
+  IO.puts(
+    "Independent Prometheus conformance: #{length(cases)} cases, " <>
+      "#{length(classification_cases)} exact math classifications and 4 exact epoch checks passed"
+  )
 after
   File.rm(path)
   Supervisor.stop(supervisor)
