@@ -50,15 +50,52 @@ defmodule PulsoWeb.LokiLabelVolumeTest do
     })
 
     token = "sha256$" <> Base.encode16(:crypto.hash(:sha256, "volume-token"), case: :lower)
-    Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{"volume" => token, "other" => token})
+    Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{"volume" => token, "other" => token, "fake" => token})
     start_supervised!(S3.ManifestSupervision)
 
     {:ok, store: store}
   end
 
-  # Semantic cases from grafana/loki v3.5.0, TestTSDBIndex_Volume's
-  # "aggregate by labels" subtests and queryrange Test_toPrometheusResponse.
-  # Sizes are actual line bytes here, not Loki's estimated chunk KB.
+  test "exact upstream Loki label-volume cases replay over HTTP and native S3 storage" do
+    raw = File.read!(Path.expand("../fixtures/logs/volume-upstream.json", __DIR__))
+
+    assert Base.encode16(:crypto.hash(:sha256, raw), case: :lower) ==
+             "f8ca9a28a3664e79efd753d92372df153e2f109839ad26785f784d588ab12444"
+
+    fixture = Pulso.JSON.decode!(raw)
+    assert length(fixture["cases"]) == 10
+    cases = Enum.reject(fixture["cases"], &Map.has_key?(&1, "excluded"))
+    assert length(cases) == 8
+    api = api(:upstream)
+
+    for {source, i} <- Enum.with_index(fixture["streams"]) do
+      lines =
+        source["chunk_bytes"]
+        |> Enum.with_index(1)
+        |> Enum.map(fn {bytes, offset} -> {@start + offset, String.duplicate("x", bytes)} end)
+
+      push(api, [stream(source["labels"], lines)], "upstream-#{i}", "fake")
+    end
+
+    for c <- cases, method <- [:get, :post], path <- ["volume", "volume_range"] do
+      extra = %{"limit" => Integer.to_string(c["limit"]), "step" => "10s"}
+      extra = if c["targets"] == [], do: extra, else: Map.put(extra, "targetLabels", Enum.join(c["targets"], ","))
+      response = volume(api, c["query"], extra, method, path, "fake")
+      assert response.status == 200, inspect({c["name"], method, path, response.body})
+
+      expected =
+        Enum.map(c["expected"], fn item ->
+          sample = [1_700_000_002, Integer.to_string(item["bytes"])]
+          row = %{"metric" => %{item["name"] => ""}}
+          if path == "volume", do: Map.put(row, "value", sample), else: Map.put(row, "values", [sample])
+        end)
+
+      assert response.body["data"]["resultType"] == if(path == "volume", do: "vector", else: "matrix")
+      assert response.body["data"]["result"] == expected, inspect({c["name"], method, path})
+    end
+  end
+
+  # Additional independent cases cover Pulso's row-byte and safety contracts.
   test "HTTP push and label volumes match Loki's label-name aggregation cases", ctx do
     api = api(:writer)
     seed(api)
@@ -332,10 +369,10 @@ defmodule PulsoWeb.LokiLabelVolumeTest do
     }
   end
 
-  defp push(api, streams, key \\ "fixture") do
+  defp push(api, streams, key \\ "fixture", tenant \\ "volume") do
     response =
       Req.post!(api <> "/loki/api/v1/push",
-        headers: headers("volume") ++ [{"idempotency-key", key}],
+        headers: headers(tenant) ++ [{"idempotency-key", key}],
         json: %{"streams" => streams},
         retry: false
       )

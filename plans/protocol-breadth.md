@@ -46,7 +46,12 @@ including the storage/scale and operational follow-ups, after this PR lands.
   [TSDB volume tests](https://github.com/grafana/loki/blob/4b16bc4fa823f7ec6e865ebf51fad89d98a2371c/pkg/storage/stores/shipper/indexshipper/tsdb/single_file_index_test.go#L593),
   [response conversion tests](https://github.com/grafana/loki/blob/4b16bc4fa823f7ec6e865ebf51fad89d98a2371c/pkg/querier/queryrange/volume_test.go#L174),
   and [target-label preparation](https://github.com/grafana/loki/blob/4b16bc4fa823f7ec6e865ebf51fad89d98a2371c/pkg/util/series_volume.go).
-  Pulso's independent cases use actual line bytes rather than chunk KB.
+  The upstream label-volume, response and middleware tests pass unmodified.
+  [Extracted upstream fixtures](../test/fixtures/logs/README.md#exact-upstream-loki-volume-cases)
+  preserve all ten label-mode cases; eight portable cases replay through both
+  HTTP endpoints/methods with exact byte expectations. Chunk-filter callbacks
+  and partial-chunk estimates remain explicit exclusions. Additional independent
+  Pulso cases exercise row-byte and safety contracts.
 - Deliberate boundaries: selector-only; actual inclusive nanosecond rows rather
   than estimated chunk overlap/whole-second windows; matrix range responses
   even for a single bucket. Stream names reuse discovery's projection, excluding
