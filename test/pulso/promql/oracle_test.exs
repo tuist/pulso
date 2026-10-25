@@ -7,6 +7,7 @@ defmodule Pulso.PromQL.OracleTest do
   alias Pulso.Test.NativeQueryStorage
 
   @directory Path.expand("../../fixtures/promql", __DIR__)
+  @math_queries Enum.map(~w(ceil sqrt exp ln log2 log10), &"#{&1}(math_input)")
 
   setup do
     bytes = File.read!(Path.join(@directory, "conformance.json"))
@@ -42,11 +43,30 @@ defmodule Pulso.PromQL.OracleTest do
   for adapter <- [Memory, NativeQueryStorage] do
     test "independently verified numerical, label, offset and stale cases through #{inspect(adapter)}", ctx do
       Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: unquote(adapter))
-      assert length(ctx.cases) == 780
+      assert length(ctx.cases) == 946
 
       for test <- ctx.cases do
         assert {:ok, result} = Evaluator.query(test["expr"], "oracle", %{end_ts_ns: test["seconds"] * 1_000_000_000})
-        assert result["data"] == test["data"], "#{test["expr"]} at #{test["seconds"]}s"
+        assert_result(result["data"], test["data"], test["expr"])
+      end
+    end
+
+    test "basic math range steps match the verified instant cases through #{inspect(adapter)}", ctx do
+      Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: unquote(adapter))
+
+      for expr <- @math_queries do
+        assert {:ok, %{"data" => %{"resultType" => "matrix", "result" => series}}} =
+                 Evaluator.query(expr, "oracle", %{start_ts_ns: 0, end_ts_ns: 720_000_000_000, step_ns: 30_000_000_000})
+
+        for test <- ctx.cases, test["expr"] == expr, test["seconds"] <= 720 do
+          entries =
+            for sample <- series,
+                [time, value] <- sample["values"],
+                time == test["seconds"],
+                do: %{"metric" => sample["metric"], "value" => [time, value]}
+
+          assert_result(%{"resultType" => "vector", "result" => entries}, test["data"], expr)
+        end
       end
     end
   end
@@ -97,6 +117,32 @@ defmodule Pulso.PromQL.OracleTest do
 
     assert {:error, :duplicate_result_label_sets} =
              Evaluator.query("timestamp({__name__=~\"a|b\"})", "rename", %{end_ts_ns: 0})
+  end
+
+  defp assert_result(actual, expected, expr) when expr in @math_queries do
+    assert actual["resultType"] == expected["resultType"]
+    assert Enum.map(actual["result"], & &1["metric"]) == Enum.map(expected["result"], & &1["metric"])
+
+    for {a, b} <- Enum.zip(actual["result"], expected["result"]) do
+      [time, value] = a["value"]
+      assert [^time, expected_value] = b["value"]
+      assert_math_value(value, expected_value)
+    end
+  end
+
+  defp assert_result(actual, expected, expr), do: assert(actual == expected, expr)
+
+  defp assert_math_value(value, value), do: :ok
+
+  defp assert_math_value(actual, expected) do
+    # Platform libm and Go can differ by one ULP. Labels, timestamps, signed
+    # zero and nonfinite classes remain exact, not relative-tolerance matches.
+    {a, ""} = Float.parse(actual)
+    {b, ""} = Float.parse(expected)
+    refute a == 0 or b == 0, "#{actual} != #{expected}"
+    <<a_bits::64>> = <<a::float-64>>
+    <<b_bits::64>> = <<b::float-64>>
+    assert abs(a_bits - b_bits) <= 1, "#{actual} != #{expected}"
   end
 
   defp value("stale"), do: :stale

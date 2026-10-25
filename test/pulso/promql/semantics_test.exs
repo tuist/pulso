@@ -66,6 +66,50 @@ defmodule Pulso.PromQL.SemanticsTest do
     assert numbers("clamp_max(vector(0), -0)") == ["-0"]
   end
 
+  test "basic math preserves IEEE domains, signed zeros and exponential limits" do
+    for {expr, expected} <- [
+          {"ceil(vector(-1.5))", "-1"},
+          {"ceil(vector(1.5))", "2"},
+          {"ceil(vector(-0.5))", "-0"},
+          {"sqrt(vector(4))", "2"},
+          {"sqrt(vector(-1))", "NaN"},
+          {"sqrt(vector(-Inf))", "NaN"},
+          {"sqrt(vector(Inf))", "+Inf"},
+          {"sqrt(vector(-0))", "-0"},
+          {"exp(vector(0))", "1"},
+          {"exp(vector(-Inf))", "0"},
+          {"exp(vector(Inf))", "+Inf"},
+          {"exp(vector(710))", "+Inf"},
+          {"exp(vector(-1000))", "0"},
+          {"exp(vector(-745))", "0"},
+          {"exp(vector(-745.1332191019411)) == bool 0", "1"},
+          {"exp(vector(-744.8)) == bool 0", "1"},
+          {"exp(vector(-744.7)) == bool 0", "0"},
+          {"ln(vector(1))", "0"},
+          {"log2(vector(8))", "3"},
+          {"log2(vector(1.0000000000000002)) > bool 3.5e-16", "1"},
+          {"log10(vector(100))", "2"},
+          {"log2(vector(5e-324))", "-1074"},
+          {"1 / ceil(vector(-0.5))", "-Inf"},
+          {"1 / sqrt(vector(-0))", "-Inf"}
+        ] do
+      assert numbers(expr) == [expected], expr
+    end
+
+    for name <- ~w(ceil sqrt exp ln log2 log10) do
+      assert numbers("#{name}(vector(NaN))") == ["NaN"]
+      assert entries("#{name}(missing)") == []
+    end
+
+    for name <- ~w(ln log2 log10) do
+      assert numbers("#{name}(vector(Inf))") == ["+Inf"]
+      assert numbers("#{name}(vector(-Inf))") == ["NaN"]
+      assert numbers("#{name}(vector(-1))") == ["NaN"]
+      assert numbers("#{name}(vector(0))") == ["-Inf"]
+      assert numbers("#{name}(vector(-0))") == ["-Inf"]
+    end
+  end
+
   test "instant selectors stop at stale markers and resume only after a fresh sample" do
     append("up", %{}, [{0, 1.0}, {20, :stale}, {40, 2.0}])
     assert numbers("up", 19) == ["1"]

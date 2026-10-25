@@ -284,7 +284,22 @@ defmodule Pulso.PromQL.Operations do
   end
 
   def call(name, [vector | params], steps)
-      when name in ["clamp_min", "clamp_max", "round", "abs", "sort", "sort_desc", "sgn", "floor"] do
+      when name in [
+             "clamp_min",
+             "clamp_max",
+             "round",
+             "abs",
+             "sort",
+             "sort_desc",
+             "sgn",
+             "floor",
+             "ceil",
+             "sqrt",
+             "exp",
+             "ln",
+             "log2",
+             "log10"
+           ] do
     vector = by_time(vector)
     params = Enum.map(params, &by_time/1)
     at_steps(steps, fn ts -> transform_vector(name, at(vector, ts), parameter(params, ts)) end)
@@ -312,6 +327,24 @@ defmodule Pulso.PromQL.Operations do
   defp transform("round", v, p), do: round_value(v, p)
   defp transform("floor", v, _) when is_number(v), do: :math.floor(v)
   defp transform("floor", v, _), do: v
+  defp transform("ceil", v, _) when is_number(v), do: :math.ceil(v)
+  defp transform("ceil", v, _), do: v
+  defp transform("sqrt", v, _) when v in [:nan, :infinity], do: v
+  defp transform("sqrt", v, _) when v == :negative_infinity or v < 0, do: :nan
+  defp transform("sqrt", v, _), do: :math.sqrt(v)
+  defp transform("exp", v, _) when v in [:nan, :infinity], do: v
+  defp transform("exp", :negative_infinity, _), do: 0.0
+  defp transform("exp", v, _), do: exponential(v)
+
+  defp transform(name, v, _) when name in ["ln", "log2", "log10"] and v == 0, do: :negative_infinity
+  defp transform(name, :infinity, _) when name in ["ln", "log2", "log10"], do: :infinity
+
+  defp transform(name, v, _) when name in ["ln", "log2", "log10"] and (v in [:nan, :negative_infinity] or v < 0),
+    do: :nan
+
+  defp transform("ln", v, _), do: :math.log(v)
+  defp transform("log2", v, _), do: binary_logarithm(v)
+  defp transform("log10", v, _), do: :math.log10(v)
   defp transform("sgn", :nan, _), do: :nan
   defp transform("sgn", v, _) when v == 0, do: v
   defp transform("sgn", v, _), do: if(Number.compare("<", v, 0), do: -1.0, else: 1.0)
@@ -332,6 +365,77 @@ defmodule Pulso.PromQL.Operations do
     rounded = Number.add(Number.multiply(value, inverse), 0.5)
     rounded = if is_number(rounded), do: :math.floor(rounded), else: rounded
     Number.divide(rounded, inverse)
+  end
+
+  # Adapted from Go 1.24.5 math/{log10.go,frexp.go,exp.go,exp_arm64.s}.
+  # Copyright 2009, 2017 The Go Authors.
+  # BSD license (also shipped in releases): priv/third_party/go-math-LICENSE.
+  # The exp polynomial also retains its original permission notice:
+  # Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+  # Permission to use, copy, modify, and distribute this software is freely
+  # granted, provided that this notice is preserved.
+  # Keep Go's reduction/scaling rather than libm: cancellation near log2(1)
+  # and arm64 exponential underflow change observable PromQL predicates.
+  defp binary_logarithm(value) do
+    {value, adjustment} =
+      if value < 2.2250738585072014e-308, do: {value * 4_503_599_627_370_496.0, -52}, else: {value, 0}
+
+    <<0::1, exponent::11, fraction::52>> = <<value::float-64>>
+    <<normalized::float-64>> = <<0::1, 1022::11, fraction::52>>
+    exponent = exponent - 1022 + adjustment
+
+    if normalized == 0.5 do
+      exponent - 1.0
+    else
+      # Go arm64 fuses Log(frac)*(1/Ln2)+exp. Form the exact integer
+      # numerator before the single float rounding; separate multiplication
+      # and addition lose most significant digits immediately above one.
+      <<1::1, log_exponent::11, log_fraction::52>> = <<:math.log(normalized)::float-64>>
+      <<0::1, 1023::11, multiplier::52>> = <<1.4426950408889634::float-64>>
+      denominator = Integer.pow(2, 1127 - log_exponent)
+      product = (4_503_599_627_370_496 + log_fraction) * (4_503_599_627_370_496 + multiplier)
+      (exponent * denominator - product) / denominator
+    end
+  end
+
+  defp exponential(value) when value > 7.09782712893383973096e2, do: :infinity
+  defp exponential(value) when value < -7.45133219101941108420e2, do: 0.0
+  defp exponential(value) when abs(value) < 3.725290298461914e-9, do: 1.0 + value
+
+  defp exponential(value) do
+    exponent = trunc(1.44269504088896338700 * value + if(value < 0, do: -0.5, else: 0.5))
+    hi = value - exponent * 6.93147180369123816490e-1
+    lo = exponent * 1.90821492927058770002e-10
+    remainder = hi - lo
+    squared = remainder * remainder
+
+    polynomial =
+      1.66666666666666657415e-1 +
+        squared *
+          (-2.77777777770155933842e-3 +
+             squared *
+               (6.61375632143793436117e-5 +
+                  squared * (-1.65339022054652515390e-6 + squared * 4.13813679705723846039e-8)))
+
+    correction = remainder - squared * polynomial
+    reduced = 1.0 - (lo - remainder * correction / (2.0 - correction) - hi)
+    <<0::1, biased::11, fraction::52>> = <<reduced::float-64>>
+    biased = biased + exponent
+
+    cond do
+      biased >= 2047 ->
+        :infinity
+
+      biased < 1 ->
+        # This is specifically the pinned Go arm64 52-bit scaling, including
+        # its early zero results at the smallest-subnormal boundary.
+        <<scaled::float-64>> = <<0::1, biased + 52::11, fraction::52>>
+        scaled * 2.220446049250313e-16
+
+      true ->
+        <<scaled::float-64>> = <<0::1, biased::11, fraction::52>>
+        scaled
+    end
   end
 
   def topk(op, grouping, parameter, vector, steps) do

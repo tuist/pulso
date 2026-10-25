@@ -38,6 +38,23 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
              |> json_response(200)
   end
 
+  test "math domain results remain successful instant and range values", %{conn: conn} do
+    conn = put_req_header(conn, "x-scope-orgid", "acme")
+
+    assert %{"data" => %{"resultType" => "vector", "result" => [%{"metric" => %{}, "value" => [20.0, "-Inf"]}]}} =
+             conn |> post("/api/v1/query", %{query: "ln(requests_total - 20)", time: "20"}) |> json_response(200)
+
+    assert %{
+             "data" => %{
+               "resultType" => "matrix",
+               "result" => [%{"metric" => %{}, "values" => [[10.0, "NaN"], [20.0, "-Inf"]]}]
+             }
+           } =
+             conn
+             |> get("/api/v1/query_range", %{query: "ln(requests_total - 20)", start: "10", end: "20", step: "10s"})
+             |> json_response(200)
+  end
+
   test "invalid syntax and parameters return structured errors", %{conn: conn} do
     for params <- [%{}, %{query: "unsupported(x)"}, %{query: "x", time: "bad"}, %{query: "x", time: "1e300"}] do
       assert %{"status" => "error", "errorType" => "bad_data"} =

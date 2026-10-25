@@ -110,8 +110,8 @@ Pulso implements a subset of the
 - Vector matching with `on`, `ignoring`, `group_left`, and `group_right`;
   ambiguous matches and duplicate output series return explicit errors
 - Classic `histogram_quantile`, `clamp_min`, `clamp_max`, `label_replace`,
-  `vector`, `scalar`, `time`, `round`, `abs`, `floor`, `sgn`, `timestamp`, `absent`,
-  `sort`, and `sort_desc`
+  `vector`, `scalar`, `time`, `round`, `abs`, `floor`, `ceil`, `sqrt`, `exp`,
+  `ln`, `log2`, `log10`, `sgn`, `timestamp`, `absent`, `sort`, and `sort_desc`
 - Explicit-resolution subqueries such as `sum_over_time((max by(job)(gauge))[6h:5m])`;
   inner grids align independently to epoch multiples. Positive subquery offsets
   are supported. Omitted resolutions (`[6h:]`) and top-level range-valued results
@@ -120,6 +120,23 @@ Pulso implements a subset of the
   sample arrives; range functions ignore stale markers
 - IEEE-754 NaN and infinities, returned as `"NaN"`, `"+Inf"`, or `"-Inf"` in
   Prometheus result values
+
+The basic math functions `ceil`, `sqrt`, `exp`, `ln`, `log2`, and `log10`
+follow Prometheus 3.5.0 semantics. Each takes one instant vector, ignores native
+histogram samples, removes the metric name, and preserves other labels. Negative
+square roots and negative logarithm inputs return `NaN`; logarithms of either
+signed zero return `-Inf`. `sqrt` preserves signed zero. `exp` overflows to
+`+Inf` and underflows through subnormal values to positive zero. These values
+are successful query results, not query errors. Instant and range queries use
+the same sample/work/result limits as other vector transforms. The numerical
+oracle is Prometheus 3.5.0 built with Go 1.24.5 on arm64. `exp` and `log2`
+reproduce that implementation's reduction and scaling, including its early
+underflow (`exp(-745)` returns zero rather than the smallest subnormal).
+This is a compatibility choice, not a correctly rounded mathematics guarantee
+or bit-identical parity with every Go version and architecture. Other finite
+results can differ by floating-point rounding. Upgrade every query-serving
+application before using these functions in dashboards or alert expressions;
+no native artifact, storage format or keyed-ingest byte change is required.
 
 ```text
 sum by (job) (rate(http_requests_total{job="api"}[5m]))
