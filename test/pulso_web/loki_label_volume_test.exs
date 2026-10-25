@@ -199,6 +199,18 @@ defmodule PulsoWeb.LokiLabelVolumeTest do
 
     empty = volume(api, ~s({foo="missing"}), %{}, :get, "volume_range")
     assert empty.body["data"] == %{"resultType" => "matrix", "result" => [], "stats" => %{}}
+
+    # A 1000-second window defaults to 4-second buckets; an explicit step wins.
+    for method <- [:get, :post], {step, timestamp} <- [{nil, 1_700_000_003.999}, {"10s", 1_700_000_009.999}] do
+      extra = %{"end" => Integer.to_string(@start + 1000 * @second), "limit" => "1"}
+      extra = if step, do: Map.put(extra, "step", step), else: extra
+      response = volume(api, ~s({foo=~".+"}), extra, method, "volume_range")
+      assert response.status == 200, inspect(response.body)
+
+      assert response.body["data"]["result"] == [
+               %{"metric" => %{"foo" => ""}, "values" => [[timestamp, "20"]]}
+             ]
+    end
   end
 
   test "the complete name dictionary is bounded before top-k truncation" do
