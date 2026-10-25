@@ -1233,6 +1233,8 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     supervisor = start_supervised!({CompactionSupervision, ctx.config})
     old_worker = Pulso.Runtime.whereis(CompactionWorker)
     ref = Process.monitor(old_worker)
+    # The monitor signal must reach the worker before its supervisor shuts it down.
+    _ = :sys.get_state(old_worker)
     Process.exit(Pulso.Runtime.whereis(CompactionOwnership.scope()), :kill)
     assert_receive {:DOWN, ^ref, :process, ^old_worker, :shutdown}
     _ = :sys.get_state(supervisor)
