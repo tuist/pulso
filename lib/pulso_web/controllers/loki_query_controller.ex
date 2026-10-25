@@ -236,7 +236,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp label_volume_step(:instant, _value, _times), do: {:ok, nil}
 
   defp label_volume_step(:range, value, times) do
-    default = "#{max(1, div(times.end_ns - times.start_ns, 100_000_000_000))}s"
+    default = "#{max(1, div(times.end_ns - times.start_ns, 250_000_000_000))}s"
 
     with {:ok, step} <- seconds_or_duration(value || default),
          true <- step >= 1_000_000,

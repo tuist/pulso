@@ -335,7 +335,7 @@ bytes per group, largest first. Both accept GET and form POST:
 Label-name volumes count actual UTF-8 line bytes within the inclusive
 nanosecond `[start,end]` window, not Loki's estimated chunk KB or whole-second
 storage windows. In `volume_range`, `step` accepts seconds or a duration, at
-least 1 ms, defaulting to the window divided by 100 (whole seconds, at least
+least 1 ms, defaulting to the window divided by 250 (whole seconds, at least
 one second). At most 11,000 epoch-aligned buckets are allowed. Internal
 boundaries belong to the next bucket, and the final `end` remains inclusive;
 nonfinal sample timestamps are one millisecond before the next boundary,
