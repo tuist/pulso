@@ -49,7 +49,7 @@ defmodule Pulso.PromQL.Evaluator do
 
         with {:ok, expr} <- Parser.parse(query),
              {:ok, kind, steps} <- evaluation_steps(opts) do
-          run_query(expr, tenant, steps, kind)
+          run_query(expr, tenant, steps, kind, opts)
         end
       end,
       opts
@@ -148,9 +148,18 @@ defmodule Pulso.PromQL.Evaluator do
          do: {:ok, {:logql, kind, series}}
   end
 
-  defp run_source(expr, tenant, steps, kind, _opts), do: run_query(expr, tenant, steps, kind)
+  defp run_source(expr, tenant, steps, kind, opts), do: run_query(expr, tenant, steps, kind, opts)
 
-  defp run_query(expr, tenant, steps, kind) do
+  defp run_query(expr, tenant, steps, kind, opts) do
+    lookback = Map.get(opts, :lookback_ns, @lookback_ns)
+
+    if not (is_integer(lookback) and lookback > 0 and lookback <= 9_223_372_036_854_775_807),
+      do: throw({:promql_error, :invalid_lookback})
+
+    # Set this for every source in a batch so one source cannot change another's
+    # default. Nested selectors and timestamp() share the current source's value.
+    Process.put(:promql_lookback_ns, lookback)
+
     if !Process.get(:promql_batch_selectors),
       do: Process.put(:promql_budget, %{samples: 0, work: 0, points: 0, materialized: 0, log_samples: 0})
 
@@ -273,7 +282,7 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp evaluate({:call, "timestamp", [{:selector, matchers, offset}]}, tenant, steps),
-    do: select(tenant, matchers, offset, @lookback_ns, steps, :timestamp)
+    do: select(tenant, matchers, offset, Process.get(:promql_lookback_ns), steps, :timestamp)
 
   defp evaluate({:call, "absent", [inner]}, tenant, steps) do
     with {:ok, vector, warnings} <- evaluate(inner, tenant, steps) do
@@ -324,7 +333,7 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp evaluate({:selector, matchers, offset}, tenant, steps) do
-    select(tenant, matchers, offset, @lookback_ns, steps, :latest)
+    select(tenant, matchers, offset, Process.get(:promql_lookback_ns), steps, :latest)
   end
 
   defp evaluate({:function, :absent_over_time, inner}, tenant, steps) do

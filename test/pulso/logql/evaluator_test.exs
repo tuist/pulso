@@ -12,6 +12,26 @@ defmodule Pulso.LogQL.EvaluatorTest do
     :ok
   end
 
+  test "categorized grouping also preserves the unlimited materializing path" do
+    log("unlimited", [
+      record(timestamp_ns: 10, body: "x=one", resource: %{"job" => "fake"}, attributes: %{"id" => "a"}),
+      record(timestamp_ns: 20, body: "x=two", resource: %{"job" => "fake"}, attributes: %{"id" => "b"})
+    ])
+
+    assert {:ok, [{%{"job" => "fake"}, values}]} =
+             run(~s({job="fake"} | logfmt), "unlimited", %{categorize_labels: true})
+
+    assert values == [
+             {20, "x=two", %{"structuredMetadata" => %{"id" => "b"}, "parsed" => %{"x" => "two"}}},
+             {10, "x=one", %{"structuredMetadata" => %{"id" => "a"}, "parsed" => %{"x" => "one"}}}
+           ]
+
+    assert {:ok, [{%{"job" => "fake"}, reversed}]} =
+             run(~s({job="fake"} | logfmt), "unlimited", %{categorize_labels: true, direction: :forward})
+
+    assert reversed == Enum.reverse(values)
+  end
+
   test "expensive sample finishing runs only on final top-k values inside the query task" do
     records = for i <- 1..20, do: record(timestamp_ns: i, service: "api", body: Integer.to_string(i))
     log("sample-final", records)

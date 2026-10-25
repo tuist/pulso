@@ -220,12 +220,21 @@ fn finish_series<'a>(
     // UTF-8 validation also excludes the 0xff byte used as the canonical
     // label separator in storage.
     if labels.iter().any(|(name, value)| {
-        simdutf8::basic::from_utf8(name).is_err() || simdutf8::basic::from_utf8(value).is_err()
+        name.is_empty()
+            || simdutf8::basic::from_utf8(name).is_err()
+            || simdutf8::basic::from_utf8(value).is_err()
     }) {
         return Err(total_samples.max(1));
     }
     labels.sort_by(|a, b| a.0.cmp(b.0));
     if labels.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(total_samples.max(1));
+    }
+    // Empty-valued labels are absent from Prometheus series identities.
+    // Validate names, UTF-8 and duplicates first: removing a losing label
+    // must not conceal an invalid series. Raw admission already charged it.
+    labels.retain(|(_, value)| !value.is_empty());
+    if labels.is_empty() {
         return Err(total_samples.max(1));
     }
     Ok(Series {
@@ -262,6 +271,11 @@ pub fn decode_v2(input: &[u8]) -> Option<Decoded<'_>> {
         if let (4, Value::Bytes(symbol)) = (field, value) {
             symbols.push(symbol);
         }
+    }
+    // The reserved empty symbol is a request-level RW2 invariant, not a
+    // per-series reference error. Reject before exposing samples or metadata.
+    if symbols.first().is_some_and(|symbol| !symbol.is_empty()) {
+        return None;
     }
 
     let mut decoded = Decoded {
@@ -453,11 +467,8 @@ fn decode_label(input: &[u8]) -> Option<(&[u8], &[u8])> {
             _ => {}
         }
     }
-    if name.is_empty() {
-        None
-    } else {
-        Some((name, value))
-    }
+    // Defer semantic name validation until every supplied point is counted.
+    Some((name, value))
 }
 
 fn decode_sample(input: &[u8]) -> Option<Sample> {
@@ -629,6 +640,11 @@ mod tests {
             &[(b"job", b"\xed\xa0\x80")],
             &[(b"job", b"a"), (b"job", b"b")],
             &[(b"job", b"a"), (b"job", b"a")],
+            &[(b"__name__", b"invalid"), (b"job", b"a"), (b"job", b"")],
+            &[(b"__name__", b"invalid"), (b"job", b""), (b"job", b"")],
+            &[(b"__name__", b"invalid"), (b"", b"value")],
+            &[(b"__name__", b"invalid"), (b"", b"")],
+            &[(b"__name__", b"invalid"), (b"\xff", b"")],
         ];
         let good = series(&[(b"__name__", b"safe"), (b"job", "é😀".as_bytes())]);
         for labels in invalid {
@@ -639,6 +655,29 @@ mod tests {
             assert_eq!(decoded.series[0].labels[1].1, "é😀".as_bytes());
             assert_eq!(decoded.series[0].samples.len(), 3);
         }
+    }
+
+    #[test]
+    fn normalizes_empty_values_and_order_before_canonical_identity() {
+        let canonical = &[
+            (b"__name__".as_slice(), b"safe".as_slice()),
+            (b"job", b"api"),
+        ];
+        let with_empty = &[
+            (b"job".as_slice(), b"api".as_slice()),
+            (b"empty", b""),
+            (b"__name__", b"safe"),
+        ];
+        let request = [
+            bytes_field(0x0a, &series(canonical)),
+            bytes_field(0x0a, &series(with_empty)),
+        ]
+        .concat();
+        let decoded = decode(&request).unwrap();
+        assert_eq!(decoded.rejected, 0);
+        assert_eq!(decoded.series.len(), 2);
+        assert_eq!(decoded.series[0].labels, canonical);
+        assert_eq!(decoded.series[1].labels, canonical);
     }
 
     const SYMBOLS: [&[u8]; 11] = [
@@ -685,6 +724,23 @@ mod tests {
         // Symbols after the series: a decoder must not depend on field order.
         let symbols: Vec<u8> = SYMBOLS.iter().flat_map(|s| bytes_field(0x22, s)).collect();
         [series.concat(), symbols].concat()
+    }
+
+    #[test]
+    fn v2_rejects_nonempty_reserved_symbol_even_if_no_reference_uses_it() {
+        let symbols: Vec<u8> = SYMBOLS
+            .iter()
+            .enumerate()
+            .flat_map(|(index, symbol)| {
+                bytes_field(0x22, if index == 0 { b"not empty" } else { symbol })
+            })
+            .collect();
+        let request = [
+            series_v2(&[1, 2], false, 2, &[0x08, 1, 0x18, 5, 0x20, 10]),
+            symbols,
+        ]
+        .concat();
+        assert!(decode_v2(&request).is_none());
     }
 
     #[test]

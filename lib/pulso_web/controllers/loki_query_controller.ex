@@ -40,7 +40,6 @@ defmodule PulsoWeb.LokiQueryController do
   alias Pulso.Storage
 
   @default_tenant "default"
-  @default_step_ms 15_000
   @default_direction :backward
   @default_limit 100
   # ---------------------------------------------------------------------------
@@ -69,18 +68,36 @@ defmodule PulsoWeb.LokiQueryController do
   end
 
   defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts) do
+    flags = response_encoding_flags(conn)
+    opts = Map.put(opts, :categorize_labels, "categorize-labels" in flags)
+
     case Evaluator.evaluate_log(ast, tenant, opts) do
-      {:ok, streams} -> json(conn, Envelope.streams(streams))
+      {:ok, streams} -> json(conn, Envelope.streams(streams, flags))
       {:error, reason} -> render_query_error(conn, reason)
     end
   end
 
   defp dispatch_eval(conn, ast, tenant, opts) do
+    flags = response_encoding_flags(conn)
+
     case Evaluator.evaluate_metric(ast, tenant, opts) do
-      {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series))
-      {:ok, {:vector, series}} -> json(conn, Envelope.vector(series))
+      {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series, flags))
+      {:ok, {:vector, series}} -> json(conn, Envelope.vector(series, flags))
       {:error, reason} -> render_query_error(conn, reason)
     end
+  end
+
+  # Flags are opaque, comma-separated tokens. Like Loki, echo unknown tokens
+  # without assigning them behavior. Only the exact known token opts into
+  # category tracking; no header leaves the existing representation untouched.
+  defp response_encoding_flags(conn) do
+    conn
+    |> get_req_header("x-loki-response-encoding-flags")
+    |> Enum.flat_map(fn
+      "" -> []
+      value -> String.split(value, ",")
+    end)
+    |> Enum.uniq()
   end
 
   # ---------------------------------------------------------------------------
@@ -130,7 +147,8 @@ defmodule PulsoWeb.LokiQueryController do
   defp parse_selectors(values, name) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
       case Parser.parse(value) do
-        {:ok, %AST.LogQuery{selector: selector}} -> {:cont, {:ok, [selector | acc]}}
+        {:ok, %AST.LogQuery{selector: selector, stages: []}} -> {:cont, {:ok, [selector | acc]}}
+        {:ok, %AST.LogQuery{}} -> {:halt, {:error, :label_matchers_only}}
         _ -> {:halt, {:error, {:invalid_query_parameter, name}}}
       end
     end)
@@ -624,7 +642,7 @@ defmodule PulsoWeb.LokiQueryController do
     with {:ok, time_opts} <- query_time_opts(params, mode) do
       opts =
         time_opts
-        |> maybe_put(:step_ns, step_for(mode, params))
+        |> maybe_put(:step_ns, step_for(mode, params, time_opts))
         |> maybe_put(:limit, parse_limit(params["limit"]))
         |> maybe_put(:direction, parse_direction(params["direction"]))
 
@@ -632,8 +650,12 @@ defmodule PulsoWeb.LokiQueryController do
     end
   end
 
-  defp step_for(:range, params), do: parse_step(params["step"]) || default_step_ns()
-  defp step_for(:instant, _params), do: nil
+  defp step_for(:range, params, times) do
+    default = max(1, div(times.end_ts_ns - times.start_ts_ns, 250_000_000_000)) * 1_000_000_000
+    parse_step(params["step"]) || default
+  end
+
+  defp step_for(:instant, _params, _times), do: nil
 
   defp parse_limit(nil), do: @default_limit
   defp parse_limit(v) when is_integer(v) and v > 0, do: v
@@ -676,8 +698,6 @@ defmodule PulsoWeb.LokiQueryController do
   end
 
   defp query_timestamp(_, name), do: {:error, {:invalid_query_parameter, name}}
-
-  defp default_step_ns, do: @default_step_ms * 1_000_000
 
   defp parse_ts(nil), do: nil
   defp parse_ts(v) when is_integer(v), do: parse_ts(Integer.to_string(v))
@@ -742,6 +762,9 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp render_error(conn, {:error, {:invalid_query_parameter, name}}),
     do: error_json(conn, :bad_request, "invalid_parameter", name)
+
+  defp render_error(conn, {:error, :label_matchers_only}),
+    do: error_json(conn, :bad_request, "invalid_parameter", "only label matchers are supported")
 
   defp render_error(conn, {:error, {:parse_error, reason}}) do
     error_json(conn, :bad_request, "parse_error", inspect(reason))

@@ -17,6 +17,28 @@ defmodule Pulso.PromQL.BatchTest do
   defp sample(name, value),
     do: %MetricSample{series_id: 1, timestamp_ns: 10, value: value, labels: %{"__name__" => name}}
 
+  test "lookback overrides apply per source, including timestamp, and never leak into defaults" do
+    assert :ok = Storage.append(:metrics, "acme", [sample("one", 4.0)])
+    time = 360_000_000_000
+
+    queries = [
+      {"wide", "one", %{end_ts_ns: time, lookback_ns: 600_000_000_000}},
+      {"default", "one", %{end_ts_ns: time}},
+      {"timestamp", "timestamp(one)", %{end_ts_ns: time, lookback_ns: 600_000_000_000}},
+      {"short", "one", %{end_ts_ns: time, lookback_ns: 60_000_000_000}}
+    ]
+
+    assert {:ok, {results, _}} = Evaluator.query_batch(queries, "acme", &finish/2)
+    assert [%{"value" => [360.0, "4"]}] = results["wide"]["data"]["result"]
+    assert [%{"value" => [360.0, "1e-08"]}] = results["timestamp"]["data"]["result"]
+    assert results["default"]["data"]["result"] == []
+    assert results["short"]["data"]["result"] == []
+
+    for invalid <- [0, -1, nil, 1.0, 9_223_372_036_854_775_808] do
+      assert {:error, :invalid_lookback} = Evaluator.query("one", "acme", %{end_ts_ns: time, lookback_ns: invalid})
+    end
+  end
+
   test "source results and final callback share a tenant-scoped admitted worker/deadline" do
     Memory.reset()
     assert :ok = Storage.append(:metrics, "acme", [sample("one", 4.0), sample("two", 8.0)])

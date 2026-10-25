@@ -11,6 +11,93 @@ Keep a versioned contract matrix with supported forms, explicit rejections,
 semantic references, bounds and operational qualifications. The operator-facing
 current boundary is [protocol coverage](../docs/protocol-coverage.md).
 
+## Upstream service integration ports
+
+The normal Elixir suite now includes selected public request/response scenarios
+from all three upstream service suites. These remain selected ports, **not a copy of
+their complete integration suites or proof of full compatibility**. Each source
+selection is pinned and separately licensed; expected data comes from upstream,
+not from regenerating answers with Pulso.
+
+| Backend | Imported selection and provenance | Elixir replay |
+| --- | --- | --- |
+| Mimir | [33 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization and invalid RW2 symbols | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (52 tests including 19 controls) |
+| Loki | [22 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows and grouped stream ordering; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (28 tests including six controls) |
+| Tempo | [Five source entry points](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search and all 31 V2 trace-by-ID depth combinations; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (15 wrappers); independent native/reference/MCP replay in `search_expression_test.exs` |
+
+All replays use native Parquet and the real S3 HTTP adapter against test-owned
+loopback object stores. Loki and Tempo also use live authenticated HTTP
+listeners; Mimir uses the production Phoenix endpoint through ConnTest. They
+require no upstream server, Go, Docker or network downloads during replay. They
+do not model upstream WAL/head/block/live-store phases: Pulso publishes durable
+segments before acknowledging ingestion. Separate Pulso controls cover malformed
+inputs, boundaries, isolation and transport variants, and are not counted as
+additional upstream cases.
+
+The ports exposed and fixed bounded HTTP compatibility gaps: Prometheus
+`lookback_delta`; Loki selector-only discovery/stats and window-derived default
+range resolution; Tempo bare v1 keys, quoted attribute targets and unescaped
+slashes. Follow-ups fixed remote-write float/native-histogram timestamp
+collisions, negotiated Loki label categories and Tempo unscoped/default-window
+search. The next selected Loki detected-field/ordering cases passed unchanged;
+Tempo V2 exact-ID filtering now validates the full stored trace before independent
+ancestor/descendant expansion. Explicitly selected subsets carry PARTIAL; missing
+reads, corrupt/legacy/conflicting nonmatches and exhausted budgets still fail
+whole. This filter adds bounded BEAM conversion work, not a native/storage change.
+Its oversized-URI control retains HTTP 414 rather than upstream's 400.
+Mimir's next five scenarios normalize empty-valued labels before merging and
+reject a nonempty reserved RW2 symbol before any sample/metadata publication.
+Duplicate/empty names and invalid UTF-8 validate before removing empty values;
+all raw labels/points still consume admission and rejected-point accounting.
+Label-order scenarios already passed, so no ordering fix was invented.
+Existing query budgets, feature gates and shared-object-store authority
+remain unchanged. Tempo now requires search capability5, tuple `{2,1,3,5,12}`;
+unscoped predicates use span-key precedence, not a resource/span OR. Omitted or
+paired-zero HTTP bounds search all retained context, not Tempo's ingester-only
+tier. Colliding or empty-valued-label remote-write requests change normalized
+fingerprints and bytes: drain affected retries and replace all receiving
+application/native pairs before resuming them. The native tuple is unchanged
+and startup does not fence older receivers. Never evade keyed 409s;
+[operator guidance](../docs/querying.md#native-histograms) applies.
+
+Whole-repository validation after this increment: `mix precommit --seed 0
+--max-cases 4 --warnings-as-errors` passed **1760 tests, 1 existing skipped,
+37 optional excluded**. A final three-service replay passed all 95 tests at
+seed 41. Codec `cargo test --release` passed 133 tests; strict Credo, formatter,
+Rustfmt and whitespace checks passed. Strict codec Clippy passed for debug and
+release with Rust/Clippy **1.97.1**; an earlier Rust 1.94 run reported two unchanged
+`nonminimal_bool` warnings in trace-segment pruning, not fixed by these ports.
+The green suite still logged compaction timeouts/CAS warnings and the intentional
+gRPC handler crash; it does not close those diagnostics or capacity acceptance.
+
+### Remaining upstream coverage and product gaps
+
+- **Mimir:** additional histogram/exemplar policies and tenant downscaling,
+  remaining invalid/partial-write permutations, OTLP translation, remote-read, federation, cardinality,
+  formatting and streaming. Sample-backed discovery now uses native histogram
+  input but still does not establish TSDB-tier behavior.
+- **Loki:** enabled label policies, deletion,
+  federation, tail/client permutations, OTLP mapping and approximate queries.
+  The upstream seven-day no-step metric case cannot reproduce its expected
+  last-four-second samples on the regular default grid; its imported count
+  assertion explicitly supplies 60s resolution. No extra terminal sample or
+  budget exemption is invented to conceal the discrepancy.
+- **Tempo:** partial time bounds, intrinsic/OR/partial-query discovery,
+  structural/spanset TraceQL, metrics exemplars and
+  expression combinations, query streaming, broader trace filters/diffs and legacy-v1
+  collisions. Existing typed/export/search fixtures do not fill these gaps by
+  implication. Unsupported discovery filters still reject rather than vanish.
+- **Architecture-specific exclusions:** upstream Kafka/WAL/ring/quorum,
+  sharding/cache and multi-storage-engine permutations are not transplanted as
+  fake equivalents. Pulso needs its own multi-instance CAS, maintenance,
+  admission, restart and provider tests, plus separately authorized deployed
+  clients and representative capacity validation.
+
+Prioritize additional portable upstream tables by those missing public
+behaviors. Keep exact ports, explicit adaptations, deliberate stricter failures
+and unsupported surfaces separate; never skip a mismatch or widen a safety
+ceiling solely to turn a selected case green.
+
 ## Historical pause point: landed protocol increment
 
 The implementation below landed in `f7a3ebe` (PR #34). Work has resumed with

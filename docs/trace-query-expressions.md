@@ -23,6 +23,16 @@ This is not full TraceQL or deployed Grafana compatibility.
 | `status`, `span:status` | `=`, `!=` with `unset`, `ok`, `error` | Stored span status, not an attribute called `status` |
 | `duration`, `span:duration` | `=`, `!=`, `<`, `<=`, `>`, `>=` with a duration literal | That span's end minus start in exact nanoseconds |
 
+Unscoped `.<key>` accepts the same string/int64 comparisons. An original span
+attribute takes precedence over an original resource attribute with that key,
+even when the span value has the wrong type or fails the predicate. Only an
+absent span key falls back to the resource. Event, link and instrumentation
+attributes are not implicit search owners. For example, `.region = "eu"` does
+not match a resource value `eu` when the same span has `region = "us"`.
+This syntax is specific to retained-context search; discovery and window-local
+search filters are unchanged. Unscoped expressions use full-scope admission,
+not the positive scoped-string service planner.
+
 Missing and differently typed attributes **do not match even negative
 predicates**. Integer-literal attribute predicates do not coerce doubles,
 strings or booleans; the pinned Tempo 2.9 Parquet search also excludes a double
@@ -66,6 +76,10 @@ completeness. HTTP seconds and MCP nanosecond window semantics remain as
 Samples include original typed values from individually matching predicates;
 false OR branches do not invent attributes. Status samples use enum strings;
 span duration is already represented by `durationNanos`, not an added attribute.
+An unscoped predicate samples independently matching values from both owners;
+the same key may appear twice. A matching resource value can appear when an
+overriding span value makes that leaf false but another OR branch selects the
+span. Samples therefore do not prove which boolean branch selected a span.
 Samples are bounded examples, not all matching spans or a full trace export.
 
 Expressions permit at most **16 predicates, 8 regexes, 16 nested groups and
@@ -94,8 +108,8 @@ string-AND grammar; this change does **not** widen those APIs.
 
 ## Upgrade and evidence
 
-Require matching application/native search capability **4**, current trace tuple
-**`{2,1,3,4,12}`**, on every serving instance before sending new expressions.
+Require matching application/native search capability **5**, current trace tuple
+**`{2,1,3,5,12}`**, on every serving instance before sending new expressions.
 Startup verifies only the local pair, not an old serving pool. There is no
 Parquet/envelope/idempotency-format change from these operators. Existing rich
 metadata upgrade and retry-draining requirements still apply independently.
@@ -107,5 +121,8 @@ Frozen synthetic inputs and expected results come from actual public **Tempo
 and independent Elixir replay. Local authenticated HTTP ingest, S3-stub
 publication, HTTP/MCP queries and the pinned Elixir clients also exercise the new
 operators. See [fixture provenance](../test/fixtures/traces/search_expressions/README.md).
+An additional [16 public-engine cases](../test/fixtures/traces/tempo_integration/README.md)
+cover unscoped collisions, precedence across original types, both sampled owners
+and zero-bound windows against actual Tempo 2.9.0 Parquet fetches.
 This is not production Alloy, real-provider, separate-node, capacity, full
 TraceQL or cutover acceptance.

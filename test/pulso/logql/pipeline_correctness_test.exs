@@ -26,6 +26,51 @@ defmodule Pulso.LogQL.PipelineCorrectnessTest do
     Pipeline.apply(Pipeline.compile(ast.stages), entry)
   end
 
+  test "all parsers track writes independently of equal values and promoted stream labels" do
+    for {stage, body} <- [
+          {"logfmt", "pod=same token=same"},
+          {~s/regexp "pod=(?P<pod>[^ ]+) token=(?P<token>.*)"/, "pod=same token=same"},
+          {"json", ~s/{"pod":"same","token":"same"}/},
+          {~s/pattern "pod=<pod> token=<token>"/, "pod=same token=same"},
+          {"unpack", ~s/{"pod":"same","token":"same","_entry":"payload"}/}
+        ] do
+      record = %Log{
+        timestamp_ns: 10,
+        service: "api",
+        severity_text: "info",
+        body: body,
+        resource: %{"app" => "a", "pod" => "same"},
+        attributes: %{"token" => "same", "untouched" => true}
+      }
+
+      assert {:keep, categorized} = apply_pipeline("| " <> stage, Entry.from_record(record, true))
+      assert {:keep, ordinary} = apply_pipeline("| " <> stage, Entry.from_record(record))
+      assert categorized.labels == ordinary.labels
+      assert categorized.line == ordinary.line
+      assert ordinary.label_categories == nil
+
+      assert Entry.categorized_labels(categorized) ==
+               {
+                 %{
+                   "app" => "a",
+                   "pod" => "same",
+                   "service" => "api",
+                   "service_name" => "api",
+                   "level" => "info",
+                   "detected_level" => "info"
+                 },
+                 %{
+                   "structuredMetadata" => %{"untouched" => "true"},
+                   "parsed" => %{"pod_extracted" => "same", "token" => "same"}
+                 }
+               }
+
+      assert {:keep, renamed} = apply_pipeline("| label_format token=token, absent=missing", categorized)
+      assert renamed.labels == categorized.labels
+      assert renamed.label_categories == categorized.label_categories
+    end
+  end
+
   for adapter <- [Memory, NativeQueryStorage] do
     @adapter adapter
     describe "#{inspect(adapter)}" do

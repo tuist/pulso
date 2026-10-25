@@ -346,13 +346,20 @@ Query fan-out is entirely within one node. Nothing crosses node boundaries at qu
   Each native pass visits at most a million rows. Candidate bookkeeping adds
   roughly 4–6 MiB outside BEAM, plus <=512 KiB native hash prefixes and a temporary
   <=2 MiB BEAM ID binary; input/retained/result bounds remain independent.
-  Current metadata2/export3/search4/discovery12 tuple {2,1,3,4,12} is required. Search capability4 also adds a separate bounded same-parent boolean RPN program for retained-context queries: string negation, original-int64 comparisons, status and own-span duration, with equal-precedence left-associative AND/OR and explicit groups. The old positive-string selector/discovery/window grammar remains separate. A dedicated storage callback fences old adapters; native compilation revalidates stack/types/16-leaf/8-regex bounds. Expression queries bypass service/ID planning and admit all retained sources, then replay exact captured bytes without more GETs. Candidate/context passes both charge two owners, all resource/span attrs and every instruction under an additional 20M-work ceiling before filtering; no DNF expansion or short-circuit accounting. Samples retain individually matching typed attributes; legacy/corruption and all limits fail whole. This is scoped public Tempo 2.9 engine/Parquet evidence, not full TraceQL or capacity acceptance. See [operator semantics](trace-query-expressions.md). This bounded immutable
+  Current metadata2/export3/search5/discovery12 tuple {2,1,3,5,12} is required. Search capability4 introduced a separate bounded same-parent boolean RPN program for retained-context queries: string negation, original-int64 comparisons, status and own-span duration, with equal-precedence left-associative AND/OR and explicit groups. Capability5 adds unscoped original-string/int64 predicates: an existing span key overrides the resource key regardless of matching type/value, while samples retain independently matching values from both owners. HTTP omitted or paired-zero search bounds use the same bounded retained scan, not an invented ingester tier; partial bounds reject. The old positive-string selector/discovery/window grammar remains separate. A dedicated storage callback fences old adapters; native compilation revalidates stack/types/16-leaf/8-regex bounds. Expression queries bypass service/ID planning and admit all retained sources, then replay exact captured bytes without more GETs. Candidate/context passes both charge two owners, all resource/span attrs and every instruction under an additional 20M-work ceiling before filtering; no DNF expansion or short-circuit accounting. Samples retain individually matching typed attributes; legacy/corruption and all limits fail whole. This is scoped public Tempo 2.9 engine/Parquet evidence, not full TraceQL or capacity acceptance. See [operator semantics](trace-query-expressions.md). This bounded immutable
   plan is not representative posting/index/client/capacity acceptance; old sources,
   false positives or read-all fallback can still exhaust limits late in context.
   It preserves
   most-recent ordering and sampled spansets; actual public Tempo Parquet/engine
   fixtures establish only its explicit selector subset. Exact-ID v1/v2 export
-  uses complete stored assembly and faithful typed serialization. Unfiltered
+  uses complete stored assembly and faithful typed serialization. V2 same-span
+  filters validate/deduplicate that entire bounded assembly before selecting
+  spans, then independently expand matched ancestors/descendants with bounded
+  graph walks. Only explicit selection can report PARTIAL; read, integrity and
+  budget failures remain whole failures, including on nonmatches. Filtering
+  uses the bounded BEAM reference exporter and the expression evaluator's 20M
+  work ceiling; unfiltered export stays native. No stored/native ABI changes.
+  Unfiltered
   resource/span/instrumentation/event/link discovery scans retained rows directly into bounded name/typed
   value sets, without trace grouping or BEAM span expansion. Names preserve all
   keys; value discovery supports original string/int64/bool/float values (nonfinite classes included) and rejects
@@ -471,7 +478,7 @@ Query fan-out is entirely within one node. Nothing crosses node boundaries at qu
   events/links are not requested owners but envelopes still validate.5000 values/
   independent1MiB dictionary/result limits reject whole; nanosecond cardinality
   commonly overflows broad queries. Legacy/corrupt nonmatches still fail. Matching
-  app/native artifacts require current tuple {2,1,3,4,12}. Six public fixtures and1047 Go
+  app/native artifacts require current tuple {2,1,3,5,12}. Six public fixtures and1047 Go
   formatter cases are scoped evidence, not physical-layout/client/capacity parity.
   A separate intrinsic scope returns tiny static Tempo vocabulary: 20 names and
   seven exact v2 keyword/empty shortcuts. It uses ordinary auth/gate/raw admission
@@ -998,7 +1005,7 @@ Original-string selectors never infer string type from those projections; raw
 query exact/regex compatibility predicates explicitly inspect projections.
 Service promotion now requires original stringValue (including removing prior
 byte-service promotion), without rewriting stored history. Drain byte-service
-keyed retries. Current trace artifacts {2,1,3,4,12} require all-participant upgrade
+keyed retries. Current trace artifacts {2,1,3,5,12} require all-participant upgrade
 before new writers resume; schema envelope1/physical columns remain unchanged.
 See [operator compatibility and remaining gaps](trace-otel-compatibility.md).
 

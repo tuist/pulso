@@ -86,3 +86,10 @@ SHA-256:
 | Upstream test source | `39503947f978f862aeb8e5db5879831f95acf7d03092ce75952ccdc2b8940b30` |
 | Extracted fixture | `f8ca9a28a3664e79efd753d92372df153e2f109839ad26785f784d588ab12444` |
 | Authored extractor | `bce0c8167bc46fe422eccbee7ba444bd1ac90ddef36c67e1637c067509e9c70e` |
+
+## Pinned upstream Loki public integration cases
+
+[`loki-upstream/README.md`](loki-upstream/README.md) maps the Elixir HTTP/S3
+integration checks to Loki revision `5aa4b9212d64d723f63b2770452054aa23df114d`,
+including attribution/license, original cases, source hashes, fixture/harness
+adaptations, discovered protocol gaps and unported suite boundaries.

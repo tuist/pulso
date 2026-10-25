@@ -295,6 +295,29 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   end
 
   describe "input validation" do
+    test "discovery and stats reject pipelines on GET and form POST", %{conn: conn} do
+      for {path, key} <- [
+            {"/loki/api/v1/labels", "query"},
+            {"/loki/api/v1/label/job/values", "query"},
+            {"/loki/api/v1/series", "match[]"},
+            {"/loki/api/v1/index/stats", "query"}
+          ],
+          expression <- [~s({job="fake"} |= "search"), ~s({job="fake"} | logfmt)],
+          method <- [:get, :post] do
+        encoded = URI.encode_query([{key, expression}])
+
+        response =
+          case method do
+            :get -> get(conn, path <> "?" <> encoded)
+            :post -> conn |> put_req_header("content-type", "application/x-www-form-urlencoded") |> post(path, encoded)
+          end
+          |> json_response(400)
+
+        assert response["message"] == "only label matchers are supported"
+        refute Map.has_key?(response, "data")
+      end
+    end
+
     test "invalid regex returns 400 with a parse_error, not 500", %{conn: conn} do
       conn =
         conn
@@ -441,6 +464,23 @@ defmodule PulsoWeb.LokiQueryControllerTest do
   end
 
   describe "vector literals" do
+    test "range default resolution follows the window and explicit steps win", %{conn: conn} do
+      for {finish, step, expected_step} <- [
+            {3600, nil, 14},
+            {3600, "", 14},
+            {100, nil, 1},
+            {3600, "5", 5},
+            {604_801, nil, 2419}
+          ] do
+        params = %{"query" => "vector(1)", "start" => "0", "end" => to_string(finish)}
+        params = if step == nil, do: params, else: Map.put(params, "step", step)
+        response = conn |> get("/loki/api/v1/query_range", params) |> json_response(200)
+        assert response["data"]["resultType"] == "matrix"
+        assert [%{"metric" => %{}, "values" => samples}] = response["data"]["result"]
+        assert samples == for(timestamp <- 0..finish//expected_step, do: [timestamp, "1"])
+      end
+    end
+
     test "Grafana's Loki health check expression evaluates to 2", %{conn: conn} do
       result =
         conn

@@ -83,10 +83,8 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
                |> json_response(200)
     end
 
-    for key <- ["limit", "lookback_delta"] do
-      assert %{"errorType" => "bad_data"} =
-               conn |> get("/api/v1/query", %{"query" => "boundary", key => "1"}) |> json_response(400)
-    end
+    assert %{"errorType" => "bad_data"} =
+             conn |> get("/api/v1/query", %{"query" => "boundary", "limit" => "1"}) |> json_response(400)
 
     assert %{"errorType" => "bad_data"} =
              conn |> get("/api/v1/query", %{query: "boundary", time: "9999-01-01T00:00:00Z"}) |> json_response(400)

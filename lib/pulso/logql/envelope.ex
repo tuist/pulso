@@ -14,13 +14,13 @@ defmodule Pulso.LogQL.Envelope do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Time
 
-  @spec streams([{map(), [{integer(), String.t()}]}]) :: map()
-  def streams(streams) when is_list(streams) do
+  @spec streams([Pulso.LogQL.Evaluator.stream()], [String.t()]) :: map()
+  def streams(streams, encoding_flags \\ []) when is_list(streams) do
     result =
       Enum.map(streams, fn {labels, entries} ->
         %{
           "stream" => stringify(labels),
-          "values" => Enum.map(entries, fn {ts, line} -> [Integer.to_string(ts), line] end)
+          "values" => Enum.map(entries, &stream_value/1)
         }
       end)
 
@@ -32,10 +32,11 @@ defmodule Pulso.LogQL.Envelope do
         "stats" => %{}
       }
     }
+    |> with_encoding_flags(encoding_flags)
   end
 
-  @spec matrix([{map(), [{integer(), float()}]}]) :: map()
-  def matrix(series) when is_list(series) do
+  @spec matrix([{map(), [{integer(), float()}]}], [String.t()]) :: map()
+  def matrix(series, encoding_flags \\ []) when is_list(series) do
     result =
       Enum.map(series, fn {labels, samples} ->
         %{
@@ -52,10 +53,11 @@ defmodule Pulso.LogQL.Envelope do
         "stats" => %{}
       }
     }
+    |> with_encoding_flags(encoding_flags)
   end
 
-  @spec vector([{map(), {integer(), float()}}]) :: map()
-  def vector(series) when is_list(series) do
+  @spec vector([{map(), {integer(), float()}}], [String.t()]) :: map()
+  def vector(series, encoding_flags \\ []) when is_list(series) do
     result =
       Enum.map(series, fn {labels, {ts, v}} ->
         %{
@@ -72,7 +74,14 @@ defmodule Pulso.LogQL.Envelope do
         "stats" => %{}
       }
     }
+    |> with_encoding_flags(encoding_flags)
   end
+
+  defp stream_value({ts, line}), do: [Integer.to_string(ts), line]
+  defp stream_value({ts, line, categories}), do: [Integer.to_string(ts), line, categories]
+
+  defp with_encoding_flags(envelope, []), do: envelope
+  defp with_encoding_flags(envelope, flags), do: put_in(envelope, ["data", "encodingFlags"], flags)
 
   defp stringify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {to_string(k), to_string(v)} end)
 

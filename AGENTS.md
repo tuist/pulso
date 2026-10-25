@@ -10,6 +10,13 @@ Pulso is agent-native from day one. It does not ship a UI. Consumers are humans 
 
 ## Where the project is right now
 
+Current trace search capability is **5**, tuple `{2,1,3,5,12}`, superseding the
+search4 snapshot references below. Unscoped original-string/int64 search uses
+span-key presence before resource fallback; sampled values may include both
+owners. Omitted or paired-zero HTTP search bounds scan bounded retained context,
+not an ingester-only tier; partial bounds reject. Discovery/window-local grammar,
+storage formats and resource ceilings are unchanged. See `docs/trace-query-expressions.md`.
+
 Early scaffolding. In place:
 
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
@@ -51,7 +58,7 @@ even logically equivalent ones, fail permanently with HTTP409 `keyed_content_mis
 never overwrite or infer semantic/hash equality. Object-store ABI is `{1,1,1,1}`
 (retention, keyed publication, snapshot GET, async requests); every writer, including recording evaluators,
 must upgrade/drain because local startup does not fence older unconditional
-writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,4,12}` and metric
+writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,5,12}` and metric
 `{2,2,1,1,1}` are the current codec requirements; footer reads do not change keyed encoder bytes.
 Remote-write 2.0 legacy series-created and modern per-point starts retain optional
 signed-int64 `start_timestamp_ms` without synthetic zeros or start-aware rates.

@@ -18,7 +18,7 @@ to support every historical client/session protocol.
 | Prometheus remote write | 1.0 and 2.0 scalar samples, stale markers and non-finite values, native histograms (integer and float, exponential and custom-bucket), exemplars, retained metric metadata, 2.0 written-count headers, and [source created/start timestamps](metrics.md#remote-write-20-start-timestamps) (legacy rc.3 per-series and rc.4 per-point); also at `/api/prom/push` and `/api/v1/push` | Optional zero-sample injection/start-aware rates, newer stateless-mode validation, full TSDB/client/compliance-suite acceptance |
 | Prometheus queries/discovery | Documented bounded PromQL subset, including basic math (`ceil`, `sqrt`, `exp`, `ln`, `log2`, `log10`); native histograms (Prometheus 3.5.0 semantics), `/api/v1/query_exemplars`, instant/range HTTP APIs, sample-backed label/series discovery, build info, query validation, `/api/v1/metadata` from retained remote-write metadata, and MCP queries | Full language/function/modifier coverage, OTLP-sourced metadata, and full TSDB/client parity |
 | Loki ingestion/queries | JSON/Snappy protobuf push and OTLP at `/otlp/v1/logs`; documented bounded LogQL queries; complete stream label, value and series discovery; index stats and volume (`aggregateBy=series` and bounded selector-only `aggregateBy=labels`, using actual line bytes rather than Loki chunk estimates); build info; WebSocket live tail; detected labels and fields; query-time patterns and `|>`/`!>` filters; MCP log reads | Full LogQL; index-backed volume cost/estimate parity; full client parity |
-| Tempo compatibility | Experimental bounded v1/v2 exact-ID export; separately opt-in retained-context search and discovery; documented typed predicates; TraceQL metrics with `topk`/`bottomk` (`rate`, `count`/`min`/`max`/`sum`/`avg_over_time`, `quantile_over_time`, `histogram_over_time`); echo and build info | Full TraceQL including structural/spanset operations, second-stage metrics (`topk`, `compare`), exemplars, full indexed planning, discovery parity and deployed-client acceptance |
+| Tempo compatibility | Experimental bounded v1/v2 exact-ID export with V2 same-span filters and ancestor/descendant depths; separately opt-in retained-context search and discovery; documented typed predicates; TraceQL metrics with `topk`/`bottomk` (`rate`, `count`/`min`/`max`/`sum`/`avg_over_time`, `quantile_over_time`, `histogram_over_time`); echo and build info | Full TraceQL including structural/spanset operations, second-stage metrics (`topk`, `compare`), exemplars, full indexed planning, discovery parity and deployed-client acceptance |
 | Alerting | Native bounded thresholds, authored mixed-source expressions, experimental recordings and delivery | Full Grafana imported-rule execution, lifecycle, routing, notification and template semantics |
 | MCP | Stateless 2026-07-28 tools, capability-scoped Pulso writes and request-scoped subscriptions | Legacy initialize/session protocols; infrastructure remediation is deliberately a separate server |
 
@@ -70,3 +70,33 @@ Public schema fixtures and independent semantic references are kept separately
 from optional live client exercises. Ordinary tests replay frozen evidence with
 the native project toolchain; they do not download or execute SDKs, Collectors,
 Go producers or external reference servers.
+
+Selected Mimir, Loki and Tempo public service-integration scenarios also replay
+against native Parquet and isolated local S3 test stores. They cover bounded
+ingest/query/discovery behavior, not the complete upstream suites, real provider
+durability/capacity or deployed-client acceptance. The
+[source selections and remaining coverage gaps](../plans/protocol-breadth.md#upstream-service-integration-ports)
+separate exact cases from explicit harness/behavior adaptations. In particular,
+Loki's adapted long-range metric check supplies an explicit resolution; it is
+not evidence for the upstream no-step expectation near the window's end.
+
+The continuation includes all seven selected Mimir ingester-query table rows,
+native/custom histogram and exemplar distributor cases, all four Loki
+categorized-label cases, detected-field windows and grouped stream counts,
+basic Tempo unscoped/default-window search, and all 31 selected V2 exact-ID
+filter-depth combinations. V2 validates the complete stored trace before
+returning an explicit filtered PARTIAL subset; nonmatching unknown/conflicting
+copies and resource errors still fail whole. A large filter URI returns 414 at
+the default HTTP ceiling instead of upstream's 400; this is documented rejection,
+not exact status parity. Filtering uses extra bounded query-task heap/CPU without
+changing storage formats or the native tuple.
+Independent public Tempo engine fixtures cover span-over-resource precedence;
+omitted HTTP bounds search bounded retained context, not an ingester-only tier.
+Tempo requires search capability **5**, tuple `{2,1,3,5,12}`. Remote-write
+float/histogram timestamp collisions now normalize to the float, and empty-valued
+labels are removed before identity/merging. Invalid label names/duplicates still
+reject before removal; a nonempty reserved RW2 symbol fails the entire request
+with zero written counts and no metadata publication. Drain affected collision
+and empty-label keyed retries and replace all receiving application/native pairs
+before resuming them; the native tuple does not fence older receivers. These scoped passes
+do not close the remaining distributed, provider, language or client gaps.

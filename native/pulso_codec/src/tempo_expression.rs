@@ -53,7 +53,7 @@ impl Expression {
                 return None;
             }
             let re = match scope.as_str() {
-                "resource.string" | "span.string" => match op.as_str() {
+                "resource.string" | "span.string" | "none.string" => match op.as_str() {
                     "=" | "!=" => None,
                     "=~" | "!~" => {
                         regexes += 1;
@@ -72,7 +72,7 @@ impl Expression {
                     }
                     _ => return None,
                 },
-                "resource.int" | "span.int" | "intrinsic" => {
+                "resource.int" | "span.int" | "none.int" | "intrinsic" => {
                     if !["=", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
                         return None;
                     }
@@ -162,6 +162,32 @@ impl Expression {
                             compare(n, wanted.parse().map_err(|_| Error::Invalid)?, op),
                             value,
                         )
+                    } else if scope.starts_with("none.") {
+                        let string_type = scope.ends_with(".string");
+                        if collect {
+                            for (name, owner) in [("resource", &resource), ("span", &span)] {
+                                if let Some(raw) = owner.get(key) {
+                                    if attribute_matches(
+                                        raw,
+                                        string_type,
+                                        op,
+                                        wanted,
+                                        regex.as_ref(),
+                                    )? {
+                                        attrs.insert((key.clone(), name.to_owned()), raw.to_vec());
+                                    }
+                                }
+                            }
+                        }
+                        // An original span value wins even if its type/value
+                        // does not match. Samples above retain both owners.
+                        let matched = span
+                            .get(key)
+                            .or_else(|| resource.get(key))
+                            .map_or(Ok(false), |raw| {
+                                attribute_matches(raw, string_type, op, wanted, regex.as_ref())
+                            })?;
+                        (matched, None)
                     } else {
                         let owner = if scope.starts_with("resource.") {
                             &resource
@@ -171,32 +197,13 @@ impl Expression {
                         match owner.get(key) {
                             None => (false, None),
                             Some(raw) => {
-                                let value = object(raw)?;
-                                let matched = if scope.ends_with(".string") {
-                                    match field(&value, b"stringValue") {
-                                        Ok(text) => {
-                                            let text = string(text)?;
-                                            let positive = regex
-                                                .as_ref()
-                                                .map_or(text == *wanted, |r| r.is_match(&text));
-                                            if op == "!=" || op == "!~" {
-                                                !positive
-                                            } else {
-                                                positive
-                                            }
-                                        }
-                                        Err(_) => false,
-                                    }
-                                } else {
-                                    match field(&value, b"intValue") {
-                                        Ok(n) => compare(
-                                            string(n)?.parse().map_err(|_| Error::Invalid)?,
-                                            wanted.parse().map_err(|_| Error::Invalid)?,
-                                            op,
-                                        ),
-                                        Err(_) => false,
-                                    }
-                                };
+                                let matched = attribute_matches(
+                                    raw,
+                                    scope.ends_with(".string"),
+                                    op,
+                                    wanted,
+                                    regex.as_ref(),
+                                )?;
                                 (matched, (collect && matched).then(|| raw.to_vec()))
                             }
                         }
@@ -215,6 +222,38 @@ impl Expression {
             matched: stack.pop().ok_or(Error::Invalid)?,
             attributes: attrs,
         })
+    }
+}
+fn attribute_matches(
+    raw: &[u8],
+    string_type: bool,
+    op: &str,
+    wanted: &str,
+    regex: Option<&regex::Regex>,
+) -> Res<bool> {
+    let value = object(raw)?;
+    if string_type {
+        match field(&value, b"stringValue") {
+            Ok(text) => {
+                let text = string(text)?;
+                let positive = regex.map_or(text == wanted, |r| r.is_match(&text));
+                Ok(if op == "!=" || op == "!~" {
+                    !positive
+                } else {
+                    positive
+                })
+            }
+            Err(_) => Ok(false),
+        }
+    } else {
+        match field(&value, b"intValue") {
+            Ok(n) => Ok(compare(
+                string(n)?.parse().map_err(|_| Error::Invalid)?,
+                wanted.parse().map_err(|_| Error::Invalid)?,
+                op,
+            )),
+            Err(_) => Ok(false),
+        }
     }
 }
 pub(crate) fn attributes(raw: &[u8]) -> Res<BTreeMap<String, &[u8]>> {

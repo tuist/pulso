@@ -93,7 +93,7 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {2, 1, 3, 4, 12},
+    if version != {2, 1, 3, 5, 12},
       do:
         raise(
           "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"

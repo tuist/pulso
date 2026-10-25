@@ -93,6 +93,19 @@ defmodule Pulso.RemoteWrite.Push do
   defp expand_series({labels, samples, series_id, histograms, exemplars})
        when is_map(labels) and is_list(samples) and is_integer(series_id) do
     floats = Enum.map(samples, &expand_sample(&1, labels, series_id, :value))
+
+    # Remote write appends floats before histograms. A same-request float at
+    # the same series/time wins, rather than storing both and letting query
+    # conflict resolution replace it with the histogram. Admission and native
+    # validation have already charged every supplied point, including losers.
+    histograms =
+      if samples == [] or histograms == [] do
+        histograms
+      else
+        float_times = MapSet.new(samples, &elem(&1, 0))
+        Enum.reject(histograms, &MapSet.member?(float_times, elem(&1, 0)))
+      end
+
     natives = Enum.map(histograms, &expand_sample(&1, labels, series_id, :histogram))
 
     case floats ++ natives do

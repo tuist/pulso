@@ -109,7 +109,7 @@ pub(crate) fn predicates(input: Vec<(String, String, String, String)>) -> Res<Ve
 }
 #[rustler::nif]
 fn tempo_search_api_version() -> u32 {
-    4
+    5
 }
 #[rustler::nif(schedule = "DirtyCpu")]
 fn tempo_search_new<'a>(

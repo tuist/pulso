@@ -56,6 +56,48 @@ defmodule Pulso.Traces.SearchExpressionTest do
     end
   end
 
+  test "public Parquet engine unscoped search preserves span precedence, original types and both sampled owners" do
+    dir = Path.expand("../../fixtures/traces/tempo_integration", __DIR__)
+    input = File.read!(Path.join(dir, "search-input.protobuf"))
+    oracle = File.read!(Path.join(dir, "search-oracle.json"))
+    assert sha(input) == "dec8004d8460e2f487c50af8093acb71e2eebfcbad84a93b921ebe269d184ea0"
+    assert sha(oracle) == "3b655f0433d4a93634098e89286a9c5c6db55e8ae8a6bda10e1ceb7d5d98c602"
+
+    assert sha(File.read!(Path.join(dir, "produce_search.go.txt"))) ==
+             "fac8fd302ae2e1085c2c98ac2270a259f64a1dcfbe86818c213e1ee2faba64cd"
+
+    assert {:ok, rows, 0} = Traces.decode_protobuf(input)
+    cases = Pulso.JSON.decode!(oracle)
+    assert length(cases) == 16
+    assert length(rows) == 6
+    Pulso.Runtime.put_env(:pulso, Storage, adapter: StringOnlyTempoSearchStorage)
+    Pulso.Runtime.put_env(:pulso, TempoSearch, enabled: true)
+    assert :ok = Storage.append(:traces, "unscoped", rows)
+
+    for c <- cases do
+      opts = Keyword.merge(@opts, trace_start: c["Start"] * 1_000_000_000, trace_end: c["End"] * 1_000_000_000)
+      assert {:ok, {:expression, program} = expression} = TempoSearch.parse(c["query"])
+      assert {:ok, actual} = native(rows, program, opts)
+      assert {:ok, reference} = TempoSearch.json(rows, expression, opts)
+      assert {:ok, stored} = TempoSearch.query("unscoped", c["query"], opts)
+      assert normalize(Pulso.JSON.decode!(actual)) === normalize(c["response"]), c["query"]
+      assert normalize(Pulso.JSON.decode!(reference)) === normalize(c["response"]), c["query"]
+      assert normalize(Pulso.JSON.decode!(stored)) === normalize(c["response"]), c["query"]
+
+      if c["Start"] > 0 do
+        args = %{
+          "tenant" => "unscoped",
+          "query" => c["query"],
+          "start_ts_ns" => opts[:trace_start],
+          "end_ts_ns" => opts[:trace_end]
+        }
+
+        assert {:ok, [%{"text" => json}]} = Tools.call("search_trace_metadata", args)
+        assert normalize(Pulso.JSON.decode!(json)) === normalize(c["response"]), c["query"]
+      end
+    end
+  end
+
   test "storage and MCP evaluate expressions without sending them to legacy string callbacks" do
     {rows, cases} = fixture()
     Pulso.Runtime.put_env(:pulso, Storage, adapter: StringOnlyTempoSearchStorage)

@@ -109,7 +109,7 @@ defmodule PulsoWeb.RemoteWriteController do
         conn |> put_status(:bad_request) |> json(%{error: "invalid_snappy"})
 
       {:error, :invalid_protobuf} ->
-        conn |> put_status(:bad_request) |> json(%{error: "invalid_protobuf"})
+        conn |> put_written_headers(version, []) |> put_status(:bad_request) |> json(%{error: "invalid_protobuf"})
 
       {:error, :payload_too_large} ->
         conn |> put_status(:request_entity_too_large) |> json(%{error: "payload_too_large"})

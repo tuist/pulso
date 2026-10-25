@@ -4,7 +4,7 @@ defmodule Pulso.Traces.SearchExpression do
   alias Pulso.Codec.NIF
 
   @word ~r/\A[A-Za-z0-9_.:µ-]+/u
-  @attribute ~r/\A(resource|span)\.([A-Za-z_][A-Za-z0-9_.-]*)\z/
+  @attribute ~r/\A(resource|span)?\.([A-Za-z_][A-Za-z0-9_.-]*)\z/
   @hint ~r/\Awith\s*\(\s*most_recent\s*=\s*true\s*\)\s*\z/
   @comparisons ~w(= != < <= > >=)
   @max_int 9_223_372_036_854_775_807
@@ -95,7 +95,7 @@ defmodule Pulso.Traces.SearchExpression do
 
   defp predicate(field, op, {:string, value}) when op in ["=", "!=", "=~", "!~"] do
     case Regex.run(@attribute, field) do
-      [_, scope, key] -> {:ok, {scope <> ".string", key, op, value}}
+      [_, scope, key] -> {:ok, {if(scope == "", do: "none", else: scope) <> ".string", key, op, value}}
       _ -> {:error, :unsupported_trace_selector}
     end
   end
@@ -118,7 +118,7 @@ defmodule Pulso.Traces.SearchExpression do
   defp numeric_predicate(field, op, value) do
     with [_, scope, key] <- Regex.run(@attribute, field),
          {number, ""} when number >= -@max_int - 1 and number <= @max_int <- Integer.parse(value) do
-      {:ok, {scope <> ".int", key, op, Integer.to_string(number)}}
+      {:ok, {if(scope == "", do: "none", else: scope) <> ".int", key, op, Integer.to_string(number)}}
     else
       _ -> {:error, :unsupported_trace_selector}
     end
@@ -217,14 +217,14 @@ defmodule Pulso.Traces.SearchExpression do
   defp stack_size([{"boolean", _, _, _} | _], _), do: -1
   defp stack_size([_ | rest], size), do: stack_size(rest, size + 1)
 
-  defp valid_leaf?({scope, key, op, value}) when scope in ["resource.string", "span.string"] do
+  defp valid_leaf?({scope, key, op, value}) when scope in ["resource.string", "span.string", "none.string"] do
     byte_size(key) in 1..256 and byte_size(value) <= 4096 and
       (op in ["=", "!="] or
          (op in ["=~", "!~"] and byte_size(value) <= 1024 and
             NIF.validate_metric_regex(value) == :ok and NIF.validate_metric_regex("(?s:\\A(?:#{value})\\z)") == :ok))
   end
 
-  defp valid_leaf?({scope, key, op, value}) when scope in ["resource.int", "span.int", "intrinsic"] do
+  defp valid_leaf?({scope, key, op, value}) when scope in ["resource.int", "span.int", "none.int", "intrinsic"] do
     byte_size(key) in 1..256 and byte_size(value) <= 20 and op in @comparisons and valid_integer?(scope, key, op, value)
   end
 

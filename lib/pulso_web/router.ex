@@ -18,8 +18,8 @@ defmodule PulsoWeb.Router do
     # OTLP responses mirror JSON/protobuf rather than applying JSON Accept negotiation.
     get "/api/search/tags", TempoController, :tags
     get "/api/v2/search/tags", TempoController, :tags_v2
-    get "/api/search/tag/:tag_name/values", TempoController, :tag_values
-    get "/api/v2/search/tag/:tag_name/values", TempoController, :tag_values_v2
+    get "/api/search/tag/*tag_path", TempoController, :tag_values
+    get "/api/v2/search/tag/*tag_path", TempoController, :tag_values_v2
     get "/api/search", TempoController, :search
     get "/api/metrics/query_range", TempoController, :metrics_query_range
     get "/api/metrics/query", TempoController, :metrics_query

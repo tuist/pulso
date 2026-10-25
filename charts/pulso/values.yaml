@@ -68,13 +68,15 @@ metricsCompaction:
 # unknown/legacy sources still read. Metadata/page/heap limits can bind before the
 # hard 8192-ref catalog maximum. Actual GETs keep 1024-input/32MiB/1M-row bounds;
 # small windows do not clip context, late fallback can exhaust budgets, and unread
-# irrelevant objects are not scrubbed. Search capability4/discovery12 artifacts
-# (tuple 2,1,3,4,12) are required on all serving instances; opt in only after capacity
+# irrelevant objects are not scrubbed. Search capability5/discovery12 artifacts
+# (tuple 2,1,3,5,12) are required on all serving instances; opt in only after capacity
 # validation. No representative postings/client/deployment acceptance claim.
 # Bounded same-span negated regex/status/int64 OR/span-duration search expressions
 # bypass service/ID planning; full-scope limits remain plus 20M prefilter owner/attr/
 # instruction work units per attempt in candidate/context passes. Equal-precedence
-# AND/OR group left-to-right. See docs/trace-query-expressions.md; discovery and
+# AND/OR group left-to-right. Unscoped keys use span-first presence precedence.
+# Omitted or paired-zero HTTP bounds scan all retained context under these limits;
+# partial windows reject. See docs/trace-query-expressions.md; discovery and
 # window-local search retain narrower grammar.
 # Also enables resource/span/instrumentation/event/link discovery (1M raw rows,
 # 2M owner-plus-attribute work per attempt before filtering, 5000 entries/1MiB).

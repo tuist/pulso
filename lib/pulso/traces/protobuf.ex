@@ -29,7 +29,7 @@ defmodule Pulso.Traces.Protobuf do
     ],
     service_entry: [{1, "key", :string}, {2, "value", {:message, :service_stats}}],
     service_stats: [{1, "spanCount", :uint}, {2, "errorCount", :uint}],
-    response: [{1, "trace", {:message, :export}}],
+    response: [{1, "trace", {:message, :export}}, {3, "status", :enum}, {4, "message", :string}],
     export: [{1, "batches", {:messages, :resource_spans}}],
     resource_spans: [
       {1, "resource", {:message, :resource}},
@@ -99,7 +99,9 @@ defmodule Pulso.Traces.Protobuf do
     "SPAN_KIND_CONSUMER" => 5,
     "STATUS_CODE_UNSET" => 0,
     "STATUS_CODE_OK" => 1,
-    "STATUS_CODE_ERROR" => 2
+    "STATUS_CODE_ERROR" => 2,
+    "COMPLETE" => 0,
+    "PARTIAL" => 1
   }
 
   def encode(trace, schema \\ :export), do: trace |> message(schema) |> IO.iodata_to_binary()
@@ -118,6 +120,14 @@ defmodule Pulso.Traces.Protobuf do
       values
       |> Enum.sort()
       |> Enum.map(fn {key, value} -> field(number, {:message, schema}, %{"key" => key, "value" => value}, false) end)
+
+  defp field(number, {:messages, :span}, values, _oneof) do
+    # A span is the retained encoding unit: release its nested event/attribute
+    # iodata before building the next span, without copying each small child.
+    Enum.map(values, fn value ->
+      number |> field({:message, :span}, value, false) |> IO.iodata_to_binary()
+    end)
+  end
 
   defp field(number, {:messages, schema}, values, _oneof),
     do: Enum.map(values, &field(number, {:message, schema}, &1, false))

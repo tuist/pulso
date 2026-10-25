@@ -14,7 +14,7 @@ defmodule Pulso.Traces.SearchExpression.Evaluator do
     {scope, key, op, regex}
   end
 
-  defp prepare_leaf({scope, key, op, value}) when scope in ["resource.int", "span.int", "intrinsic"],
+  defp prepare_leaf({scope, key, op, value}) when scope in ["resource.int", "span.int", "none.int", "intrinsic"],
     do: {scope, key, op, String.to_integer(value)}
 
   defp prepare_leaf(leaf), do: leaf
@@ -35,6 +35,23 @@ defmodule Pulso.Traces.SearchExpression.Evaluator do
 
   defp instruction({"boolean", "", op, ""}, {[rhs, lhs | tail], selected}, _, _, _),
     do: {[if(op == "&&", do: lhs and rhs, else: lhs or rhs) | tail], selected}
+
+  defp instruction({"none." <> type, key, op, wanted}, {stack, selected}, span, resource, attrs) do
+    # Presence, not a successful typed comparison, selects the winning owner.
+    owner = if Map.has_key?(attrs, key), do: "span", else: "resource"
+    {actual, _, _} = actual(owner <> "." <> type, key, span, resource, attrs)
+    matched = match_value(actual, op, wanted)
+
+    # Tempo samples independently matching values from both requested owners,
+    # even when this leaf is false and another OR branch selects the span.
+    selected =
+      Enum.reduce(["resource", "span"], selected, fn owner, acc ->
+        {actual, value, _} = actual(owner <> "." <> type, key, span, resource, attrs)
+        if match_value(actual, op, wanted), do: Map.put(acc, {key, owner}, value), else: acc
+      end)
+
+    {[matched | stack], selected}
+  end
 
   defp instruction({scope, key, op, wanted}, {stack, selected}, span, resource, attrs) do
     {actual, value, owner} = actual(scope, key, span, resource, attrs)

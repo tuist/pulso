@@ -8,36 +8,49 @@ defmodule Pulso.Traces.Tempo do
   alias Pulso.Storage
   alias Pulso.Traces.Protobuf
   alias Pulso.Traces.Search
+  alias Pulso.Traces.TempoFilter
 
   @limit 16_777_216
   @kinds ~w(SPAN_KIND_UNSPECIFIED SPAN_KIND_INTERNAL SPAN_KIND_SERVER SPAN_KIND_CLIENT SPAN_KIND_PRODUCER SPAN_KIND_CONSUMER)
   @codes ~w(STATUS_CODE_UNSET STATUS_CODE_OK STATUS_CODE_ERROR)
+  @filtered_message "Trace filtered, only a subset of spans matching the filter is returned"
 
-  def lookup(tenant, trace_id, format) do
+  defguardp uint32?(value) when is_integer(value) and value >= 0 and value <= 4_294_967_295
+  defguardp timestamp?(value) when is_integer(value) and value >= 0 and value <= 9_223_372_036_854_775_807
+
+  def lookup(tenant, trace_id, format, filter \\ nil) do
     QueryRunner.run(tenant, :raw, fn deadline ->
-      with {:ok, assembly} <- Storage.get_trace_json(tenant, trace_id, QueryRunner.storage_opts(deadline)),
-           do: export(assembly, format)
+      with {:ok, assembly} <- Storage.get_trace_json(tenant, trace_id, QueryRunner.storage_opts(deadline)) do
+        export(assembly, format, filter)
+      end
     end)
   end
 
-  def export(assembly, format) do
+  def export(assembly, format, filter \\ nil)
+
+  def export(assembly, format, nil) do
     case NIF.tempo_trace_export(assembly, format) do
       :fallback -> reference(assembly, format)
       result -> result
     end
   end
 
+  def export(assembly, format, filter), do: reference(assembly, format, filter)
+
   @doc false
-  def reference(assembly, format) when byte_size(assembly) <= @limit do
+  def reference(assembly, format, filter \\ nil)
+
+  def reference(assembly, format, filter) when byte_size(assembly) <= @limit do
     with {:ok, data} <- decode_assembly(assembly),
          :ok <- coverage(data["coverage"]),
          spans when is_list(spans) <- data["spans"],
          :ok <- span_count(spans),
          :ok <- same_trace(spans, data["trace_id"]),
          {:ok, spans} <- unique(spans),
+         {:ok, spans, partial?} <- TempoFilter.apply(spans, filter),
          {:ok, groups} <- groups(spans),
          trace = %{"batches" => Enum.map(groups, &resource/1)},
-         {:ok, body} <- encode(trace, format),
+         {:ok, body} <- encode_filtered(trace, format, partial?),
          true <- byte_size(body) <= @limit do
       {:ok, body}
     else
@@ -49,7 +62,7 @@ defmodule Pulso.Traces.Tempo do
     _ -> {:error, :invalid_trace_export}
   end
 
-  def reference(_assembly, _format), do: {:error, :query_resource_limit}
+  def reference(_assembly, _format, _filter), do: {:error, :query_resource_limit}
 
   defp decode_assembly(assembly) do
     case Pulso.JSON.decode(assembly) do
@@ -66,6 +79,16 @@ defmodule Pulso.Traces.Tempo do
 
   defp same_trace(spans, id) do
     if Enum.all?(spans, &(&1["trace_id"] == id)), do: :ok, else: {:error, :invalid_trace_export}
+  end
+
+  defp encode_filtered(trace, format, false), do: encode(trace, format)
+
+  defp encode_filtered(trace, "protobuf_v2", true),
+    do: {:ok, Protobuf.encode(%{"trace" => trace, "status" => "PARTIAL", "message" => @filtered_message}, :response)}
+
+  defp encode_filtered(%{"batches" => batches}, "json_v2", true) do
+    trace = if batches == [], do: %{}, else: %{"resourceSpans" => batches}
+    {:ok, Pulso.JSON.encode!(%{"trace" => trace, "status" => "PARTIAL", "message" => @filtered_message})}
   end
 
   defp encode(trace, "json"), do: {:ok, Pulso.JSON.encode!(trace)}
@@ -120,8 +143,36 @@ defmodule Pulso.Traces.Tempo do
     span = Span.from_map(map)
 
     match?({:ok, _}, Traces.id(span.trace_id, 32)) and match?({:ok, _}, Traces.id(span.span_id, 16)) and
-      span.kind in 0..5 and span.status["code"] in 0..2 and Search.validate_metadata(span) == :ok
+      span.kind in 0..5 and span.status["code"] in 0..2 and Search.validate_metadata(span) == :ok and
+      valid_core?(span)
   end
+
+  # Validate every stored owner, including nonmatches, without allocating export
+  # maps, decimal timestamps or base64 IDs. Only selected spans are converted.
+  defp valid_core?(span) do
+    optional_id?(span.parent_span_id, 16) and is_binary(span.name) and is_binary(span.trace_state) and
+      uint32?(span.flags) and uint32?(span.dropped_attributes_count) and uint32?(span.dropped_events_count) and
+      uint32?(span.dropped_links_count) and is_binary(span.status["message"]) and valid_owner_fields?(span)
+  end
+
+  defp valid_owner_fields?(span) do
+    uint32?(span.resource_dropped_attributes_count) and is_binary(span.resource_schema_url) and
+      is_binary(span.scope["name"]) and is_binary(span.scope["version"]) and
+      uint32?(span.scope["dropped_attributes_count"]) and is_binary(span.scope_schema_url) and
+      Enum.all?(span.events, &valid_event?/1) and Enum.all?(span.links, &valid_link?/1)
+  end
+
+  defp valid_event?(event) do
+    timestamp?(event["timestamp_ns"]) and is_binary(event["name"]) and uint32?(event["dropped_attributes_count"])
+  end
+
+  defp valid_link?(link) do
+    optional_id?(link["trace_id"], 32) and optional_id?(link["span_id"], 16) and is_binary(link["trace_state"]) and
+      uint32?(link["flags"]) and uint32?(link["dropped_attributes_count"])
+  end
+
+  defp optional_id?(nil, _width), do: true
+  defp optional_id?(value, width), do: match?({:ok, _}, Traces.id(value, width))
 
   defp groups(spans) do
     spans
@@ -237,11 +288,9 @@ defmodule Pulso.Traces.Tempo do
   defp number(map, key, value, quoted \\ false)
   defp number(map, _key, 0, _quoted), do: map
 
-  defp number(map, key, value, true) when is_integer(value) and value > 0 and value <= 9_223_372_036_854_775_807,
-    do: Map.put(map, key, Integer.to_string(value))
+  defp number(map, key, value, true) when timestamp?(value), do: Map.put(map, key, Integer.to_string(value))
 
-  defp number(map, key, value, false) when is_integer(value) and value > 0 and value <= 4_294_967_295,
-    do: Map.put(map, key, value)
+  defp number(map, key, value, false) when uint32?(value), do: Map.put(map, key, value)
 
   defp enum(map, _key, 0, _values), do: map
   defp enum(map, key, value, values), do: Map.put(map, key, Enum.fetch!(values, value))

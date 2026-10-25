@@ -46,7 +46,7 @@ this does not implement non-finite arithmetic. Retained-context search separatel
 Pause trace ingress, drain in-flight/keyed retries, and upgrade **all trace
 readers, writers, compactors and serving application/native pairs** sharing the
 bucket before resuming writers. This is not a rolling mixed-artifact guarantee. Required
-trace tuple: `{2,1,3,4,12}` (metadata, span search, Tempo export, retained-context
+trace tuple: `{2,1,3,5,12}` (metadata, span search, Tempo export, retained-context
 search, discovery). The envelope is still version 1; physical columns and ordinary
 finite records with string service names are unchanged. Old readers/compactors
 reject these new values. Startup checks cannot fence another serving pool.

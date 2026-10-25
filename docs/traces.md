@@ -227,7 +227,7 @@ remain unsupported.
 
 ## Typed-metadata upgrade boundary
 
-Current required native trace tuple is `{2,1,3,4,12}`. Before accepting non-finite
+Current required native trace tuple is `{2,1,3,5,12}`. Before accepting non-finite
 values, upgrade all participants; old readers/compactors reject them. NaN
 normalizes by class, not payload bits. Service promotion now requires original
 `stringValue`, also removing prior byte-service promotion; drain those keyed
@@ -278,9 +278,13 @@ operators, pipelines, variable expansion and streaming endpoints remain unsuppor
 Separate [tag discovery](#experimental-scoped-tag-discovery) is available behind
 the same default-off gate and retains its narrower parent-string grammar.
 
-HTTP accepts only `q`, required positive decimal `start` and `end` (uint32 Unix
-**seconds**, start ≤ end), `limit` (1–1000, default 100), and `spss` (sampled
-spans per spanset, 1–100, default 3). Tenant/auth rules match trace lookup.
+HTTP accepts only `q`, paired decimal `start` and `end` (uint32 Unix
+**seconds**, positive start ≤ end), `limit` (1–1000, default 100), and `spss`
+(sampled spans per spanset, 1–100, default 3). Omit both time bounds or supply
+`start=0&end=0` to search all retained context under the same admission and scan
+ceilings. This differs from Tempo's ingester-only default routing: Pulso has no
+separate ingester data tier. Partial or mixed-zero windows still reject.
+Tenant/auth rules match trace lookup.
 Both JSON and exact `Accept: application/protobuf` responses are supported.
 MCP requires positive `start_ts_ns`/`end_ts_ns`, `tenant` and `query`, with the
 same optional `limit` and `spss`. HTTP endpoints become exact nanosecond
@@ -381,7 +385,7 @@ Record-based reference adapters have no source indexes or native compressed-inpu
 owner caps. Dirty native work can outlive deadlines; exceptions/panics rely on
 resource cleanup and lock contention remains a generic resource error.
 
-Require complete-context search capability **4**, current tuple **`{2,1,3,4,12}`**, on
+Require complete-context search capability **5**, current tuple **`{2,1,3,5,12}`**, on
 all serving application/native artifacts before use; discovery capability is
 **12**. Startup verifies only local artifacts, not other running nodes. Smaller
 windows/result limits do not themselves reduce retained context. Broad, legacy,
@@ -425,8 +429,22 @@ separate static intrinsic vocabulary described below:
 |---|---|---|
 | `/api/search/tags` | Optional `scope` (omitted/empty/`none` combines scopes) | `tagNames` string list |
 | `/api/v2/search/tags` | Optional `scope` (omitted/empty/`none` combines scopes) | `scopes` with `name` and `tags` |
-| `/api/search/tag/<scope.key>/values` | Explicit `<scope>.<key>` or unscoped `.<key>` | `tagValues` string list |
+| `/api/search/tag/<target>/values` | Bare original key (e.g. `service.name`), explicit `<scope>.<key>` or unscoped `.<key>` | `tagValues` string list |
 | `/api/v2/search/tag/<scope.key>/values` | Explicit `<scope>.<key>` or unscoped `.<key>` | Typed `tagValues` with `type` and `value` |
+
+V1 bare keys search the same three original owners as unscoped values below.
+Existing canonical scoped and intrinsic targets retain precedence, so this is
+not full legacy-v1 alias/collision parity. V2 still requires a scoped/unscoped
+attribute identifier or one of the supported intrinsic names.
+
+Attribute targets accept JSON-compatible double-quoted keys, for example
+`span."http route"` or `resource."attr=equals"`. URL-encode the target when
+building requests. Slashes inside keys work both as `%2F` and as literal path
+separators; only the final `/values` is the route suffix. Percent sequences are
+URL-decoded once, so a literal `%20` in a key must travel as `%2520`. Invalid
+quotes/escapes and keys beyond 256 decoded UTF-8 bytes reject with `400` rather
+than returning an empty dictionary. This identifier support does not expand
+the separate supported filter grammar.
 
 Supported explicit scopes are **resource, span, instrumentation, event and link**.
 Each searches only original attributes of that owner: instrumentation does not
@@ -579,7 +597,7 @@ metadata always fails. Empty matches return an empty list only after the admitte
 scan completes. Source routing/windows and raw provider/footer bounds are unchanged;
 this does not use metadata search's service/ID optimizer.
 
-Require discovery capability **12**, tuple **`{2,1,3,4,12}`**, across all serving apps
+Require discovery capability **12**, tuple **`{2,1,3,5,12}`**, across all serving apps
 and native artifacts. Non-window adapters need explicit query-aware unscoped
 execution or a bounded reference scan; old unfiltered callbacks cannot receive
 queries. Windowed filtered-unscoped execution requires separate explicit support,
@@ -682,8 +700,8 @@ provider capacity, migration or cutover acceptance. An additional 68 actual
 Parquet/engine cases cover all five scopes, shared keys with different owners,
 multiple events/links under one parent, typed extremes/empty values and parent
 filters. Actual public protobuf decoders also consumed all 68 current results.
-Install matching native artifacts: discovery capability is now **9** (startup
-tuple `{2,1,3,4,12}`); no physical column changes are introduced. Upgrade/drain every
+Install matching native artifacts: discovery capability is **12** (startup
+tuple `{2,1,3,5,12}`); no physical column changes are introduced. Upgrade/drain every
 instance serving discovery before clients use event-time/filtered-unscoped/time-windowed/float/stored-intrinsic values through a shared pool.
 Startup only checks the local artifact; it does not fence older running nodes.
 
@@ -755,7 +773,7 @@ support**; they never pass through that older generic callback. Non-window callb
 support does not establish window support. Flat-record/old adapters reject rather
 than ignore time or invent segment boundaries. There is no storage-format or
 mutable coordination change. Upgrade/drain **every** serving app/native participant
-to capability **12**, tuple **`{2,1,3,4,12}`**, before use.
+to capability **12**, tuple **`{2,1,3,5,12}`**, before use.
 
 ### Stored intrinsic string values
 
@@ -851,7 +869,7 @@ because windows include whole sources and compaction can broaden them. Filters
 reduce returned values but **not** requested-owner work or provider/header costs.
 Inspect the tagged reason: dictionary/row/work exhaustion is not stored corruption.
 
-Requires current discovery **12**, tuple **`{2,1,3,4,12}`**, on every serving app/native
+Requires current discovery **12**, tuple **`{2,1,3,5,12}`**, on every serving app/native
 participant. Explicit event-time execution or a bounded reference is required;
 old stored-string callbacks cannot receive the new target. Windowed event-time
 execution needs separate explicit support and cannot use an old generic window
@@ -933,7 +951,7 @@ The global **2M work / 5000 values / independent 1 MiB dictionary and encoded-re
 limits still reject whole requests. Filters do not evade prefilter work or raw I/O.
 No native bound is a node/deployment-wide capacity guarantee.
 
-Requires current discovery **12**, tuple **`{2,1,3,4,12}`**, across every serving
+Requires current discovery **12**, tuple **`{2,1,3,5,12}`**, across every serving
 app/native participant. New explicit root execution or bounded complete reference
 is required; windowed roots need dedicated window-aware support with source
 boundaries. Old span-local string or generic window callbacks never receive
@@ -1000,7 +1018,7 @@ and narrow source windows can help without a guarantee, and do not avoid raw
 provider/header costs or prefilter work. Compaction can broaden candidate sources.
 This is not representative indexed capacity or transparent production autocomplete.
 
-Current discovery **12**, tuple **`{2,1,3,4,12}`**, is required across every serving
+Current discovery **12**, tuple **`{2,1,3,5,12}`**, is required across every serving
 app/native participant. New explicit trace-duration execution or a bounded complete
 sentinel reference is required; windows need dedicated support preserving source
 boundaries. Old root/string/generic-window callbacks never receive this mode.
@@ -1060,7 +1078,7 @@ without backend clients established the seven v2 static shortcuts and public
 protobuf decoders consumed all eight name/value responses. This is not a running
 Grafana/Tempo deployment acceptance result. Upgrade every instance serving
 discovery before clients use the new mode in a shared pool. Matching native
-artifacts require tuple `{2,1,3,4,12}`; static vocabulary itself does not alter
+artifacts require tuple `{2,1,3,5,12}`; static vocabulary itself does not alter
 native or storage formats. Startup does not fence older application nodes.
 
 ### Tempo v1 trace lookup
@@ -1110,11 +1128,50 @@ curl -H 'Authorization: Bearer <token>' -H 'X-Scope-OrgID: example' \
 order. They are routing hints in this lookup contract, not span filters: Pulso
 always reads all visible stored spans for that ID, including outside those
 hints. Only `mode=all` (default) and `allowPartialTrace=false` (default) are
-accepted. Ingesters/backends-only modes, block UUID selectors, partial output
+accepted. Ingesters/backends-only modes, block UUID selectors, error-truncated output
 and unknown query parameters reject rather than approximate another backend.
 Exact `Accept: application/protobuf` selects protobuf; JSON/no Accept/`*/*`
 selects JSON. Unsupported media types return 406; protobuf quality/list variants
 are not yet negotiated like a general-purpose HTTP server.
+
+V2 additionally accepts an explicit same-span `q` filter using the documented
+[bounded expression grammar](trace-query-expressions.md): original resource/span
+strings and int64s, status, own-span duration and boolean groups. An unscoped
+key uses span-over-resource presence precedence. Structural/spanset operations
+remain unsupported. An omitted/blank `q` ignores filtering options; `{}` matches
+every span. Filters do not change time-hint semantics or reduce storage reads.
+
+- `match_depth` includes descendants of each match: default `0`, `-1` unbounded,
+  or a nonnegative signed-int64 hop count.
+- `keep_hierarchy=true` includes ancestors: `ancestor_depth` defaults to `-1`,
+  or accepts the same hop counts. Without hierarchy, this parameter is ignored,
+  even if malformed. Ancestor and descendant expansion start independently at
+  matches; including an ancestor never pulls in its other children.
+- If filtering removes any unique stored span, HTTP 200 carries `status: PARTIAL`
+  and a message identifying the explicit subset. No matches produce an empty
+  trace with `PARTIAL`, not 404. Selecting the whole trace retains the protocol's
+  omitted/default `COMPLETE`. V1 does not accept these filter parameters.
+
+The complete trace is loaded, deduplicated and validated **before filtering**:
+nonmatching legacy/conflicting copies still return 409, and malformed stored
+owners, spans, events or links still return 500. Incomplete reads and exhausted
+budgets never become a partial success. Filtering expands the bounded assembly
+into the supervised task's BEAM heap, unlike native unfiltered export. All stored
+fields undergo type, range and ID validation before selection, but only selected
+spans become export maps and encoded timestamps/IDs. There is no discarded full
+conversion pass or second whole-trace response binary. Protobuf encoding packs
+each span individually instead of retaining every span's complete nested
+intermediate tree until the response is finished. Account for the memory and
+CPU of decoding and validating the complete assembly even for empty results.
+Expression evaluation charges all spans under the existing 20-million-work
+ceiling. Each directional graph walk visits each ID/edge at most once, tolerates
+cycles and never invents missing parents.
+The 5,000-stored-span and 16 MiB assembly/key/result bounds remain; a small
+selection cannot make an over-budget trace readable. The HTTP request-line
+ceiling may reject a large URL with 414 before query parsing returns 400.
+Upgrade all query-serving applications before clients rely on filtering under
+non-sticky routing; older applications reject these parameters. Filtering
+itself changes no stored bytes or native capability requirement.
 
 Lookup uses the same admitted, supervised all-stored assembly as `get_trace`:
 maximum 5,000 stored spans, independent 16 MiB payload/key/result budgets, shared
@@ -1129,7 +1186,8 @@ negative lookups and native-plan fallback work when sizing query/provider capaci
 
 - **200:** every visible stored span can be represented faithfully. Exactly
   identical known copies under one span ID are deduplicated in this compatibility
-  response only. `get_trace` still preserves all duplicate rows and diagnoses them.
+  response only. V2 can then return an explicitly filtered subset as above.
+  `get_trace` still preserves all duplicate rows and diagnoses them.
 - **404:** successful complete stored lookup found no span at the retention floor.
 - **409 `trace_metadata_unknown`:** any legacy/nil copy prevents faithful export,
   even alongside a projection-identical rich copy. Compaction cannot infer types.
@@ -1145,8 +1203,8 @@ negative lookups and native-plan fallback work when sizing query/provider capaci
 - **500/503:** malformed stored export data/internal failure versus unavailable
   storage authority/provider. Neither returns a clipped success.
 
-`X-Pulso-Trace-Coverage` states all visible stored spans and unknown exporter
-completeness. Retention can remove early spans/roots; this header does not claim
+`X-Pulso-Trace-Coverage` states all visible stored spans, or an explicit filtered
+subset, and unknown exporter completeness. Retention can remove early spans/roots; this header does not claim
 an exporter-complete or pre-retention trace. These lookup APIs are not Tempo search/tag compatibility,
 full shared-span-ID handling, Grafana datasource validation or production readiness.
 Lookup always emits a status message, including empty `{}` / zero-length protobuf
@@ -1157,9 +1215,9 @@ wire. The client conversion itself is not lossless: this Grafana version renders
 bytes as empty string, projects nanosecond times to float milliseconds and exposes
 large int64s to downstream JavaScript-number limitations. Keep Pulso metadata/wire
 as the fidelity boundary rather than treating a frame as an original OTLP record.
-Install matching native artifacts: export capability remains 2 and complete-context
-search is now 4 (metadata 2/export 3/discovery 12), tuple `{2,1,3,4,12}`. Startup checks reject the previous bindings; storage formats
-are unchanged by these two ABI changes. Upgrade or drain **every node serving
+Install matching native artifacts: complete-context search capability is now 5
+(metadata 2/export 3/discovery 12), tuple `{2,1,3,5,12}`. Startup checks reject
+previous bindings; unscoped search adds no storage-format change. Upgrade or drain **every node serving
 Tempo endpoints** before pointing Grafana at the pool: a rolling mix with the
 previous exporter can still omit default status and intermittently crash client
 conversion. Startup checks only the local artifact; they cannot fence old nodes.

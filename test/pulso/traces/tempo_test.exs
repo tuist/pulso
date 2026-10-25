@@ -7,6 +7,7 @@ defmodule Pulso.Traces.TempoTest do
   alias Pulso.Record.SpanKey
   alias Pulso.Test.OTLPTraceFixture, as: Fixture
   alias Pulso.Traces.{Assembly, Tempo}
+  alias Pulso.Traces.TempoFilter
 
   defp official do
     wire = File.read!(Path.expand("../../fixtures/otlp/protoc-trace-values.protobuf", __DIR__))
@@ -122,6 +123,8 @@ defmodule Pulso.Traces.TempoTest do
     assert byte_size(excessive) < 16_777_216
     assert {:error, :query_resource_limit} = NIF.tempo_trace_export(excessive, "protobuf_v2")
     assert {:error, :query_resource_limit} = Tempo.reference(excessive, "protobuf_v2")
+    assert {:ok, filter} = TempoFilter.parse(%{"q" => ~s({ span.missing = "no match" })})
+    assert {:error, :query_resource_limit} = Tempo.reference(excessive, "protobuf_v2", filter)
 
     for invalid <- [
           "not json",
@@ -130,6 +133,72 @@ defmodule Pulso.Traces.TempoTest do
           data |> Map.put("trace_id", String.duplicate("f", 32)) |> Pulso.JSON.encode!()
         ] do
       assert {:error, :invalid_trace_export} = Tempo.export(invalid, "json")
+    end
+  end
+
+  test "filtering cannot hide invalid export fields on a nonmatching span or its owners" do
+    assert {:ok, [span], 0} = Traces.decode(Fixture.payload())
+    assert {:ok, assembly} = Assembly.json([span], span.trace_id)
+    data = Pulso.JSON.decode!(assembly)
+
+    nonmatch =
+      hd(data["spans"])
+      |> Map.put("span_id", "0000000000000002")
+      |> Map.put("attributes", %{})
+      |> put_in(["otlp", "attributes"], [])
+
+    filters =
+      for value <- ["api", "absent"] do
+        assert {:ok, filter} = TempoFilter.parse(%{"q" => ~s({ span.request_kind = "#{value}" })})
+        filter
+      end
+
+    boundary =
+      nonmatch
+      |> put_in(["events", Access.at(0), "timestamp_ns"], 9_223_372_036_854_775_807)
+      |> put_in(["links", Access.at(0), "flags"], 4_294_967_295)
+      |> Map.put("resource_dropped_attributes_count", 4_294_967_295)
+
+    valid = data |> Map.update!("spans", &(&1 ++ [boundary])) |> Pulso.JSON.encode!()
+
+    for format <- ["json_v2", "protobuf_v2"], filter <- [nil | filters] do
+      assert {:ok, _body} = Tempo.export(valid, format, filter)
+    end
+
+    for {path, value} <- [
+          {["parent_span_id"], "00"},
+          {["trace_state"], 1},
+          {["flags"], 4_294_967_296},
+          {["status", "message"], 1},
+          {["resource_dropped_attributes_count"], -1},
+          {["resource_schema_url"], 1},
+          {["scope", "name"], 1},
+          {["scope", "dropped_attributes_count"], 4_294_967_296},
+          {["scope_schema_url"], 1},
+          {["events", Access.at(0), "timestamp_ns"], -1},
+          {["events", Access.at(0), "timestamp_ns"], 9_223_372_036_854_775_808},
+          {["events", Access.at(0), "name"], 1},
+          {["events", Access.at(0), "dropped_attributes_count"], 4_294_967_296},
+          {["links", Access.at(0), "trace_id"], "not-a-trace-id"},
+          {["links", Access.at(0), "trace_id"], "abcd"},
+          {["links", Access.at(0), "trace_id"], String.duplicate("0", 32)},
+          {["links", Access.at(0), "span_id"], "abcd"},
+          {["links", Access.at(0), "span_id"], String.duplicate("0", 16)},
+          {["links", Access.at(0), "trace_state"], 1},
+          {["links", Access.at(0), "flags"], 4_294_967_296},
+          {["links", Access.at(0), "dropped_attributes_count"], -1}
+        ] do
+      invalid = data |> Map.update!("spans", &(&1 ++ [put_in(nonmatch, path, value)])) |> Pulso.JSON.encode!()
+
+      for format <- ["json_v2", "protobuf_v2"] do
+        assert {:error, :invalid_trace_export} = Tempo.export(invalid, format)
+        assert {:error, :invalid_trace_export} = Tempo.reference(invalid, format)
+
+        for filter <- filters do
+          assert {:error, :invalid_trace_export} = Tempo.export(invalid, format, filter)
+          assert {:error, :invalid_trace_export} = Tempo.reference(invalid, format, filter)
+        end
+      end
     end
   end
 
@@ -174,42 +243,90 @@ defmodule Pulso.Traces.TempoTest do
     assert {:error, :not_found} = Tempo.export(empty, "json")
   end
 
-  @tag timeout: 60_000
-  test "5,000 spans with 40 attributes share one owner without exhausting aggregate protobuf message plans" do
-    attrs =
-      Enum.map(Enum.take(Enum.to_list(?a..?z) ++ Enum.to_list(?A..?Z), 40), fn key ->
-        %{"key" => <<key>>, "value" => %{"boolValue" => false}}
-      end)
+  for format <- ["protobuf", "protobuf_v2"] do
+    @tag timeout: 60_000
+    test "5,000 spans with 40 attributes share one owner without exhausting aggregate protobuf message plans / #{format}" do
+      format = unquote(format)
 
-    payload = %{
-      "resourceSpans" => [
-        %{
-          "scopeSpans" => [
-            %{
-              "spans" => [
-                %{
-                  "traceId" => String.duplicate("1", 32),
-                  "spanId" => String.duplicate("2", 16),
-                  "startTimeUnixNano" => "1",
-                  "endTimeUnixNano" => "2",
-                  "attributes" => attrs
-                }
-              ]
-            }
-          ]
-        }
-      ]
-    }
+      attrs =
+        Enum.map(Enum.take(Enum.to_list(?a..?z) ++ Enum.to_list(?A..?Z), 40), fn key ->
+          %{"key" => <<key>>, "value" => %{"boolValue" => false}}
+        end)
 
-    assert {:ok, [base], 0} = Traces.decode(payload)
-    assert SpanKey.size(base) * 5000 < 16_777_216
-    spans = for id <- 1..5000, do: %{base | span_id: id |> Integer.to_string(16) |> String.pad_leading(16, "0")}
-    assert {:ok, assembly} = Assembly.json(spans, base.trace_id)
+      payload = %{
+        "resourceSpans" => [
+          %{
+            "scopeSpans" => [
+              %{
+                "spans" => [
+                  %{
+                    "traceId" => String.duplicate("1", 32),
+                    "spanId" => String.duplicate("2", 16),
+                    "startTimeUnixNano" => "1",
+                    "endTimeUnixNano" => "2",
+                    "attributes" => attrs
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
 
-    for format <- ["protobuf", "protobuf_v2"] do
+      assert {:ok, [base], 0} = Traces.decode(payload)
+      assert SpanKey.size(base) * 5000 < 16_777_216
+      spans = for id <- 1..5000, do: %{base | span_id: id |> Integer.to_string(16) |> String.pad_leading(16, "0")}
+      assert {:ok, assembly} = Assembly.json(spans, base.trace_id)
+      assert {:ok, filter} = TempoFilter.parse(%{"q" => "{}"})
+
       assert {:ok, native} = NIF.tempo_trace_export(assembly, format)
       assert {:ok, native} == Tempo.reference(assembly, format)
+      assert {:ok, native} == Tempo.reference(assembly, format, filter)
     end
+  end
+
+  @tag timeout: 60_000
+  test "5,000 rich filtered spans preserve native protobuf within the default query heap" do
+    assert {:ok, [base], 0} = Traces.decode(Fixture.payload())
+
+    spans =
+      for id <- 1..5000 do
+        value = Integer.to_string(rem(id, 100))
+        pair = %{"key" => "bucket", "value" => %{"intValue" => value}}
+
+        %{
+          base
+          | span_id: id |> Integer.to_string(16) |> String.pad_leading(16, "0"),
+            attributes: Map.put(base.attributes, "bucket", value),
+            otlp: Map.update!(base.otlp, "attributes", &(&1 ++ [pair]))
+        }
+      end
+
+    assert {:ok, assembly} = Assembly.json(spans, base.trace_id)
+    assert {:ok, expected} = NIF.tempo_trace_export(assembly, "protobuf_v2")
+    assert {:ok, filter} = TempoFilter.parse(%{"q" => "{ span.bucket >= 0 }"})
+    parent = self()
+
+    pid =
+      start_supervised!(
+        {Task,
+         fn ->
+           Process.flag(:max_heap_size, %{size: 16_000_000, kill: true, error_logger: false})
+           send(parent, {:export_ready, self()})
+
+           receive do
+             :export ->
+               send(parent, {:bounded_export, Tempo.export(assembly, "protobuf_v2", filter)})
+           end
+         end}
+      )
+
+    ref = Process.monitor(pid)
+    assert_receive {:export_ready, ^pid}
+    send(pid, :export)
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 30_000
+    assert reason == :normal
+    assert_receive {:bounded_export, {:ok, ^expected}}
   end
 
   test "owner grouping shares resource/scope bytes but preserves typed and signed-zero identity" do

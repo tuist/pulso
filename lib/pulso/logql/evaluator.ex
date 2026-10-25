@@ -28,10 +28,12 @@ defmodule Pulso.LogQL.Evaluator do
           optional(:end_ts_ns) => integer(),
           optional(:limit) => pos_integer(),
           optional(:direction) => :forward | :backward,
-          optional(:step_ns) => pos_integer()
+          optional(:step_ns) => pos_integer(),
+          optional(:categorize_labels) => boolean()
         }
 
-  @type stream :: {labels :: map(), entries :: [{ts :: integer(), line :: String.t()}]}
+  @type stream ::
+          {labels :: map(), entries :: [{integer(), String.t()} | {integer(), String.t(), map()}]}
   @type series :: {labels :: map(), samples :: [{ts :: integer(), value :: float()}] | float()}
 
   # ---------------------------------------------------------------------------
@@ -60,7 +62,7 @@ defmodule Pulso.LogQL.Evaluator do
   defp do_evaluate_log(query, tenant, %{limit: limit} = opts) when is_integer(limit) and limit > 0 do
     with {:ok, entries} <- do_select_entries(query, tenant, opts, fn entry, _record -> entry end) do
       entries
-      |> group_streams()
+      |> group_streams(Map.get(opts, :categorize_labels, false))
       |> apply_direction(Map.get(opts, :direction, :backward))
       |> ok()
     end
@@ -69,7 +71,7 @@ defmodule Pulso.LogQL.Evaluator do
   defp do_evaluate_log(query, tenant, opts) do
     with {:ok, entries} <- evaluate_log_raw(query, tenant, opts) do
       entries
-      |> group_streams()
+      |> group_streams(Map.get(opts, :categorize_labels, false))
       |> apply_direction(Map.get(opts, :direction, :backward))
       |> apply_limit(Map.get(opts, :limit))
       |> ok()
@@ -136,7 +138,7 @@ defmodule Pulso.LogQL.Evaluator do
 
       entries =
         records
-        |> Stream.map(&Entry.from_record/1)
+        |> Stream.map(&Entry.from_record(&1, Map.get(opts, :categorize_labels, false)))
         |> then(&Pipeline.run(compiled, &1))
         |> Enum.to_list()
 
@@ -159,19 +161,23 @@ defmodule Pulso.LogQL.Evaluator do
       compiled = Pipeline.compile(remaining_stages)
 
       storage_opts = if stop, do: Keyword.put(storage_opts, :log_fold_stop, stop), else: storage_opts
-      storage_result(Storage.fold_logs(tenant, storage_opts, acc, &fold_records(&1, &2, compiled, fun)))
+      categorize_labels? = Map.get(opts, :categorize_labels, false)
+
+      storage_result(
+        Storage.fold_logs(tenant, storage_opts, acc, &fold_records(&1, &2, compiled, fun, categorize_labels?))
+      )
     end
   end
 
-  defp fold_records(records, acc, compiled, fun) do
+  defp fold_records(records, acc, compiled, fun, categorize_labels?) do
     # Log lines share the cross-language sample quota, as when materialized.
     if Process.get(:promql_budget), do: Evaluator.charge(:work, length(records))
 
-    Enum.reduce(records, acc, &fold_record(&1, &2, compiled, fun))
+    Enum.reduce(records, acc, &fold_record(&1, &2, compiled, fun, categorize_labels?))
   end
 
-  defp fold_record(record, acc, compiled, fun) do
-    case Pipeline.apply(compiled, Entry.from_record(record)) do
+  defp fold_record(record, acc, compiled, fun, categorize_labels?) do
+    case Pipeline.apply(compiled, Entry.from_record(record, categorize_labels?)) do
       {:keep, entry} -> fun.(entry, record, acc)
       :drop -> acc
     end
@@ -320,7 +326,17 @@ defmodule Pulso.LogQL.Evaluator do
   defp newest_complete?({set, size}, next_max_ts, limit),
     do: size >= limit and is_integer(next_max_ts) and next_max_ts < elem(:gb_sets.smallest(set), 0)
 
-  defp group_streams(entries) do
+  defp group_streams(entries, true) do
+    entries
+    |> Enum.map(fn entry ->
+      {stream, categories} = Entry.categorized_labels(entry)
+      {stream, {entry.timestamp_ns || 0, entry.line, categories}}
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.map(fn {stream, values} -> {stream, Enum.sort_by(values, &elem(&1, 0), :desc)} end)
+  end
+
+  defp group_streams(entries, false) do
     entries
     |> Enum.group_by(fn %Entry{labels: l} -> l end)
     |> Enum.map(fn {labels, group} ->

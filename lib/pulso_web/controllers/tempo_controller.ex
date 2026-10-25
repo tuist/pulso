@@ -9,6 +9,7 @@ defmodule PulsoWeb.TempoController do
   alias Pulso.Traces.SearchExpression
   alias Pulso.Traces.Tempo
   alias Pulso.Traces.TempoDiscovery
+  alias Pulso.Traces.TempoFilter
   alias Pulso.Traces.TempoIntrinsics
   alias Pulso.Traces.TempoSearch
 
@@ -22,13 +23,26 @@ defmodule PulsoWeb.TempoController do
 
   def tags(conn, params), do: discover(conn, params, 1, :names)
   def tags_v2(conn, params), do: discover(conn, params, 2, :names)
-  def tag_values(conn, params), do: discover(conn, params, 1, :values)
-  def tag_values_v2(conn, params), do: discover(conn, params, 2, :values)
+  def tag_values(conn, params), do: discover_path(conn, params, 1)
+  def tag_values_v2(conn, params), do: discover_path(conn, params, 2)
+
+  # A tag can contain slashes, including a literal /values inside its name.
+  # Phoenix has already URL-decoded each segment; never decode the joined key again.
+  defp discover_path(conn, %{"tag_path" => path} = params, version) do
+    case Enum.split(path, -1) do
+      {[_ | _] = name, ["values"]} ->
+        params = params |> Map.delete("tag_path") |> Map.put("tag_name", Enum.join(name, "/"))
+        discover(conn, params, version, :values)
+
+      _ ->
+        send_resp(conn, 404, "")
+    end
+  end
 
   defp discover(conn, params, version, mode) do
     with {:ok, tenant} <- tenant(conn),
          :ok <- authorize(conn, tenant),
-         {:ok, scope, key} <- discovery_params(params, mode),
+         {:ok, scope, key} <- discovery_params(params, mode, version),
          {:ok, window} <- discovery_window(params),
          {:ok, format} <- format(conn),
          {:ok, body} <- TempoDiscovery.query(tenant, scope, key, version, format, params["q"], window) do
@@ -70,11 +84,11 @@ defmodule PulsoWeb.TempoController do
   defp discovery_coverage(_scope, _mode, _query, _version),
     do: "all-visible-stored-attributes; exporter-completeness-unknown"
 
-  defp discovery_params(params, mode) do
+  defp discovery_params(params, mode, version) do
     allowed = if mode == :names, do: ~w(scope q start end), else: ~w(tag_name q start end)
 
     if Enum.all?(Map.keys(params), &(&1 in allowed)) do
-      discovery_target(params, mode)
+      discovery_target(params, mode, version)
     else
       {:error, :unsupported_trace_discovery}
     end
@@ -115,31 +129,52 @@ defmodule PulsoWeb.TempoController do
 
   defp window_coverage(_scope, _key, _window), do: "retention-visible-segment-envelope; not-span-time-filter"
 
-  defp discovery_target(params, :names) do
+  defp discovery_target(params, :names, _version) do
     scope = if params["scope"] in [nil, ""], do: "none", else: params["scope"]
     with :ok <- TempoDiscovery.target(scope, ""), do: {:ok, scope, ""}
   end
 
-  defp discovery_target(%{"tag_name" => name}, :values) when is_binary(name) do
+  defp discovery_target(%{"tag_name" => name}, :values, version) when is_binary(name) do
     if TempoIntrinsics.value_key?(name) do
       {:ok, "intrinsic", name}
     else
-      stored_discovery_target(name)
+      stored_discovery_target(name, version)
     end
   end
 
-  defp discovery_target(_params, _mode), do: {:error, :unsupported_trace_discovery}
+  defp discovery_target(_params, _mode, _version), do: {:error, :unsupported_trace_discovery}
 
-  defp stored_discovery_target(name) do
+  defp stored_discovery_target(name, version) do
     case String.split(name, ".", parts: 2) do
       ["", key] when key != "" ->
-        with :ok <- TempoDiscovery.validate("none", key), do: {:ok, "none", key}
+        stored_discovery_key("none", key)
 
       [scope, key] when key != "" and scope in ["resource", "span", "instrumentation", "event", "link"] ->
-        with :ok <- TempoDiscovery.validate(scope, key), do: {:ok, scope, key}
+        stored_discovery_key(scope, key)
+
+      _ when version == 1 and name != "" ->
+        with :ok <- TempoDiscovery.validate("none", name), do: {:ok, "none", name}
 
       _ ->
         {:error, :unsupported_trace_discovery}
+    end
+  end
+
+  defp stored_discovery_key(scope, <<"\"", _::binary>> = quoted) when byte_size(quoted) <= 2048 do
+    with {:ok, key} when is_binary(key) and key != "" <- Pulso.JSON.decode(quoted),
+         :ok <- TempoDiscovery.validate(scope, key) do
+      {:ok, scope, key}
+    else
+      _ -> {:error, :unsupported_trace_discovery}
+    end
+  end
+
+  defp stored_discovery_key(scope, key) do
+    with :ok <- TempoDiscovery.validate(scope, key),
+         false <- Regex.match?(~r/[\s{}()=~!<>&|^,"]/u, key) do
+      {:ok, scope, key}
+    else
+      _ -> {:error, :unsupported_trace_discovery}
     end
   end
 
@@ -147,9 +182,7 @@ defmodule PulsoWeb.TempoController do
     with {:ok, tenant} <- tenant(conn),
          :ok <- authorize(conn, tenant),
          true <- Enum.all?(Map.keys(params), &(&1 in ~w(q start end limit spss))),
-         {:ok, start} <- seconds(params["start"]),
-         {:ok, finish} <- seconds(params["end"]),
-         true <- is_integer(start) and is_integer(finish) and start > 0 and finish >= start,
+         {:ok, {start, finish}} <- search_window(params),
          {:ok, limit} <- positive(params["limit"], 100, 1000),
          {:ok, spss} <- positive(params["spss"], 3, 100),
          {:ok, format} <- format(conn),
@@ -169,6 +202,26 @@ defmodule PulsoWeb.TempoController do
     else
       false -> failure(conn, :unsupported_parameters)
       {:error, reason} -> failure(conn, reason)
+    end
+  end
+
+  defp search_window(params) do
+    case {params["start"], params["end"]} do
+      {nil, nil} ->
+        {:ok, {0, 0}}
+
+      {start, finish} when is_binary(start) and is_binary(finish) ->
+        with {:ok, start_s} <- seconds(start),
+             {:ok, finish_s} <- seconds(finish),
+             true <- Regex.match?(~r/\A[0-9]+\z/, start) and Regex.match?(~r/\A[0-9]+\z/, finish),
+             true <- (start_s == 0 and finish_s == 0) or (start_s > 0 and finish_s >= start_s) do
+          {:ok, {start_s, finish_s}}
+        else
+          _ -> {:error, :unsupported_parameters}
+        end
+
+      _ ->
+        {:error, :unsupported_parameters}
     end
   end
 
@@ -273,16 +326,17 @@ defmodule PulsoWeb.TempoController do
   defp lookup(conn, params, v2) do
     with {:ok, tenant} <- tenant(conn),
          :ok <- authorize(conn, tenant),
-         :ok <- parameters(params),
+         {:ok, filter} <- parameters(params, v2),
          {:ok, trace_id} <- trace_id(params["trace_id"]),
          {:ok, format} <- format(conn),
          export_format = if(v2, do: format <> "_v2", else: format),
-         {:ok, body} <- Tempo.lookup(tenant, trace_id, export_format) do
+         {:ok, body} <- Tempo.lookup(tenant, trace_id, export_format, filter) do
       type = if format == "protobuf", do: "application/protobuf", else: "application/json"
+      coverage = if filter, do: "explicit-filter-subset-of-all-visible-stored-spans", else: "all-visible-stored-spans"
 
       conn
       |> put_resp_content_type(type)
-      |> put_resp_header("x-pulso-trace-coverage", "all-visible-stored-spans; exporter-completeness-unknown")
+      |> put_resp_header("x-pulso-trace-coverage", coverage <> "; exporter-completeness-unknown")
       |> send_resp(200, body)
     else
       {:error, reason} -> failure(conn, reason)
@@ -311,14 +365,15 @@ defmodule PulsoWeb.TempoController do
 
   defp trace_id(_value), do: {:error, :invalid_trace_id}
 
-  defp parameters(params) do
+  defp parameters(params, v2) do
     allowed = ~w(trace_id start end mode allowPartialTrace)
+    allowed = if v2, do: allowed ++ ~w(q keep_hierarchy match_depth ancestor_depth), else: allowed
 
     with true <- Enum.all?(Map.keys(params), &(&1 in allowed)),
          true <- Map.get(params, "mode", "all") == "all",
          true <- Map.get(params, "allowPartialTrace", "false") == "false",
          :ok <- time_hints(params) do
-      :ok
+      if v2, do: TempoFilter.parse(params), else: {:ok, nil}
     else
       _ -> {:error, :unsupported_parameters}
     end

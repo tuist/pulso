@@ -94,6 +94,36 @@ values are capped at ten seconds. Results use Prometheus scalar, vector, and mat
 formats, so Grafana can use Pulso as a Prometheus data source within the
 supported subset below.
 
+Both query endpoints accept a positive `lookback_delta` in seconds or duration
+syntax, for example `600` or `10m`. It changes how far instant selectors (including
+`timestamp()` and selectors nested inside subqueries) look back from each
+evaluation time; the default is five minutes. The lower boundary is exclusive.
+Explicit range-vector windows such as `[10m]` are unaffected. Zero, negative,
+malformed and signed-int64-nanosecond-overflowing values return `400`, rather than
+silently selecting the default. Existing scan, sample, work, heap and timeout
+budgets still apply, so longer lookbacks can fail on resource limits. Upgrade all
+query-serving instances before clients send the parameter; older instances
+reject it. No native artifact, stored format or ingest-byte change is required.
+
+Remote-write labels are sorted and empty-valued labels are omitted before
+series identity, same-label entry merging and storage. Duplicate label names,
+empty label names and invalid UTF-8 still reject their complete series, even
+when an offending label has an empty value. Supplied labels and points consume
+the existing admission budgets before normalization. Valid sibling series are
+stored: RW1 returns `204` with `X-Pulso-Rejected-Records`, while RW2 returns
+`400` with that count and the valid written counts. An RW2 symbol table whose
+first entry is nonempty rejects the whole request with `400`, zero written
+counts and no sample or metadata publication.
+
+Upgrade every receiving application/native codec pair together and drain keyed
+remote-write retries containing empty-valued labels first. Their normalized
+labels, series hashes, caller-content hashes and segment bytes change; replaying
+across versions can derive different object keys and duplicate existing data.
+This does not rewrite historical rows or change the storage format/native tuple.
+Exact-byte verification at an existing derived key is unchanged; never bypass a
+`409 keyed_content_mismatch`. Requests without empty-valued labels retain their
+existing encoding. Label sorting alone was already supported.
+
 Pulso implements a subset of the
 [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/):
 
@@ -180,6 +210,19 @@ windows or groups mixing floats and histograms have no result, as in
 Prometheus. Custom-bucket histograms (schema -53) are supported; mixing them
 with exponential ones has no result.
 
+Within one remote-write request, a float sample wins over a native histogram
+at the same series identity and timestamp, including across separate entries
+with the same labels. The histogram is not stored, and exemplars still attach
+to the surviving samples. This is request-local normalization, not a
+cross-request conflict registry or a repair of previously stored collisions.
+All supplied points still consume ingestion admission budgets. Before upgrading
+receivers, drain keyed retries containing these collisions and replace every
+receiving instance: their normalized caller content and segment bytes change.
+Replaying them across versions can derive different object keys and duplicate
+already stored data. Byte disagreements at the same derived key still return
+`409 keyed_content_mismatch`, never an overwrite or a semantic-equivalence
+shortcut. Ordinary noncolliding requests keep their existing encoding.
+
 Not supported yet: omitted-resolution subqueries, negative offsets, `@`, and
 functions outside the lists above. Regular expressions use a
 bounded RE2-compatible subset: unsupported constructs return errors, including
@@ -245,6 +288,11 @@ object and version evidence; there is no automatic repair command.
 the tenant in the `X-Scope-OrgID` header, like Loki, or the username of HTTP
 Basic credentials when the header is absent.
 
+When a range query omits `step`, the resolution is the window duration divided
+by 250, rounded down to whole seconds, with a one-second minimum, as in Loki.
+Supply `step` explicitly when you need a finer grid: a coarse default grid may
+not include observations near the end of the requested window.
+
 Metric results use Loki's sample format: `[<Unix seconds as a JSON number>,
 "<value>"]`, with values formatted as Prometheus and Loki do (`"8"`, not
 `"8.0"`). Log results keep nanosecond timestamp strings.
@@ -259,6 +307,34 @@ Label matchers match the **whole** label value, as in Loki and Prometheus:
 prefix. This applies to stream selectors, pipeline label filters
 (`| pod=~"..."`) and `drop`/`keep` matchers. Line filters (`|~`) and the
 `regexp` parser remain unanchored searches.
+
+### Response encoding
+
+Without an encoding header, log results keep merged stream, structured-metadata
+and parser labels in `stream`, with `["<nanoseconds>", "<line>"]` values.
+Send `X-Loki-Response-Encoding-Flags: categorize-labels` on either query endpoint
+(GET or form POST) to separate labels by origin. Only surviving stream labels
+remain in `stream`; each value has a third JSON object containing optional
+`structuredMetadata` and `parsed` maps, or `{}` when both are empty:
+
+```json
+["1760000000000000000", "msg=ready", {"structuredMetadata":{"traceID":"123"},"parsed":{"msg":"ready"}}]
+```
+
+Parser writes and `label_format` destinations are parsed labels even when they
+retain the previous value. `drop`, `keep` and renames remove the affected labels
+from their original category too. Resource/promoted labels that survive without
+such a rewrite remain stream labels. This changes grouping/encoding only, not
+selectors, filtering, line formatting, global `limit` selection or stored data.
+
+The response echoes comma-separated, deduplicated flags in `data.encodingFlags`.
+Tokens are exact and case-sensitive; unknown tokens are echoed without behavior.
+An absent or empty header keeps the existing response unchanged. Metric samples
+are unchanged by these flags. Categorized queries use extra per-label query
+memory, and per-entry labels can enlarge the response; existing scan, timeout
+and query-task heap bounds still apply and may reject an expensive request.
+No storage-format migration or keyed-ingest retry drain is needed. Upgrade all
+query-serving instances before relying on the header under non-sticky routing.
 
 ### Parser labels and quantities
 
@@ -317,6 +393,11 @@ stream selector can match: the stream labels of pushed logs, the resource
 attributes of OTLP logs, and `service_name` for records with a service.
 Empty values count as absent. Without `start`/`end`, discovery covers the last
 six hours, as in Loki.
+
+Discovery selectors and the `query` parameter of `/loki/api/v1/index/stats`
+accept only label matchers. A pipeline such as `{job="api"} |= "error"` or
+`{job="api"} | logfmt` returns HTTP 400 rather than silently ignoring stages.
+Use `/loki/api/v1/query_range` to filter log lines.
 
 Discovery reads only the timestamp, service, level and stream-label columns
 of the stored segments, natively, and evaluates each distinct stream once per
@@ -406,6 +487,13 @@ JSON path) or otherwise as logfmt. Types are Loki's: `int`, `float`,
 `boolean`, `duration`, `bytes` or `string`. `limit` (default 1000, at most
 5000) caps the number of fields or values. Cardinality is the exact count of
 distinct values in the sampled lines, where Loki estimates it.
+
+Both time bounds are inclusive. The newest-line limit applies across all
+matching segments, not separately to each segment or time bucket. Widening the
+window may reveal older field values only when they fit in that sample; it does
+not turn these suggestions into a complete retained-field inventory. GET and
+form POST use the same bounds and sampling rules, and existing scan/query
+resource limits still apply to wide windows.
 
 ### Live tail
 

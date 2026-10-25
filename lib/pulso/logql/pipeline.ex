@@ -222,32 +222,32 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp apply_stage({:label_format, entries}, %Entry{} = e) do
-    labels =
-      Enum.reduce(entries, e.labels, fn
+    formatted =
+      Enum.reduce(entries, e, fn
         {name, {:template, t}}, acc ->
-          Map.put(acc, name, Template.render(t, acc))
+          Entry.put_label(acc, name, Template.render(t, acc.labels), :parsed)
 
         {name, {:rename, src}}, acc ->
-          case Map.fetch(acc, src) do
-            {:ok, value} -> acc |> Map.delete(src) |> Map.put(name, value)
+          case Map.fetch(acc.labels, src) do
+            {:ok, value} -> acc |> Entry.delete_label(src) |> Entry.put_label(name, value, :parsed)
             :error -> acc
           end
       end)
 
-    {:keep, %{e | labels: labels}}
+    {:keep, formatted}
   end
 
   defp apply_stage({:drop, entries}, %Entry{} = e) do
-    labels =
-      Enum.reduce(entries, e.labels, fn {name, match}, acc ->
-        if drop_matches?(match, Map.get(acc, name)) do
-          Map.delete(acc, name)
+    dropped =
+      Enum.reduce(entries, e, fn {name, match}, acc ->
+        if drop_matches?(match, Map.get(acc.labels, name)) do
+          Entry.delete_label(acc, name)
         else
           acc
         end
       end)
 
-    {:keep, %{e | labels: labels}}
+    {:keep, dropped}
   end
 
   defp apply_stage({:keep, entries}, %Entry{} = e) do
@@ -256,7 +256,7 @@ defmodule Pulso.LogQL.Pipeline do
         {name, value}
       end
 
-    {:keep, %{e | labels: kept}}
+    {:keep, Entry.keep_labels(e, kept)}
   end
 
   defp apply_stage(:decolorize, %Entry{} = e) do
@@ -344,13 +344,10 @@ defmodule Pulso.LogQL.Pipeline do
   # allowed; only names present before the pipeline receive one suffix, even
   # after drop/rename. Do not recursively invent unused suffix names.
   defp extract_labels(entry, extracted) do
-    labels =
-      Enum.reduce(extracted, entry.labels, fn {name, value}, acc ->
-        target = if Map.has_key?(entry.base_labels, name), do: name <> "_extracted", else: name
-        Map.put(acc, target, value)
-      end)
-
-    %{entry | labels: labels}
+    Enum.reduce(extracted, entry, fn {name, value}, acc ->
+      target = if Map.has_key?(entry.base_labels, name), do: name <> "_extracted", else: name
+      Entry.put_label(acc, target, value, :parsed)
+    end)
   end
 
   defp decode_json(""), do: :error

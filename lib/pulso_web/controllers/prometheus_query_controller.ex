@@ -22,6 +22,7 @@ defmodule PulsoWeb.PrometheusQueryController do
          query when is_binary(query) <- params["query"],
          {:ok, opts} <- options(params, mode),
          {:ok, opts} <- timeout_options(params, opts),
+         {:ok, opts} <- lookback_options(params, opts),
          {:ok, result} <- Evaluator.query(query, tenant, opts) do
       json(conn, result)
     else
@@ -81,7 +82,23 @@ defmodule PulsoWeb.PrometheusQueryController do
 
   defp supported_parameters(params, mode) do
     allowed = if mode == :instant, do: ["query", "time", "timeout"], else: ["query", "start", "end", "step", "timeout"]
-    if Enum.all?(Map.keys(params), &(&1 in allowed)), do: :ok, else: {:error, :unsupported_parameters}
+
+    if Enum.all?(Map.keys(params), &(&1 in ["lookback_delta" | allowed])),
+      do: :ok,
+      else: {:error, :unsupported_parameters}
+  end
+
+  defp lookback_options(params, opts) do
+    case Map.fetch(params, "lookback_delta") do
+      :error ->
+        {:ok, opts}
+
+      {:ok, value} ->
+        case step(value) do
+          {:ok, ns} when ns > 0 and ns <= 9_223_372_036_854_775_807 -> {:ok, Map.put(opts, :lookback_ns, ns)}
+          _ -> {:error, :invalid_lookback}
+        end
+    end
   end
 
   defp timeout_options(params, opts) do
