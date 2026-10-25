@@ -107,7 +107,8 @@ defmodule Pulso.Loki.Discovery do
     if MapSet.size(streams) > @entries * 4, do: {:halt, {:error, :query_resource_limit}}, else: {:cont, {:ok, streams}}
   end
 
-  defp labels(%Log{resource: resource, service: service}) do
+  @doc false
+  def labels(%Log{resource: resource, service: service}) do
     stream =
       for {name, value} <- resource || %{}, is_binary(name), name != "", is_binary(value), value != "", into: %{} do
         {name, value}

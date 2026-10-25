@@ -33,6 +33,7 @@ defmodule PulsoWeb.LokiQueryController do
   alias Pulso.LogQL.StreamMatchers
   alias Pulso.Loki.Detected
   alias Pulso.Loki.Discovery
+  alias Pulso.Loki.LabelVolume
   alias Pulso.Loki.Patterns
   alias Pulso.Loki.Tail
   alias Pulso.QueryRunner
@@ -191,16 +192,65 @@ defmodule PulsoWeb.LokiQueryController do
   end
 
   @doc """
-  Log volume in bytes per stream group, as Loki's volume API. Groups are
-  `targetLabels` when given, otherwise the selector's label names; the
-  `limit` largest groups are returned. Volumes are computed from the stored
-  log lines with the native LogQL evaluator, `aggregateBy=series` only.
+  Log volume in bytes per stream group or label name, as Loki's volume API.
+  Series groups use `targetLabels` or the selector's label names; label
+  aggregation counts all stream names unless `targetLabels` is supplied.
   """
   def volume(conn, params), do: volume(conn, params, :instant)
 
   def volume_range(conn, params), do: volume(conn, params, :range)
 
   defp volume(conn, params, mode) do
+    case Auth.verify(conn, tenant_from(conn)) do
+      :ok ->
+        if params["aggregateBy"] == "labels",
+          do: label_volume(conn, params, mode),
+          else: series_volume(conn, params, mode)
+
+      err ->
+        render_error(conn, err)
+    end
+  end
+
+  defp label_volume(conn, params, mode) do
+    with {:ok, query, selector} <- volume_selector(params),
+         {:ok, ast} <- Parser.parse(query),
+         {:ok, times} <- discovery_times(params),
+         {:ok, limit} <- volume_limit(params["limit"]),
+         {:ok, targets} <- label_volume_targets(params["targetLabels"], selector),
+         {:ok, step} <- label_volume_step(mode, params["step"], times),
+         {:ok, result} <- LabelVolume.query(tenant_from(conn), ast, times, targets, limit, step) do
+      case result do
+        {:vector, series} -> json(conn, Envelope.vector(series))
+        {:matrix, series} -> json(conn, Envelope.matrix(series))
+      end
+    else
+      {:error, {:invalid_regex, _, _, _} = reason} -> render_query_error(conn, reason)
+      err -> render_error(conn, err)
+    end
+  end
+
+  defp label_volume_targets(value, _selector) when value in [nil, ""], do: {:ok, nil}
+  defp label_volume_targets(value, selector), do: volume_labels(value, selector)
+
+  defp label_volume_step(:instant, _value, _times), do: {:ok, nil}
+
+  defp label_volume_step(:range, value, times) do
+    default = "#{max(1, div(times.end_ns - times.start_ns, 100_000_000_000))}s"
+
+    with {:ok, step} <- seconds_or_duration(value || default),
+         true <- step >= 1_000_000,
+         last = max(times.start_ns, times.end_ns - 1),
+         true <-
+           Integer.floor_div(last, step) - Integer.floor_div(times.start_ns, step) <
+             Pulso.QueryLimits.max_evaluation_steps() do
+      {:ok, step}
+    else
+      _ -> {:error, {:invalid_query_parameter, "step"}}
+    end
+  end
+
+  defp series_volume(conn, params, mode) do
     with {:ok, query, selector} <- volume_selector(params),
          {:ok, times} <- discovery_times(params),
          {:ok, limit} <- volume_limit(params["limit"]),
@@ -710,6 +760,7 @@ defmodule PulsoWeb.LokiQueryController do
               :query_resource_limit,
               :query_result_limit,
               :query_work_limit,
+              :query_intermediate_limit,
               :query_execution_failed
             ], do: render_query_error(conn, reason)
 

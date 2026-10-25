@@ -317,11 +317,39 @@ is an upper bound; `streams` is always `0` because Pulso does not index
 streams.
 
 `/loki/api/v1/index/volume` and `/loki/api/v1/index/volume_range` return log
-bytes per group, largest first, as Loki's volume API: groups are `targetLabels`
-(comma-separated) when given, otherwise the selector's label names, and
-`limit` (default 100) bounds the instant result. They are computed from the
-stored lines with the LogQL evaluator, so they cost what an equivalent
-`bytes_over_time` query costs. Only `aggregateBy=series` is supported.
+bytes per group, largest first. Both accept GET and form POST:
+
+- `aggregateBy=series` (the default) groups by `targetLabels` (comma-separated)
+  when given, otherwise by the selector's label names. `limit` (default 100,
+  maximum 5,000) bounds the instant result. This uses the same storage reads
+  as an equivalent `bytes_over_time` query.
+- `aggregateBy=labels` counts each selected line's bytes once for every stream
+  **label name**, across all values, returning metrics such as `{"pod":""}`.
+  Omitted `targetLabels` includes all names on matching streams, not only names
+  in the selector. Explicit targets restrict names; each target not already
+  constrained by the selector also requires a nonempty stream value. Empty
+  values, structured metadata, parser-created labels and Loki's internal
+  `__loki_tenant__` name are not counted. This mode accepts selectors only,
+  not pipelines, and scans stored lines once instead of using chunk estimates.
+
+Label-name volumes count actual UTF-8 line bytes within the inclusive
+nanosecond `[start,end]` window, not Loki's estimated chunk KB or whole-second
+storage windows. In `volume_range`, `step` accepts seconds or a duration, at
+least 1 ms, defaulting to the window divided by 100 (whole seconds, at least
+one second). At most 11,000 epoch-aligned buckets are allowed. Internal
+boundaries belong to the next bucket, and the final `end` remains inclusive;
+nonfinal sample timestamps are one millisecond before the next boundary,
+and the final timestamp is `end`. `limit` applies independently per bucket,
+so a matrix may contain more than `limit` names. Missing buckets are omitted,
+not zero-filled; range responses always use a matrix. Ties sort by name;
+series sort by their first sample's bytes, then name.
+
+Label-name queries fail whole on scan, selected-line, work, intermediate or
+result-point limits. The complete dictionary is capped at 5,000 names and
+1 MiB of name bytes **before** applying `limit`; reducing `limit` does not
+bypass admission. These queries read Parquet lines in bounded batches and
+can cost more than Loki's index-backed volume estimates. No index or storage
+format change is required.
 
 `/loki/api/v1/status/buildinfo` reports the Loki API version Pulso follows.
 

@@ -122,7 +122,7 @@ defmodule PulsoWeb.CompatControllerTest do
     end
 
     test "volume rejects unsupported aggregation and invalid labels", %{conn: conn, tenant: tenant} do
-      for extra <- [%{"aggregateBy" => "labels"}, %{"targetLabels" => "service.name"}, %{"limit" => "0"}] do
+      for extra <- [%{"aggregateBy" => "invalid"}, %{"targetLabels" => "service.name"}, %{"limit" => "0"}] do
         params = Map.merge(%{"query" => ~s({namespace="prod"}), "start" => "0", "end" => "100"}, extra)
 
         assert conn
