@@ -150,7 +150,21 @@ impl Limits {
                                 return Err(Error::AttributesTooLarge);
                             }
                         }
-                        (2..=4, Value::Bytes(_)) => increment(&mut records, self.records)?,
+                        (2..=4, Value::Bytes(point)) => {
+                            increment(&mut records, self.records)?;
+                            if field != 4 {
+                                let start_field = if field == 2 { 3 } else { 17 };
+                                fields(point, |n, value| {
+                                    if n == start_field && !matches!(value, Value::Varint(_)) {
+                                        return Err(Error::InvalidProtobuf);
+                                    }
+                                    Ok(())
+                                })?;
+                            }
+                        }
+                        (6, value) if !matches!(value, Value::Varint(_)) => {
+                            return Err(Error::InvalidProtobuf);
+                        }
                         _ => {}
                     }
                     Ok(())

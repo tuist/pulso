@@ -370,6 +370,10 @@ resources:
 # use type: Recreate and rollingUpdate: null so old readers never overlap new
 # writers. Existing buckets cannot be rolled back to the old reader after those
 # values are stored. See docs/deployment.md's stale-sample compatibility section.
+# Remote-write source-start upgrades also require Recreate/rollingUpdate: null
+# plus a fleet-wide metric-delivery pause, old keyed-retry drain and shutdown of
+# all old readers/writers/compactors. Recreate alone cannot coordinate other
+# deployments sharing the bucket; see docs/deployment.md's source-start section.
 strategy:
   type: RollingUpdate
   rollingUpdate:

@@ -11,6 +11,12 @@ defmodule Pulso.Codec.MetricJSONTest do
   # tools' Elixir reference does).
   defp fields(sample) do
     fields = Map.take(sample, [:series_id, :timestamp_ns, :value, :labels, :otlp])
+
+    fields =
+      if is_nil(sample.start_timestamp_ms),
+        do: fields,
+        else: Map.put(fields, :start_timestamp_ms, sample.start_timestamp_ms)
+
     if sample.exemplars, do: Map.put(fields, :exemplars, Enum.map(sample.exemplars, &Map.from_struct/1)), else: fields
   end
 
@@ -23,6 +29,7 @@ defmodule Pulso.Codec.MetricJSONTest do
           %MetricSample{
             series_id: Enum.random([nil, -9_223_372_036_854_775_808, i]),
             timestamp_ns: Enum.random([nil, -i, 9_223_372_036_854_775_807]),
+            start_timestamp_ms: Enum.random([nil, -9_223_372_036_854_775_808, -i, i, 9_223_372_036_854_775_807]),
             value: Enum.random([nil, i, i / 3, -0.0, :nan, :stale, :infinity, :negative_infinity]),
             otlp: Enum.random([nil, %{"nested" => [%{"doubleValue" => -0.0}, %{"bytesValue" => "AP8="}]}]),
             labels: Enum.random([labels, %{}, Map.put(labels, "instance", "node-#{i}")]),

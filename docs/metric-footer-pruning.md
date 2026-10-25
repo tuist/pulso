@@ -33,7 +33,7 @@ Use TLS outside a trusted local network. Provider ETags and footer checksums are
 not cryptographic end-to-end authentication or independent integrity proofs.
 
 Every serving application/native pair must have matching artifacts: metric codec
-API `{1,2,1,1,1}` (metadata, OTLP, postings, discovery, footer planning), object-store
+API `{2,2,1,1,1}` (metadata/start timestamps, OTLP, postings, discovery, footer planning), object-store
 API `{1,1,1,1}` (retention, keyed publication, snapshot GET, asynchronous requests). Startup checks cannot
 fence old pooled applications. There is no new segment format or change to
 keyed encoder bytes. Existing rich-metadata and immutable-keyed-publication

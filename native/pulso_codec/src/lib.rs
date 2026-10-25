@@ -108,6 +108,7 @@ mod atoms {
         struct_key = "__struct__",
         log = "Elixir.Pulso.Record.Log",
         timestamp_ns,
+        start_timestamp_ms,
         observed_timestamp_ns,
         severity_number,
         severity_text,
@@ -648,7 +649,7 @@ fn trace_payload_size<'a>(env: Env<'a>, records: Term<'a>, limit: usize) -> Term
 
 #[rustler::nif]
 fn metric_metadata_api_version() -> u32 {
-    1
+    2
 }
 
 #[rustler::nif]
@@ -1248,11 +1249,13 @@ fn decode_remote_write_inner<'a>(
             .samples
             .iter()
             .map(|s| {
-                (
-                    s.timestamp_ms.encode(env),
-                    metric_value::encode(env, s.value),
-                )
-                    .encode(env)
+                let ts = s.timestamp_ms.encode(env);
+                let value = metric_value::encode(env, s.value);
+                if v2 {
+                    (ts, value, s.start_timestamp_ms).encode(env)
+                } else {
+                    (ts, value).encode(env)
+                }
             })
             .collect();
         let sorted_pairs: Vec<(&[u8], &[u8])> =
@@ -1261,7 +1264,13 @@ fn decode_remote_write_inner<'a>(
         let histograms: Vec<Term<'a>> = series
             .histograms
             .iter()
-            .map(|(h, ts)| (ts.encode(env), h.to_term(env)).encode(env))
+            .map(|(h, ts, start)| {
+                if v2 {
+                    (ts.encode(env), h.to_term(env), start).encode(env)
+                } else {
+                    (ts.encode(env), h.to_term(env)).encode(env)
+                }
+            })
             .collect();
         // Exemplar timestamps leave in nanoseconds, like stored ones.
         let exemplars: Vec<Term<'a>> = series

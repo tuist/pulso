@@ -283,6 +283,36 @@ pass. Shared source-point representation would require a separately designed,
 self-contained immutable storage format and coherent reader/compactor upgrade,
 not a second mutable authority or dangling point-reference store.
 
+## Completed checkpoint: Remote Write 2.0 source starts
+
+- Investigated the experimental schema transition: public Prometheus 3.5.0
+  (rc.3, per-series created timestamp) versus 3.8.0 (rc.4, per-sample/histogram
+  start timestamp). Retain both in an optional signed-int64 millisecond column,
+  including exact extremes, zero-as-unset and same-label entries with differing
+  starts. Hybrid precedence is explicitly a Pulso policy, not upstream parity.
+- Match default public receiver operation with optional zero-injection disabled;
+  preserve ordinary PromQL samples and exact written counts, not synthetic rows.
+  No per-series local/cluster authority, ingest forwarding or sticky routing.
+- Keep source-record/body/label bounds and native preflight; malformed start
+  fields and safety failures append nothing. Preserve sample-time retention,
+  series identity, immutable PUT/CAS, old nil-start encoder bytes and keyed
+  fingerprint stability. Starts join content hashes only when present.
+- Metric metadata/start capability 2 changes the current tuple to `{2,2,1,1,1}`.
+  Retention activates immediately. Require a fleet-wide maintenance pause:
+  block metric delivery, drain old keyed retries, stop all old readers/writers/
+  compactors, replace every participant, then resume traffic. Old ingress can
+  change derived object keys; old compactors erase starts. No under-traffic
+  rolling rollout, default-off switch, automatic historical repair or safe old
+  compactor rollback is provided.
+- Freeze actual public Go-schema production/decoding plus actual release
+  receiver written headers and stored-query results: 56 cases / 112 source
+  samples across floats and integer/float/custom histograms. Replay with native
+  project tooling; validate raw MCP native/fallback JSON, Parquet, owned local
+  S3/CAS, independent runtime instances, restart and mixed null/start compaction.
+  See [fixture provenance](../test/fixtures/metrics/remote_write_start/README.md).
+  This does not establish separate-node, real-provider, SDK/Alloy, pressure or
+  full compliance-suite acceptance.
+
 ## Remaining protocol work, independent of application usage
 
 1. **OTLP metric semantics:** native exponential-histogram representation beyond
@@ -293,8 +323,11 @@ not a second mutable authority or dangling point-reference store.
    deltas only in node memory or depend on sticky routing. Evaluate retaining
    interval observations and query-time conversion before adding mutable state.
 2. **Prometheus interoperability:** explicit versioned OTLP naming/unit/resource
-   policies; broader native-histogram/exemplar query/export and remote-write2/
-   metadata acceptance beyond their current working-tree implementations. Projection must
+   policies; broader native-histogram/exemplar query/export, remote-write2
+   metadata/client/compliance acceptance and newer stateless-mode validation.
+   Optional created/start zero-injection and start-aware query/reset semantics
+   remain open: do not infer them from source-start retention or add a
+   node-local durable reset cache. Projection must
    not silently mix incompatible original instruments or invent counter resets.
 3. **OTLP wire breadth:** entity references, remaining
    null/presence/request-shape and unsupported-message validation, broader OTLP

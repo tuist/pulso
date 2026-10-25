@@ -1822,13 +1822,16 @@ defmodule Pulso.Storage.S3 do
   def caller_content_hash(:metrics, records) when is_list(records) do
     canonical =
       Enum.map(records, fn %MetricSample{} = s ->
-        %{
-          timestamp_ns: s.timestamp_ns,
-          value: s.value,
-          labels: s.labels
-        }
-        |> with_log_metadata(s.otlp)
-        |> with_rich_sample(s)
+        fields =
+          %{
+            timestamp_ns: s.timestamp_ns,
+            value: s.value,
+            labels: s.labels
+          }
+          |> with_log_metadata(s.otlp)
+          |> with_rich_sample(s)
+
+        if is_nil(s.start_timestamp_ms), do: fields, else: Map.put(fields, :start_timestamp_ms, s.start_timestamp_ms)
       end)
 
     digest_hex(canonical)

@@ -6,8 +6,12 @@ defmodule PulsoWeb.RemoteWriteV2Test do
 
   import Bitwise
 
+  alias Pulso.Codec.NIF
+  alias Pulso.MCP.Tools
   alias Pulso.Record.MetricSample
+  alias Pulso.Runtime
   alias Pulso.Storage
+  alias Pulso.Storage.S3
 
   @v2 "application/x-protobuf;proto=io.prometheus.write.v2.Request"
 
@@ -64,6 +68,159 @@ defmodule PulsoWeb.RemoteWriteV2Test do
   end
 
   defp tenant, do: "rw2-#{System.unique_integer([:positive])}"
+
+  @fixtures Path.expand("../../fixtures/metrics/remote_write_start", __DIR__)
+
+  test "public Prometheus schemas and real receivers preserve source starts without zero injection" do
+    for version <- ["3.5.0", "3.8.0"],
+        c <- File.read!(Path.join(@fixtures, "prometheus-#{version}.json")) |> JSON.decode!() do
+      tenant = tenant()
+      compressed = Base.decode64!(c["snappy_base64"])
+
+      conn =
+        build_conn()
+        |> put_req_header("x-scope-orgid", tenant)
+        |> put_req_header("content-type", @v2)
+        |> put_req_header("content-encoding", "snappy")
+        |> post("/api/v1/write", compressed)
+
+      assert conn.status == c["status"], "#{version}: #{c["name"]}"
+      assert written(conn) == c["written"]
+      assert {:ok, stored} = Storage.query(:metrics, tenant)
+      stored = Enum.sort_by(stored, & &1.timestamp_ns)
+      assert Enum.map(stored, & &1.start_timestamp_ms) == c["starts_ms"], "#{version}: #{c["name"]}"
+      assert length(stored) == 2
+      assert {:ok, []} = Storage.query(:metrics, tenant <> "-other")
+
+      [reference] = c["query"]["data"]["result"]
+      {plural, singular} = if c["kind"] == "float", do: {"values", "value"}, else: {"histograms", "histogram"}
+
+      for [seconds, _value] = pair <- reference[plural] do
+        assert {:ok, [%{"text" => actual}]} =
+                 Tools.call("query_promql", %{
+                   "tenant" => tenant,
+                   "query" => c["name"],
+                   "end_ts_ns" => seconds * 1_000_000_000
+                 })
+
+        assert Pulso.JSON.decode!(actual) == %{
+                 "status" => "success",
+                 "data" => %{
+                   "resultType" => "vector",
+                   "result" => [
+                     %{"metric" => reference["metric"], singular => pair}
+                   ]
+                 }
+               }
+      end
+
+      # Native and fallback raw JSON both expose starts; histograms exercise
+      # the fallback while ordinary floats must actually use the native path.
+      assert {:ok, [%{"text" => raw}]} = Tools.call("query_metrics", %{"tenant" => tenant})
+
+      assert raw |> Pulso.JSON.decode!() |> Enum.sort_by(& &1["timestamp_ns"]) |> Enum.map(& &1["start_timestamp_ms"]) ==
+               c["starts_ms"]
+
+      if c["kind"] == "float", do: assert({:ok, _} = NIF.encode_metric_samples(stored))
+
+      assert {:ok, blob, 1_700_000_000_000_000_000, 1_700_000_015_000_000_000} = S3.encode_segment(:metrics, stored)
+      assert {:ok, ^stored} = S3.decode_segment(:metrics, blob, nil, nil, [])
+      assert {:ok, again, _, _} = S3.encode_segment(:metrics, stored)
+      assert {:ok, ^stored} = S3.decode_segment(:metrics, again, nil, nil, [])
+    end
+  end
+
+  test "modern starts override legacy starts, zero unsets, and singular occurrences are last-wins" do
+    symbols = Enum.map_join(["", "__name__", "starts"], &field(4, &1))
+    labels = field(1, <<1, 2>>)
+    point = fn ts, extra -> field(2, <<9, -0.0::little-float-64>> <> varint_field(2, ts) <> extra) end
+
+    body =
+      symbols <>
+        field(
+          5,
+          labels <>
+            point.(10, "") <>
+            point.(11, varint_field(3, 0)) <>
+            point.(12, varint_field(3, 3) <> varint_field(3, 7)) <>
+            point.(13, varint_field(3, 4) <> varint_field(3, 0)) <>
+            varint_field(6, 1) <> varint_field(6, 2)
+        ) <>
+        field(5, labels <> point.(13, varint_field(3, 8)) <> varint_field(6, 9))
+
+    tenant = tenant()
+    assert tenant |> post_v2(body) |> response(204)
+    assert {:ok, stored} = Storage.query(:metrics, tenant)
+    stored = Enum.sort_by(stored, & &1.timestamp_ns)
+    assert Enum.map(stored, & &1.start_timestamp_ms) == [2, nil, 7, nil, 8]
+    assert stored |> Enum.map(& &1.series_id) |> Enum.uniq() |> length() == 1
+    assert Enum.all?(stored, &(<<&1.value::float-64>> == <<0x8000000000000000::64>>))
+    # Same labels/time/value but different starts must not share a decoded row.
+    assert {:ok, blob, _, _} = S3.encode_segment(:metrics, stored)
+    assert {:ok, ^stored} = S3.decode_segment(:metrics, blob, nil, nil, [])
+
+    # Unset starts do not create a new physical column; plain keyed bytes stay
+    # byte-identical to the pinned pre-change encoder fixture.
+    assert {:ok, legacy} =
+             NIF.decode_metric_segment_parquet(
+               File.read!(Path.join(@fixtures, "../keyed_metric_v2.parquet")),
+               nil,
+               nil,
+               []
+             )
+
+    assert Enum.all?(legacy, &is_nil(&1.start_timestamp_ms))
+    assert {:ok, exact, _, _, _} = NIF.encode_metric_segment_parquet_v2(legacy)
+    assert exact == File.read!(Path.join(@fixtures, "../keyed_metric_v2.parquet"))
+  end
+
+  test "start-bearing requests retain supplied-record admission before storage, including keyed requests" do
+    Runtime.put_env(:pulso, Pulso.IngestLimits, max_records: 1)
+
+    for version <- ["3.5.0", "3.8.0"] do
+      c = File.read!(Path.join(@fixtures, "prometheus-#{version}.json")) |> JSON.decode!() |> Enum.at(1)
+      tenant = tenant()
+
+      conn =
+        build_conn()
+        |> put_req_header("x-scope-orgid", tenant)
+        |> put_req_header("idempotency-key", "start-key")
+        |> put_req_header("content-type", @v2)
+        |> put_req_header("content-encoding", "snappy")
+        |> post("/api/v1/write", Base.decode64!(c["snappy_base64"]))
+
+      assert json_response(conn, 413) == %{"error" => "too_many_records"}
+      assert {:ok, []} = Storage.query(:metrics, tenant)
+    end
+  end
+
+  test "malformed start fields fail whole before any valid sibling or metadata is published" do
+    symbols = Enum.map_join(["", "__name__", "starts"], &field(4, &1))
+    labels = field(1, <<1, 2>>)
+    metadata = field(5, varint_field(1, 1))
+    good = field(5, labels <> sample(1.0, 10) <> metadata)
+    control = tenant()
+    assert control |> post_v2(symbols <> good) |> response(204)
+    assert {:ok, %{"starts" => _}} = Storage.metric_metadata(control)
+
+    bad_points = [
+      field(2, <<9, 1.0::little-float-64, 16, 11>> <> field(3, "bad")),
+      field(3, <<8, 1, 120, 11>> <> field(17, "bad")),
+      sample(1.0, 11) <> field(6, "bad"),
+      field(2, <<9, 1.0::little-float-64, 16, 11, 24, 128>>),
+      field(3, <<8, 1, 120, 11, 136, 1, 128>>),
+      # Malformed point framing is wire corruption even without a start.
+      field(2, <<9, 1.0::little-float-64, 16>>)
+    ]
+
+    for bad <- bad_points do
+      tenant = tenant()
+      conn = tenant |> post_v2(symbols <> good <> field(5, labels <> bad))
+      assert json_response(conn, 400) == %{"error" => "invalid_protobuf"}
+      assert {:ok, []} = Storage.query(:metrics, tenant)
+      assert {:ok, %{}} = Storage.metric_metadata(tenant)
+    end
+  end
 
   @symbols [
     "",

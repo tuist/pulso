@@ -6,6 +6,11 @@ This is one application's compatibility acceptance track, not Pulso's product
 boundary. Full public-protocol feature breadth is the generic goal; see
 [the protocol workstream](protocol-breadth.md) and [current coverage](../docs/protocol-coverage.md).
 
+Current metric artifact tuple is `{2,2,1,1,1}` for remote-write source starts;
+the explicit-distribution tuple below is historical. Source starts require the
+[fleet-wide maintenance upgrade](../docs/metrics.md#remote-write-20-start-timestamps),
+not a rolling deployment under traffic.
+
 Replace the observability ingest, storage, query, alert evaluation and notification dependencies Tuist actually uses. Pulso remains headless: it does not implement Grafana's UI or become a general-purpose SQL datasource. IRM and its incident/status integration move to Atlas and are outside Pulso's scope. Dashboard clients and any actually used profiling/synthetic products remain separate consumer or scope decisions, not an implied Pulso UI. Installed datasource entries alone are not evidence that a product is in use.
 
 No production reconfiguration, token retrieval, or deployment mutation is authorized by this workstream. Local implementation, read-only contract inventory and isolated validation are authorized. A cutover requires human-authorized shadow deployment and rollback evidence.

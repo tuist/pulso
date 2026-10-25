@@ -180,8 +180,9 @@ before they reach Pulso.
   Pulso only acknowledges a batch after it is durable in the bucket, so
   collectors retry anything cut off mid-request.
 - **Compatible upgrades** roll out one new pod before stopping the old one.
-  Read release notes first. Crossing the stale-sample compatibility boundary
-  below requires a non-overlapping upgrade, not the default rolling strategy.
+  Read release notes first. Crossing the source-start or stale-sample
+  compatibility boundaries below requires a non-overlapping upgrade, not the
+  default rolling strategy.
   Do not mix incompatible readers, writers, or compactors.
 - **Retention worker shutdown**: when the worker runs (`retention.enabled` or a
   positive duration), the chart raises the
@@ -195,6 +196,23 @@ before they reach Pulso.
 
 The pod runs as an unprivileged user with a read-only root filesystem. The only
 writable path is an `emptyDir` at `/tmp` for runtime scratch files.
+
+### Remote-write source-start storage compatibility
+
+Upgrading from metric capability tuple `{1,2,1,1,1}` to `{2,2,1,1,1}` requires a
+**fleet-wide maintenance pause**, not an ordinary `helm upgrade` under traffic.
+Senders can already supply starts and the new ingress retains them immediately.
+Block metric delivery, finish pending old keyed retries, stop every old metric
+reader/writer/compactor, replace all participants, then resume. Otherwise old
+compactors can erase starts and mixed-version retries can duplicate records.
+Follow the complete [source-start upgrade procedure](metrics.md#remote-write-20-start-timestamps).
+
+For one chart deployment, use `strategy.type: Recreate` and
+`strategy.rollingUpdate: null` during this upgrade. That only prevents overlap
+within that deployment: coordinate the maintenance pause across **all** releases,
+standalone instances and maintenance workers sharing the bucket. Pausing only
+compaction is insufficient. Do not roll back to readers or compactors that drop
+the start column after source-start writes.
 
 ### Stale-sample storage compatibility
 
@@ -415,7 +433,7 @@ series or streams that differ, values beyond a relative tolerance (default
   source for the [supported query subset](querying.md#prometheus-api).
   Bounded label/value/series discovery is also available through `/api/v1/labels`,
   `/api/v1/label/<name>/values` and `/api/v1/series`; see [metadata API limits](metric-discovery.md).
-  Serving app/native pairs require metric codec `{1,2,1,1,1}` (including footer planning). These routes do not
+  Serving app/native pairs require metric codec `{2,2,1,1,1}` (including source-start retention and footer planning). These routes do not
   establish complete Grafana datasource/client compatibility.
 - **Loki API**: `/loki/api/v1/query`, `query_range`, `labels`, and
   `label/<name>/values`.

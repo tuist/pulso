@@ -183,7 +183,7 @@ automatic semantic cross-encoder recovery remains unimplemented. See
 [keyed ingestion](keyed-ingestion.md). Existing
 and older-compatible readers can ignore the footer; index-free writers only lose
 acceleration. This release's local native startup check requires metric API tuple
-`{1,2,1,1,1}` (metadata, OTLP, postings, discovery, footer planning). That check does not fence other serving nodes;
+`{2,2,1,1,1}` (metadata/start timestamps, OTLP, postings, discovery, footer planning). That check does not fence other serving nodes;
 the separate all-participant rich-metadata upgrade requirements below still apply.
 
 ## Discover labels and series
@@ -239,7 +239,8 @@ labels/counts for extreme, rounded and zero-overlap cases; previously acknowledg
 keys can therefore return permanent `409 keyed_content_mismatch`. Do not delete,
 overwrite, change keys or resend unkeyed/subsets to bypass this. Historical
 projections are not repaired automatically. Parquet/envelope formats, shared wire
-capability 3 and the metric codec tuple `{1,2,1,1,1}` are unchanged; local native
+capability 3 are unchanged by that projection correction; the current metric codec
+tuple is `{2,2,1,1,1}` including remote-write source starts. Local native
 checks cannot fence an older application implementing the previous projection.
 
 ## Delta temporality
@@ -357,6 +358,82 @@ exclusive reservation: different content with the same key is a different
 publication. Unkeyed lost-response retries may duplicate samples. Per-request
 limits and local admission do not establish deployment-wide capacity.
 
+## Remote Write 2.0 start timestamps
+
+`POST /api/v1/write` (also `/api/prom/push` and `/api/v1/push`) accepts
+Snappy-compressed `io.prometheus.write.v2.Request` with the corresponding
+`Content-Type: application/x-protobuf;proto=io.prometheus.write.v2.Request`.
+The source start time is retained for float and native-histogram samples:
+
+- Prometheus 3.8.0 / Remote Write 2.0-rc.4: `Sample.start_timestamp` (field 3)
+  and `Histogram.start_timestamp` (field 17), independently per sample.
+- Compatibility with Prometheus 3.5.0 / rc.3: `TimeSeries.created_timestamp`
+  (field 6) applies to every sample/histogram in that series entry.
+- Zero means **unset**, not the Unix epoch. Missing/zero becomes `null` in stored
+  records; raw `query_metrics` omits the field when unset. Other signed int64
+  values survive exactly as `start_timestamp_ms`, in **milliseconds**, avoiding
+  overflow from conversion to nanoseconds. Do not treat a start later than its
+  sample as a valid cumulative interval: this is source retention, not interval
+  validation or conversion. Negative, equal and later starts are retained too.
+- For a hybrid message carrying both experimental layouts, a present per-point
+  field wins, including explicit zero; otherwise the legacy field applies.
+  Repeated singular scalar fields use protobuf's last occurrence. This hybrid
+  precedence is Pulso's compatibility policy, not an upstream schema guarantee.
+
+This matches the **default receiver behavior with zero-injection disabled** in
+the two pinned Prometheus releases: no synthetic zero samples and no extra
+written counts. Prometheus's optional `created-timestamp-zero-ingestion` feature,
+start-aware rates/resets and delta-to-cumulative processing are **not implemented**.
+No mutable series history, sticky routing, local reset cache or additional S3
+authority is introduced. Starts are not labels, sample timestamps, manifest time
+bounds, retention clocks or query-window bounds. Exemplars retain their own time.
+Existing sample-count/body/attribute bounds remain; one supplied point is still
+one stored sample. Malformed start wire fields **and malformed sample/histogram
+protobuf framing, even without starts,** fail the whole v2 request before
+samples or metadata publish; exceeded ingestion budgets still return 413.
+Well-framed semantic errors (for example invalid histogram buckets) retain the
+existing partial-acceptance policy for unkeyed requests; keyed rejections append
+nothing. Treating malformed v2 point framing as whole-request corruption is
+stricter than the older Pulso decoder and matches public protobuf unmarshaling.
+
+Parquet adds a nullable signed `Int64 start_timestamp_ms` column **only when any
+row has a start**; legacy segments read as unset/unknown, never reconstructed.
+Compaction preserves starts and mixed null rows. Non-null starts participate in
+keyed content fingerprints; absent starts keep existing keyed fingerprints and
+encoder bytes. Acknowledgment still requires immutable PUT and manifest CAS,
+and existing exact-byte conflict responses remain permanent 409s.
+
+**This requires a fleet-wide maintenance upgrade, not a rolling deployment under
+traffic.** Start retention is active immediately after upgrade; senders can
+already populate these fields and there is no opt-in retention switch. Pause
+exporter delivery/queue unsent data, block all metric ingestion at the routing
+boundary, drain in-flight requests and finish pending keyed retries on the old
+fleet. Stop **all** old metric writers (including recording evaluators), readers
+and compactors before starting any upgraded participant. Do not leave an old
+compactor running against the shared bucket. Resume delivery only after every
+participant has matching app/native metric tuple `{2,2,1,1,1}`. Pausing only
+compaction does not prevent mixed-ingress keyed duplicates, and a per-node
+`Recreate` restart does not coordinate a multi-deployment fleet.
+
+Metadata/start capability 2 also fences the changed v2 decoder result. Old readers
+drop the column and old compactors can erase it. Drain pending start-bearing
+keyed requests before upgrading: older ingress discarded the field, so a retry
+can otherwise select a different content-derived object key and duplicate data.
+Do not change keys, overwrite objects or resend unkeyed to bypass a conflict.
+Past discarded starts cannot be recovered. Roll back only to compatible readers,
+writers and compactors, or after a separately validated migration. Startup only
+checks the local artifact, not another running pool.
+
+The [public specification](https://prometheus.io/docs/specs/prw/remote_write_spec_2_0/)
+is still experimental. The pinned
+[3.5.0 schema](https://github.com/prometheus/prometheus/blob/v3.5.0/prompb/io/prometheus/write/v2/types.proto),
+[3.8.0 schema](https://github.com/prometheus/prometheus/blob/v3.8.0/prompb/io/prometheus/write/v2/types.proto)
+and real receivers supply independent wire, written-count and stored-query
+evidence for 56 offline-replayed cases. Starts come from public schema
+marshal/unmarshal, not a live sender/exporter or a TSDB start-retention query.
+This is not full TSDB, newer `stateless` mode validation, public compliance-suite,
+deployed-client or provider-capacity acceptance.
+
 ## Upgrade and rollback
 
 **Upgrade every metric reader, writer and compactor before enabling rich OTLP
@@ -368,11 +445,12 @@ obsolete codec artifacts, not older running application versions.
 
 Before sending histograms/summaries, upgrade **every serving ingestion instance**
 to the application/native pair requiring OTLP metric decoder capability 2
-(current metric tuple `{1,2,1,1,1}`). An older application may reject these points
+(current metric tuple `{2,2,1,1,1}`). An older application may reject these points
 rather than store them, so a load balancer can otherwise make acceptance depend
 on routing. Startup checks only fence the local artifact, not another pool.
-This addition does not change the Parquet schema, scalar keyed encoder or metadata
-capability 1. Readers/compactors that already preserve the full metadata envelope
+The OTLP decoder addition did not change the Parquet schema or scalar keyed encoder.
+Metadata/start capability 2 is now required separately for remote-write source
+starts above. Readers/compactors that already preserve the full metadata envelope
 retain these new source fields, but the earlier all-participant rich-metadata
 upgrade requirement still applies to older codecs.
 

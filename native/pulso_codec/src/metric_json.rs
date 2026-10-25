@@ -74,6 +74,12 @@ fn write<'a, S: Sink>(env: Env<'a>, out: &mut S, samples: Term<'a>, limit: usize
         )?;
         out.extend(b",\"otlp\":");
         enc.value(out, sample.map_get(atoms::otlp()).unwrap_or(nil), 0)?;
+        let start = sample.map_get(atoms::start_timestamp_ms()).unwrap_or(nil);
+        if start.as_c_arg() != nil.as_c_arg() {
+            start.decode::<i64>().map_err(|_| EncodeError::Fallback)?;
+            out.extend(b",\"start_timestamp_ms\":");
+            enc.value(out, start, 0)?;
+        }
         write_exemplars(
             out,
             &enc,
