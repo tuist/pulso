@@ -4,7 +4,7 @@ defmodule Pulso.LogQL.AST.VectorAgg do
 
   `inner` is another metric expression (`RangeAgg`, `VectorAgg`,
   `BinaryOp`, or `NumberLit`). `grouping` is optional. `param` is the
-  scalar argument for `topk`/`bottomk` (an integer).
+  scalar argument for `topk`/`bottomk`/`approx_topk` (an integer).
   """
 
   alias Pulso.LogQL.AST.Grouping
@@ -21,6 +21,7 @@ defmodule Pulso.LogQL.AST.VectorAgg do
           | :stddev
           | :stdvar
           | :topk
+          | :approx_topk
           | :bottomk
           | :sort
           | :sort_desc

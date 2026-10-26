@@ -8,6 +8,11 @@ defmodule Pulso.PromQL.ParserTest do
     matchers = Enum.map_join(1..65, ",", &~s(a#{&1}="x"))
     assert {:error, _} = Parser.parse("m{" <> matchers <> "}")
     assert {:error, _} = Parser.parse(~s(m{job=~"#{String.duplicate("a", 1025)}"}))
+
+    quoted_matchers = Enum.map_join(1..64, ",", &~s("label😀#{&1}"="x"))
+    assert {:ok, _} = Parser.parse("{" <> quoted_matchers <> "}")
+    assert {:error, _} = Parser.parse(~s({"metric😀",#{quoted_matchers}}))
+    assert {:error, _} = Parser.parse(~s({"label😀"=~"#{String.duplicate("a", 1025)}"}))
   end
 
   test "unclosed nested aggregations cannot backtrack exponentially" do
@@ -36,7 +41,13 @@ defmodule Pulso.PromQL.ParserTest do
 
   test "mutated untrusted input always returns a parse result" do
     :rand.seed(:exsss, {11, 37, 91})
-    seeds = [~s|sum by(job) (rate(m{job=~"api.*"}[5m]))|, "m offset 1h", "# comment\nm"]
+
+    seeds = [
+      ~s|sum by(job) (rate(m{job=~"api.*"}[5m]))|,
+      "m offset 1h",
+      "# comment\nm",
+      ~S({"metric😀","label😀"="test"})
+    ]
 
     for seed <- seeds, _ <- 1..100 do
       position = :rand.uniform(byte_size(seed)) - 1
@@ -119,6 +130,45 @@ defmodule Pulso.PromQL.ParserTest do
     assert {:ok, {:selector, [_, {"job", :eq, "a\"}b"}], 0}} = Parser.parse(~S(x{job="a\"}b"}))
     assert {:ok, _} = Parser.parse(~S(x{job=~`api\d+`}))
     assert {:error, _} = Parser.parse(~S(x{job="\q"}))
+  end
+
+  test "quoted UTF8 metric and label names normalize to existing selector matchers" do
+    for query <- [~s({"metric😀"}), ~s({'metric😀'}), "{`metric😀`}", ~S({"metric\U0001f600"})] do
+      assert {:ok, {:selector, [{"__name__", :eq, "metric😀"}], 0}} = Parser.parse(query)
+    end
+
+    assert {:ok, {:selector, [{"__name__", :eq, "metric😀"}, {"label\"😀", :eq, "test"}], 0}} =
+             Parser.parse(~S({"metric😀","label\"😀"="test",}))
+
+    assert {:ok, {:selector, [{"label😀", :re, "te.*"}, {"__name__", :eq, "metric😀"}], 0}} =
+             Parser.parse("{ 'label😀' =~ `te.*`, # metric follows\n `metric😀`, }")
+
+    assert Parser.parse(~S(legacy{"label😀"!="other"})) == Parser.parse(~S({__name__="legacy","label😀"!="other"}))
+
+    assert {:ok, {:function, :rate, {:range, [{"__name__", :eq, "metric😀"}], 300_000_000_000, 0}}} =
+             Parser.parse(~s|rate({"metric😀"}[5m])|)
+  end
+
+  test "quoted names cannot conceal empty names, duplicate bare metrics or malformed selectors" do
+    for query <- [
+          ~S({""}),
+          ~S({"",job="test"}),
+          ~S({""="test"}),
+          ~S({"metric😀","other"}),
+          ~S(legacy{"metric😀"}),
+          ~S({"metric😀" job="test"}),
+          ~S({"metric😀",label😀="test"}),
+          ~S(m{label:name="test"}),
+          ~S({"metric😀","label😀"=}),
+          ~S({"metric😀","label😀"="test}),
+          ~S({"metric😀","label\q"="test"}),
+          ~S({"metric😀","label\xff"="test"}),
+          ~S({"metric\xff"}),
+          ~S({"label😀"=~".*"}),
+          "metric😀"
+        ] do
+      assert {:error, _} = Parser.parse(query), query
+    end
   end
 
   test "escaped bytes and Unicode preserve matcher values without silent transcoding" do

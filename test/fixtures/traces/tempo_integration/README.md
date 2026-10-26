@@ -12,6 +12,8 @@ This is a selected public API port, **not the complete Tempo integration suite**
 | `TestSearchTagValuesV2_badRequest` | HTTP rejection of `app.user.id`; Pulso's diagnostic rather than Tempo's parser wording |
 | [`TestSearchTraceQL`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/search/search_test.go) and [`SearchTraceQLAndAssertTrace{WithRange}`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/util/harness_api_reads.go) | Find the ingested trace with `{ .<original-key> = "<value>" }`, both without bounds and with explicit bounds. Random trace/attribute selection becomes the first batch's fixed `firstRes` and `firstSpan`; this preserves the found-trace assertion/query shape, not the random producer's full input. |
 | [`TestTraceByIDV2Filtering`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/tracebyid/trace_by_id_filtering_test.go) | All 31 depth-table combinations, the exact six-span parent graph, two integer predicates, span-ID sets and COMPLETE/PARTIAL expectations; malformed query and active/ignored depth assertions. The oversized-URI response is an explicit adaptation below. |
+| [`TestQueryRangeExemplars`, metric and HTTP-validation subtests](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L306-L536) | All three aligned/unaligned/default-step interval rows (3/4/122 samples), all five instant/range aggregate comparisons, the instant-average comparison, all six topk/bottomk rows, both empty-result counts, and HTTP rejection of `0`, `0s` and `35ms` steps. Small-step diagnostic wording is explicitly adapted below. Exemplar production/requests and transport permutations are excluded. |
+| [`TestQueryRangeTypeHandling` and `TestQueryRangeMaxSeriesDisabled`, metric-cardinality selections](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L636-L725) | Two spans with `foo` string `123` versus integer `123`, and the timed one-span producer, queried with `{} \| rate() by (span:id)`, five-minute bounds and `5s` step. COMPLETE and exact producer-cardinality assertions are retained. Exemplar requests, streaming and the unlimited-series configuration are not selected. |
 
 The separate malformed-name, exact-percent, nested `/values`, missing-key, route
 suffix, authentication, search-window rejection and full-response public-engine
@@ -23,7 +25,7 @@ checks are Pulso regressions, not additional upstream integration cases.
 mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs
 ```
 
-Seventeen async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
+Forty-two async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
 owned Bandit listener, persist native Parquet through Pulso's S3 adapter against
 an owned loopback object store, restart manifest supervision, and query JSON and
 protobuf responses. Default tests need no Go, Docker, remote services or network
@@ -158,6 +160,162 @@ These controls are not counted as upstream cases.
 | --- | --- |
 | Upstream `integration/api/tracebyid/trace_by_id_filtering_test.go` | `5e3a1700e9bc3d580316651ed5ccc95b52e3f59ba6bfcf07ea6df874e86c0b56` |
 | `filter-cases.json` | `f7dc3635a0b5b9e676fe02b21e9543eb728c519c24c9c3acf0e25fe72507a550` |
+
+## Metric table continuation
+
+The fifteen metric-only subtests preserve the upstream queries, range lengths,
+steps, reductions, interval counts and ranking cardinalities. They passed on the
+unchanged runtime (seed 67), alongside the existing seventeen wrappers and a
+separately identified ranking control: **33 passed**. This is additional regression
+coverage, not evidence of a newly fixed metric implementation bug.
+
+The source's timed producer becomes exactly twenty half-second ticks, with its
+three one-span batches per tick. Names, attribute keys, fixed values and
+one-microsecond durations are unchanged; UUIDs and trace/span IDs become distinct
+deterministic strings. The query clock is fixed to a recent minute boundary,
+with source starts from clock minus 13 seconds to minus 3.5 seconds. This keeps
+the complete input inside the source's aligned windows without sleeps, timers or
+wall-clock-dependent empty results. Unaligned ends use exactly half a second
+past that boundary. Input reaches the real OTLP/HTTP and durable Parquet/S3 path,
+then manifest supervision restarts before querying. There is no simulated
+ingester/backend double read or gRPC-streaming coverage.
+
+The upstream helper normally also sends an unasserted exemplar-count request
+parameter; the metric-only selection omits it. **This is not a port of exemplar
+behavior**, `compare()`, arithmetic between metric expressions, or every subtest
+in `TestQueryRangeExemplars`. Metric JSON content is checked over HTTP, not
+protobuf or the source helper's second gRPC transport. In addition to the
+upstream aggregate consistency assertions, independent expectations use the exact
+sixty input spans and their durations, so mutually incorrect range/instant
+responses cannot agree their way through the tests.
+
+Two separately named Pulso controls exercise unequal series counts 1/3/5 through
+both ranking directions, both attribute scopes and both metric endpoints; and
+unequal counts/durations across three intervals. The latter checks exact
+timestamps and span-weighted instant averages rather than an average of interval
+averages. These are not additional upstream cases. No runtime, native ABI,
+storage format, keyed bytes, budgets or upgrade requirements change for this
+Tempo coverage increment.
+
+| Upstream source | SHA-256 |
+| --- | --- |
+| `integration/api/metrics/query_range_test.go` | `7749294d4d682939a602e656cac41728f2b9c63344e913999d5c7d58170078f2` |
+| `integration/util/harness_api_writes.go` | `53ea99c9dad9c6e2645e4004aeb587fe6d8bf6235ae7aab3bbb191e5124d66d3` |
+
+## Span-ID metric grouping continuation
+
+The two new source selections failed before runtime edits: the full HTTP replay
+had **34/37 passing wrappers** (seed 71), with both upstream-derived requests
+and the new Pulso control returning HTTP 400 for `by (span:id)`. No source
+assertion was weakened. The numeric/string `foo` values, default helper's `x=y`,
+`xx=""`, service/name, one-microsecond duration, five-minute query geometry,
+five-second step and source cardinality assertions are preserved. Random IDs
+become distinct fixed IDs. The five-second/half-second producer freezes to ten
+ticks with starts from query time minus 7.5 to minus 3 seconds. This preserves
+the one-span-per-tick helper and counts actual input, without sleeps or races
+between upstream's final timer/ticker events. Both cases use persisted S3 after
+manifest-supervision restart, not separate recent/backend phases.
+
+The selection is explicitly **metric-cardinality only**: the unasserted
+`exemplars=100` parameter and gRPC-streaming repetition are omitted. Pulso does
+not reproduce the `max_series=0` override or unlimited-series semantics; its
+10,000-series hard ceiling remains. A separate public query test checks exactly
+10,000 distinct IDs succeeding and 10,001 failing whole with `trace_group_limit`,
+while an ungrouped count still sees all 10,001. A local-fixture iteration first
+caught out-of-window and uppercase core-ID mistakes in that boundary test; only
+the fixture changed, not validation or limits.
+
+Grouping now reads the already validated core span ID without attribute-owner
+expansion and emits the canonical `span:id` label with a 16-character lowercase
+hex string. The pinned public implementation confirms the protocol spelling in
+[`enum_attributes.go`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/pkg/traceql/enum_attributes.go#L210-L211),
+string typing in
+[`block_traceql.go`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/tempodb/encoding/vparquet4/block_traceql.go#L3199),
+and fixed-width formatting in
+[`SpanIDToHexString`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/pkg/util/traceid.go#L54-L65).
+No upstream runtime code is copied. The parser admits this intrinsic only for
+grouping, and native compilation independently rejects it as a numeric value.
+
+Additional controls distinguish intrinsic IDs from ordinary `span.id` and
+`resource.id`, preserve typed string/int64 `foo` groupings, combine reused span
+IDs across distinct traces, retain leading zeros and high unsigned bits, and
+normalize uppercase ingress to lowercase output. Both instant and range metric
+endpoints run these checks. Bare `id`, `trace:id` and numeric ID aggregations
+still reject. Legacy core-only grouping remains supported without inventing
+unknown original attributes. These controls are not additional upstream ports.
+
+Trace metrics capability **2** is independently required at startup alongside
+the unchanged trace tuple `{2,1,3,5,12}`. Upgrade all serving app/native pairs
+before depending on the syntax. No encoder, storage format, keyed bytes,
+migration or retry-drain requirement changes. Five grouping keys, series/point/
+byte ceilings and shared query/scan budgets remain unchanged. These offline
+ports do not establish full typed metrics, deployed clients or capacity parity.
+
+Final cross-protocol replay passed **149 tests** (seed 76), including all 37
+Tempo HTTP wrappers and the trace metrics unit/HTTP suites. Whole-repository
+`mix precommit` passed **1807 tests**, with one existing optional promtool skip
+and 37 optional exclusions (seed 75). Codec release tests passed all 133 cases;
+strict Credo, release Clippy, formatters and whitespace checks passed. Direct
+native validation also rejected numeric ID operations and six grouping keys.
+
+| Additional inspected source | SHA-256 |
+| --- | --- |
+| `pkg/traceql/enum_attributes.go` | `7150265d29922a9209821369a9df1d9450eadfcfc66476eae82cf13125c84062` |
+| `pkg/util/traceid.go` | `1158046cd8942d42e052c10c7562c40a593ff660623ad705e56f17cc1bf19787` |
+| `tempodb/encoding/vparquet4/block_traceql.go` | `87d66734e1e26a66fa467f461d217cff84bf92ab31af19f21ec1013e0d5729a4` |
+
+## Empty selections and interval validation continuation
+
+Five more rows from the pinned `TestQueryRangeExemplars` are ported: both
+empty-result count queries (`{status=error}` and the absent `span.randomattr`),
+and HTTP steps `0`, `0s` and `35ms`. The same frozen sixty-span fixture remains
+non-error and lacks that attribute. Bounds retain the helper's five minutes
+before / one minute after the anchor, with its `5s` step for empty selections.
+Both empty cases preserve the at-least-one-series and zero-exemplar assertions.
+The unsupported exemplar-count request and gRPC transport remain excluded;
+zero exemplars here do not prove exemplar production or selection support.
+
+Both empty-result assertions failed before the native fix (seed 78), returning
+`series: []`; the initial baseline used the receiver-default step, later made
+explicit as the upstream helper's `5s`. A public-query control also failed because
+it expected exact zero samples. Ungrouped count/rate finalization now returns its
+zero identity only after a successful scan. It does not invent labels for grouped
+queries or numeric/histogram/quantile observations. Separate public-query
+controls check every aligned timestamp/value for nonmatching selectors, empty
+tenants and out-of-window spans, plus instant zeros and unchanged empty
+grouped/numeric results. Legacy/corrupt inputs and exhausted budgets still fail,
+not zeros.
+
+The three HTTP validation rows initially passed **2/3** (seed 80): `35ms` over
+six minutes wrongly returned HTTP 200. Admission now checks the original range's
+integer interval quotient against the pinned default **10,000**, before boundary
+alignment. The native aligned-window ceiling remains 11,000, not an operator
+override. A public-query boundary control accepts exactly 10,000 requested
+intervals and a sub-step remainder (10,001/10,002 aligned output samples), rejects
+10,001 requested intervals, and leaves instant requests at one interval.
+**Diagnostic adaptation:** the small-step port preserves HTTP 400 rather than
+upstream's exact `step of 35ms is too small, minimum step for given range is 36ms`
+text; Pulso retains its generic invalid-parameter diagnostic. Zero-step source
+cases only assert rejection. No source safety ceiling is raised.
+
+Runtime changes are independently written, not copied upstream implementations.
+Upgrade all serving app/native pairs for consistent query semantics; no storage,
+keyed bytes, native ABI or migration changes are introduced by this increment.
+The earlier span-ID capability remains **2**. Pinned runtime inspection confirms
+the ungrouped placeholder series and pre-alignment interval validation:
+
+| Additional inspected source | SHA-256 |
+| --- | --- |
+| [`pkg/traceql/engine_metrics.go`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/pkg/traceql/engine_metrics.go#L768-L774) (`UngroupedAggregator.Series` at lines 994–1005) | `cd05466f788a7a0705578fd79aa47d38a1408ca9609cdbd9b9e6fa8493058e01` |
+| [`modules/frontend/metrics_query_validation.go`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/modules/frontend/metrics_query_validation.go#L16-L34) | `dde4a210f65c885d59844b089a04e61cbb43e89eca0955acda6aaaca303966ad` |
+| [`modules/frontend/config.go`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/modules/frontend/config.go#L152) | `5fa9a3e016101b5f3ed6e79a26f9eb91a3373f19131a194b9f1ffb4fd9b0a10c` |
+
+The final three-service plus trace metrics unit/HTTP replay passed **157 tests**
+(seed 83), including all **42 Tempo wrappers**. `mix precommit` passed **1815**
+with one existing optional promtool skip and 37 optional exclusions (seed 82).
+Codec release tests passed all **133** cases; strict Credo, release Clippy,
+formatters and whitespace checks passed. These remain offline HTTP/native-S3
+regressions, not a run of upstream Tempo or deployed-client acceptance.
 
 ## Explicit remaining gaps
 

@@ -60,12 +60,12 @@ defmodule PulsoWeb.LogsEndToEndTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -82,12 +82,13 @@ defmodule PulsoWeb.LogsEndToEndTest do
     start_supervised!(ManifestSupervision)
 
     api =
-      start_supervised!({Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0},
+      start_supervised!(
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0},
         id: :log_api
       )
 
     {:ok, {_ip, api_port}} = ThousandIsland.listener_info(api)
-    %{store: store, config: config, tenant: tenant, token: token, url: "http://localhost:#{api_port}"}
+    %{store: store, config: config, tenant: tenant, token: token, url: "http://127.0.0.1:#{api_port}"}
   end
 
   test "public OTLP gzip protobuf to real native S3/Parquet/CAS to MCP survives cache loss and keyed retry", ctx do

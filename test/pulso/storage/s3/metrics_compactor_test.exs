@@ -48,12 +48,12 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: agent}, port: 0})
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: agent}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       # Isolate native connection caches even if the OS reuses a test port.
       access_key_id: "test-#{System.unique_integer([:positive])}",

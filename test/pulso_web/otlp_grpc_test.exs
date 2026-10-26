@@ -111,7 +111,7 @@ defmodule PulsoWeb.OTLPGRPCTest do
 
   test "an incomplete body expires and frees admission without closing its HTTP2 connection" do
     {:ok, listener, port} = NIF.otlp_grpc_start("127.0.0.1", 0, self(), 1024, 1, 100)
-    {:ok, conn} = Mint.HTTP2.connect(:http, "localhost", port, mode: :passive)
+    {:ok, conn} = Mint.HTTP2.connect(:http, "127.0.0.1", port, mode: :passive)
     tasks = start_supervised!(Task.Supervisor)
 
     try do
@@ -175,13 +175,19 @@ defmodule PulsoWeb.OTLPGRPCTest do
     try do
       first = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
       assert_receive {:pulso_otlp_grpc, first_reply, :traces, _, ""}, 5_000
-      assert %{status: 14} = Task.await(first, 5_000)
+      assert %{status: 14, message: "ingest timed out"} = Task.await(first, 5_000)
+
+      # The queued call's deadline includes admission. Its completion, not a
+      # fixed delay, proves it cannot bypass the retained BEAM reply handle.
       second = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
-      refute_receive {:pulso_otlp_grpc, _, _, _, _}, 50
+      assert %{status: 14, message: "ingest timed out"} = Task.await(second, 5_000)
+      refute_received {:pulso_otlp_grpc, _, _, _, _}
+
       assert :ok = NIF.otlp_grpc_reply(first_reply, 0, "", "")
-      assert_receive {:pulso_otlp_grpc, second_reply, :traces, _, ""}, 5_000
-      assert :ok = NIF.otlp_grpc_reply(second_reply, 0, "", "")
-      assert %{status: 0} = Task.await(second, 5_000)
+      third = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
+      assert_receive {:pulso_otlp_grpc, third_reply, :traces, _, ""}, 5_000
+      assert :ok = NIF.otlp_grpc_reply(third_reply, 0, "", "")
+      assert %{status: 0} = Task.await(third, 5_000)
     after
       NIF.otlp_grpc_stop(listener)
     end

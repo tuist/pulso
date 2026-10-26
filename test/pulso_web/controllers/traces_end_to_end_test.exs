@@ -37,12 +37,12 @@ defmodule PulsoWeb.TracesEndToEndTest do
          end}
       )
 
-    object_server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    object_server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_ip, object_port}} = ThousandIsland.listener_info(object_server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{object_port}",
+      endpoint: "http://127.0.0.1:#{object_port}",
       region: "us-east-1",
       access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -61,12 +61,12 @@ defmodule PulsoWeb.TracesEndToEndTest do
 
     api_server =
       start_supervised!(
-        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0},
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0},
         id: :trace_api_server
       )
 
     {:ok, {_ip, api_port}} = ThousandIsland.listener_info(api_server)
-    %{store: store, tenant: tenant, token: token, url: "http://localhost:#{api_port}"}
+    %{store: store, tenant: tenant, token: token, url: "http://127.0.0.1:#{api_port}"}
   end
 
   defp wire_batches(<<>>), do: []
@@ -1032,12 +1032,13 @@ defmodule PulsoWeb.TracesEndToEndTest do
     Runtime.put_env(:pulso, TempoSearch, enabled: false)
 
     disabled =
-      start_supervised!({Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0},
+      start_supervised!(
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0},
         id: :disabled_tempo_search
       )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(disabled)
-    assert Req.get!("http://localhost:#{port}/api/search", headers: headers, params: params).status == 501
+    assert Req.get!("http://127.0.0.1:#{port}/api/search", headers: headers, params: params).status == 501
   end
 
   test "Tempo v1 HTTP lookup returns independent JSON/protobuf, honors auth, deduplicates retries and never filters by shard hints",
@@ -1119,12 +1120,13 @@ defmodule PulsoWeb.TracesEndToEndTest do
     # Endpoint dependencies are immutable snapshots; inject the limited context
     # into a separately owned listener, not the already-running server.
     limited =
-      start_supervised!({Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0},
+      start_supervised!(
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0},
         id: :limited_trace_api_server
       )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(limited)
-    assert Req.get!("http://localhost:#{port}/api/traces/" <> id, headers: headers).status == 422
+    assert Req.get!("http://127.0.0.1:#{port}/api/traces/" <> id, headers: headers).status == 422
   end
 
   test "public OTLP to native trace-level selector search remains tenant-authorized after cache restart", ctx do

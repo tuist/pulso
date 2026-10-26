@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Adapted from Grafana Tempo integration/api/search/{search,search_tags}_test.go.
 # Filtering cases: integration/api/tracebyid/trace_by_id_filtering_test.go.
+# Metric cases: integration/api/metrics/query_range_test.go.
 # Source revision, adaptations and license: test/fixtures/traces/tempo_integration/README.md.
 defmodule PulsoWeb.TempoUpstreamIntegrationTest do
   use Pulso.Test.Case, async: true
@@ -44,12 +45,12 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
          end}
       )
 
-    object_server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    object_server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_, object_port}} = ThousandIsland.listener_info(object_server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{object_port}",
+      endpoint: "http://127.0.0.1:#{object_port}",
       region: "us-east-1",
       access_key_id: "tempo-upstream-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -68,14 +69,14 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
 
     server =
       start_supervised!(
-        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0},
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0},
         id: :tempo_upstream_api
       )
 
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     %{
-      url: "http://localhost:#{port}",
+      url: "http://127.0.0.1:#{port}",
       headers: [{"authorization", "Bearer " <> token}, {"x-scope-orgid", tenant}],
       tenant: tenant,
       now: System.system_time(:second)
@@ -450,6 +451,340 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     end
   end
 
+  # integration/api/metrics/query_range_test.go: TestQueryRangeExemplars
+  # contains these metric-only subtests too. No exemplar assertion is selected.
+  describe "TestQueryRangeExemplars / metric-only tables" do
+    setup ctx do
+      # Freeze twenty half-second producer ticks and random UUIDs. A minute
+      # boundary keeps every batch inside both aligned upstream query windows.
+      now = div(ctx.now, 60) * 60
+      ctx = %{ctx | now: now}
+      ingest_metric_batches(ctx)
+      %{now: now}
+    end
+
+    for {name, offset_ns, step, intervals} <- [
+          {"aligned", 0, "1m", 3},
+          {"unaligned", 500_000_000, "1m", 4},
+          {"default step", 500_000_000, nil, 122}
+        ] do
+      test "intervals / #{name}", ctx do
+        finish = ctx.now * 1_000_000_000 + unquote(offset_ns)
+        params = %{"q" => "{} | count_over_time()", "start" => finish - 120_000_000_000, "end" => finish}
+        params = if unquote(step), do: Map.put(params, "step", unquote(step)), else: params
+        assert %{"series" => [series]} = get(ctx, "/api/metrics/query_range", params)
+        assert length(series["samples"]) == unquote(intervals)
+        # Independent control: the exact frozen input is sixty single spans.
+        assert Enum.sum_by(series["samples"], & &1["value"]) == 60
+      end
+    end
+
+    for query <- [
+          "{status=error} | count_over_time()",
+          ~s'{span.randomattr = "doesnotexist"} | count_over_time()'
+        ] do
+      test "empty results / #{query}", ctx do
+        params = %{"q" => unquote(query), "start" => ctx.now - 300, "end" => ctx.now + 60, "step" => "5s"}
+        result = get(ctx, "/api/metrics/query_range", params)
+        assert [_ | _] = result["series"]
+        assert Enum.sum_by(result["series"], &length(Map.get(&1, "exemplars", []))) == 0
+      end
+    end
+
+    for {name, step} <- [{"step=0 (default step)", "0"}, {"step=0s (default step)", "0s"}, {"small step", "35ms"}] do
+      test "HTTP validation / #{name}", ctx do
+        params = %{
+          "q" => "{} | count_over_time()",
+          "start" => ctx.now - 300,
+          "end" => ctx.now + 60,
+          "step" => unquote(step)
+        }
+
+        response = Req.get!(ctx.url <> "/api/metrics/query_range", headers: ctx.headers, params: params)
+        # Preserve HTTP rejection; Pulso uses its own bounded-parameter diagnostic.
+        assert response.status == 400
+      end
+    end
+
+    for {name, query, step, reduction, expected} <- [
+          {"count_over_time", "{} | count_over_time()", "1s", :sum, 60},
+          {"sum_over_time", "{} | sum_over_time(duration)", "1s", :sum, 0.00006},
+          {"max_over_time", "{} | max_over_time(duration)", "1s", :max, 0.000001},
+          {"min_over_time", "{} | min_over_time(duration)", "1s", :min, 0.000001},
+          {"1m step", "{} | count_over_time()", "1m", :sum, 60}
+        ] do
+      test "instant and range / #{name}", ctx do
+        params = %{"q" => unquote(query), "start" => ctx.now - 300, "end" => ctx.now + 60, "step" => unquote(step)}
+        assert %{"series" => [range]} = get(ctx, "/api/metrics/query_range", params)
+        assert %{"series" => [instant]} = get(ctx, "/api/metrics/query", params)
+        values = Enum.map(range["samples"], & &1["value"])
+
+        reduced =
+          case unquote(reduction) do
+            :sum -> Enum.sum(values)
+            :max -> Enum.max(values)
+            :min -> Enum.min(values)
+          end
+
+        assert_in_delta instant["value"], reduced, 1.0e-12
+        assert_in_delta instant["value"], unquote(expected), 1.0e-12
+      end
+    end
+
+    test "avg_over_time instant query", ctx do
+      params = %{"start" => ctx.now - 300, "end" => ctx.now + 60}
+
+      results =
+        Map.new(["avg", "sum", "count"], fn op ->
+          argument = if op == "count", do: "", else: "duration"
+          query = "{} | #{op}_over_time(#{argument})"
+          assert %{"series" => [series]} = get(ctx, "/api/metrics/query", Map.put(params, "q", query))
+          {op, series["value"]}
+        end)
+
+      assert results["count"] == 60
+      assert_in_delta results["avg"], results["sum"] / results["count"], 1.0e-12
+      assert_in_delta results["avg"], 0.000001, 1.0e-12
+    end
+
+    for {name, query, count} <- [
+          {"top 1 by span attribute", "{ } | rate() by (span.span_high_cardinality) | topk(1)", 1},
+          {"top 10 by span attribute", "{ } | rate() by (span.span_high_cardinality) | topk(10)", 10},
+          {"top 2 by resource attribute", "{ } | rate() by (resource.res_high_cardinality) | topk(2)", 2},
+          {"bottom 1 by resource attribute", "{ } | rate() by (resource.res_high_cardinality) | bottomk(1)", 1},
+          {"bootom 10 by resource attribute", "{ } | rate() by (resource.res_high_cardinality) | bottomk(10)", 10},
+          {"bottom 2 by span attribute", "{ } | rate() by (span.span_high_cardinality) | bottomk(2)", 2}
+        ] do
+      test "ranking / #{name}", ctx do
+        params = %{"q" => unquote(query), "start" => ctx.now - 300, "end" => ctx.now + 60, "step" => "1m"}
+        result = get(ctx, "/api/metrics/query", params)
+        assert length(result["series"]) == unquote(count)
+      end
+    end
+  end
+
+  test "TestQueryRangeTypeHandling / metric-only: string and integer attributes do not lose span-ID series", ctx do
+    batches =
+      for {id, value} <- [{"00000000000000ab", %{"stringValue" => "123"}}, {"7fffffffffffffff", %{"intValue" => "123"}}] do
+        %{
+          "spanCount" => 1,
+          "name" => "my operation",
+          "resourceAttr" => "xx",
+          "resourceAttVal" => "",
+          "spanAttr" => "x",
+          "spanAttVal" => "y",
+          "spanId" => id,
+          "extraSpanAttributes" => [%{"key" => "foo", "value" => value}]
+        }
+      end
+
+    ingest(ctx, batches)
+    params = %{"q" => "{} | rate() by (span:id)", "start" => ctx.now - 300, "end" => ctx.now, "step" => "5s"}
+    result = get(ctx, "/api/metrics/query_range", params)
+    assert Map.get(result, "status", "COMPLETE") == "COMPLETE"
+    assert length(result["series"]) == 2
+
+    # Pulso control: cardinality alone cannot detect lost ID bits or a wrong label.
+    assert Enum.sort(Enum.map(result["series"], & &1["labels"])) == [
+             [%{"key" => "span:id", "value" => %{"stringValue" => "00000000000000ab"}}],
+             [%{"key" => "span:id", "value" => %{"stringValue" => "7fffffffffffffff"}}]
+           ]
+
+    for series <- result["series"] do
+      assert_in_delta Enum.sum_by(series["samples"], & &1["value"]), 0.2, 1.0e-12
+    end
+  end
+
+  test "TestQueryRangeMaxSeriesDisabled / metric-cardinality selection: every frozen producer span returns a series",
+       ctx do
+    batches =
+      for tick <- 1..10 do
+        %{
+          "spanCount" => 1,
+          "name" => "my operation",
+          "resourceAttr" => "xx",
+          "resourceAttVal" => "",
+          "spanAttr" => "x",
+          "spanAttVal" => "y",
+          "spanId" => tick |> Integer.to_string(16) |> String.pad_leading(16, "0"),
+          "startNs" => (ctx.now - 8) * 1_000_000_000 + tick * 500_000_000
+        }
+      end
+
+    ingest(ctx, batches)
+    params = %{"q" => "{} | rate() by (span:id)", "start" => ctx.now - 300, "end" => ctx.now, "step" => "5s"}
+    result = get(ctx, "/api/metrics/query_range", params)
+    assert Map.get(result, "status", "COMPLETE") == "COMPLETE"
+    assert length(result["series"]) == 10
+  end
+
+  test "Pulso metric controls: span IDs are core strings, not user attributes or trace-local identities", ctx do
+    ctx = %{ctx | now: div(ctx.now, 60) * 60 - 30}
+
+    batches =
+      for {id, value} <- [
+            {"00000000000000ab", %{"stringValue" => "123"}},
+            {"00000000000000ab", %{"intValue" => "123"}},
+            {"fedcba9876543210", %{"stringValue" => "123"}}
+          ] do
+        %{
+          "spanCount" => 1,
+          "name" => "my operation",
+          "resourceAttr" => "id",
+          "resourceAttVal" => "resource-id",
+          "spanAttr" => "id",
+          "spanAttVal" => "attribute-id",
+          "spanId" => String.upcase(id),
+          "extraSpanAttributes" => [%{"key" => "foo", "value" => value}]
+        }
+      end
+
+    ingest(ctx, batches)
+
+    for endpoint <- ["query", "query_range"],
+        {group, expected} <- [
+          {"span:id", %{%{"stringValue" => "00000000000000ab"} => 2, %{"stringValue" => "fedcba9876543210"} => 1}},
+          {"span.id", %{%{"stringValue" => "attribute-id"} => 3}},
+          {"resource.id", %{%{"stringValue" => "resource-id"} => 3}},
+          {"span.foo", %{%{"stringValue" => "123"} => 2, %{"intValue" => "123"} => 1}}
+        ] do
+      params = %{
+        "q" => "{} | count_over_time() by (#{group})",
+        "start" => ctx.now - 300,
+        "end" => ctx.now,
+        "step" => "5s"
+      }
+
+      result = get(ctx, "/api/metrics/" <> endpoint, params)
+
+      actual =
+        Map.new(result["series"], fn series ->
+          assert [%{"key" => ^group, "value" => value}] = series["labels"]
+          count = if endpoint == "query", do: series["value"], else: Enum.sum_by(series["samples"], & &1["value"])
+          {value, count}
+        end)
+
+      assert actual == expected
+      assert length(result["series"]) == map_size(expected)
+    end
+
+    for query <- [
+          "{} | rate() by (id)",
+          "{} | rate() by (trace:id)",
+          "{} | sum_over_time(span:id)",
+          "{} | quantile_over_time(span:id, 0.5)"
+        ] do
+      response =
+        Req.get!(ctx.url <> "/api/metrics/query",
+          headers: ctx.headers,
+          params: %{"q" => query, "start" => ctx.now - 300, "end" => ctx.now}
+        )
+
+      assert response.status == 400
+    end
+  end
+
+  test "Pulso metric controls: ranking selects actual extremes, not arbitrary k series", ctx do
+    ctx = %{ctx | now: div(ctx.now, 60) * 60 - 30}
+
+    batches =
+      for {value, count} <- [{"small", 1}, {"middle", 3}, {"large", 5}] do
+        %{
+          "spanCount" => count,
+          "name" => "operation",
+          "resourceAttr" => "res_high_cardinality",
+          "resourceAttVal" => value,
+          "spanAttr" => "span_high_cardinality",
+          "spanAttVal" => value
+        }
+      end
+
+    ingest(ctx, batches)
+
+    for {scope, key} <- [{"span", "span_high_cardinality"}, {"resource", "res_high_cardinality"}],
+        {op, value, count} <- [{"topk", "large", 5}, {"bottomk", "small", 1}],
+        endpoint <- ["query", "query_range"] do
+      label = scope <> "." <> key
+      query = "{} | count_over_time() by (#{label}) | #{op}(1)"
+      # Every input is in one minute. Empty range intervals may retain another
+      # zero-valued tie winner; compare the actual nonzero ranking separately.
+      finish = div(ctx.now, 60) * 60 + 60
+      params = %{"q" => query, "start" => finish - 60, "end" => finish, "step" => "1m"}
+      result = get(ctx, "/api/metrics/" <> endpoint, params)
+
+      if endpoint == "query" do
+        assert result["series"] == [
+                 %{"labels" => [%{"key" => label, "value" => %{"stringValue" => value}}], "value" => count}
+               ]
+      else
+        assert [series] = Enum.filter(result["series"], &Enum.any?(&1["samples"], fn point -> point["value"] > 0 end))
+        assert series["labels"] == [%{"key" => label, "value" => %{"stringValue" => value}}]
+        assert Enum.sum_by(series["samples"], & &1["value"]) == count
+      end
+    end
+  end
+
+  test "Pulso metric controls: instant duration averages weight spans, not occupied intervals", ctx do
+    start = div(ctx.now, 60) * 60 - 60
+
+    batches =
+      for {offset, count, duration_ms} <- [{5, 1, 100}, {15, 3, 200}, {25, 5, 700}] do
+        %{
+          "spanCount" => count,
+          "name" => "operation",
+          "resourceAttr" => "res_attr",
+          "resourceAttVal" => "res_val",
+          "spanAttr" => "span_attr",
+          "spanAttVal" => "span_val",
+          "startNs" => (start + offset) * 1_000_000_000,
+          "durationNs" => duration_ms * 1_000_000
+        }
+      end
+
+    ingest(ctx, batches)
+
+    for {op, expected, values} <- [
+          {"sum", 4.2, [0.1, 0.6, 3.5]},
+          {"avg", 4.2 / 9, [0.1, 0.2, 0.7]},
+          {"min", 0.1, [0.1, 0.2, 0.7]},
+          {"max", 0.7, [0.1, 0.2, 0.7]}
+        ] do
+      params = %{"q" => "{} | #{op}_over_time(duration)", "start" => start, "end" => start + 30, "step" => "10s"}
+      assert %{"series" => [instant]} = get(ctx, "/api/metrics/query", params)
+      assert_in_delta instant["value"], expected, 1.0e-12
+      assert %{"series" => [range]} = get(ctx, "/api/metrics/query_range", params)
+      assert length(range["samples"]) == 3
+
+      for {sample, value, offset} <- Enum.zip([range["samples"], values, [10, 20, 30]]) do
+        assert sample["timestampMs"] == Integer.to_string((start + offset) * 1000)
+        assert_in_delta sample["value"], value, 1.0e-12
+      end
+    end
+  end
+
+  defp ingest_metric_batches(ctx) do
+    batches =
+      for tick <- 0..19,
+          {name, resource_key, resource_value, span_key, span_value} <- [
+            {"my operation", "res_attr", "res_val", "span_attr", "span_val"},
+            {"my operation", "res_attr", "res_val2", "span_attr", "span_val2"},
+            {"operation with high cardinality", "res_high_cardinality", "resource-#{tick}", "span_high_cardinality",
+             "span-#{tick}"}
+          ] do
+        %{
+          "spanCount" => 1,
+          "name" => name,
+          "resourceAttr" => resource_key,
+          "resourceAttVal" => resource_value,
+          "spanAttr" => span_key,
+          "spanAttVal" => span_value,
+          "startNs" => (ctx.now - 13) * 1_000_000_000 + tick * 500_000_000
+        }
+      end
+
+    ingest(ctx, batches)
+  end
+
   defp ingest_filter_trace(ctx, graph \\ [{1, 0, 0}, {2, 1, 0}, {3, 2, 500}, {4, 1, 200}, {5, 3, 0}, {6, 5, 0}]) do
     spans =
       for {id, parent, code} <- graph do
@@ -494,16 +829,18 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
   defp ingest(ctx, batches) do
     for {batch, i} <- Enum.with_index(batches, 1) do
       attributes = fn key, value -> [%{"key" => key, "value" => %{"stringValue" => value}}] end
+      start = Map.get(batch, "startNs", (ctx.now - 3) * 1_000_000_000)
 
       spans =
         for j <- 1..batch["spanCount"] do
           %{
             "traceId" => i |> Integer.to_string(16) |> String.pad_leading(32, "0"),
-            "spanId" => j |> Integer.to_string(16) |> String.pad_leading(16, "0"),
+            "spanId" => Map.get(batch, "spanId", j |> Integer.to_string(16) |> String.pad_leading(16, "0")),
             "name" => batch["name"],
-            "startTimeUnixNano" => Integer.to_string((ctx.now - 3) * 1_000_000_000),
-            "endTimeUnixNano" => Integer.to_string((ctx.now - 3) * 1_000_000_000 + 1000),
-            "attributes" => attributes.(batch["spanAttr"], batch["spanAttVal"])
+            "startTimeUnixNano" => Integer.to_string(start),
+            "endTimeUnixNano" => Integer.to_string(start + Map.get(batch, "durationNs", 1000)),
+            "attributes" =>
+              attributes.(batch["spanAttr"], batch["spanAttVal"]) ++ Map.get(batch, "extraSpanAttributes", [])
           }
         end
 

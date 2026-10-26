@@ -59,9 +59,13 @@ defmodule Pulso.PromQL.Parser do
     ])
     |> reduce({__MODULE__, :decode_string, []})
 
+  label_identifier =
+    ascii_char([?a..?z, ?A..?Z, ?_])
+    |> repeat(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
+    |> reduce({List, :to_string, []})
+
   matcher =
-    parsec(:ws)
-    |> concat(identifier)
+    choice([label_identifier, quoted])
     |> parsec(:ws)
     |> choice([
       string("=~") |> replace(:re),
@@ -72,6 +76,8 @@ defmodule Pulso.PromQL.Parser do
     |> parsec(:ws)
     |> concat(quoted)
     |> reduce({__MODULE__, :matcher, []})
+
+  matcher = parsec(:ws) |> choice([matcher, quoted |> reduce({__MODULE__, :metric_name, []})])
 
   labels =
     ignore(string("{"))
@@ -414,9 +420,24 @@ defmodule Pulso.PromQL.Parser do
   @doc false
   def matcher([name, op, value]), do: {name, op, value}
   @doc false
-  def selector([name, matchers]), do: [{"__name__", :eq, name} | matchers]
-  def selector([name]) when is_binary(name), do: [{"__name__", :eq, name}]
-  def selector([matchers]), do: matchers
+  def metric_name([""]), do: raise(ArgumentError)
+  def metric_name([name]), do: {:metric_name, name}
+  @doc false
+  def selector([name, matchers]), do: selector_matchers([{:metric_name, name} | matchers])
+  def selector([name]) when is_binary(name), do: selector_matchers([{:metric_name, name}])
+  def selector([matchers]), do: selector_matchers(matchers)
+
+  defp selector_matchers(matchers) do
+    # Keep shorthand names distinct until assembly, so two bare metric names
+    # cannot silently turn into contradictory __name__ matchers.
+    if Enum.count(matchers, &match?({:metric_name, _}, &1)) > 1, do: raise(ArgumentError)
+
+    Enum.map(matchers, fn
+      {:metric_name, name} -> {"__name__", :eq, name}
+      matcher -> matcher
+    end)
+  end
+
   @doc false
   def duration_component([n, unit]), do: {String.to_integer(n), unit}
   @doc false
@@ -675,7 +696,7 @@ defmodule Pulso.PromQL.Parser do
     valid =
       length(matchers) <= 64 and
         Enum.all?(matchers, fn {name, op, value} ->
-          label_name?(name) and
+          name != "" and String.valid?(name) and
             (op not in [:re, :nre] or valid_regex?(value))
         end)
 

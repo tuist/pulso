@@ -5,7 +5,7 @@ defmodule Pulso.Test.GRPCClient do
   # grpc-status/message and raw trailers.
 
   def unary(port, path, message, opts \\ []) do
-    {:ok, conn} = Mint.HTTP2.connect(:http, "localhost", port, mode: :passive)
+    {:ok, conn} = Mint.HTTP2.connect(:http, "127.0.0.1", port, mode: :passive)
 
     {flag, payload} =
       if opts[:gzip], do: {1, :zlib.gzip(message)}, else: {0, message}

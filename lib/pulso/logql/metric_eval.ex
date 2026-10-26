@@ -51,6 +51,7 @@ defmodule Pulso.LogQL.MetricEval do
         Process.put(:promql_deadline_ms, Process.get(:query_deadline_ms, System.monotonic_time(:millisecond) + 10_000))
 
     with :ok <- validate_steps(opts),
+         :ok <- validate_query_mode(expr, result_kind(opts)),
          {:ok, kind, series} <- eval(expr, tenant, opts) do
       {:ok, {kind, series}}
     end
@@ -139,6 +140,10 @@ defmodule Pulso.LogQL.MetricEval do
   # ---------------------------------------------------------------------------
   # Vector aggregation
   # ---------------------------------------------------------------------------
+
+  # Exact ranking is the bounded implementation here, not a count-min sketch.
+  # All input samples and intermediate points still spend the ordinary budgets.
+  defp do_eval(%AST.VectorAgg{op: :approx_topk} = agg, tenant, opts), do: do_eval(%{agg | op: :topk}, tenant, opts)
 
   defp do_eval(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
     with {:ok, kind, inner_series} <- eval(inner, tenant, opts) do
@@ -617,6 +622,17 @@ defmodule Pulso.LogQL.MetricEval do
   defp result_kind(opts) do
     if Map.get(opts, :step_ns), do: :matrix, else: :vector
   end
+
+  # Inspect the whole tree before a left-hand selector can start storage work.
+  defp validate_query_mode(_expr, :vector), do: :ok
+  defp validate_query_mode(%AST.VectorAgg{op: :approx_topk}, :matrix), do: {:error, :instant_query_required}
+  defp validate_query_mode(%AST.VectorAgg{inner: inner}, kind), do: validate_query_mode(inner, kind)
+
+  defp validate_query_mode(%AST.BinaryOp{left: left, right: right}, kind) do
+    with :ok <- validate_query_mode(left, kind), do: validate_query_mode(right, kind)
+  end
+
+  defp validate_query_mode(_expr, _kind), do: :ok
 
   defp validate_steps(opts) do
     case Map.get(opts, :step_ns) do

@@ -17,7 +17,7 @@ defmodule Pulso.Traces.Metrics do
   `Pulso.Traces.SearchExpression`, optionally `&&`-combined with `true` and
   `nestedSetParent<0` (root spans only). `<attr>` is `duration`,
   `span.<key>`, `resource.<key>` or `.<key>`; `by` also accepts `name`,
-  `status` and `kind`, and at most five attributes. `with (...)` hints are
+  `status`, `kind` and `span:id`, and at most five attributes. `with (...)` hints are
   accepted and ignored, so sampling hints yield exact results.
 
   Spans are reduced natively per segment (`trace_metrics.rs`); see that
@@ -110,9 +110,11 @@ defmodule Pulso.Traces.Metrics do
     aligned_end = if rem(finish, step) == 0, do: finish, else: finish + step - rem(finish, step)
     aligned_start = if aligned_start > step, do: aligned_start - step, else: aligned_start
 
-    if aligned_end <= 9_223_372_036_854_775_807 and div(aligned_end - aligned_start, step) in 1..11_000,
-      do: {:ok, {aligned_start, aligned_end, step, false}},
-      else: {:error, :unsupported_parameters}
+    # Tempo checks the requested range before alignment adds boundary intervals.
+    if div(finish - start, step) <= 10_000 and aligned_end <= 9_223_372_036_854_775_807 and
+         div(aligned_end - aligned_start, step) in 1..11_000,
+       do: {:ok, {aligned_start, aligned_end, step, false}},
+       else: {:error, :unsupported_parameters}
   end
 
   def window(_window, _instant), do: {:error, :unsupported_parameters}
@@ -318,6 +320,7 @@ defmodule Pulso.Traces.Metrics do
     Enum.reduce_while(attributes, {:ok, []}, fn text, {:ok, acc} ->
       case attribute(text) do
         {:ok, {scope, key}} -> {:cont, {:ok, [{scope, key, label(scope, key, text)} | acc]}}
+        :error when text == "span:id" -> {:cont, {:ok, [{"intrinsic", "id", "span:id"} | acc]}}
         :error -> {:halt, :error}
       end
     end)

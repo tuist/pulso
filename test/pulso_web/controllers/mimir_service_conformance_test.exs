@@ -40,13 +40,13 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
     Runtime.put_env(:pulso, Storage, adapter: S3)
 
     Runtime.put_env(:pulso, S3, %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "mimir-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -172,6 +172,107 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
                "resultType" => "matrix",
                "result" => [%{"metric" => unquote(Macro.escape(expected_labels)), "values" => [[@start, "100"]]}]
              }
+
+      assert_parquet(store)
+    end
+  end
+
+  # TestDistributor_NameValidation: only the UTF8Validation scheme, which is
+  # already Pulso's receiver contract. The legacy-validation policy is not ported.
+  # Unlike the earlier distributor table, the single sample is at queryEnd.
+  for {name, metric, labels, symbols, refs, query, metadata?} <- [
+        {"legacy metric name", "legacy_metricC", [{"__name__", "legacy_metricC"}, {"label_name", "test"}],
+         ["", "__name__", "legacy_metricC", "label_name", "test"], [1, 2, 3, 4], "legacy_metricC", false},
+        {"utf8 metric name", "utf_metric😀C", [{"__name__", "utf_metric😀C"}],
+         ["", "__name__", "utf_metric😀C", "some helpC", "someunitC"], [1, 2], ~s({"utf_metric😀C"}), true},
+        {"utf8 label name", "legacy_metricC_total_2", [{"__name__", "legacy_metricC_total_2"}, {"utf8_label😀", "test"}],
+         ["", "__name__", "legacy_metricC_total_2", "utf8_label😀", "test"], [1, 2, 3, 4], "legacy_metricC_total_2",
+         false}
+      ],
+      version <- [:v1, :v2] do
+    @tag rw_version: version
+    test "TestDistributor_NameValidation / utf8 / #{name} / #{version}", %{store: store, rw_version: version} do
+      metric = unquote(metric)
+      labels = unquote(Macro.escape(labels))
+      query_end = @start + 3600
+
+      bytes =
+        case version do
+          :v1 ->
+            metadata =
+              if unquote(metadata?),
+                do: field(3, uint(1, 1) <> field(2, metric) <> field(4, "some helpC") <> field(5, "someunitC")),
+                else: ""
+
+            field(1, series(labels, [{query_end, 100}])) <> metadata
+
+          :v2 ->
+            metadata = if unquote(metadata?), do: field(5, uint(1, 1) <> uint(3, 3) <> uint(4, 4)), else: ""
+
+            Enum.map_join(unquote(symbols), &field(4, &1)) <>
+              field(
+                5,
+                field(1, Enum.map_join(unquote(refs), &varint/1)) <> field(2, sample(query_end, 100)) <> metadata
+              )
+        end
+
+      response = post_write(bytes, version)
+      assert response.status == 204
+      assert_written(response, version, 1, 0, 0)
+
+      assert data("/api/v1/query_range", query: unquote(query), start: @start, end: query_end, step: "5m") == %{
+               "resultType" => "matrix",
+               "result" => [%{"metric" => Map.new(labels), "values" => [[query_end, "100"]]}]
+             }
+
+      # Metadata is an upstream input; the public read is an extra Pulso control.
+      expected_metadata =
+        if unquote(metadata?),
+          do: %{metric => [%{"type" => "counter", "help" => "some helpC", "unit" => "someunitC"}]},
+          else: %{}
+
+      assert data("/api/v1/metadata", metric: metric) == expected_metadata
+      assert_parquet(store)
+    end
+  end
+
+  for version <- [:v1, :v2] do
+    @tag rw_version: version
+    test "Pulso UTF8 selector controls / #{version}", %{store: store, rw_version: version} do
+      labels = [{"__name__", "utf_metric😀C"}, {"label\"😀", "test"}]
+      assert post_write(label_request(version, [%{labels: labels, samples: [{@start, 100}]}]), version).status == 204
+
+      for query <- [
+            ~S({"utf_metric\U0001f600C","label\"😀"="test"}),
+            ~S({ "label\"😀" =~ "te.*", "utf_metric😀C", }),
+            ~S({"utf_metric😀C","label\"😀"!="other"}),
+            ~S({"utf_metric😀C","label\"😀"!~"other.*"}),
+            ~S({"__name__"="utf_metric😀C","label\"😀"="test"})
+          ] do
+        assert data("/api/v1/query", query: query, time: @start) == %{
+                 "resultType" => "vector",
+                 "result" => [%{"metric" => Map.new(labels), "value" => [@start, "100"]}]
+               }
+      end
+
+      assert data("/api/v1/query", query: ~S({"utf_metric😀C","label\"😀"="other"}), time: @start) == %{
+               "resultType" => "vector",
+               "result" => []
+             }
+
+      for query <- [
+            ~S({"utf_metric😀C","other"}),
+            ~S(legacy_metricC{"utf_metric😀C"}),
+            ~S({"","label😀"="test"}),
+            ~S({""="test"}),
+            ~S({"utf_metric😀C","label😀"=}),
+            ~S({"utf_metric😀C","label\q"="test"}),
+            ~S({"utf_metric😀C"),
+            "utf_metric😀C"
+          ] do
+        response = conn() |> get("/api/v1/query", %{query: query, time: @start})
+        assert %{"status" => "error", "errorType" => "bad_data"} = json_response(response, 400)
+      end
 
       assert_parquet(store)
     end
@@ -521,6 +622,66 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
              ) ==
                %{"resultType" => "matrix", "result" => matrix}
     end
+  end
+
+  # TestQueryFrontendErrorMessageParity: only its eight portable invalid range
+  # requests. Preserve HTTP/status/errorType, but assert Pulso's complete generic
+  # diagnostic envelope, not upstream error-message parity. QueryRangeRaw sends
+  # numeric seconds (including -60), not duration strings. The last row's omitted
+  # subquery resolution rejects as unsupported syntax, not range-vector typing.
+  for {name, query, first, last, step} <- [
+        {"maximum resolution error", "unknown", @start - 86_400, @start, "1"},
+        {"negative step", "unknown", @start - 3600, @start, "-60"},
+        {"unknown function", "unknown(up)", @start - 3600, @start, "60"},
+        {"range vector instead of instant vector",
+         ~s|sum by(grpc_method)(grpc_server_handled_total{job="cortex-dedicated-06/etcd"}[1m])|, @start - 3600, @start,
+         "60"},
+        {"start after end", "unknown", @start, @start - 3600, "60"},
+        {"wrong duration specified in step", "unknown", @start - 3600, @start, "123notafloat"},
+        {"wrong timestamp in start", "unknown", "depths-of-time", @start, "30"},
+        {"range query with range vector", "(sum(rate(up[1m])))[5m:]", @start - 3600, @start, "60"}
+      ] do
+    test "TestQueryFrontendErrorMessageParity / #{name} / Pulso diagnostics", %{store: store} do
+      params = [query: unquote(query), start: unquote(first), end: unquote(last), step: unquote(step)]
+      assert Agent.get(store, & &1.requests) == []
+
+      response = conn() |> get("/api/v1/query_range?" <> URI.encode_query(params))
+
+      assert json_response(response, 400) == %{
+               "status" => "error",
+               "errorType" => "bad_data",
+               "error" => "Invalid or unsupported query parameters."
+             }
+
+      assert Agent.get(store, & &1.requests) == []
+    end
+  end
+
+  # integration/querier_test.go: TestHashCollisionHandling, RW1 as sent by Push.
+  # These labels collide in upstream fingerprints/fast fingerprints, not in
+  # Pulso's StableHash/xxhash64. This replays the public result, not a Pulso collision.
+  test "TestHashCollisionHandling", %{store: store} do
+    bytes =
+      field(1, series([{"A", "K6sjsNNczPl"}, {"__name__", "fingerprint_collision"}], [{@start, 0}])) <>
+        field(1, series([{"A", "cswpLMIZpwt"}, {"__name__", "fingerprint_collision"}], [{@start, 1}]))
+
+    assert post_write(bytes, :v1, [{"x-scope-orgid", "user-0"}]).status == 204
+
+    assert data("/api/v1/query", [query: "fingerprint_collision", time: @start], "user-0") == %{
+             "resultType" => "vector",
+             "result" => [
+               %{
+                 "metric" => %{"A" => "K6sjsNNczPl", "__name__" => "fingerprint_collision"},
+                 "value" => [@start, "0"]
+               },
+               %{
+                 "metric" => %{"A" => "cswpLMIZpwt", "__name__" => "fingerprint_collision"},
+                 "value" => [@start, "1"]
+               }
+             ]
+           }
+
+    assert_parquet(store)
   end
 
   # integration/querier_test.go: testMetadataQueriesWithBlocksStorage, called by

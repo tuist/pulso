@@ -87,16 +87,16 @@ defmodule Pulso.Codec.NIF do
 
     version =
       try do
-        {trace_metadata_api_version(), trace_search_api_version(), tempo_trace_api_version(),
-         tempo_search_api_version(), tempo_discovery_api_version()}
+        {{trace_metadata_api_version(), trace_search_api_version(), tempo_trace_api_version(),
+          tempo_search_api_version(), tempo_discovery_api_version()}, trace_metrics_api_version()}
       rescue
         ErlangError -> :unavailable
       end
 
-    if version != {2, 1, 3, 5, 12},
+    if version != {{2, 1, 3, 5, 12}, 2},
       do:
         raise(
-          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with span-ID grouping; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
         )
 
     :ok

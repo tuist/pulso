@@ -44,6 +44,7 @@ enum Lookup {
     Status,
     Kind,
     Duration,
+    SpanId,
 }
 
 impl Lookup {
@@ -165,13 +166,14 @@ fn lookup(scope: &str, key: &str) -> Res<Lookup> {
         ("intrinsic", "status") => Lookup::Status,
         ("intrinsic", "kind") => Lookup::Kind,
         ("intrinsic", "duration") => Lookup::Duration,
+        ("intrinsic", "id") => Lookup::SpanId,
         _ => return Err(Error::Invalid),
     })
 }
 
 #[rustler::nif]
 fn trace_metrics_api_version() -> u32 {
-    1
+    2
 }
 
 /// `program` is a `tempo_expression` program or nil; `op` an operation name;
@@ -216,7 +218,10 @@ fn trace_metrics_new<'a>(
             Ok((scope, key)) => Some(lookup(&scope, &key)?),
             Err(_) => None,
         };
-        if matches!(op, Op::Count | Op::Rate) != value.is_none() || by.len() > 5 {
+        if matches!(op, Op::Count | Op::Rate) != value.is_none()
+            || by.len() > 5
+            || matches!(value, Some(Lookup::SpanId))
+        {
             return Err(Error::Invalid);
         }
         let by = by
@@ -472,6 +477,17 @@ impl State {
     }
 
     fn final_series(&self) -> Res<Vec<Final>> {
+        // Ungrouped counts/rates have an identity even without observations.
+        // Do not invent group keys or numeric/histogram observations.
+        if self.series.is_empty() && self.by.is_empty() && matches!(self.op, Op::Count | Op::Rate) {
+            return Ok(vec![(
+                vec![(
+                    "__name__".to_owned(),
+                    string_value(self.op.name().as_bytes()),
+                )],
+                vec![0.0; self.mapper.count],
+            )]);
+        }
         let mut finals = Vec::new();
         let rate = 1e9 / self.mapper.step as f64;
         if let Op::Quantile(qs) = &self.op {
@@ -701,6 +717,7 @@ impl<'a> Owners<'a> {
                 None => attribute(self.resource.get(key))?,
             },
             Lookup::Name => Some(string_value(string(field(fields, b"name")?)?.as_bytes())),
+            Lookup::SpanId => Some(string_value(string(field(fields, b"span_id")?)?.as_bytes())),
             Lookup::Status => {
                 let code = crate::tempo_search::integer(field(
                     &object(field(fields, b"status")?)?,

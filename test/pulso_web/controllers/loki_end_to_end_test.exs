@@ -33,12 +33,12 @@ defmodule PulsoWeb.LokiEndToEndTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -54,11 +54,15 @@ defmodule PulsoWeb.LokiEndToEndTest do
     Runtime.put_env(:pulso, S3, config)
     start_supervised!(ManifestSupervision)
 
-    api = start_supervised!({Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0})
+    api =
+      start_supervised!(
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0}
+      )
+
     {:ok, {_, api_port}} = ThousandIsland.listener_info(api)
 
     now = System.system_time(:nanosecond)
-    ctx = %{url: "http://localhost:#{api_port}", tenant: tenant, token: token, now: now, store: store}
+    ctx = %{url: "http://127.0.0.1:#{api_port}", tenant: tenant, token: token, now: now, store: store}
 
     # Three pushes become three segments, so discovery unions sources.
     push(ctx, [

@@ -29,14 +29,18 @@ defmodule Pulso.Storage.S3.MetricMetadataStoreTest do
     # instead of waiting out the 60 s read timeout.
     server =
       start_supervised!(
-        {Bandit, plug: {CompactionStore, agent: store}, port: 0, thousand_island_options: [shutdown_timeout: 0]}
+        {Bandit,
+         plug: {CompactionStore, agent: store},
+         ip: {127, 0, 0, 1},
+         port: 0,
+         thousand_island_options: [shutdown_timeout: 0]}
       )
 
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",

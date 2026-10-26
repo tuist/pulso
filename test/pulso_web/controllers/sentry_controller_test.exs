@@ -111,14 +111,18 @@ defmodule PulsoWeb.SentryControllerTest do
 
     server =
       start_supervised!(
-        {Bandit, plug: {CompactionStore, agent: agent}, port: 0, thousand_island_options: [shutdown_timeout: 100]}
+        {Bandit,
+         plug: {CompactionStore, agent: agent},
+         ip: {127, 0, 0, 1},
+         port: 0,
+         thousand_island_options: [shutdown_timeout: 100]}
       )
 
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "sentry-#{System.unique_integer([:positive])}",
       secret_access_key: "test",

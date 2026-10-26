@@ -21,9 +21,9 @@ not from regenerating answers with Pulso.
 
 | Backend | Imported selection and provenance | Elixir replay |
 | --- | --- | --- |
-| Mimir | [33 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization and invalid RW2 symbols | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (52 tests including 19 controls) |
-| Loki | [22 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows and grouped stream ordering; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (28 tests including six controls) |
-| Tempo | [Five source entry points](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search and all 31 V2 trace-by-ID depth combinations; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (15 wrappers); independent native/reference/MCP replay in `search_expression_test.exs` |
+| Mimir | [48 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization, invalid RW2 symbols, all three UTF8Validation name rows over both write versions, the exact upstream fingerprint fixture and eight invalid-range requests with explicitly adapted diagnostics | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (69 tests including 21 controls) |
+| Loki | [26 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows, grouped stream ordering, per-request query length, standalone request-policy isolation, four-line WebSocket tail and `approx_topk` public result using exact bounded ranking; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (43 tests including 17 controls) |
+| Tempo | [Eight source entry points](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search, all 31 V2 trace-by-ID depth combinations, 20 selected metric/HTTP-validation subtests and two span-ID metric-cardinality selections; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (42 wrappers); independent native/reference/MCP replay in `search_expression_test.exs` |
 
 All replays use native Parquet and the real S3 HTTP adapter against test-owned
 loopback object stores. Loki and Tempo also use live authenticated HTTP
@@ -60,7 +60,7 @@ application/native pairs before resuming them. The native tuple is unchanged
 and startup does not fence older receivers. Never evade keyed 409s;
 [operator guidance](../docs/querying.md#native-histograms) applies.
 
-Whole-repository validation after this increment: `mix precommit --seed 0
+Previous increment's whole-repository validation: `mix precommit --seed 0
 --max-cases 4 --warnings-as-errors` passed **1760 tests, 1 existing skipped,
 37 optional excluded**. A final three-service replay passed all 95 tests at
 seed 41. Codec `cargo test --release` passed 133 tests; strict Credo, formatter,
@@ -70,14 +70,178 @@ release with Rust/Clippy **1.97.1**; an earlier Rust 1.94 run reported two uncha
 The green suite still logged compaction timeouts/CAS warnings and the intentional
 gRPC handler crash; it does not close those diagnostics or capacity acceptance.
 
+The next increment ports six Mimir UTF8Validation rows, one Loki per-request
+length case and fifteen Tempo metric-only rows. Baselines reproduced Mimir's
+quoted-metric query returning 400 after successful ingestion and Loki's ignored
+one-minute policy returning 200. Quoted UTF-8 selector names now reuse the
+existing matcher AST; no receiver validation-mode knob or grammar expansion
+outside selectors is introduced. Loki's `maxQueryLength` checks effective finite
+bounds before storage across finite endpoints. Other policy fields, duplicate or
+malformed policies and live-tail policies explicitly reject rather than silently
+run unrestricted; this stricter policy is not exact malformed-header parity.
+Existing server ceilings cannot be increased by the request. Upgrade all query
+applications before relying on either feature; no native/storage/keyed-byte
+change or retry drain is required.
+
+Tempo's selected metric tables passed on unchanged runtime. The timed/random
+producer is frozen to sixty single spans; no exemplar request/assertion, gRPC
+transport or metrics expression arithmetic is claimed. All 3/4/122 interval
+counts, six ranking cardinalities, five range/instant reductions and the average
+comparison are preserved. Independent asymmetric controls verify actual ranking
+identities and span-weighted durations, not just agreement between two Pulso
+outputs. Fixture READMEs preserve pinned source hashes, licenses, baseline
+evidence and exact harness adaptations.
+
+Validation before the span-ID continuation:
+
+- `ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mise exec -- mix precommit
+  --seed 69 --max-cases 4 --warnings-as-errors`: **1800 passed, 1 existing
+  optional promtool skip, 37 optional exclusions**, including compile/dependency/
+  formatter checks. Runtime: 225.3 seconds.
+- All three service replay files together at seed 70: **130 passed**.
+  The targeted Tempo metric/HTTP set also passed all 46 tests at seed 68.
+- Strict Credo checked 437 source files with no findings; `git diff --check`
+  passed. No Rust sources changed; native Parquet/S3 execution was exercised by
+  the Elixir suites, not a separate new Cargo unit-test run.
+- The full green run still logged compaction timeouts/conflicts, manifest CAS
+  warnings and an acceptor teardown error, alongside deliberate oversized-URI
+  and gRPC-crash controls. Passing tests do not resolve those diagnostics or
+  establish provider/capacity/deployed-client acceptance. No deployment or
+  shared infrastructure changes were performed.
+
+The subsequent continuation selects two Tempo span-ID metric-cardinality cases
+and Loki's four-line tail plus standalone per-request-limits test. Both Tempo
+source selections failed with HTTP 400 before runtime edits (34/37 wrappers
+passed, seed 71). Native `by (span:id)` now groups validated core IDs as
+fixed-width lowercase strings, distinct from ordinary `span.id` attributes.
+Original string/int64 types, reused IDs across traces, leading zeros, high bits,
+legacy core-only rows and instant/range responses have separate controls.
+Exactly 10,000 ID series succeed; 10,001 fail whole while an ungrouped count
+still sees all source spans. The upstream unlimited-series override, exemplar
+request and streaming transport are explicitly not selected or implemented.
+The metrics capability advances independently to **2**, fenced at startup;
+the trace tuple, storage format and keyed bytes remain unchanged. Upgrade all
+query-serving app/native pairs before relying on the syntax, without a data
+migration or retry drain for this addition.
+
+Both new Loki ports passed unchanged. A separate authenticated native-S3/socket
+control covers explicit history bounds, matching live formatted lines, durable
+finite-query visibility and monitored socket shutdown. These tests do not
+establish cross-instance continuity, full tail completeness or Loki's topology.
+All additions preserve pinned source/license provenance and distinguish harness
+adaptations and local controls from source expectations.
+
+Final validation for this continuation:
+
+- `mix precommit --seed 75 --max-cases 4 --warnings-as-errors`: **1807 passed,
+  1 existing optional promtool skip, 37 optional exclusions**, 196.7 seconds.
+  Compile/dependency/formatter checks passed too.
+- All three service files plus the trace metrics unit and HTTP files:
+  **149 passed**, seed 76. The service files contain 60 Mimir, 39 Loki and
+  37 Tempo wrappers, with source ports and local controls counted separately.
+- Codec `cargo test --release`: **133 passed**. Release Clippy with all targets
+  and warnings denied passed on Rust 1.97.1. Direct native validation admitted
+  ID grouping and rejected numeric ID operations and six-key grouping.
+- Strict Credo checked 437 source files without findings. Elixir formatter,
+  Rustfmt and whitespace checks passed. The green full suite still logged
+  compaction timeouts/conflicts and manifest CAS warnings, alongside intentional
+  oversized-URI/gRPC-crash controls; none is claimed resolved by these ports.
+- All changes remain local and uncommitted. No upstream multi-service suite,
+  deployed provider/client, infrastructure change or data migration was run.
+
+The next continuation selects five more Tempo metric/HTTP-validation rows and
+Mimir's `TestHashCollisionHandling` public result. Both empty-result Tempo
+assertions failed before the native fix (seed 78); zero-step cases already
+rejected, but the six-minute `35ms` request incorrectly succeeded (seed 80).
+Ungrouped counts/rates now return zero series values after a successful scan,
+without fabricating grouped/numeric observations or masking scan failures.
+Range admission checks the original interval quotient against 10,000 before
+alignment adds boundary intervals. Separate public-query controls distinguish
+10,000 requested intervals, a sub-step remainder and 10,001 intervals, and
+exercise empty tenants, filtered/absent spans, instant results and all aligned
+zero timestamps. No safety ceiling is increased. The small-step diagnostic uses
+Pulso's own HTTP-400 wording; exemplar production/request and gRPC remain outside
+this selection. Serving app/native pairs must all upgrade for consistent results;
+storage, keyed bytes and the native ABI are unchanged in this continuation.
+
+Mimir's exact tenant, two label sets, same-time values and full ordered vector
+passed before runtime changes. Native diagnostics confirmed distinct Pulso IDs:
+the upstream labels collide under its fingerprints, not Pulso's StableHash.
+This port is not evidence for Pulso hash-collision handling. No new Loki behavior
+is claimed in this continuation; its existing public ports remain in combined
+regression validation. Source hashes, licenses and adaptations are retained in
+each fixture README.
+
+Validation for the empty-selection/interval continuation:
+
+- `mix precommit --seed 82 --max-cases 4 --warnings-as-errors`: **1815 passed,
+  1 existing optional promtool skip, 37 optional exclusions**, 238.4 seconds.
+- All three service files plus trace metrics unit/HTTP tests: **157 passed**,
+  seed 83. Service totals are 61 Mimir, 39 Loki and 42 Tempo wrappers.
+- Codec release tests: **133 passed**. Release Clippy with all targets and
+  warnings denied passed using Rust 1.97.1. Strict Credo checked 437 files with
+  no findings; formatter, Rustfmt and whitespace checks passed.
+- The full green run still logged compaction timeouts/conflicts and manifest
+  CAS warnings, plus intentional oversized-URI and gRPC-crash controls. These
+  ports do not resolve those diagnostics or establish provider/client capacity.
+  Changes remain local and uncommitted; no deployment or data migration ran.
+
+The next continuation ports eight Mimir invalid-range requests and Loki's
+`TestProbabilisticQuery`. All eight Mimir HTTP/status/errorType assertions
+already passed; diagnostics deliberately retain Pulso's generic wording.
+The omitted-resolution subquery rejects as unsupported syntax, not proof of
+range-vector result typing. An initial Mimir baseline had two existing writes
+return 503 without captured bodies; its same-seed expanded replay passed all
+69 tests. No cause or runtime fix for those write failures is claimed.
+
+The Loki instant query failed with HTTP 400 before the syntax/evaluator change
+(seed 84). `approx_topk` now uses exact ranking with unchanged scan, log-sample,
+work, intermediate-point, deadline and heap budgets. It requires a positive
+signed-int64 integer literal, rejects all outer grouping and rejects range mode
+across the whole expression before provider work. Three local controls cover
+full values, windows, inner aggregation, arithmetic, GET/form POST, invalid
+ranks/grouping, nested mode rejection and fail-whole budgets with `k=1`.
+This does not implement probabilistic sketches, distributed merging or
+high-cardinality acceleration. Only serving application upgrades are needed
+for this operator; no native/storage/keyed-byte change or retry drain.
+
+Validation for the bounded ranking/invalid-request continuation:
+
+- Loki HTTP/WebSocket, module, LogQL and mixed-query-batch tests: **386 passed**,
+  seed 87. All three service files plus trace metrics unit/HTTP tests:
+  **169 passed**, seed 89; service totals are 69 Mimir, 43 Loki and 42 Tempo.
+- `mix precommit --seed 88 --max-cases 4 --warnings-as-errors`: **1824/1827
+  passed, 3 failed, 1 optional promtool skip, 37 optional exclusions**, 400s.
+  Failures were the 60s filtered-intrinsic discovery test timeout, gRPC admission
+  reply timing, and the 150k-span trace query deadline. All three passed unchanged
+  under `mix test --failed --max-cases 1 --seed 88 --warnings-as-errors` in 8.9s.
+  No timeout/budget was raised or assertion skipped. Runner load averages were
+  approximately 193/201/138 during the failed run, but causation is unproven;
+  the full suite is not claimed green or the underlying timing issue fixed.
+- Strict Credo: **437 files, no issues**. Precommit compile, unused-dependency
+  and formatter stages passed. No native code changed in this increment.
+  Source pins, attribution, adaptations and baseline failures are recorded in
+  each selected fixture README. Changes remain local and uncommitted.
+- Repeated combined runs at seed 90 each passed **168/169**: the four-case
+  concurrent run hit HTTP 500 in an existing Loki category-control push; the
+  serial run hit HTTP 503 ingesting an existing Tempo legacy-filter control.
+  Both passed alone unchanged in 1.9s and 4.9s respectively. Original response
+  bodies were not captured; the Loki push helper now includes the body in its
+  failure diagnostic. These failures remain unexplained, even with serial
+  tests; neither lower concurrency nor this increment is claimed to fix them.
+- Final selection of all twelve additions, including exact result lengths:
+  **12 passed, 100 excluded**, seed 91, serial execution, 7.9s. This covers
+  nine selected upstream cases and three Pulso controls on the final runtime.
+
 ### Remaining upstream coverage and product gaps
 
 - **Mimir:** additional histogram/exemplar policies and tenant downscaling,
   remaining invalid/partial-write permutations, OTLP translation, remote-read, federation, cardinality,
-  formatting and streaming. Sample-backed discovery now uses native histogram
+  formatting, UTF-8 grammar outside selectors and streaming. Sample-backed discovery now uses native histogram
   input but still does not establish TSDB-tier behavior.
 - **Loki:** enabled label policies, deletion,
-  federation, tail/client permutations, OTLP mapping and approximate queries.
+  federation, other per-request query policies, tail/client permutations, OTLP
+  mapping, probabilistic sketches/high-cardinality acceleration and `approx_count_distinct`.
   The upstream seven-day no-step metric case cannot reproduce its expected
   last-four-second samples on the regular default grid; its imported count
   assertion explicitly supplies 60s resolution. No extra terminal sample or

@@ -79,6 +79,32 @@ defmodule Pulso.Traces.MetricsTest do
 
     assert {:ok, json} = Metrics.query(tenant, "{} | count_over_time() by (name)", window, false)
     assert [_] = Pulso.JSON.decode!(json)["series"]
+
+    assert {:ok, json} = Metrics.query(tenant, "{} | count_over_time() by (span:id)", window, false)
+
+    assert [%{"labels" => [%{"key" => "span:id", "value" => %{"stringValue" => "00f067aa0ba902b7"}}]}] =
+             Pulso.JSON.decode!(json)["series"]
+  end
+
+  test "span-ID grouping fails whole above the series ceiling rather than truncating" do
+    {:ok, stored} = Storage.query(:traces, ctx().tenant, [])
+    span = Enum.min_by(stored, & &1.timestamp_ns)
+    tenant = ctx().tenant <> "-series-limit"
+
+    spans =
+      for id <- 1..10_000 do
+        %{span | span_id: Base.encode16(<<id::64>>, case: :lower)}
+      end
+
+    assert :ok = Storage.append(:traces, tenant, spans)
+    window = {1000 * @s, 1060 * @s, nil}
+    assert {:ok, json} = Metrics.query(tenant, "{} | count_over_time() by (span:id)", window, true)
+    assert length(Pulso.JSON.decode!(json)["series"]) == 10_000
+
+    assert :ok = Storage.append(:traces, tenant, [%{span | span_id: "0000000000002711"}])
+    assert {:ok, json} = Metrics.query(tenant, "{} | count_over_time()", window, true)
+    assert [%{"value" => 10_001}] = Pulso.JSON.decode!(json)["series"]
+    assert {:error, :trace_group_limit} = Metrics.query(tenant, "{} | count_over_time() by (span:id)", window, true)
   end
 
   test "negative, noninteger and overflowing windows reject before native decoding" do
@@ -97,6 +123,53 @@ defmodule Pulso.Traces.MetricsTest do
              %{"span.http.route" => "/a"} => zeros(%{1010 => 1}),
              %{"span.http.route" => "/b"} => zeros(%{1010 => 1})
            }
+  end
+
+  test "empty ungrouped counts and rates return zeros without inventing grouped or numeric observations" do
+    empty = %{ctx() | tenant: ctx().tenant <> "-empty"}
+    window = {1000 * @s, 1060 * @s, 10 * @s}
+
+    for context <- [ctx(), empty],
+        selector <- [~s'{span.missing="none"}', "{duration>10s}"],
+        op <- ["count_over_time", "rate"] do
+      query = "#{selector} | #{op}()"
+      labels = [%{"key" => "__name__", "value" => %{"stringValue" => op}}]
+      assert range(context, query) == %{%{"__name__" => op} => zeros(%{})}
+      assert {:ok, json} = Metrics.query(context.tenant, query, window, true)
+      assert Pulso.JSON.decode!(json) == %{"series" => [%{"labels" => labels, "value" => 0}]}
+
+      assert range(context, query <> " by (name)") == %{}
+    end
+
+    for op <- ["min", "max", "sum", "avg", "histogram"], context <- [ctx(), empty] do
+      assert range(context, ~s'{span.missing="none"} | #{op}_over_time(duration)') == %{}
+    end
+
+    assert range(empty, "{} | count_over_time()") == %{%{"__name__" => "count_over_time"} => zeros(%{})}
+
+    assert {:ok, json} = Metrics.query(ctx().tenant, "{} | rate()", {2000 * @s, 2060 * @s, 10 * @s}, false)
+    assert [%{"samples" => samples}] = Pulso.JSON.decode!(json)["series"]
+    assert points(%{"samples" => samples}) == Map.new(2000..2060//10, &{&1, 0})
+  end
+
+  test "range interval admission uses the requested window, not the aligned output" do
+    tenant = ctx().tenant <> "-interval-limit"
+    query = "{} | count_over_time()"
+    start = 1000 * @s
+    finish = start + 10 * @s
+    step = 1_000_000
+
+    for {extra_ns, expected_points, last_ms} <- [{0, 10_001, 1_010_000}, {999_999, 10_002, 1_010_001}] do
+      assert {:ok, json} = Metrics.query(tenant, query, {start, finish + extra_ns, step}, false)
+      assert [%{"samples" => samples}] = Pulso.JSON.decode!(json)["series"]
+      assert length(samples) == expected_points
+      assert hd(samples) == %{"timestampMs" => "1000000", "value" => 0}
+      assert List.last(samples) == %{"timestampMs" => to_string(last_ms), "value" => 0}
+    end
+
+    assert {:error, :unsupported_parameters} = Metrics.query(tenant, query, {start, finish + step, step}, false)
+    assert {:ok, json} = Metrics.query(tenant, query, {start, finish + step, step}, true)
+    assert [%{"value" => 0}] = Pulso.JSON.decode!(json)["series"]
   end
 
   test "root spans, status selectors and missing group values" do

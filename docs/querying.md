@@ -65,14 +65,26 @@ with `nestedSetParent<0` for root spans, piped into `rate()`,
 `count_over_time()`, `min_over_time`, `max_over_time`, `sum_over_time`,
 `avg_over_time`, `quantile_over_time(<attr>, <q>...)` or
 `histogram_over_time(<attr>)` over `duration`, `span.<key>`, `resource.<key>` or
-`.<key>`, with `by (...)` over up to five attributes or `name`, `status` and
-`kind`. As in Tempo, ranges are aligned to the step with one extra leading
-interval, spans count by start time, durations aggregate in seconds, and
-quantiles interpolate between power-of-two duration buckets. `with (...)` hints
+`.<key>`, with `by (...)` over up to five keys (attributes, `name`, `status`,
+`kind` or the grouping-only `span:id`). As in Tempo, ranges are aligned to the
+step with one extra leading interval, spans count by start time, durations
+aggregate in seconds, and quantiles interpolate between power-of-two duration
+buckets. `with (...)` hints
 are accepted and ignored, so sampled queries return exact results. `| topk(n)` and
 `| bottomk(n)` keep, at each interval, the `n` series with the largest or
 smallest values, as Tempo does (ties go to the series first in label order).
 `compare()` is not supported.
+
+Ungrouped `count_over_time()` and `rate()` return one zero-valued series when
+no spans match, including empty tenants and windows. Range results include every
+aligned interval; instant results contain one zero. No group labels or numeric,
+histogram or quantile observations are invented for an empty selection. Storage,
+metadata and budget errors still fail the whole query rather than becoming zeros.
+
+Range requests reject HTTP `400` when integer division of the original
+`end - start` by `step` exceeds 10,000, before alignment adds boundary intervals.
+Zero steps also reject. Alignment can therefore produce more than 10,000 output
+points per series. Instant requests use one interval and ignore `step`.
 
 Spans are reduced natively per stored segment without being decoded into
 queryable records; the scan budgets of [query budgets](configuration.md#query-budgets)
@@ -84,6 +96,19 @@ never invented as missing labels or silently excluded from averages. Unfiltered
 core-only operations, such as counts grouped by span name, can still read those
 rows.
 
+`by (span:id)` reads the stored core span ID and returns it as a 16-character
+lowercase hex string under the `span:id` label. `span.id` remains an ordinary
+attribute; bare `id`, `trace:id` and numeric aggregation over span IDs are not
+supported. Equal span IDs group together even across different traces; this is
+an ID-value grouping, not a globally unique trace/span identity. Core-only
+span-ID grouping can read legacy rows with valid core fields. The same five-key,
+10,000-series and point/byte ceilings apply; exceeding them fails whole, never
+truncates. There is no unlimited-series override. Upgrade every query-serving
+app/native pair before relying on this syntax: startup requires trace metrics
+capability **2**, independently of the trace search/export/discovery tuple.
+Storage format and keyed encoder bytes are unchanged; no retry drain or data
+migration is needed for this addition.
+
 ## Prometheus API
 
 `GET|POST /api/v1/query` and `/api/v1/query_range` accept the standard Prometheus
@@ -93,6 +118,17 @@ a timezone; steps accept seconds or durations such as `15s`. Client `timeout`
 values are capped at ten seconds. Results use Prometheus scalar, vector, and matrix
 formats, so Grafana can use Pulso as a Prometheus data source within the
 supported subset below.
+
+Selectors accept quoted UTF-8 metric and label names, for example
+`{"utf_metric😀C", "utf8_label😀"="test"}`. A quoted metric name inside braces
+is shorthand for `__name__="..."`; use quotes for non-ASCII names rather than
+bare identifiers. Quotes and escapes follow PromQL string syntax. Empty names,
+multiple shorthand metric names, malformed escapes and selectors whose matchers
+all match empty values reject. Existing matcher-count, regex and query budgets
+still apply. This adds selector syntax, not quoted names in every grouping or
+modifier position. Upgrade all query-serving applications before using it;
+ingestion already accepts UTF-8 names, with no new validation-mode setting,
+stored format, native ABI or keyed-byte change.
 
 Both query endpoints accept a positive `lookback_delta` in seconds or duration
 syntax, for example `600` or `10m`. It changes how far instant selectors (including
@@ -297,6 +333,20 @@ Metric results use Loki's sample format: `[<Unix seconds as a JSON number>,
 "<value>"]`, with values formatted as Prometheus and Loki do (`"8"`, not
 `"8.0"`). Log results keep nanosecond timestamp strings.
 
+`approx_topk(k, expression)` is available for instant metric queries, using
+**exact ranking under the ordinary query budgets**. It does not implement
+Loki's count-min sketches, distributed sketch merging or high-cardinality
+acceleration: reducing `k` does not reduce input scan/sample/intermediate-result
+costs, and exhausted budgets fail the whole query. Use a positive signed-int64
+integer literal for `k`; fractional, decimal/exponent and overflowing ranks
+reject. Outer `by`/`without` grouping, including empty grouping, rejects; put
+grouping in an inner aggregation such as `sum by (job) (...)`. Range queries
+reject this operator, even inside another aggregation or arithmetic expression,
+before reading storage. Existing `topk`/`bottomk` behavior is unchanged.
+Upgrade every query-serving application instance before clients depend on the
+new syntax behind non-sticky routing. No storage migration, native upgrade or
+keyed-retry drain is required for this operator.
+
 Pattern line filters (`|> "<_> level=error <_>"` and `!> "..."`) match lines
 against a pattern in which `<_>` stands for any non-empty text, as in Loki: the
 line must start and end where the pattern does, unless the pattern starts or
@@ -366,6 +416,29 @@ collision and quantity semantics. They do not change stored records or keyed
 encoder bytes.
 
 ### Limits and metric evaluation
+
+Send `X-Loki-Query-Limits: {"maxQueryLength":"1m"}` to add a request-local
+time-window ceiling to finite Loki reads (GET or form POST). The exact boundary
+is allowed; a longer `end - start` returns HTTP 400 before storage reads. The
+check uses effective default bounds too, including discovery's six-hour default.
+It covers log/metric queries, discovery, index statistics/volumes, detected
+labels/fields/values and patterns. Instant metrics normally have a zero-length
+evaluation window; range selectors such as `[1h]` are not this policy's window.
+Instant log reads require an explicit finite `start` with a positive ceiling.
+
+Only `maxQueryLength` is supported. Use ordered, unrepeated integer duration
+components (`y`, `w`, `d`, `h`, `m`, `s`, `ms`), for example `1h30m`; the
+duration must fit signed 64-bit nanoseconds. An absent header, `{}`, or a zero
+`maxQueryLength` duration adds no restriction. Policies are limited to one header of 1,024 bytes and a
+128-byte duration string. Malformed, negative, overflowing, duplicate-key,
+duplicate-header and unsupported-field policies return HTTP 400 rather than
+being ignored. This is deliberately stricter than Loki's malformed-header
+fallback. Live tail rejects this header because it has no finite end. Client
+policies never raise server scan/admission/resource budgets or persist between
+requests. This is optional client tightening, not an operator security quota.
+Upgrade all query-serving applications before relying on enforcement;
+older instances ignore the header. No configuration switch, native/storage or
+keyed-byte change is required.
 
 `limit` keeps the newest lines (`direction=backward`, the default) or the oldest
 lines (`direction=forward`) across all matching streams, as Loki does. Only

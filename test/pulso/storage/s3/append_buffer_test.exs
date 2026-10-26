@@ -42,14 +42,18 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     # are awaited below; do not spend 15s draining each idle socket at teardown.
     server =
       start_supervised!(
-        {Bandit, plug: {CompactionStore, agent: agent}, port: 0, thousand_island_options: [shutdown_timeout: 100]}
+        {Bandit,
+         plug: {CompactionStore, agent: agent},
+         ip: {127, 0, 0, 1},
+         port: 0,
+         thousand_island_options: [shutdown_timeout: 100]}
       )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       # Native clients cache connection pools by full config. Unique test
       # credentials prevent reusing a stale pool if the OS recycles a port.

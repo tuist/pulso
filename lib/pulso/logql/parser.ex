@@ -794,6 +794,7 @@ defmodule Pulso.LogQL.Parser do
       string("stddev") |> replace(:stddev),
       string("stdvar") |> replace(:stdvar),
       string("topk") |> replace(:topk),
+      string("approx_topk") |> replace(:approx_topk),
       string("bottomk") |> replace(:bottomk),
       string("sort_desc") |> replace(:sort_desc),
       string("sort") |> replace(:sort)
@@ -932,7 +933,7 @@ defmodule Pulso.LogQL.Parser do
   @doc false
   def build_vector_call_body(parts) do
     Enum.reduce(parts, %{param: nil, inner: nil}, fn
-      {:param, p}, acc -> %{acc | param: if(p == trunc(p), do: trunc(p), else: p)}
+      {:param, p}, acc -> %{acc | param: p}
       inner, acc -> %{acc | inner: inner}
     end)
   end
@@ -966,7 +967,11 @@ defmodule Pulso.LogQL.Parser do
 
   @doc false
   def attach_vector_op([op, %{grouping: grouping, body: body}]) do
-    %AST.VectorAgg{op: op, inner: body.inner, grouping: grouping, param: body.param}
+    # Preserve integer syntax for approx_topk; other aggregations retain their
+    # existing normalization of integral float parameters.
+    param = body.param
+    param = if op != :approx_topk and is_number(param) and param == trunc(param), do: trunc(param), else: param
+    %AST.VectorAgg{op: op, inner: body.inner, grouping: grouping, param: param}
   end
 
   # ---------------------------------------------------------------------------

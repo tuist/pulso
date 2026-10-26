@@ -7,12 +7,15 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
   alias Pulso.Auth
   alias Pulso.Auth.SharedSecret
+  alias Pulso.Loki.Tail
+  alias Pulso.PromQL.Evaluator
   alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.RuntimePlug
+  alias Pulso.Test.WebSocketClient
 
   @second 1_000_000_000
   @minute 60 * @second
@@ -39,12 +42,12 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, port: 0})
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     config = %{
       bucket: "pulso",
-      endpoint: "http://localhost:#{port}",
+      endpoint: "http://127.0.0.1:#{port}",
       region: "us-east-1",
       access_key_id: "loki-upstream-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
@@ -61,14 +64,16 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     start_supervised!(ManifestSupervision)
 
     api =
-      start_supervised!({Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, port: 0})
+      start_supervised!(
+        {Bandit, plug: {RuntimePlug, plug: PulsoWeb.Endpoint, runtime: Runtime.current()}, ip: {127, 0, 0, 1}, port: 0}
+      )
 
     {:ok, {_, api_port}} = ThousandIsland.listener_info(api)
 
     # Preserve upstream relative times, but keep the +3s label-access input in
     # the past so its default-time label APIs cannot race the wall clock.
     %{
-      url: "http://localhost:#{api_port}",
+      url: "http://127.0.0.1:#{api_port}",
       tenant: tenant,
       token: token,
       now: System.system_time(:nanosecond) - 10 * @second,
@@ -123,6 +128,182 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       response = request(ctx, "/index/stats", [{"query", ~s({job="fake"}|= "search")}], 400)
       assert response["message"] =~ "only label matchers are supported"
       refute_parquet_read(ctx)
+    end
+
+    test "per-request-limits", ctx do
+      limited = Map.put(ctx, :extra_headers, [{"x-loki-query-limits", ~s({"maxQueryLength":"1m"})}])
+      response = request(limited, "/labels", [], 400)
+      assert response["message"] =~ "the query time range exceeds the limit (query length"
+      refute_parquet_read(ctx)
+    end
+
+    test "tail", ctx do
+      # The pinned Tail client uses the connection's wall clock, not Client.Now,
+      # with limit=100, start=now-1h and no delay_for parameter for zero delay.
+      {:ok, socket} =
+        tail(ctx, ~s({job="fake"}), [
+          {"limit", "100"},
+          {"start", to_string(System.system_time(:nanosecond) - 60 * @minute)}
+        ])
+
+      try do
+        entries = tail_values(socket, 4)
+        assert Enum.sort(Enum.map(entries, &Enum.at(&1, 1))) == ["lineA", "lineB", "lineC", "lineD"]
+        assert_parquet_read(ctx)
+      after
+        WebSocketClient.close(socket)
+      end
+    end
+  end
+
+  describe "TestProbabilisticQuery" do
+    setup ctx do
+      for {line, timestamp, job} <- [
+            {"lineA", ctx.now - 45 * @minute, "one"},
+            {"lineB", ctx.now - 45 * @minute, "one"},
+            {"lineC", ctx.now, "one"},
+            {"lineD", ctx.now, "two"}
+          ] do
+        push(ctx, line, timestamp, %{"job" => job})
+      end
+
+      assert_parquet(ctx, 4)
+      :ok
+    end
+
+    test "query", ctx do
+      response = instant(ctx, ~s'approx_topk(1, count_over_time({job=~".+"}[1h]))')
+      assert response["data"]["resultType"] == "vector"
+      assert length(response["data"]["result"]) == 1
+      assert values(response) == %{%{"job" => "one"} => "3"}
+      assert_parquet_read(ctx)
+    end
+
+    # Pulso-authored controls, not additional upstream integration cases.
+    test "bounded exact ranking preserves values, inner grouping, windows and form transport", ctx do
+      inner = ~s'count_over_time({job=~".+"}[1h])'
+
+      for k <- [2, 10, 9_223_372_036_854_775_807] do
+        expression = "approx_topk(#{k}, #{inner})"
+        response = instant(ctx, expression)
+        assert length(response["data"]["result"]) == 2
+        assert values(response) == %{%{"job" => "one"} => "3", %{"job" => "two"} => "1"}
+
+        assert request_form(ctx, "/query", query: expression, time: to_string(ctx.now + @second)) == response
+      end
+
+      assert values(instant(ctx, "approx_topk(1, sum without(job) (#{inner}))")) == %{%{} => "4"}
+
+      assert values(instant(ctx, ~s'approx_topk(2, count_over_time({job=~".+"}[1m]))')) ==
+               %{%{"job" => "one"} => "1", %{"job" => "two"} => "1"}
+
+      assert values(instant(ctx, ~s'approx_topk(1, count_over_time({job="absent"}[1h]))')) == %{}
+      assert values(instant(ctx, "approx_topk(1, #{inner}) * 2")) == %{%{"job" => "one"} => "6"}
+    end
+
+    test "invalid ranks and outer grouping reject before storage; range mode rejects every nested placement", ctx do
+      inner = ~s'count_over_time({job=~".+"}[1h])'
+      requests = Agent.get(ctx.store, & &1.requests)
+
+      for expression <- [
+            "approx_topk(0, #{inner})",
+            "approx_topk(-1, #{inner})",
+            "approx_topk(1.5, #{inner})",
+            "approx_topk(1.0, #{inner})",
+            "approx_topk(1e0, #{inner})",
+            "approx_topk(9223372036854775808, #{inner})",
+            "approx_topk(#{inner})",
+            "approx_topk(1, #{inner}) by ()",
+            "approx_topk(1, #{inner}) without (job)",
+            "approx_topk by(job) (1, #{inner})"
+          ] do
+        params = [query: expression, time: to_string(ctx.now + @second)]
+        assert request(ctx, "/query", params, 400)["status"] == "error"
+        assert request_form(ctx, "/query", params, 400)["status"] == "error"
+      end
+
+      for expression <- [
+            "approx_topk(1, #{inner})",
+            "sum(approx_topk(1, #{inner}))",
+            "#{inner} + approx_topk(1, #{inner})",
+            "approx_topk(1, #{inner}) + #{inner}"
+          ] do
+        params = [query: expression, start: to_string(ctx.now), end: to_string(ctx.now + @second), step: "1"]
+
+        for response <- [request(ctx, "/query_range", params, 400), request_form(ctx, "/query_range", params, 400)] do
+          assert response["status"] == "error"
+          assert response["message"] == ":instant_query_required"
+        end
+      end
+
+      assert Agent.get(ctx.store, & &1.requests) == requests
+    end
+
+    test "small output ranks do not bypass scan or intermediate result budgets", ctx do
+      expression = ~s'approx_topk(1, count_over_time({job=~".+"}[1h]))'
+      params = [query: expression, time: to_string(ctx.now + @second)]
+      objects = Agent.get(ctx.store, & &1.objects)
+      Runtime.put_env(:pulso, Pulso.QueryRunner, max_scan_rows: 1)
+      assert request(ctx, "/query", params, 422)["error"] == "query_limit"
+
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+      Runtime.put_env(:pulso, Evaluator, max_result_points: 1)
+      assert request_form(ctx, "/query", params, 422)["error"] == "query_limit"
+      assert Agent.get(ctx.store, & &1.objects) == objects
+    end
+  end
+
+  describe "TestPerRequestLimits" do
+    test "limited range and label requests reject, then the same tenant reads without the policy", ctx do
+      limited = query_limits(ctx, ~s({"maxQueryLength": "1m"}))
+      push(limited, "lineA", ctx.now - 45 * @minute, %{"job" => "fake"})
+      assert_parquet(ctx, 1)
+
+      response = request(limited, "/query_range", [{"query", ~s({job="fake"})} | range(ctx)], 400)
+      assert response["message"] =~ "the query time range exceeds the limit (query length"
+
+      response = request(limited, "/labels", [], 400)
+      assert response["message"] =~ "the query time range exceeds the limit (query length"
+      refute_parquet_read(ctx)
+
+      # Recreate the client without InjectHeadersOption, as upstream does.
+      assert lines(query(ctx, ~s({job="fake"}))) == ["lineA"]
+      assert_parquet_read(ctx)
+    end
+  end
+
+  # Pulso-authored regression control, not another upstream case. The upstream
+  # tail case reads only pre-existing entries; this discriminates a history-only
+  # implementation, ignored start bounds, and unauthenticated/unfiltered sockets.
+  describe "tail HTTP/S3 controls" do
+    test "authenticated bounded history hands off to durable matching live writes", ctx do
+      push(ctx, "level=error msg=history", ctx.now - @second, %{"job" => "fake"})
+      expression = ~s({job="fake"} | logfmt | level="error" | line_format "{{.msg}}")
+      params = [{"start", to_string(ctx.now)}, {"limit", "100"}]
+
+      for unauthorized <- [%{ctx | token: "wrong-token"}, %{ctx | tenant: ctx.tenant <> "-other"}] do
+        assert {:error, {401, _}} = tail(unauthorized, expression, params)
+      end
+
+      refute_parquet_read(ctx)
+      {:ok, socket} = tail(ctx, expression, params)
+      [tailer] = Tail.tailers(ctx.tenant)
+      monitor = Process.monitor(tailer)
+
+      try do
+        assert WebSocketClient.next_json(socket, 10_000)["streams"] == []
+        push(ctx, "level=info msg=skip", ctx.now + @second, %{"job" => "fake"})
+        push(ctx, "level=error msg=other", ctx.now + 2 * @second, %{"job" => "other"})
+        push(ctx, "level=error msg=live", ctx.now + 3 * @second, %{"job" => "fake"})
+        assert_parquet(ctx, 4)
+
+        assert tail_values(socket, 1) == [[to_string(ctx.now + 3 * @second), "live"]]
+        assert lines(query(%{ctx | now: ctx.now + 4 * @second}, expression)) == ["history", "live"]
+        assert_parquet_read(ctx)
+      after
+        WebSocketClient.close(socket)
+        assert_receive {:DOWN, ^monitor, :process, ^tailer, _}, 5_000
+      end
     end
   end
 
@@ -318,6 +499,178 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
   end
 
   # Pulso-specific controls, not additional upstream ports.
+  describe "per-request query length controls" do
+    setup ctx do
+      push(ctx, "foo=bar", ctx.now, %{"job" => "fake"})
+      :ok
+    end
+
+    test "exact minute passes and one extra nanosecond rejects every finite read before storage", ctx do
+      limited = query_limits(ctx, ~s({"maxQueryLength":"1m"}))
+
+      for {path, extras} <- finite_reads() do
+        bounds = [{"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now)}]
+        params = extras ++ bounds ++ [{"time", to_string(ctx.now)}]
+        too_long = List.keyreplace(params, "start", 0, {"start", to_string(ctx.now - @minute - 1)})
+        before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+        for response <- [request(limited, path, too_long, 400), request_form(limited, path, too_long, 400)] do
+          assert response["error"] == "query_limit"
+          assert response["message"] =~ "query length: 60000000001ns, limit: 60000000000ns"
+          refute Map.has_key?(response, "data")
+        end
+
+        assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+        ordinary = request(ctx, path, params)
+        assert request(limited, path, params) == ordinary
+        assert request_form(limited, path, params) == ordinary
+      end
+
+      assert_parquet_read(ctx)
+    end
+
+    test "default windows cannot evade the ceiling", ctx do
+      limited = query_limits(ctx, ~s({"maxQueryLength":"1m"}))
+
+      for {path, extras} <- finite_reads(), path != "/query" do
+        assert request(limited, path, extras, 400)["error"] == "query_limit"
+        assert request_form(limited, path, extras, 400)["error"] == "query_limit"
+      end
+
+      refute_parquet_read(ctx)
+    end
+
+    test "malformed, negative, overflowing, duplicate and unsupported policies fail closed", ctx do
+      invalid = [
+        "",
+        "{broken}",
+        "[]",
+        "null",
+        ~s({"maxQueryLength":null}),
+        ~s({"maxQueryLength":60}),
+        ~s({"maxQueryLength":"-1m"}),
+        ~s({"maxQueryLength":"+1m"}),
+        ~s({"maxQueryLength":"1.5m"}),
+        ~s({"maxQueryLength":"1ns"}),
+        ~s({"maxQueryLength":"1us"}),
+        ~s({"maxQueryLength":"60"}),
+        ~s({"maxQueryLength":"1s1m"}),
+        ~s({"maxQueryLength":"1m1m"}),
+        ~s({"maxQueryLength":"9223372036855ms"}),
+        ~s({"maxQueryLength":"292y24w3d23h47m16s855ms"}),
+        ~s({"maxQueryLength":"#{String.duplicate("1", 129)}s"}),
+        ~s({"maxQueryLength":"1m","maxQueryLength":"0"}),
+        ~S({"maxQueryLength":"1m","maxQuery\u004cength":"0"}),
+        ~s({"MaxQueryLength":"1m"}),
+        ~s({"maxQueryLength":"1m","maxQueryTime":"1s"}),
+        ~s({"futureLimit":1}),
+        ~s({"maxQueryLength":"1m"} trailing),
+        String.duplicate(" ", 1025)
+      ]
+
+      for policy <- invalid do
+        limited = query_limits(ctx, policy)
+
+        for response <- [request(limited, "/labels", [], 400), request_form(limited, "/labels", [], 400)] do
+          assert response["error"] == "invalid_parameter"
+          assert response["message"] =~ "X-Loki-Query-Limits"
+        end
+      end
+
+      for policies <- [[~s({"maxQueryLength":"1m"}), ~s({"maxQueryLength":"0"})], ["{}", "{}"]] do
+        limited = Map.put(ctx, :extra_headers, Enum.map(policies, &{"x-loki-query-limits", &1}))
+        assert request(limited, "/labels", [], 400)["error"] == "invalid_parameter"
+      end
+
+      refute_parquet_read(ctx)
+    end
+
+    test "absent and zero policies preserve results and ordered model durations are accepted", ctx do
+      params = [{"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now)}]
+      ordinary = request(ctx, "/labels", params)
+      assert ordinary["data"] == ["job"]
+      objects = Agent.get(ctx.store, & &1.objects)
+
+      for policy <- [
+            "{}",
+            ~s({"maxQueryLength":"0"}),
+            ~s({"maxQueryLength":"0ms"}),
+            ~s({"maxQueryLength":"0y0w0d0h0m0s0ms"}),
+            ~s({"maxQueryLength":"60000ms"}),
+            ~s({"maxQueryLength":"1m0s"}),
+            ~s({"maxQueryLength":"0h1m"}),
+            ~s({"maxQueryLength":"1h30m45s"}),
+            ~s({"maxQueryLength":"292y24w3d23h47m16s854ms"}),
+            ~S( {"maxQuery\u004cength":"1m"} )
+          ] do
+        limited = query_limits(ctx, policy)
+        assert request(limited, "/labels", params) == ordinary
+        assert request_form(limited, "/labels", params) == ordinary
+      end
+
+      # Zero means no additional restriction, not a zero-length server budget.
+      for policy <- ["{}", ~s({"maxQueryLength":"0"})] do
+        assert request(query_limits(ctx, policy), "/labels")["data"] == ["job"]
+      end
+
+      assert Agent.get(ctx.store, & &1.objects) == objects
+    end
+
+    test "instant metrics have a zero evaluation window but unbounded log reads require a start", ctx do
+      limited = query_limits(ctx, ~s({"maxQueryLength":"1m"}))
+      params = [{"query", ~s({job="fake"})}, {"time", to_string(ctx.now)}]
+
+      for response <- [request(limited, "/query", params, 400), request_form(limited, "/query", params, 400)] do
+        assert response["message"] =~ "requires a finite start"
+      end
+
+      assert request(limited, "/tail", params, 400)["message"] =~ "not supported for live tail"
+      refute_parquet_read(ctx)
+
+      metrics = [{"query", ~s'count_over_time({job="fake"}[1h])'}, {"time", to_string(ctx.now + @second)}]
+      assert values(request(limited, "/query", metrics)) == %{%{"job" => "fake"} => "1"}
+      assert request_form(limited, "/query", metrics) == request(ctx, "/query", metrics)
+
+      explicit = [{"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now - 1)} | params]
+      assert lines(request(limited, "/query", explicit)) == ["foo=bar"]
+      too_long = List.keyreplace(explicit, "time", 0, {"time", to_string(ctx.now + 1)})
+      assert request(limited, "/query", too_long, 400)["error"] == "query_limit"
+    end
+
+    test "policies are request-local and authentication keeps tenants isolated", ctx do
+      other = %{ctx | tenant: ctx.tenant <> "-other", token: "other-token"}
+
+      tokens =
+        Map.new([ctx, other], fn context ->
+          {context.tenant, "sha256$" <> Base.encode16(:crypto.hash(:sha256, context.token), case: :lower)}
+        end)
+
+      Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: tokens)
+      push(other, "other", ctx.now, %{"private" => "other"})
+      assert request(query_limits(ctx, ~s({"maxQueryLength":"1m"})), "/labels", [], 400)["error"] == "query_limit"
+      assert request(ctx, "/labels")["data"] == ["job"]
+      assert request(other, "/labels")["data"] == ["private"]
+      assert request(query_limits(other, ~s({"maxQueryLength":"1m"})), "/labels", [], 400)["error"] == "query_limit"
+      unauthorized = query_limits(%{other | token: ctx.token}, "{broken}")
+      assert request(unauthorized, "/labels", [], 401)["error"] == "invalid_token"
+      assert request(ctx, "/labels")["data"] == ["job"]
+    end
+
+    test "a client policy never raises server scan budgets", ctx do
+      push(ctx, "foo=baz", ctx.now - @second, %{"job" => "fake"})
+      Runtime.put_env(:pulso, Pulso.QueryRunner, max_scan_rows: 1)
+      params = [{"query", ~s({job="fake"})} | range(ctx)]
+      ordinary = request(ctx, "/query_range", params, 422)
+      assert ordinary["error"] == "query_limit"
+
+      for policy <- [~s({"maxQueryLength":"0"}), ~s({"maxQueryLength":"1y"})] do
+        limited = query_limits(ctx, policy)
+        assert request(limited, "/query_range", params, 422) == ordinary
+        assert request_form(limited, "/query_range", params, 422) == ordinary
+      end
+    end
+  end
+
   describe "categorized response encoding controls" do
     test "collisions, repeated parsing and label mutations retain explicit provenance", ctx do
       line = "job=same pod=body token=same keep=kept gone=drop"
@@ -648,7 +1001,8 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
   defp push(ctx, line, timestamp, labels, metadata \\ %{}) do
     body = %{"streams" => [%{"stream" => labels, "values" => [[to_string(timestamp), line, metadata]]}]}
-    assert Req.post!(ctx.url <> "/loki/api/v1/push", headers: headers(ctx), json: body).status == 204
+    response = Req.post!(ctx.url <> "/loki/api/v1/push", headers: headers(ctx), json: body)
+    assert response.status == 204, inspect(response.body)
   end
 
   defp request(ctx, path, params \\ [], status \\ 200) do
@@ -657,10 +1011,52 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     Pulso.JSON.decode!(response.body)
   end
 
-  defp request_form(ctx, path, params) do
+  defp request_form(ctx, path, params, status \\ 200) do
     response = Req.post!(ctx.url <> "/loki/api/v1" <> path, headers: headers(ctx), form: params, decode_body: false)
-    assert response.status == 200, response.body
+    assert response.status == status, response.body
     Pulso.JSON.decode!(response.body)
+  end
+
+  defp query_limits(ctx, policy), do: Map.put(ctx, :extra_headers, [{"x-loki-query-limits", policy}])
+
+  defp tail(ctx, expression, params) do
+    path = "/loki/api/v1/tail?" <> URI.encode_query([{"query", expression} | params])
+    WebSocketClient.connect(URI.parse(ctx.url).port, path, headers(ctx))
+  end
+
+  # Receive frames, not timers or storage polls. Like upstream's collector,
+  # retain every entry, including duplicates, until the expected count arrives.
+  defp tail_values(socket, count, entries \\ []) do
+    response = WebSocketClient.next_json(socket, 10_000)
+    entries = entries ++ Enum.flat_map(response["streams"], & &1["values"])
+    assert length(entries) <= count
+
+    if length(entries) == count,
+      do: entries,
+      else: tail_values(socket, count, entries)
+  end
+
+  defp finite_reads do
+    for {path, params} <- [
+          {"/query", []},
+          {"/query_range", []},
+          {"/query_range", [{"query", ~s'count_over_time({job="fake"}[1s])'}, {"step", "1"}]},
+          {"/labels", []},
+          {"/label/job/values", []},
+          {"/series", [{"match[]", ~s({job="fake"})}]},
+          {"/index/stats", []},
+          {"/index/volume", []},
+          {"/index/volume", [{"aggregateBy", "labels"}]},
+          {"/index/volume_range", [{"step", "1s"}]},
+          {"/index/volume_range", [{"aggregateBy", "labels"}, {"step", "1s"}]},
+          {"/detected_labels", []},
+          {"/detected_fields", []},
+          {"/detected_field/foo/values", []},
+          {"/patterns", []}
+        ] do
+      params = if List.keymember?(params, "query", 0), do: params, else: [{"query", ~s({job="fake"})} | params]
+      {path, params}
+    end
   end
 
   defp categorize(ctx), do: Map.put(ctx, :extra_headers, [{"x-loki-response-encoding-flags", "categorize-labels"}])
