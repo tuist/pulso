@@ -253,6 +253,151 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
   end
 
+  describe "TestApproxCountDistinctQuery" do
+    setup ctx do
+      for {mac, minutes, device} <- [
+            {"shared", 20, "a"},
+            {"only-a", 10, "a"},
+            {"shared", 15, "b"},
+            {"only-b", 5, "b"}
+          ] do
+        push(ctx, ~s(mac="#{mac}"), ctx.now - minutes * @minute, %{
+          "job" => "devices",
+          "version" => "1",
+          "device" => device
+        })
+      end
+
+      assert_parquet(ctx, 4)
+      :ok
+    end
+
+    test "query", ctx do
+      response = instant(ctx, ~s'approx_count_distinct(mac, {job="devices"} | logfmt [1h]) by (version)')
+      assert length(response["data"]["result"]) == 1
+      assert values(response) == %{%{"version" => "1"} => "3"}
+      assert_parquet_read(ctx)
+    end
+
+    test "query-ungrouped", ctx do
+      response = instant(ctx, ~s'approx_count_distinct(mac, {job="devices"} | logfmt [1h]) by ()')
+      assert length(response["data"]["result"]) == 1
+      assert values(response) == %{%{} => "3"}
+      assert_parquet_read(ctx)
+    end
+
+    # Pulso-authored controls, not additional upstream integration cases.
+    test "distinct strings skip missing/empty fields and remove only the counted label", ctx do
+      for line <- [~s(mac="01"), ~s(mac="1"), ~s(mac="1.0"), ~s(mac="01"), ~s(mac=""), ""] do
+        push(ctx, line, ctx.now, %{"job" => "devices", "version" => "2", "device" => "c"})
+      end
+
+      expression = ~s'approx_count_distinct(mac, {job="devices"} | logfmt [1h])'
+      response = instant(ctx, expression)
+      assert length(response["data"]["result"]) == 3
+
+      assert values(response) == %{
+               %{"job" => "devices", "version" => "1", "device" => "a"} => "2",
+               %{"job" => "devices", "version" => "1", "device" => "b"} => "2",
+               %{"job" => "devices", "version" => "2", "device" => "c"} => "3"
+             }
+
+      assert request_form(ctx, "/query", query: expression, time: to_string(ctx.now + @second)) == response
+
+      assert values(instant(ctx, expression <> " by (version)")) ==
+               %{%{"version" => "1"} => "3", %{"version" => "2"} => "3"}
+
+      assert values(instant(ctx, "(#{expression} by ()) * 2")) == %{%{} => "12"}
+
+      assert values(instant(ctx, ~s'approx_count_distinct(device, {job="devices"}[1h])')) ==
+               %{%{"job" => "devices", "version" => "1"} => "2", %{"job" => "devices", "version" => "2"} => "1"}
+
+      assert values(instant(ctx, ~s'approx_count_distinct(missing, {job="devices"}[1h]) by ()')) == %{}
+    end
+
+    test "range windows deduplicate independently with open lower bounds, inclusive ends and offsets", ctx do
+      expression = ~s'approx_count_distinct(mac, {job="devices"} | logfmt [10m]) by ()'
+
+      params = [
+        query: expression,
+        start: to_string(ctx.now - 20 * @minute),
+        end: to_string(ctx.now),
+        step: "300"
+      ]
+
+      response = request(ctx, "/query_range", params)
+      assert response["data"]["resultType"] == "matrix"
+
+      expected =
+        for {minutes, value} <- [{20, "1"}, {15, "1"}, {10, "2"}, {5, "2"}, {0, "1"}],
+            do: [(ctx.now - minutes * @minute) / @second, value]
+
+      assert response["data"]["result"] == [%{"metric" => %{}, "values" => expected}]
+      assert request_form(ctx, "/query_range", params) == response
+
+      offset_expression = ~s'approx_count_distinct(mac, {job="devices"} | logfmt [10m] offset 5m) by ()'
+      offset = request(ctx, "/query_range", Keyword.put(params, :query, offset_expression))
+
+      expected =
+        for {minutes, value} <- [{15, "1"}, {10, "1"}, {5, "2"}, {0, "2"}],
+            do: [(ctx.now - minutes * @minute) / @second, value]
+
+      assert offset["data"]["result"] == [%{"metric" => %{}, "values" => expected}]
+
+      # The only-a value first appears at the inclusive upper bound; the
+      # overlapping shared values still count once across both streams.
+      for {time, count} <- [{ctx.now - 10 * @minute - 1, "1"}, {ctx.now - 10 * @minute, "2"}] do
+        response = request(ctx, "/query", query: expression, time: to_string(time))
+        assert values(response) == %{%{} => count}
+      end
+
+      assert values(request(ctx, "/query", query: expression, time: to_string(ctx.now - 20 * @minute - 1))) == %{}
+    end
+
+    test "invalid distinct arguments, grouping and unwrap reject before provider requests", ctx do
+      requests = Agent.get(ctx.store, & &1.requests)
+
+      for expression <- [
+            ~s'approx_count_distinct({job="devices"}[1h])',
+            ~s'approx_count_distinct(1, {job="devices"}[1h])',
+            ~s'approx_count_distinct("mac", {job="devices"}[1h])',
+            ~s'approx_count_distinct(mac, {job="devices"}[0s])',
+            ~s'approx_count_distinct(mac, {job="devices"}[1h]) without (device)',
+            ~s'approx_count_distinct(mac, {job="devices"}[1h]) by (version, mac)',
+            ~s'approx_count_distinct(mac, {job="devices"} | unwrap mac [1h])',
+            ~s'approx_count_distinct(mac, {job="devices"}[1h] @ 1)',
+            ~s'count_over_time(mac, {job="devices"}[1h])',
+            ~s'quantile_over_time(mac, {job="devices"} | unwrap n [1h])'
+          ] do
+        params = [query: expression, time: to_string(ctx.now)]
+        assert request(ctx, "/query", params, 400)["status"] == "error"
+        assert request_form(ctx, "/query", params, 400)["status"] == "error"
+      end
+
+      assert Agent.get(ctx.store, & &1.requests) == requests
+    end
+
+    test "one distinct result still charges duplicate observations and fails whole on exhausted budgets", ctx do
+      expression = ~s'approx_count_distinct(mac, {job="devices"} | logfmt [1h]) by ()'
+      params = [query: expression, time: to_string(ctx.now + @second)]
+      objects = Agent.get(ctx.store, & &1.objects)
+      Runtime.put_env(:pulso, Pulso.QueryRunner, max_scan_rows: 3)
+      assert request(ctx, "/query", params, 422)["error"] == "query_limit"
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+
+      for limit <- [[max_log_samples: 3], [max_materialized_samples: 3], [max_result_points: 0], [max_work: 5]] do
+        Runtime.put_env(:pulso, Evaluator, limit)
+        response = request_form(ctx, "/query", params, 422)
+        assert response["error"] == "query_limit"
+        refute Map.has_key?(response, "data")
+      end
+
+      Runtime.put_env(:pulso, Evaluator, max_log_samples: 4, max_materialized_samples: 4, max_result_points: 1)
+      assert values(instant(ctx, expression)) == %{%{} => "3"}
+      assert Agent.get(ctx.store, & &1.objects) == objects
+    end
+  end
+
   describe "TestPerRequestLimits" do
     test "limited range and label requests reject, then the same tenant reads without the policy", ctx do
       limited = query_limits(ctx, ~s({"maxQueryLength": "1m"}))

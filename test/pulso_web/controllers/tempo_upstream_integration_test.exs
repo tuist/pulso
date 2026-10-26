@@ -2,6 +2,7 @@
 # Adapted from Grafana Tempo integration/api/search/{search,search_tags}_test.go.
 # Filtering cases: integration/api/tracebyid/trace_by_id_filtering_test.go.
 # Metric cases: integration/api/metrics/query_range_test.go.
+# Default metric steps: pkg/traceql/engine_metrics_test.go.
 # Source revision, adaptations and license: test/fixtures/traces/tempo_integration/README.md.
 defmodule PulsoWeb.TempoUpstreamIntegrationTest do
   use Pulso.Test.Case, async: true
@@ -760,6 +761,87 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
         assert_in_delta sample["value"], value, 1.0e-12
       end
     end
+  end
+
+  describe "TestDefaultQueryRangeStep / HTTP sample spacing" do
+    setup ctx do
+      # Upstream tests only the window/step table. One persisted span makes
+      # the same policy observable through the real HTTP/native query path.
+      batch = @cases["batches"] |> hd() |> Map.merge(%{"spanCount" => 1, "startNs" => 1_000_000_000})
+      ingest(ctx, [batch])
+      :ok
+    end
+
+    for {name, seconds, step_ms} <- [
+          {"59s", 59, 200},
+          {"1m", 60, 1000},
+          {"5m", 300, 1000},
+          {"15m", 900, 3000},
+          {"30m", 1800, 5000},
+          {"1h", 3600, 15_000},
+          {"3h", 10_800, 45_000},
+          {"6h", 21_600, 60_000},
+          {"12h", 43_200, 180_000},
+          {"24h - 1s", 86_399, 300_000},
+          {"24h", 86_400, 300_000},
+          {"2d", 172_800, 600_000},
+          {"7d", 604_800, 2_400_000},
+          {"14d", 1_209_600, 3_600_000},
+          {"30d", 2_592_000, 10_800_000}
+        ] do
+      test "#{name}", ctx do
+        params = %{"q" => "{} | count_over_time()", "start" => 0, "end" => unquote(seconds) * 1_000_000_000}
+        assert %{"series" => [series]} = get(ctx, "/api/metrics/query_range", params)
+        timestamps = Enum.map(series["samples"], &String.to_integer(&1["timestampMs"]))
+
+        assert length(timestamps) > 1
+        assert hd(timestamps) == unquote(step_ms)
+        assert Enum.uniq(Enum.zip_with(timestamps, tl(timestamps), &(&2 - &1))) == [unquote(step_ms)]
+        assert Enum.sum_by(series["samples"], & &1["value"]) == 1
+      end
+    end
+  end
+
+  test "Pulso default-step controls: minimum, rounding and minute boundary at a shifted epoch", ctx do
+    start = 1_700_000_000_000_000_000
+    batch = @cases["batches"] |> hd() |> Map.merge(%{"spanCount" => 1, "startNs" => start + 1})
+    ingest(ctx, [batch])
+
+    for {window_ns, step_ms} <- [
+          {1, 50},
+          {11_999_999_999, 50},
+          {24_000_000_000, 100},
+          {59_999_999_999, 200},
+          {60_000_000_000, 1000}
+        ] do
+      params = %{"q" => "{} | count_over_time()", "start" => start, "end" => start + window_ns}
+      assert %{"series" => [series]} = get(ctx, "/api/metrics/query_range", params)
+      timestamps = Enum.map(series["samples"], &String.to_integer(&1["timestampMs"]))
+
+      assert length(timestamps) > 1
+      assert hd(timestamps) == div(start, 1_000_000)
+      assert Enum.uniq(Enum.zip_with(timestamps, tl(timestamps), &(&2 - &1))) == [step_ms]
+      assert Enum.sum_by(series["samples"], & &1["value"]) == 1
+    end
+  end
+
+  test "Pulso default-step controls: explicit steps, instant values and interval admission stay independent", ctx do
+    batch = @cases["batches"] |> hd() |> Map.merge(%{"spanCount" => 1, "startNs" => 1_000_000_000})
+    ingest(ctx, [batch])
+    params = %{"q" => "{} | count_over_time()", "start" => 0, "end" => 59_000_000_000, "step" => "700ms"}
+    assert %{"series" => [series]} = get(ctx, "/api/metrics/query_range", params)
+    timestamps = Enum.map(series["samples"], &String.to_integer(&1["timestampMs"]))
+    assert length(timestamps) == 85
+    assert hd(timestamps) == 700
+    assert Enum.uniq(Enum.zip_with(timestamps, tl(timestamps), &(&2 - &1))) == [700]
+    assert Enum.sum_by(series["samples"], & &1["value"]) == 1
+
+    assert %{"series" => [%{"value" => 1}]} = get(ctx, "/api/metrics/query", Map.put(params, "step", "ignored"))
+
+    response =
+      Req.get!(ctx.url <> "/api/metrics/query_range", headers: ctx.headers, params: Map.put(params, "step", "1ms"))
+
+    assert response.status == 400
   end
 
   defp ingest_metric_batches(ctx) do

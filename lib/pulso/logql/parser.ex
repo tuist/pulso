@@ -769,6 +769,7 @@ defmodule Pulso.LogQL.Parser do
       string("rate_counter") |> replace(:rate_counter),
       string("rate") |> replace(:rate),
       string("count_over_time") |> replace(:count_over_time),
+      string("approx_count_distinct") |> replace(:approx_count_distinct),
       string("bytes_over_time") |> replace(:bytes_over_time),
       string("bytes_rate") |> replace(:bytes_rate),
       string("sum_over_time") |> replace(:sum_over_time),
@@ -856,14 +857,15 @@ defmodule Pulso.LogQL.Parser do
     |> ignore(string("]"))
     |> unwrap_and_tag(:range)
 
-  # Optional leading scalar param, e.g. `0.99,` in `quantile_over_time(0.99, ...)`.
+  # Optional leading quantile or distinct-field argument; validation checks
+  # which parameter type the chosen operator accepts.
   range_leading_param =
-    parsec(:number_literal)
+    choice([parsec(:number_literal), parsec(:identifier)])
     |> unwrap_and_tag(:param)
     |> parsec(:ws)
     |> ignore(string(","))
 
-  # Range aggregator body: an optional leading scalar, the log query,
+  # Range aggregator body: an optional leading parameter, the log query,
   # `[duration]`, and optional offset / @ modifiers. Each sub-part emits either
   # a `%LogQuery{}` or a tagged tuple so `build_range_body` can identify them.
   range_body =

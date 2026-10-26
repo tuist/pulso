@@ -22,8 +22,8 @@ not from regenerating answers with Pulso.
 | Backend | Imported selection and provenance | Elixir replay |
 | --- | --- | --- |
 | Mimir | [48 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization, invalid RW2 symbols, all three UTF8Validation name rows over both write versions, the exact upstream fingerprint fixture and eight invalid-range requests with explicitly adapted diagnostics | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (69 tests including 21 controls) |
-| Loki | [26 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows, grouped stream ordering, per-request query length, standalone request-policy isolation, four-line WebSocket tail and `approx_topk` public result using exact bounded ranking; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (43 tests including 17 controls) |
-| Tempo | [Eight source entry points](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search, all 31 V2 trace-by-ID depth combinations, 20 selected metric/HTTP-validation subtests and two span-ID metric-cardinality selections; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (42 wrappers); independent native/reference/MCP replay in `search_expression_test.exs` |
+| Loki | [28 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows, grouped stream ordering, per-request query length, standalone request-policy isolation, four-line WebSocket tail, `approx_topk` and grouped/ungrouped `approx_count_distinct` public results using exact bounded evaluation; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (49 tests including 21 controls) |
+| Tempo | [Eight integration source entry points plus fifteen public engine step rows](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search, all 31 V2 trace-by-ID depth combinations, 20 selected metric/HTTP-validation subtests and two span-ID metric-cardinality selections; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (59 wrappers including two new local step controls); independent native/reference/MCP replay in `search_expression_test.exs` |
 
 All replays use native Parquet and the real S3 HTTP adapter against test-owned
 loopback object stores. Loki and Tempo also use live authenticated HTTP
@@ -233,6 +233,56 @@ Validation for the bounded ranking/invalid-request continuation:
   **12 passed, 100 excluded**, seed 91, serial execution, 7.9s. This covers
   nine selected upstream cases and three Pulso controls on the final runtime.
 
+### Bounded distinct-count continuation
+
+The two public queries in Loki's `TestApproxCountDistinctQuery` failed with
+HTTP 400 before the change (seed 101). Their four original logfmt writes,
+overlapping `shared` values across devices, relative timestamps, full labels,
+exact queries and one-series value `3` expectations now replay in Elixir.
+The upstream `Shards > 1` assertions are excluded: Pulso counts exactly under
+existing bounds, not with HyperLogLog or distributed sketch merging.
+
+Four local HTTP/S3 controls cover raw string identity, missing/empty fields,
+default/explicit/empty grouping, labels and parser values, arithmetic, instant/
+range windows, nanosecond boundaries, offsets, GET/form POST, pre-storage invalid
+queries and fail-whole budgets. Detached observations, including duplicates,
+spend both selected-log and existing materialized-sample limits before window
+deduplication; repeated window visits spend work. No new memory-byte ceiling,
+high-cardinality acceleration, native/storage/keyed-byte change or retry drain.
+Upgrade every query-serving application before relying on the syntax.
+
+Combined Loki HTTP/WebSocket/module/LogQL/batch and Mimir/Tempo service regression:
+**503 passed**, seed 104. The Loki service file contains 28 upstream-derived
+checks and 21 local controls. Source pin, hashes, adaptations and baseline
+failures are in its fixture README; no upstream cluster or deployed provider
+was executed. This continuation remains local and uncommitted.
+
+### Tempo default metric-step continuation
+
+The fifteen original `TestDefaultQueryRangeStep` engine rows now run through
+authenticated HTTP and persisted native Parquet with fresh manifest state.
+Their window/expected-step table stays exact; an explicitly adapted one-span
+fixture makes the chosen step visible in every response timestamp. These are
+public engine-table ports, not additional upstream service-integration cases.
+
+The unchanged-runtime baseline failed seven source rows plus the local minimum-
+step control (seed 105). Omitted steps now use Tempo's 50 ms floor below one
+minute and coarser window-dependent rounding otherwise. Explicit steps, instant
+queries, interval admission and native/storage/keyed-byte contracts are unchanged.
+Two local controls cover shifted-epoch and nanosecond/minute boundaries, explicit
+700 ms spacing, instant ignored-step behavior and fail-whole interval admission.
+Upgrade all query-serving applications for consistent defaults; no migration or
+native ABI change. The targeted Tempo unit/HTTP/service replay passed **74**,
+seed 106, including all **59 service-file wrappers**.
+
+Broader Loki/Mimir/Tempo regression passed **510**, seed 107; the separate
+batch suite passed **9**, seed 108. The seventeen additions passed eleven
+consecutive fixed-seed runs (**187 executions**, seed 109). Strict compile,
+Credo across 437 source files, scoped formatting and whitespace checks passed.
+No native source changed or native unit tests reran. These are offline loopback
+regressions, not upstream-server, provider or deployed-client acceptance.
+Changes remain local and uncommitted.
+
 ### Remaining upstream coverage and product gaps
 
 - **Mimir:** additional histogram/exemplar policies and tenant downscaling,
@@ -241,7 +291,7 @@ Validation for the bounded ranking/invalid-request continuation:
   input but still does not establish TSDB-tier behavior.
 - **Loki:** enabled label policies, deletion,
   federation, other per-request query policies, tail/client permutations, OTLP
-  mapping, probabilistic sketches/high-cardinality acceleration and `approx_count_distinct`.
+  mapping, probabilistic sketches/distributed merging/high-cardinality acceleration.
   The upstream seven-day no-step metric case cannot reproduce its expected
   last-four-second samples on the regular default grid; its imported count
   assertion explicitly supplies 60s resolution. No extra terminal sample or

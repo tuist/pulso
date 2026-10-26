@@ -119,13 +119,19 @@ defmodule Pulso.Traces.Metrics do
 
   def window(_window, _instant), do: {:error, :unsupported_parameters}
 
-  # Tempo's default: about 240 points, in whole 5s (or 1s) steps, at least 1s.
+  # Target 240 points, rounding down at Tempo's window-dependent granularity.
   @doc false
   def default_step(start, finish) do
     baseline = div(finish - start, 240)
-    interval = div(baseline, 5_000_000_000) * 5_000_000_000
-    interval = if interval < 5_000_000_000, do: div(baseline, 1_000_000_000) * 1_000_000_000, else: interval
-    max(interval, 1_000_000_000)
+
+    granularity =
+      if finish - start < 60_000_000_000 do
+        50_000_000
+      else
+        Enum.find([3600, 300, 60, 15, 5, 1], 1, &(&1 * 1_000_000_000 <= baseline)) * 1_000_000_000
+      end
+
+    max(div(baseline, granularity), 1) * granularity
   end
 
   # -- parsing ------------------------------------------------------------------

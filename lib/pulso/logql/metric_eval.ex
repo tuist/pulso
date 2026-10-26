@@ -97,8 +97,8 @@ defmodule Pulso.LogQL.MetricEval do
   # Range aggregations stream the selected entries, reducing each to a
   # compact `{timestamp, tie, value}` sample of its series instead of holding
   # pipeline entries. Every window then reads a slice of the series' samples
-  # in the canonical log order, so results match evaluating the materialized
-  # entries while memory follows two numbers per log line.
+  # in the canonical log order. Numeric samples retain no line text; distinct
+  # counting retains detached strings under the materialized-sample budget.
   defp do_eval(%AST.RangeAgg{op: :absent_over_time} = agg, tenant, opts) do
     kind = result_kind(opts)
     times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
@@ -230,6 +230,20 @@ defmodule Pulso.LogQL.MetricEval do
     Evaluator.fold_log(inner, tenant, query_opts, %{}, &add_entry(&1, &2, &3, spec))
   end
 
+  defp add_entry(entry, _record, acc, %{op: :approx_count_distinct, param: name} = spec) do
+    check_pipeline_error(entry)
+
+    case {entry.timestamp_ns, Map.get(entry.labels, name)} do
+      {ts, value} when is_integer(ts) and is_binary(value) and value != "" ->
+        Budget.charge(:log_samples, 1)
+        Budget.charge(:materialized, 1)
+        add_sample(acc, series_key(entry, spec), {ts, nil, :binary.copy(value)})
+
+      _ ->
+        acc
+    end
+  end
+
   defp add_entry(entry, record, acc, spec) do
     check_pipeline_error(entry)
 
@@ -253,6 +267,10 @@ defmodule Pulso.LogQL.MetricEval do
   end
 
   defp series_key(_entry, %{grouping: :all}), do: %{}
+
+  defp series_key(entry, %{op: :approx_count_distinct, param: name, grouping: grouping}),
+    do: entry_label_key(%{entry | labels: Map.delete(entry.labels, name)}, nil, grouping)
+
   defp series_key(entry, %{unwrap: unwrap, grouping: grouping}), do: entry_label_key(entry, unwrap, grouping)
 
   # Equal timestamps keep the canonical log order only where it decides the
@@ -353,6 +371,15 @@ defmodule Pulso.LogQL.MetricEval do
   defp range_series(labels, [point], :vector), do: [{labels, point}]
 
   defp aggregate(%{op: :count_over_time}, _samples, first, last, _start, _finish), do: (last - first + 1) * 1.0
+
+  # Exact string identity, not a probabilistic sketch or a sum of per-stream
+  # cardinalities. Each window visit already spends the ordinary work budget.
+  defp aggregate(%{op: :approx_count_distinct}, samples, first, last, _start, _finish) do
+    first..last//1
+    |> Enum.reduce(MapSet.new(), fn index, distinct -> MapSet.put(distinct, value_at(samples, index)) end)
+    |> MapSet.size()
+    |> Kernel.*(1.0)
+  end
 
   defp aggregate(%{op: :rate, unwrap: unwrap}, samples, first, last, start, finish) do
     seconds = (finish - start + 1) / 1_000_000_000

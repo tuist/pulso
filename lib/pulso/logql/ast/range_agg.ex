@@ -7,8 +7,7 @@ defmodule Pulso.LogQL.AST.RangeAgg do
   `range_ns` is the duration in nanoseconds; `offset_ns` is the
   optional `offset` modifier; `at_ns` is the optional `@ <timestamp>`
   modifier (absolute epoch time in nanoseconds). `param` is the
-  aggregator's numeric argument (currently only `quantile_over_time`
-  uses it).
+  quantile's numeric argument or the `approx_count_distinct` field name.
   """
 
   alias Pulso.LogQL.AST.Grouping
@@ -21,6 +20,7 @@ defmodule Pulso.LogQL.AST.RangeAgg do
           :rate
           | :rate_counter
           | :count_over_time
+          | :approx_count_distinct
           | :bytes_over_time
           | :bytes_rate
           | :sum_over_time
@@ -40,7 +40,7 @@ defmodule Pulso.LogQL.AST.RangeAgg do
           range_ns: integer(),
           offset_ns: integer() | nil,
           at_ns: integer() | nil,
-          param: number() | nil,
+          param: number() | String.t() | nil,
           grouping: Grouping.t() | nil
         }
 end

@@ -14,6 +14,7 @@ This is a selected public API port, **not the complete Tempo integration suite**
 | [`TestTraceByIDV2Filtering`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/tracebyid/trace_by_id_filtering_test.go) | All 31 depth-table combinations, the exact six-span parent graph, two integer predicates, span-ID sets and COMPLETE/PARTIAL expectations; malformed query and active/ignored depth assertions. The oversized-URI response is an explicit adaptation below. |
 | [`TestQueryRangeExemplars`, metric and HTTP-validation subtests](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L306-L536) | All three aligned/unaligned/default-step interval rows (3/4/122 samples), all five instant/range aggregate comparisons, the instant-average comparison, all six topk/bottomk rows, both empty-result counts, and HTTP rejection of `0`, `0s` and `35ms` steps. Small-step diagnostic wording is explicitly adapted below. Exemplar production/requests and transport permutations are excluded. |
 | [`TestQueryRangeTypeHandling` and `TestQueryRangeMaxSeriesDisabled`, metric-cardinality selections](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L636-L725) | Two spans with `foo` string `123` versus integer `123`, and the timed one-span producer, queried with `{} \| rate() by (span:id)`, five-minute bounds and `5s` step. COMPLETE and exact producer-cardinality assertions are retained. Exemplar requests, streaming and the unlimited-series configuration are not selected. |
+| [`TestDefaultQueryRangeStep`, public engine table](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/pkg/traceql/engine_metrics_test.go#L35-L65) | All fifteen original window/expected-step pairs, retaining start zero and end equal to the window. Assert the expected spacing through HTTP/native-Parquet range samples rather than a private helper; the one-span producer is a separately identified Pulso adaptation. This is an engine-table port, not an additional upstream service-integration test. |
 
 The separate malformed-name, exact-percent, nested `/values`, missing-key, route
 suffix, authentication, search-window rejection and full-response public-engine
@@ -25,11 +26,12 @@ checks are Pulso regressions, not additional upstream integration cases.
 mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs
 ```
 
-Forty-two async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
+Fifty-nine async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
 owned Bandit listener, persist native Parquet through Pulso's S3 adapter against
 an owned loopback object store, restart manifest supervision, and query JSON and
 protobuf responses. Default tests need no Go, Docker, remote services or network
-downloads. All data and expectations are checked in.
+downloads. All data and expectations are checked in. The latest additions are
+fifteen public engine-table rows and two separately labelled Pulso controls.
 
 The upstream harness converts Jaeger batches to OTLP/gRPC and queries both live
 and flushed backend data. This port expresses the same resource/span attributes
@@ -316,6 +318,51 @@ with one existing optional promtool skip and 37 optional exclusions (seed 82).
 Codec release tests passed all **133** cases; strict Credo, release Clippy,
 formatters and whitespace checks passed. These remain offline HTTP/native-S3
 regressions, not a run of upstream Tempo or deployed-client acceptance.
+
+## Default metric-step continuation
+
+All fifteen `TestDefaultQueryRangeStep` rows preserve the public source's
+start-zero/window-end geometry and expected duration exactly: 59 seconds through
+30 days. Expected steps are transcribed into milliseconds for the public JSON
+timestamps, not computed by Pulso. Each case ingests one rich span at one second
+using the existing fixture helper, restarts manifest supervision and queries
+`{} | count_over_time()` without `step`. It checks the first sample timestamp,
+every adjacent sample spacing and total count one. The original unit test has
+no producer; this persisted span and HTTP transport are explicit adaptations,
+not copied upstream input or an execution of Tempo itself.
+
+The unchanged-runtime baseline failed **7/15 upstream rows** (seed 105): 59s,
+6h, 24h minus 1s, 24h, 2d, 7d and 14d. The minimum-step Pulso control also
+failed; the explicit-step control already passed. The independently written
+default policy now rounds the window/240 baseline at 50 ms below one minute,
+or at the largest applicable hour/5m/1m/15s/5s/1s granularity otherwise, with a
+one-second minimum in that second branch. No Tempo runtime code is copied.
+
+Two local controls cover a one-nanosecond window, the 50 ms floor, subminute
+rounding, both sides of the minute boundary and a shifted nanosecond epoch;
+explicit `700ms` spacing, instant ignored-step/count behavior, and unchanged
+HTTP rejection above 10,000 requested intervals. These are not additional
+upstream rows. The complete Tempo service plus metrics unit/HTTP suites passed
+**74 tests**, seed 106, including all **59 HTTP wrappers**.
+
+The broader Loki HTTP/WebSocket/module/LogQL, Mimir service and Tempo replay
+passed **510 tests**, seed 107; the separate batch suite passed **9**, seed 108.
+All seventeen additions passed eleven consecutive runs (**187 executions**,
+fixed seed 109). Compile with warnings as errors, strict Credo across 437 source
+files, scoped formatting and whitespace checks passed. No native source changed;
+native unit tests were not separately rerun for this application-only policy.
+
+Upgrade every query-serving application for consistent omitted-step results.
+Trace metrics capability **2**, storage formats, keyed bytes and all existing
+query/result bounds remain unchanged; no native ABI change, migration or retry
+drain is introduced. These offline checks do not establish metrics exemplars,
+expression arithmetic, streaming, deployed clients or provider/capacity parity.
+
+| Additional pinned source | SHA-256 |
+| --- | --- |
+| `pkg/traceql/engine_metrics_test.go` | `6568615e285b21b5094c218444d1a93aa8996d2fda82b5eb65d44f9e1637fe49` |
+| Selected lines 35–65 (`TestDefaultQueryRangeStep`) | `b4c1bf93cbfc446f35d2a87c9f4e227524adb9bd7227fd226533f3490b1c19bf` |
+| Inspected `pkg/traceql/engine_metrics.go` (policy at lines 37–81) | `cd05466f788a7a0705578fd79aa47d38a1408ca9609cdbd9b9e6fa8493058e01` |
 
 ## Explicit remaining gaps
 

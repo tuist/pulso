@@ -13,16 +13,17 @@ The test harness and production fixes use Pulso's own HTTP/storage interfaces.
 
 ## Source-to-test mapping
 
-There are **26 upstream-derived ExUnit checks**: 25 preserve the selected public
+There are **28 upstream-derived ExUnit checks**: 27 preserve the selected public
 request/response semantics, and one metric-range check has an explicit resolution
-adaptation described below. They are not 26 complete upstream integration suites.
-Seventeen additional HTTP/S3 controls in the same file are Pulso-authored, not
+adaptation described below. They are not 28 complete upstream integration suites.
+Twenty-one additional HTTP/S3 controls in the same file are Pulso-authored, not
 upstream ports; two pipeline/evaluator controls live in the existing LogQL test files.
 
 | Upstream source | Selected cases | Checks |
 | --- | --- | ---: |
 | [`integration/loki_micro_services_test.go`, `TestMicroServicesIngestQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L110-L209) | `query`, `label-names`, `label-values`, `series`, `series error`, `stats error`, `per-request-limits`, `tail` | 8 |
 | [`integration/loki_micro_services_test.go`, `TestProbabilisticQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L779-L886) | Exact four `lineA`–`lineD` writes under `job=one/two`; instant `approx_topk(1, count_over_time({job=~".+"}[1h]))` returns only `job=one`, value `3`. Pulso ranks exactly under existing bounds, not with upstream sketches. | 1 |
+| [`integration/loki_micro_services_test.go`, `TestApproxCountDistinctQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L888-L992) | Four exact `mac` logfmt writes with overlapping `shared` values under `job=devices,version=1,device=a/b`; `query` groups by version and `query-ungrouped` uses `by ()`, both returning `3`. Multi-shard statistics assertions are excluded. | 2 |
 | [`integration/per_request_limits_test.go`, `TestPerRequestLimits`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/per_request_limits_test.go#L21-L64) | One `lineA` write; limited range and default-time label requests reject, then a header-free range request returns `lineA`, in one sequential check | 1 |
 | [`integration/labelaccess_test.go`, `TestLabelAccessTestCases/disabled`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/labelaccess_test.go#L78-L112) and its [ingest](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/labelaccess_test.go#L297-L305) / [assertion helpers](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/labelaccess_test.go#L385-L470) | `logs-query`, `label-values-query`, `series-query`, `metrics-query`, `metrics-range-query` | 5 |
 | [`integration/loki_micro_services_test.go`, `TestCategorizedLabels`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L1070-L1291) | `no header - no parser`, `no header - with parser`, `with header - no parser`, `with header - with parser` | 4 |
@@ -30,8 +31,8 @@ upstream ports; two pipeline/evaluator controls live in the existing LogQL test 
 | [`integration/explore_logs_test.go`, `Test_ExploreLogsApis/detected_fields`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/explore_logs_test.go#L117-L223) | All six log lines; `non-split queries` (`now-1m` to `now+1m`, foo string/1, color string/3); `split queries` (`now-24h` to `now+1m`, foo string/1, color string/4) | 3 |
 | [`integration/loki_sample_query_ordering_test.go`, `TestSampleQueryStreamOrderingEquivalence`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_sample_query_ordering_test.go#L23-L105) | Public `sum by (cluster, job, app) (count_over_time({cluster="prod"}[1h]))` result with all three labels and counts `a=3,b=2,c=1`, counted once | 1 |
 
-These cover eight upstream fixtures: the four `lineA`–`lineD` pushes, their separate
-`job=one/two` probabilistic-query fixture, the standalone
+These cover nine upstream fixtures: the four `lineA`–`lineD` pushes, their separate
+`job=one/two` probabilistic-query fixture, the four overlapping `mac` pushes, the standalone
 limits case's single `lineA` push, the four `line1`–`line4` pushes with
 missing/classified environment labels, the four
 structured-metadata/parser pushes, the five `msg=... n=...` pushes, the six
@@ -365,6 +366,49 @@ all twelve additions passed **12 tests, 100 excluded** (seed 91), including
 the strengthened exact result-length assertions. No flaky retry is built into
 the tests, and these later failures are not hidden by the earlier green run.
 
+### Bounded exact distinct-count public-result replay
+
+The two `TestApproxCountDistinctQuery` ports preserve all four original lines,
+their `now-20m`, `now-10m`, `now-15m`, `now-5m` timestamps, complete stream
+labels, exact queries, vector types, one-series results, expected labels and
+value `3`. The client helper's `now+1s` evaluation time is unchanged.
+Both failed with HTTP 400 `parse_error` before the runtime changes (seed 101),
+then passed with the implementation (seed 102). Summing per-stream counts would
+return four, so the repeated `shared` value discriminates that incorrect approach.
+
+Pulso computes exact string cardinalities in each existing range window;
+it does not port Loki's runtime, HyperLogLog hashing/estimation, protobuf
+sketches, sharding or sketch merging. Both upstream `Shards > 1` assertions
+are deliberately omitted rather than simulated. High-cardinality results may
+differ from an estimate, and this bounded implementation provides no sketch
+acceleration or distributed execution evidence.
+
+The pinned [grammar](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/syntax.y#L120-L123),
+[validation](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/ast.go#L1705-L1748),
+[extractor grouping](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/extractor.go#L108-L135),
+[raw-string/missing/empty extraction](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/metrics_extraction.go#L407-L501)
+and [instant/range execution test](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/approx_count_distinct_test.go#L273-L405)
+were inspected for the additional semantics, not counted as additional ports.
+
+Four separately marked Pulso HTTP/S3 controls cover default/explicit/empty
+grouping, labels versus parsed fields, exact numeric-looking strings, duplicate/
+missing/empty values, arithmetic, GET/form POST, complete per-step matrices,
+open lower/inclusive upper nanosecond boundaries, offset and empty windows;
+invalid parameter/grouping/unwrap requests before any provider access; and
+fail-whole scan, selected-log-sample, materialized-sample, work and result limits.
+Retained strings are detached from decoded arenas; duplicates spend both
+sample quotas before window deduplication. The existing materialized-sample
+limit defaults to 100,000, separate from the five-million selected-log ceiling.
+This is not a new string-byte memory ceiling or a capacity benchmark.
+
+The combined Loki HTTP/WebSocket/module/LogQL/batch and Mimir/Tempo service
+regression passed **503 tests**, seed 104. All six additions also passed eleven
+consecutive randomized runs (66 executions, `--repeat-until-failure 10`).
+Compile-with-warnings-as-errors, scoped formatting, strict Credo (437 files)
+and whitespace checks passed. No upstream process or deployed provider was
+launched. Only query-serving applications need upgrading for the
+syntax; no storage/keyed-byte/native ABI change, migration or retry drain.
+
 ## Gaps found and fixed
 
 1. Series and index stats silently discarded LogQL pipeline stages and returned
@@ -385,6 +429,9 @@ the tests, and these later failures are not hidden by the earlier green run.
    ranks exactly within ordinary query budgets, with instant-only, positive
    integer and no-outer-grouping restrictions. Sketch-based acceleration remains
    unimplemented rather than being inferred from this small public fixture.
+6. Both upstream distinct-count queries returned parse errors. They now count
+   exact strings across streams within each output group/window, with missing/
+   empty fields omitted and all retained observations charged before deduplication.
 
 ## Unported boundaries
 
@@ -392,7 +439,7 @@ This selection does not establish full Loki compatibility. It omits enabled
 LBAC/aggregated metric policies, deletion APIs, multi-tenant federation,
 per-request limits other than `maxQueryLength`, unselected WebSocket tail
 behaviors, OTLP promotion/drop policies, probabilistic sketches/high-cardinality
-acceleration, `approx_count_distinct`, ruler evaluation,
+acceleration and distributed merging, ruler evaluation,
 Kafka deduplication, scheduler/ring changes, schema/provider migration, bloom
 builders, data-object reader statistics/cache/cost parity and capacity testing.
 The selected Explore requests do not establish query-frontend split/cache
@@ -435,5 +482,9 @@ The original files have these SHA-256 hashes:
 | `docs/sources/query/metric_queries.md` | `4ff8122d63c2fc6bc14c201b0419186d836dbe884faa620448450296cbcbabfe` |
 | `pkg/logql/syntax/ast.go` | `87eb6811c68654e2b2f7d629d799d215dc79fb549e0f9d71a805a46bd51e1e69` |
 | `pkg/logql/count_min_sketch_test.go` | `04b97ef240c41bd1063f8e3b1a0145edf4766cfae864fd57e81b9d141497891b` |
+| `pkg/logql/approx_count_distinct_test.go` | `7067c3a1e8d992e4bef6f974e6f36b7b3781b544dd84f048130937ee81bf7377` |
+| `pkg/logql/syntax/syntax.y` | `cc92e3cfd669d63fb4e987f0830ffefd85b75c26b2786e54885a103ae3a67a7a` |
+| `pkg/logql/syntax/extractor.go` | `631842bfc26139802c3623c2117b0e75b548dc2b209e6b6b9e70c5194b7f4411` |
+| `pkg/logql/log/metrics_extraction.go` | `6118400c0a9cbd491b7843b45f54932cf8ec47ae6726e33f27b222318d802214` |
 | `pkg/logql/internal/logqltest/testdata/functions.logqltest` | `38c92a4989e2f7f19abdba06f5b789d0ef3c4d7cdb5850aab729a85f63bf3d66` |
 | `LICENSE` | `0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0` |

@@ -30,7 +30,7 @@ defmodule Pulso.LogQL.QueryValidation do
     with :ok <- validate_range_duration(range),
          :ok <- validate_range_parameter(op, param),
          :ok <- validate_at(at),
-         :ok <- validate_range_grouping(grouping, op),
+         :ok <- validate_range_grouping(grouping, op, param),
          :ok <- validate_range_unwrap(inner, op),
          do: validate(inner)
   end
@@ -98,14 +98,20 @@ defmodule Pulso.LogQL.QueryValidation do
   defp validate_range_duration(_), do: {:error, :invalid_range_duration}
   defp validate_range_parameter(:quantile_over_time, param) when is_number(param), do: :ok
   defp validate_range_parameter(:quantile_over_time, _), do: {:error, :invalid_range_parameter}
+  defp validate_range_parameter(:approx_count_distinct, param) when is_binary(param) and param != "", do: :ok
+  defp validate_range_parameter(:approx_count_distinct, _), do: {:error, :invalid_range_parameter}
   defp validate_range_parameter(_, nil), do: :ok
   defp validate_range_parameter(_, _), do: {:error, :invalid_range_parameter}
 
   defp validate_at(nil), do: :ok
   defp validate_at(_), do: {:error, :unsupported_at_modifier}
-  defp validate_range_grouping(nil, _), do: :ok
+  defp validate_range_grouping(nil, _, _), do: :ok
 
-  defp validate_range_grouping(%AST.Grouping{}, op)
+  defp validate_range_grouping(%AST.Grouping{mode: :by, labels: names}, :approx_count_distinct, param) do
+    if param in names, do: {:error, :unsupported_range_grouping}, else: :ok
+  end
+
+  defp validate_range_grouping(%AST.Grouping{}, op, _)
        when op in [
               :avg_over_time,
               :stddev_over_time,
@@ -117,7 +123,7 @@ defmodule Pulso.LogQL.QueryValidation do
               :last_over_time
             ], do: :ok
 
-  defp validate_range_grouping(_, _), do: {:error, :unsupported_range_grouping}
+  defp validate_range_grouping(_, _, _), do: {:error, :unsupported_range_grouping}
   defp validate_range_unwrap(_, :rate_counter), do: {:error, :unsupported_rate_counter}
 
   defp validate_range_unwrap(%AST.LogQuery{stages: stages}, op) do
@@ -144,7 +150,11 @@ defmodule Pulso.LogQL.QueryValidation do
             ], do: :ok
 
   defp unwrap_op(_), do: {:error, :invalid_range_aggregation}
-  defp log_op(op) when op in [:bytes_over_time, :bytes_rate, :count_over_time, :rate, :absent_over_time], do: :ok
+
+  defp log_op(op)
+       when op in [:bytes_over_time, :bytes_rate, :count_over_time, :rate, :absent_over_time, :approx_count_distinct],
+       do: :ok
+
   defp log_op(_), do: {:error, :invalid_range_aggregation}
 
   defp validate_selector(%AST.Selector{matchers: matchers}) do

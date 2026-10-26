@@ -59,6 +59,15 @@ Queries take `q` (or `query`), `start`, `end` (Unix seconds, nanoseconds or
 RFC3339; by default the hour before `end`, or `since`) and, for ranges, `step`
 (seconds or a duration; by default about 240 points).
 
+Without `step`, windows shorter than one minute use multiples of 50 ms, with a
+50 ms minimum. Longer windows use a one-second minimum and round the window's
+1/240 baseline down at the largest applicable granularity: one hour, five
+minutes, one minute, fifteen seconds, five seconds or one second. For example,
+59 seconds defaults to 200 ms, six hours to one minute, and 24 hours to five
+minutes. Rounding and boundary alignment can produce more than 240 points.
+Explicit steps are unchanged. Upgrade every query-serving application before
+relying on the default policy; no data migration or native ABI change is needed.
+
 Supported: a selector of `{}`, `{true}` or the
 [bounded expression grammar](trace-query-expressions.md), optionally combined
 with `nestedSetParent<0` for root spans, piped into `rate()`,
@@ -346,6 +355,29 @@ before reading storage. Existing `topk`/`bottomk` behavior is unchanged.
 Upgrade every query-serving application instance before clients depend on the
 new syntax behind non-sticky routing. No storage migration, native upgrade or
 keyed-retry drain is required for this operator.
+
+`approx_count_distinct(field, {selector} | pipeline [range])` counts nonempty
+string label or parsed-field values in instant and range metric queries.
+Counting is **exact within existing query budgets**, not HyperLogLog or
+distributed sketch merging. Repeated values count once across streams within
+each output group and evaluation window; numeric-looking strings such as
+`"01"`, `"1"` and `"1.0"` remain distinct. Missing and empty fields contribute
+nothing, and empty windows emit no sample rather than zero.
+
+Without grouping, output labels retain the pipeline labels except the counted
+field. Use suffix `by (version)` to combine streams by selected labels, or
+`by ()` for one unlabeled series. `without`, grouping by the counted field,
+`unwrap` and nonpositive windows reject. Each window uses `(time - range, time]`,
+shifted by an optional `offset`. Ordinary pipeline-error rejection still applies.
+
+This operator retains detached string observations in the Elixir evaluator,
+not native numeric samples. Every retained observation, including duplicates,
+spends the existing selected-log-sample and materialized-sample budgets (the
+latter defaults to 100,000); each window visit also spends work. Scan, result,
+deadline and heap limits still apply and failures return no partial answer.
+This is not high-cardinality acceleration or a dedicated string-byte memory
+ceiling. Upgrade all query-serving applications before relying on the syntax;
+no native/storage upgrade, migration or keyed-retry drain is required.
 
 Pattern line filters (`|> "<_> level=error <_>"` and `!> "..."`) match lines
 against a pattern in which `<_>` stands for any non-empty text, as in Loki: the
