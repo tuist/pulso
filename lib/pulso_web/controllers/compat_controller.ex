@@ -11,7 +11,7 @@ defmodule PulsoWeb.CompatController do
   use PulsoWeb, :controller
 
   alias Pulso.Auth
-  alias Pulso.PromQL.Parser
+  alias Pulso.PromQL.Formatter
 
   # Versions whose APIs Pulso's compatible endpoints follow.
   @prometheus_version "3.5.0"
@@ -85,11 +85,11 @@ defmodule PulsoWeb.CompatController do
   defp exemplar_time("", default), do: {:ok, default}
   defp exemplar_time(value, _default), do: Pulso.PromQL.Time.parse_timestamp(value)
 
-  @doc "Validates a query. Pulso has no PromQL pretty-printer, so valid input is returned unchanged."
+  @doc "Formats a query in Pulso's supported PromQL grammar without executing it."
   def format_query(conn, %{"query" => query}) when is_binary(query) do
     authorized(conn, fn ->
-      case Parser.parse(query) do
-        {:ok, _ast} -> %{"status" => "success", "data" => query}
+      case Formatter.format(query) do
+        {:ok, formatted} -> %{"status" => "success", "data" => formatted}
         {:error, reason} -> {:bad_data, inspect(reason)}
       end
     end)

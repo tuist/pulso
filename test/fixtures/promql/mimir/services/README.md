@@ -5,7 +5,7 @@ Revision: **`dd039cdd4ba466adb5d28280bf1b8a374a98432e`**.
 The executable fixtures are embedded in
 [`mimir_service_conformance_test.exs`](../../../../pulso_web/controllers/mimir_service_conformance_test.exs).
 They are ports of the public request/response portions of actual Mimir service
-integration tests, not invented cases labelled upstream. This is **48 selected
+integration tests, not invented cases labelled upstream. This is **49 selected
 scenario replays**, plus 21 separately named Pulso regression/control tests,
 not the complete Mimir integration suite. The existing math corpus in the parent
 directory is separate and remains unchanged.
@@ -27,6 +27,7 @@ All links below are pinned to the revision above.
 | [`TestQueryFrontendErrorMessageParity` → `testQueryFrontendErrorMessageParityScenario`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L566-L905) | Eight portable invalid range requests: maximum resolution; negative step; unknown function; range vector instead of instant vector; start after end; malformed step; malformed start; range query with range vector. Exact HTTP/status/errorType, explicitly adapted diagnostic text, and weaker omitted-resolution syntax rejection (details below). | 8 |
 | [`TestQuerierWithBlocksStorageRunningInSingleBinaryMode`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L311-L517) → [`testMetadataQueriesWithBlocksStorage`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L573-L790) | All four helper time windows: inside head; inside ingester/outside head; partially inside ingester; entirely outside ingester. Every series lookup, metric-name values selector (including OR), and label-name expectation in that helper is retained: 29 discovery requests. | 4 |
 | [`TestHashCollisionHandling`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L983-L1068) | One RW1 push containing both `fingerprint_collision` series under `user-0`, then the complete instant vector at the shared sample timestamp | 1 |
+| [`TestFormatQueryAPIEndpoint`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/api_endpoints_test.go#L89-L112) | Exact GET expression `count(up)by(foo)`, HTTP 200 and expected `data="count by (foo) (up)"`; no storage request | 1 |
 
 ### Preserved inputs and assertions
 
@@ -408,10 +409,47 @@ mix format --check-formatted test/pulso_web/controllers/mimir_service_conformanc
 git diff --check -- test/pulso_web/controllers/mimir_service_conformance_test.exs test/fixtures/promql/mimir/services/README.md
 ```
 
+### Query-formatting increment
+
+The added service port preserves `TestFormatQueryAPIEndpoint`'s expression,
+GET method, HTTP 200 and exact formatted string. Only the existing route,
+tenant and owned ConnTest harness adaptations apply. There is no input data or
+wall clock to freeze. The source only decodes `data`; the shared Pulso helper
+additionally checks the success envelope and the test verifies zero provider
+requests. This is not a Parquet read/write test or a live Mimir execution.
+
+Before runtime changes, the isolated upstream case failed at seed 111:
+`count(up)by(foo)` was returned unchanged, not `count by (foo) (up)`.
+The new independently written Elixir formatter prints Pulso's validated AST,
+preserving evaluation order and selector order. It handles all currently
+supported node types without adding query syntax, storage or native state.
+Input and formatted output must both fit the existing 16 KiB query ceiling.
+Comments/redundant parentheses are removed; output remains single-line and
+does not claim upstream multiline, matcher-sorting or redundant-syntax parity.
+All query-serving apps must upgrade for consistent formatting; no native ABI,
+stored format, keyed bytes, migration or retry drain changes are involved.
+
+Three additional Pulso tests and the extended existing formatter check in
+`compat_controller_test.exs` cover GET/form POST, exact expected strings,
+idempotence, all 450 two-operator/parenthesization combinations, subqueries,
+offsets, vector matching, UTF-8/control-character quoting, special metric names,
+signed zero, finite float extremes/subnormals and fail-whole input/output-size
+checks. They compare successfully reparsed trees, not two parse errors. The
+authentication control rejects an unauthorized malformed query before parsing.
+These are local controls, not additional upstream ports. The complete Mimir
+service plus compatibility-controller replay passed **84 tests**, seed 113.
+
+Pinned source SHA-256 hashes:
+
+```text
+7f7e61388811ca343fdd2c6d8ec859eb1b74b41bba1170c4a2a63f98dce53c77  integration/api_endpoints_test.go
+ceff996c20433ee86378330cfa02d27b8ec58ab213158af7b6027137257cadde  selected lines 89–112, including final newline
+```
+
 Remaining service-suite gaps include exemplar age/disabled policies and histogram
 downscaling under tenant overrides, broader label/name-validation and partial-write
 permutations, HA/relabel/tenant configuration, UTF-8 grammar outside selectors, OTLP translation,
-remote-read, tenant federation, cardinality analysis, query formatting,
+remote-read, tenant federation, cardinality analysis, exact upstream printer layout,
 streaming transport and Mimir-specific sharding/caching/limits/failure topology.
 Passing this selection is not full PromQL, full Mimir service or deployed-client
 compatibility evidence.
@@ -431,7 +469,7 @@ test, with no application/OS environment mutation.
 ## Attribution and licenses
 
 The adapted service test retains **AGPL-3.0-only** attribution to Grafana Mimir.
-Its `querier_test.go` and `query_frontend_test.go` sources also preserve
+Its `querier_test.go`, `query_frontend_test.go` and `api_endpoints_test.go` sources also preserve
 **Apache-2.0** Cortex provenance, copyright **The Cortex Authors**. The vendored
 histogram generator is **Apache-2.0**, copyright **The Prometheus Authors**.
 The test header retains these attributions. The parent directory's [`LICENSE`](../LICENSE)

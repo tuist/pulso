@@ -21,11 +21,11 @@ not from regenerating answers with Pulso.
 
 | Backend | Imported selection and provenance | Elixir replay |
 | --- | --- | --- |
-| Mimir | [48 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization, invalid RW2 symbols, all three UTF8Validation name rows over both write versions, the exact upstream fingerprint fixture and eight invalid-range requests with explicitly adapted diagnostics | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (69 tests including 21 controls) |
+| Mimir | [49 scenarios](../test/fixtures/promql/mimir/services/README.md): RW1/RW2 scalar/classic/native/custom histograms, summaries, exemplars and metadata; all seven ingester-query table rows including mixed/colliding types; four lookback cases and four discovery windows; empty-label/order normalization, invalid RW2 symbols, all three UTF8Validation name rows over both write versions, the exact upstream fingerprint fixture, eight invalid-range requests with explicitly adapted diagnostics and the query-formatting endpoint | `test/pulso_web/controllers/mimir_service_conformance_test.exs` (70 tests including 21 controls) |
 | Loki | [28 checks](../test/fixtures/logs/loki-upstream/README.md): ingest/query/labels/series/errors, disabled label policy, all four categorized-label cases, count/unwrap/filter results, detected-field windows, grouped stream ordering, per-request query length, standalone request-policy isolation, four-line WebSocket tail, `approx_topk` and grouped/ungrouped `approx_count_distinct` public results using exact bounded evaluation; one range-resolution adaptation is explicit | `test/pulso_web/controllers/loki_upstream_integration_test.exs` (49 tests including 21 controls) |
 | Tempo | [Eight integration source entry points plus fifteen public engine step rows](../test/fixtures/traces/tempo_integration/README.md): seven two-span batches, v1 names/values, six complete v2 discovery filters, all 19 enabled special-character pairs, invalid-scope rejection, basic unscoped search, all 31 V2 trace-by-ID depth combinations, 20 selected metric/HTTP-validation subtests and two span-ID metric-cardinality selections; 16 separately labelled public Parquet/engine controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs` (59 wrappers including two new local step controls); independent native/reference/MCP replay in `search_expression_test.exs` |
 
-All replays use native Parquet and the real S3 HTTP adapter against test-owned
+Data-bearing replays use native Parquet and the real S3 HTTP adapter against test-owned
 loopback object stores. Loki and Tempo also use live authenticated HTTP
 listeners; Mimir uses the production Phoenix endpoint through ConnTest. They
 require no upstream server, Go, Docker or network downloads during replay. They
@@ -283,11 +283,42 @@ No native source changed or native unit tests reran. These are offline loopback
 regressions, not upstream-server, provider or deployed-client acceptance.
 Changes remain local and uncommitted.
 
+### Mimir query-formatting continuation
+
+The exact `TestFormatQueryAPIEndpoint` expression/result is now an offline
+service regression. It failed before runtime changes (seed 111), echoing
+`count(up)by(foo)` instead of `count by (foo) (up)`. The endpoint now formats
+all supported PromQL AST nodes without executing queries or reading storage.
+The Mimir service plus compatibility-controller replay passed **84 tests**,
+seed 113. Source pin, source/selection hashes, attribution and adaptations are
+recorded in the Mimir fixture README.
+
+Local HTTP controls cover exact outputs, GET/form POST, idempotence, all 450
+two-operator parenthesization combinations, UTF-8/control quoting, special metric
+names versus scalar literals, finite float extremes/subnormals, offsets,
+subqueries, vector matching and authentication. Input and output both retain
+the 16 KiB ceiling; expansion beyond it fails whole instead of emitting a query
+the parser cannot accept. Selector order is retained; comments/redundant
+parentheses are not. This closes validation-only echo behavior, not upstream
+multiline/matcher-sorting/redundant-syntax parity or unsupported PromQL grammar.
+Upgrade query-serving applications; no native ABI, storage/keyed-byte change,
+migration or retry drain is needed.
+
+Validation: `mix precommit --max-cases 4 --seed 114 --warnings-as-errors`
+passed **1854 tests**, with one existing optional skip and 37 opt-in exclusions
+(268.0 seconds), including strict compile, unused-dependency and formatter
+checks. A final three-service plus compatibility-controller replay passed
+**192 tests**, seed 115. Strict Credo checked 438 files without findings. The green full run
+still logged compaction timeouts/conflicts and manifest-CAS warnings; this
+query-formatting change does not resolve those diagnostics or establish
+provider/capacity acceptance. No native source changed or native unit tests
+reran. Changes remain local and uncommitted; no deployment or migration ran.
+
 ### Remaining upstream coverage and product gaps
 
 - **Mimir:** additional histogram/exemplar policies and tenant downscaling,
   remaining invalid/partial-write permutations, OTLP translation, remote-read, federation, cardinality,
-  formatting, UTF-8 grammar outside selectors and streaming. Sample-backed discovery now uses native histogram
+  exact upstream printer layout, UTF-8 grammar outside selectors and streaming. Sample-backed discovery now uses native histogram
   input but still does not establish TSDB-tier behavior.
 - **Loki:** enabled label policies, deletion,
   federation, other per-request query policies, tail/client permutations, OTLP

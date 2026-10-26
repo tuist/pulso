@@ -294,8 +294,19 @@ the Prometheus evaluator's string-valued result numbers.
 ### Datasource metadata
 
 For Grafana's Prometheus datasource, `/api/v1/status/buildinfo` reports the
-Prometheus API version Pulso follows and `/api/v1/format_query` validates a
-query, returning it unchanged (there is no pretty-printer).
+Prometheus API version Pulso follows. GET/form-POST `/api/v1/format_query`
+validates and formats the supported PromQL subset without reading storage or
+executing the query. For example, `count(up)by(foo)` becomes
+`count by (foo) (up)`. Formatting normalizes spacing, grouping placement,
+string quoting, durations and numeric literals while preserving evaluation
+order, vector matching and selector order. Comments and redundant parentheses
+are not retained. Output is single-line, not byte-for-byte Mimir/Prometheus
+multiline pretty-printing; unsupported language features still return HTTP 400.
+Both input and output must fit the existing 16 KiB query limit. A valid input
+whose escaped strings or fixed-decimal literals expand beyond that limit also
+returns HTTP 400, never an unusable formatted query. Authentication still applies.
+Upgrade all query-serving applications for consistent formatting behind a load
+balancer. No storage, native ABI, configuration or keyed-byte change is involved.
 
 `/api/v1/query_exemplars` returns the exemplars of every series the query's
 selectors select, with timestamps in `[start, end]` (`end` defaults to now,

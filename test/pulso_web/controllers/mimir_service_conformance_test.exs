@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Adapted from grafana/mimir integration tests at dd039cdd4ba466adb5d28280bf1b8a374a98432e.
-# querier_test.go and query_frontend_test.go also carry:
+# querier_test.go, query_frontend_test.go and api_endpoints_test.go also carry:
 # Provenance-includes-license: Apache-2.0
 # Provenance-includes-copyright: The Cortex Authors.
 # Histogram generator geometry also adapted from vendored Prometheus tsdbutil:
@@ -56,6 +56,12 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
 
     start_supervised!(ManifestSupervision)
     %{store: store}
+  end
+
+  # integration/api_endpoints_test.go: TestFormatQueryAPIEndpoint.
+  test "TestFormatQueryAPIEndpoint", %{store: store} do
+    assert data("/api/v1/format_query", query: "count(up)by(foo)") == "count by (foo) (up)"
+    assert Agent.get(store, & &1.requests) == []
   end
 
   # integration/distributor_test.go: testDistributorWithCachingUnmarshalData.

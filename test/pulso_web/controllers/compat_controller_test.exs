@@ -3,6 +3,7 @@ defmodule PulsoWeb.CompatControllerTest do
 
   alias Pulso.Auth
   alias Pulso.Auth.SharedSecret
+  alias Pulso.PromQL.Parser
   alias Pulso.Record.Log
   alias Pulso.Storage
 
@@ -27,12 +28,119 @@ defmodule PulsoWeb.CompatControllerTest do
                build_conn() |> post("/api/v1/query_exemplars", %{"query" => "up"}) |> json_response(200)
     end
 
-    test "format_query validates and echoes the query", %{conn: conn} do
+    test "format_query formats the supported grammar over GET and form POST", %{conn: conn} do
       assert %{"data" => "sum(rate(up[5m]))"} =
                conn |> get("/api/v1/format_query", %{"query" => "sum(rate(up[5m]))"}) |> json_response(200)
 
+      for {input, expected} <- [
+            {"SUM ( rate ( up [300s] OFFSET 60s ) ) BY (job,instance)",
+             "sum by (job, instance) (rate(up[5m] offset 1m))"},
+            {"topk( 2,sum(up)without(instance))by(job)", "topk by (job) (2, sum without (instance) (up))"},
+            {"sum by()(up)", "sum by () (up)"},
+            {"sum without()(up)", "sum without () (up)"},
+            {"up/ON(job)GROUP_LEFT(region)other", "up / on (job) group_left (region) other"},
+            {"up>BOOL IGNORING(instance)GROUP_RIGHT other", "up > bool ignoring (instance) group_right other"},
+            {"up/ON(job)GROUP_LEFT()other", "up / on (job) group_left () other"},
+            {"up and ON() other or third unless fourth", "up and on () other or third unless fourth"},
+            {"round( (up+2)*3,.25)", "round((up + 2) * 3, 0.25)"},
+            {"up-(other-third)", "up - (other - third)"},
+            {"(up^2)^3", "(up ^ 2) ^ 3"},
+            {"up^(2^3)", "up ^ 2 ^ 3"},
+            {"-(up+2)^2", "-((up + 2) ^ 2)"},
+            {"(-up)^2", "(-up) ^ 2"},
+            {"rate((up + other)[3600s:60s] offset 120s)", "rate((up + other)[1h:1m] offset 2m)"},
+            {"up # remove this comment\n + 2", "up + 2"},
+            {~S|{"metric😀","label😀"!='a',"with space"=~`a\..*`,x!~"b"}|,
+             ~S|{__name__="metric😀","label😀"!="a","with space"=~"a\\..*",x!~"b"}|},
+            {~S|label_replace(up,'dst','$1','src',`(a\b)`) |, ~S|label_replace(up, "dst", "$1", "src", "(a\\b)")|},
+            {"vector(0x10+010+1_000)", "vector(16 + 8 + 1000)"},
+            {"vector(-0.0)", "vector(-0)"},
+            {"vector(NaN+Inf)", "vector(NaN + Inf)"},
+            {"up offset 1w1d1h1m1s1ms", "up offset 8d1h1m1s1ms"}
+          ] do
+        for method <- [:get, :post] do
+          response = format_query(input, method)
+          assert response == %{"status" => "success", "data" => expected}, input
+          assert format_query(expected, method) == response
+          assert {:ok, parsed} = Parser.parse(input)
+          assert Parser.parse(expected) === {:ok, parsed}
+        end
+      end
+    end
+
+    test "format_query preserves number boundaries, strings and every binary precedence" do
+      for literal <- ["5e-324", "2.2250738585072014e-308", "1e-7", "1e20", "1.7976931348623157e308"],
+          sign <- ["", "-"] do
+        query = "vector(#{sign}#{literal})"
+        %{"data" => formatted} = format_query(query)
+        assert {:ok, parsed} = Parser.parse(query)
+        assert Parser.parse(formatted) === {:ok, parsed}
+        assert format_query(formatted)["data"] == formatted
+      end
+
+      for name <- ["NaN", "nan", "Inf", "iNF", "or", "sum", ":colon", "1leading", "with space", "😀"],
+          suffix <- ["", ~s(,job="api")],
+          range <- ["", " offset 1m"] do
+        query = "{" <> Pulso.JSON.encode!(name) <> suffix <> "}" <> range
+        %{"data" => formatted} = format_query(query)
+        assert {:ok, parsed} = Parser.parse(query)
+        assert Parser.parse(formatted) === {:ok, parsed}, inspect({query, formatted})
+      end
+
+      for value <- ["quote\" slash\\ newline\n\t\r", <<0, 1, 7, 8, 12, 11, 27, 127>>, "😀 café #{<<0x2028::utf8>>}"] do
+        query = "up{job=" <> Pulso.JSON.encode!(value) <> "}"
+        %{"data" => formatted} = format_query(query)
+        assert {:ok, parsed} = Parser.parse(query)
+        assert Parser.parse(formatted) === {:ok, parsed}
+      end
+
+      operators = ["+", "-", "*", "/", "%", "^", "==", "!=", ">", "<", ">=", "<=", "and", "unless", "or"]
+
+      for outer <- operators,
+          inner <- operators,
+          query <- ["(a #{inner} b) #{outer} c", "a #{outer} (b #{inner} c)"] do
+        %{"data" => formatted} = format_query(query)
+        assert {:ok, parsed} = Parser.parse(query)
+        assert Parser.parse(formatted) === {:ok, parsed}, inspect({query, formatted})
+        assert format_query(formatted)["data"] == formatted
+      end
+    end
+
+    test "format_query rejects invalid and oversized queries instead of returning executable-looking text" do
       assert %{"errorType" => "bad_data"} =
                build_conn() |> get("/api/v1/format_query", %{"query" => "sum(("}) |> json_response(400)
+
+      for method <- [:get, :post],
+          query <- ["", "unknown(up)", "up @ 123", "sum by(job,job)(up)", String.duplicate(" ", 16_385) <> "up"] do
+        assert %{"status" => "error", "errorType" => "bad_data"} = format_query(query, method, 400)
+      end
+
+      assert build_conn() |> get("/api/v1/format_query") |> json_response(400)
+
+      for method <- [:get, :post] do
+        assert format_query("up" <> String.duplicate(" ", 16_382), method)["data"] == "up"
+
+        expanded = ~s(up{job=`#{String.duplicate(<<1>>, 3000)}`})
+        assert {:ok, _} = Parser.parse(expanded)
+        assert format_query(expanded, method, 400)["error"] == ":query_expression_limit"
+
+        numeric = Enum.map_join(1..60, " + ", fn _ -> "vector(1e-308)" end)
+        assert {:ok, _} = Parser.parse(numeric)
+        assert format_query(numeric, method, 400)["error"] == ":query_expression_limit"
+      end
+    end
+
+    test "format_query authenticates before parsing" do
+      token = "formatter-secret"
+      digest = "sha256$" <> Base.encode16(:crypto.hash(:sha256, token), case: :lower)
+      Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{"acme" => digest})
+
+      assert %{"errorType" => "unauthorized"} = format_query("sum((", :get, 401)
+
+      assert build_conn()
+             |> put_req_header("authorization", "Basic " <> Base.encode64("acme:" <> token))
+             |> get("/api/v1/format_query", %{"query" => "count(up)by(foo)"})
+             |> json_response(200) == %{"status" => "success", "data" => "count by (foo) (up)"}
     end
 
     test "metadata requires the tenant's credentials", %{conn: conn} do
@@ -166,5 +274,20 @@ defmodule PulsoWeb.CompatControllerTest do
         assert aliased.resp_body == canonical.resp_body
       end
     end
+  end
+
+  defp format_query(query, method \\ :get, status \\ 200) do
+    response =
+      case method do
+        :get ->
+          get(build_conn(), "/api/v1/format_query", %{"query" => query})
+
+        :post ->
+          build_conn()
+          |> put_req_header("content-type", "application/x-www-form-urlencoded")
+          |> post("/api/v1/format_query", URI.encode_query(%{"query" => query}))
+      end
+
+    json_response(response, status)
   end
 end
