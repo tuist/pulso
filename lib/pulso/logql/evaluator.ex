@@ -144,6 +144,8 @@ defmodule Pulso.LogQL.Evaluator do
 
       {:ok, entries}
     end
+  catch
+    {:logql_error, reason} -> {:error, reason}
   end
 
   @doc """
@@ -167,6 +169,8 @@ defmodule Pulso.LogQL.Evaluator do
         Storage.fold_logs(tenant, storage_opts, acc, &fold_records(&1, &2, compiled, fun, categorize_labels?))
       )
     end
+  catch
+    {:logql_error, reason} -> {:error, reason}
   end
 
   defp fold_records(records, acc, compiled, fun, categorize_labels?) do
@@ -212,7 +216,7 @@ defmodule Pulso.LogQL.Evaluator do
   # ---------------------------------------------------------------------------
 
   @spec evaluate_metric(term(), Storage.tenant(), opts()) ::
-          {:ok, {:matrix, [series()]} | {:vector, [series()]}} | {:error, term()}
+          {:ok, MetricEval.result()} | {:error, term()}
   def evaluate_metric(expr, tenant, opts \\ %{}) when is_binary(tenant) do
     Pulso.SelfMetrics.track(:query, :logql_metric, fn ->
       QueryRunner.run(
@@ -263,9 +267,8 @@ defmodule Pulso.LogQL.Evaluator do
   # Elixir — a parser may not modify `body`, but keeping the split simple
   # avoids reasoning about which stages preserve the raw bytes.
   #
-  # `ip(...)` line filters are validated out by
-  # `Pulso.LogQL.QueryValidation` before we get here, so we only handle
-  # string and regex forms.
+  # IP and pattern filters stay in the Elixir pipeline. Their presence ends
+  # this head run, preserving the authored order of subsequent filters.
   defp split_head_line_filters(stages) do
     {head, rest} = Enum.split_while(stages, &AST.LineFilter.native?/1)
 

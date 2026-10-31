@@ -14,11 +14,14 @@ defmodule Pulso.PromQL.Formatter do
     "<" => 3,
     ">=" => 3,
     "<=" => 3,
+    "</" => 3,
+    ">/" => 3,
     "+" => 4,
     "-" => 4,
     "*" => 5,
     "/" => 5,
     "%" => 5,
+    "atan2" => 5,
     "^" => 7
   }
 
@@ -67,6 +70,9 @@ defmodule Pulso.PromQL.Formatter do
   defp render({:scalar, :nan}), do: "NaN"
   defp render({:scalar, :infinity}), do: "Inf"
   defp render({:scalar, value}), do: number(value)
+  defp render({:duration_number, text}), do: text
+  defp render({:duration_literal, 0}), do: "0s"
+  defp render({:duration_literal, ns}), do: [if(ns < 0, do: "-", else: ""), duration(abs(ns))]
 
   # Equal precedence still needs parentheses on the non-associative side.
   # In particular, a - (b - c) and (a ^ b) ^ c must retain their trees.
@@ -81,10 +87,13 @@ defmodule Pulso.PromQL.Formatter do
   defp precedence(_), do: 8
 
   defp grouping(nil), do: []
-  defp grouping({:grouping, mode, labels}), do: [" ", Atom.to_string(mode), " (", Enum.intersperse(labels, ", "), ") "]
+
+  defp grouping({:grouping, mode, labels}),
+    do: [" ", Atom.to_string(mode), " (", Enum.map_intersperse(labels, ", ", &label/1), ") "]
+
   defp modifier("bool"), do: " bool"
   defp modifier([mode]), do: [" ", mode]
-  defp modifier([mode, labels]), do: [" ", mode, " (", Enum.intersperse(labels, ", "), ")"]
+  defp modifier([mode, labels]), do: [" ", mode, " (", Enum.map_intersperse(labels, ", ", &label/1), ")"]
 
   defp selector([{"__name__", :eq, name} | rest] = matchers) do
     # Bare NaN/Inf are scalars, even when a stored metric has that name.
@@ -101,12 +110,22 @@ defmodule Pulso.PromQL.Formatter do
   end
 
   defp matcher({name, op, value}) do
-    name = if Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*\z/, name), do: name, else: Pulso.JSON.encode!(name)
-    [name, Map.fetch!(@operators, op), Pulso.JSON.encode!(value)]
+    [label(name), Map.fetch!(@operators, op), Pulso.JSON.encode!(value)]
   end
 
+  defp label(name), do: if(Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*\z/, name), do: name, else: Pulso.JSON.encode!(name))
+
   defp offset(0), do: []
+
+  defp offset({:at, anchor, shift}),
+    do: [" @ ", if(is_binary(anchor), do: [anchor, "()"], else: seconds(anchor)), offset(shift)]
+
+  defp offset(value) when value < 0, do: [" offset -", duration(-value)]
   defp offset(value), do: [" offset ", duration(value)]
+
+  defp duration(nil), do: []
+  defp duration({:duration, expr}), do: ["(", render(expr), ")"]
+  defp duration(value) when rem(value, 1_000_000) != 0, do: seconds(value)
 
   defp duration(value) do
     # Whole years/weeks are compact; mixed values stay in days and smaller units.
@@ -130,6 +149,19 @@ defmodule Pulso.PromQL.Formatter do
       end)
 
     parts
+  end
+
+  defp seconds(value) do
+    whole = div(abs(value), 1_000_000_000)
+    fraction = rem(abs(value), 1_000_000_000)
+    sign = if value < 0, do: "-", else: ""
+
+    if fraction == 0 do
+      [sign, Integer.to_string(whole)]
+    else
+      digits = fraction |> Integer.to_string() |> String.pad_leading(9, "0") |> String.trim_trailing("0")
+      [sign, Integer.to_string(whole), ".", digits]
+    end
   end
 
   # Fixed decimal avoids lexical changes such as leading-zero octal integers

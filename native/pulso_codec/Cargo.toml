@@ -28,6 +28,9 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # Unicode-case tables out of the build while retaining the DFA perf
 # path and the Perl-level character classes LogQL label filters need.
 regex = { version = "1", default-features = false, features = ["std", "perf-dfa", "unicode-perl"] }
+# Reuse regex's already-locked parser to check nested counted repetition before
+# automaton construction, without expanding Unicode classes or repetitions.
+regex-syntax = { version = "0.8", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = true

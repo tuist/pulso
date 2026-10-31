@@ -385,7 +385,7 @@ defmodule Pulso.Traces.TempoDiscovery do
 
   defp prepare({scope, key, "=~", value}) do
     :ok = NIF.validate_metric_regex(value)
-    {:ok, regex} = NIF.compile_metric_capture_regex(value)
+    {:ok, regex} = NIF.compile_log_regex(Pulso.QueryRegex.anchor(value))
     {scope, key, "=~", regex}
   end
 
@@ -398,7 +398,7 @@ defmodule Pulso.Traces.TempoDiscovery do
 
     case Enum.find(metadata[owner], &(&1["key"] == key)) do
       %{"value" => %{"stringValue" => actual}} ->
-        if op == "=", do: actual == value, else: NIF.metric_regex_captures(value, actual) != nil
+        if op == "=", do: actual == value, else: NIF.match_log_regex(value, actual)
 
       _ ->
         false

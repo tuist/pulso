@@ -107,6 +107,25 @@ defmodule Pulso.Traces.MetricsTest do
     assert {:error, :trace_group_limit} = Metrics.query(tenant, "{} | count_over_time() by (span:id)", window, true)
   end
 
+  @tag :trace_math_batch
+  test "metric branches share the series ceiling before the final arithmetic" do
+    {:ok, stored} = Storage.query(:traces, ctx().tenant, [])
+    span = Enum.min_by(stored, & &1.timestamp_ns)
+    tenant = ctx().tenant <> "-expression-limit"
+    spans = for id <- 1..5000, do: %{span | span_id: Base.encode16(<<id::64>>, case: :lower)}
+    assert :ok = Storage.append(:traces, tenant, spans)
+    window = {1000 * @s, 1060 * @s, nil}
+    query = "({} | count_over_time() by (span:id)) + ({} | sum_over_time(duration) by (span:id))"
+
+    assert {:ok, json} = Metrics.query(tenant, query, window, true)
+    series = Pulso.JSON.decode!(json)["series"]
+    assert length(series) == 5000
+    assert Enum.all?(series, &(abs(&1["value"] - 1.1) < 1.0e-12))
+
+    assert :ok = Storage.append(:traces, tenant, [%{span | span_id: "0000000000001389"}])
+    assert {:error, :trace_group_limit} = Metrics.query(tenant, query, window, true)
+  end
+
   test "negative, noninteger and overflowing windows reject before native decoding" do
     for instant <- [true, false], window <- [{-1, @s, @s}, {0.5, @s, @s}, {0, 9_223_372_036_854_775_808, @s}] do
       assert {:error, :unsupported_parameters} = Metrics.window(window, instant)
@@ -230,6 +249,119 @@ defmodule Pulso.Traces.MetricsTest do
                %{"labels" => [%{"key" => "__name__", "value" => %{"stringValue" => "count_over_time"}}], "value" => 3}
              ]
            }
+  end
+
+  @tag :trace_math_batch
+  test "metric scalar math keeps operand order and integer versus float constant folding" do
+    leaf = "({} | count_over_time() by (resource.service.name))"
+
+    assert range(ctx(), "20 - 2 * (#{leaf} + 3)") == %{
+             %{"resource.service.name" => "api"} => Map.put(Map.new(1000..1060//10, &{&1, 14}), 1010, 10),
+             %{"resource.service.name" => "web"} => Map.new(1000..1060//10, &{&1, if(&1 == 1020, do: 12, else: 14)})
+           }
+
+    assert range(ctx(), leaf <> " * (3/2)") == %{
+             %{"resource.service.name" => "api"} => zeros(%{1010 => 2}),
+             %{"resource.service.name" => "web"} => zeros(%{1020 => 1})
+           }
+
+    assert range(ctx(), leaf <> " * (3.0/2)") == %{
+             %{"resource.service.name" => "api"} => zeros(%{1010 => 3}),
+             %{"resource.service.name" => "web"} => zeros(%{1020 => 1.5})
+           }
+
+    assert range(ctx(), leaf <> " * (-9223372036854775808 + 9223372036854775807)") == %{
+             %{"resource.service.name" => "api"} => zeros(%{1010 => -2}),
+             %{"resource.service.name" => "web"} => zeros(%{1020 => -1})
+           }
+
+    for literal <- [
+          "9223372036854775808",
+          "12345678901234567890",
+          "-9223372036854775809",
+          "(-9223372036854775808 / -1)",
+          "(9223372036854775807 + 1)"
+        ] do
+      assert {:error, _} = Metrics.parse(leaf <> " * " <> literal)
+    end
+  end
+
+  @tag :trace_math_batch
+  test "metric joins broadcast only ungrouped operands and preserve arithmetic names" do
+    grouped = "({} | count_over_time() by (resource.service.name))"
+    total = "({} | count_over_time())"
+
+    expected = %{
+      %{"resource.service.name" => "api"} => %{1010 => 1, 1020 => 0},
+      %{"resource.service.name" => "web"} => %{1010 => 0, 1020 => 1}
+    }
+
+    assert range(ctx(), "#{grouped} / #{total}") == expected
+
+    assert range(ctx(), "#{total} / #{grouped}") == %{
+             %{"resource.service.name" => "api"} => %{1010 => 1},
+             %{"resource.service.name" => "web"} => %{1020 => 1}
+           }
+
+    assert range(ctx(), total <> " + ({} | rate())") == %{
+             %{"__name__" => "(count_over_time + rate)"} => zeros(%{1010 => 2.2, 1020 => 1.1})
+           }
+
+    assert range(ctx(), grouped <> " + ({} | count_over_time() by (name))") == %{}
+  end
+
+  @tag :trace_math_batch
+  test "metric joins distinguish typed values, ordered labels and missing groups" do
+    spans =
+      for {value, id} <- [{%{"intValue" => "123"}, 1}, {%{"stringValue" => "123"}, 2}, {nil, 3}] do
+        attributes = [%{"key" => "bar", "value" => %{"stringValue" => "z"}}]
+        attributes = if value, do: [%{"key" => "foo", "value" => value} | attributes], else: attributes
+
+        %{
+          "traceId" => "0af7651916cd43dd8448eb211c80319c",
+          "spanId" => Base.encode16(<<id::64>>, case: :lower),
+          "startTimeUnixNano" => to_string(1001 * @s),
+          "endTimeUnixNano" => to_string(1002 * @s),
+          "attributes" => attributes
+        }
+      end
+
+    assert {:ok, records, 0} = Traces.decode(%{"resourceSpans" => [%{"scopeSpans" => [%{"spans" => spans}]}]})
+    context = %{ctx() | tenant: ctx().tenant <> "-typed-joins"}
+    assert :ok = Storage.append(:traces, context.tenant, records)
+
+    # The missing foo is omitted, so that one group has identical bar-only
+    # labels in both orders. Groups retaining both keys must not match.
+    assert range(context, "({} | count_over_time() by (span.foo, span.bar)) + ({} | rate() by (span.bar, span.foo))") ==
+             %{%{"span.bar" => "z"} => zeros(%{1010 => 1.1})}
+
+    assert range(context, "({} | count_over_time() by (span.foo)) + ({} | rate() by (span.bar))") == %{}
+
+    assert range(
+             context,
+             ~s'({span.foo=123} | count_over_time() by (span.foo)) + ({span.foo="123"} | rate() by (span.foo))'
+           ) == %{}
+
+    query = "({} | count_over_time() by (span.foo)) + ({} | rate() by (span.foo))"
+    assert {:ok, json} = Metrics.query(context.tenant, query, {1000 * @s, 1060 * @s, 10 * @s}, false)
+    series = Pulso.JSON.decode!(json)["series"]
+    assert length(series) == 3
+
+    assert MapSet.new(Enum.map(series, & &1["labels"])) ==
+             MapSet.new(
+               for value <- [%{"stringValue" => "nil"}, %{"intValue" => "123"}, %{"stringValue" => "123"}],
+                   do: [%{"key" => "span.foo", "value" => value}]
+             )
+
+    assert Enum.all?(series, &(points(&1) == zeros(%{1010 => 1.1})))
+  end
+
+  @tag :trace_math_batch
+  test "metric filters keep values and propagate masked samples through later arithmetic" do
+    leaf = "({} | count_over_time() by (resource.service.name))"
+    assert range(ctx(), "(#{leaf} > 1) * 10 != 0") == %{%{"resource.service.name" => "api"} => %{1010 => 20}}
+    assert range(ctx(), "(#{leaf} / 0) != 1") == %{}
+    assert range(ctx(), "#{leaf} >= 1 < 2") == %{%{"resource.service.name" => "web"} => %{1020 => 1}}
   end
 
   test "parses Tempo's metrics grammar and rejects what it cannot evaluate" do

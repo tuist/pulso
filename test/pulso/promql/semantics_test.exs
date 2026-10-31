@@ -66,6 +66,39 @@ defmodule Pulso.PromQL.SemanticsTest do
     assert numbers("clamp_max(vector(0), -0)") == ["-0"]
   end
 
+  test "clamp preserves IEEE bounds, zero signs and duplicate-label checks" do
+    for {expr, expected} <- [
+          {"clamp(vector(-Inf), -2, 7)", "-2"},
+          {"clamp(vector(Inf), -2, 7)", "7"},
+          {"clamp(vector(NaN), -2, 7)", "NaN"},
+          {"clamp(vector(-2), -2, 7)", "-2"},
+          {"clamp(vector(7), -2, 7)", "7"},
+          {"clamp(vector(0), -0, -0)", "-0"},
+          {"clamp(vector(-0), 0, 0)", "0"},
+          {"clamp(vector(-0), -0, 0)", "-0"},
+          {"clamp(vector(0), -0, 0)", "0"},
+          {"clamp(vector(-0), 0, -0)", "0"},
+          {"clamp(vector(0), -Inf, Inf)", "0"},
+          {"clamp(vector(-0), -Inf, Inf)", "-0"},
+          {"1 / clamp(vector(-0), 0, -0)", "+Inf"},
+          {"clamp(vector(2), Inf, Inf)", "+Inf"},
+          {"clamp(vector(2), -Inf, -Inf)", "-Inf"},
+          {"clamp(vector(Inf), NaN, -Inf)", "NaN"},
+          {"clamp(vector(-Inf), Inf, NaN)", "NaN"}
+        ] do
+      assert numbers(expr) == [expected], expr
+    end
+
+    assert entries("clamp(vector(NaN), 7, -2)") == []
+    assert entries("clamp(vector(0), Inf, -Inf)") == []
+    assert entries("clamp(missing, -2, 7)") == []
+
+    append("a", %{"job" => "api"}, [{30, 3.0}])
+    append("b", %{"job" => "api"}, [{30, 6.0}])
+    assert {:error, :duplicate_result_label_sets} = query(~s|clamp({__name__=~"a\|b"}, -2, 7)|)
+    assert entries(~s|clamp({__name__=~"a\|b"}, 7, -2)|) == []
+  end
+
   test "basic math preserves IEEE domains, signed zeros and exponential limits" do
     for {expr, expected} <- [
           {"ceil(vector(-1.5))", "-1"},
@@ -281,13 +314,15 @@ defmodule Pulso.PromQL.SemanticsTest do
     end
   end
 
-  test "sample and work budgets apply across selectors in a binary expression" do
+  test "sample and work budgets apply across multiple expression inputs" do
     append("a", %{}, [{30, 1.0}])
     append("b", %{}, [{30, 2.0}])
     Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 1)
     assert {:error, :query_sample_limit} = query("a + b")
+    assert {:error, :query_sample_limit} = query("clamp(a, scalar(b), -1)")
     Pulso.Runtime.put_env(:pulso, Evaluator, max_work: 3)
     assert {:error, :query_work_limit} = query("a + b")
+    assert {:error, :query_work_limit} = query("clamp(a, scalar(b), -1)")
   end
 
   test "invalid operand types, matching modifiers, and excessive expression depth are rejected" do

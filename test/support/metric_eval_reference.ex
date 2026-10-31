@@ -5,6 +5,11 @@ defmodule Pulso.Test.MetricEvalReference do
   First/last deliberately materialize all selected values before choosing an
   endpoint: the historical snapshot's endpoint-only unwrap validation was a
   shared bug, not an oracle. Literal regression tests pin the corrected contract.
+  Missing/empty unwrap fields are independently removed before grouping or
+  testing window presence, matching the upstream extractor rather than the
+  snapshot's historical extraction error.
+  Failed unwrap conversion replaces earlier pipeline errors before validation,
+  as Loki's streamLabelSampleExtractor.Process/LabelsBuilder.SetErr specify.
 
   Metric-query evaluator.
 
@@ -104,6 +109,7 @@ defmodule Pulso.Test.MetricEvalReference do
     with {:ok, entries} <-
            query_window(remove_unwrap(agg.inner), tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
       unwrap = extract_unwrap(agg.inner)
+      entries = observations(entries, unwrap)
       if unwrap, do: Enum.each(entries, &unwrap_value(&1, unwrap, nil))
       points = Enum.flat_map(times, &absence_point(&1, entries, agg.range_ns, offset))
       labels = absence_labels(agg.inner.selector.matchers)
@@ -207,6 +213,7 @@ defmodule Pulso.Test.MetricEvalReference do
     with {:ok, entries} <- query_window(inner, tenant, opts, union_start, union_end) do
       series =
         entries
+        |> observations(spec.unwrap)
         |> Enum.group_by(&entry_label_key(&1, spec.unwrap, spec.grouping))
         |> Enum.map(&bucket_series(&1, spec))
         |> Enum.reject(fn {_, points} -> points == [] end)
@@ -245,6 +252,7 @@ defmodule Pulso.Test.MetricEvalReference do
     with {:ok, entries} <- query_window(inner, tenant, opts, start_ts, end_ts) do
       series =
         entries
+        |> observations(unwrap)
         |> Enum.group_by(&entry_label_key(&1, unwrap, grouping))
         |> Enum.map(fn {labels, es} ->
           {labels, {ts, compute_range_agg(op, es, unwrap, start_ts, end_ts, p)}}
@@ -252,6 +260,23 @@ defmodule Pulso.Test.MetricEvalReference do
 
       {:ok, :vector, series}
     end
+  end
+
+  defp observations(entries, nil) do
+    Enum.each(entries, &check_pipeline_error/1)
+    entries
+  end
+
+  defp observations(entries, %AST.Unwrap{label: label, conversion: conversion}) do
+    Enum.each(entries, fn entry ->
+      value = Map.get(entry.labels, label)
+      # Invalid present values replace earlier errors with extraction errors,
+      # which remain deferred until a window reads that observation. Keep the
+      # existing strict pipeline guard for absent/empty unwrap targets.
+      if value in [nil, ""] or parse_unwrap(conversion, value) != nil, do: check_pipeline_error(entry)
+    end)
+
+    Enum.reject(entries, &(Map.get(&1.labels, label) in [nil, ""]))
   end
 
   defp filter_by_bucket(entries, start_ts, end_ts) do
@@ -561,9 +586,6 @@ defmodule Pulso.Test.MetricEvalReference do
 
     with {:ok, entries} <- Evaluator.evaluate_log_raw(inner, tenant, query_opts) do
       Budget.charge(:work, length(entries))
-
-      Enum.each(entries, &check_pipeline_error/1)
-
       {:ok, entries}
     end
   end

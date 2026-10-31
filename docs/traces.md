@@ -1261,6 +1261,22 @@ fully anchored, using the bounded RE2-compatible subset described below. Input
 is at most 16,384 UTF-8 bytes, keys 256 bytes, exact literals 4,096 bytes, regex
 patterns 1,024 bytes and at most eight compiled regex programs.
 
+Trace regex predicates share the [query regex profile](querying.md#shared-query-regex-semantics),
+including `\Q...\E` literal quoting and Unicode-valued octal escapes. An omitted
+terminal `\E` does not weaken whole-value anchoring. These forms also work in
+retained-context search, filtered discovery and raw trace regex filters, within
+their existing feature gates and input/resource bounds. Counted bounds and
+nested products follow Go's 1,000-copy limit; malformed or leading-zero counts
+are literal text, not quantifiers. Repeated `&&` and `~~` inside classes are
+ordinary members, never Rust set operators. Opening brackets are literal class
+members except in complete POSIX named classes; hyphens form Go's left-to-right
+scalar ranges, not set subtraction. Invalid ranges and raw capture/modifier
+headers reject before literal decoding. Empty/repeated inline flags retain
+scope, atom binding and greediness. Numeric/repeated capture names and
+flag-separated repetition of already quantified atoms remain unsupported.
+Upgrade every serving
+app/native pair; no trace capability tuple, storage format or keyed bytes change.
+
 The native search visits every candidate object in the admitted snapshot and
 groups **all** window spans by trace ID, including nonmatching context. Only
 then does it select matching traces and apply the trace limit. One trace with

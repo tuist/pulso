@@ -43,6 +43,20 @@ defmodule Pulso.PromQL.Number do
   def binary("%", a, b) when is_number(a) and b in [:infinity, :negative_infinity], do: a
   def binary("%", _, _), do: :nan
   def binary("^", a, b), do: power(a, b)
+  def binary("atan2", a, b), do: arctangent(a, b)
+
+  defp arctangent(:nan, _), do: :nan
+  defp arctangent(_, :nan), do: :nan
+
+  defp arctangent(a, b) when a in [:infinity, :negative_infinity] and b in [:infinity, :negative_infinity],
+    do: sign(a) * if(sign(b) > 0, do: :math.pi() / 4, else: 3 * :math.pi() / 4)
+
+  defp arctangent(a, _) when a in [:infinity, :negative_infinity], do: sign(a) * (:math.pi() / 2)
+
+  defp arctangent(a, b) when b in [:infinity, :negative_infinity],
+    do: sign(a) * if(sign(b) > 0, do: 0.0, else: :math.pi())
+
+  defp arctangent(a, b), do: :math.atan2(a, b)
 
   defp power(a, b) when b == 0 or a == 1, do: 1.0
   defp power(:nan, _), do: :nan
@@ -170,6 +184,18 @@ defmodule Pulso.PromQL.Number do
   def max(:nan, b), do: b
   def max(a, :nan), do: a
   def max(a, b), do: if(less?(a, b), do: b, else: a)
+
+  # Scalar math.Min/Max differ from aggregation: the selected infinity wins
+  # even over NaN; otherwise NaN propagates. Zero ties retain the correct sign.
+  def extremum("min_of", a, b) when a == :negative_infinity or b == :negative_infinity, do: :negative_infinity
+  def extremum("max_of", a, b) when a == :infinity or b == :infinity, do: :infinity
+  def extremum(_, :nan, _), do: :nan
+  def extremum(_, _, :nan), do: :nan
+  def extremum("min_of", a, b) when a == 0 and b == 0, do: if(sign(a) < 0, do: a, else: b)
+  def extremum("max_of", a, b) when a == 0 and b == 0, do: if(sign(a) < 0, do: b, else: a)
+  def extremum("min_of", a, b), do: __MODULE__.min(a, b)
+  def extremum("max_of", a, b), do: __MODULE__.max(a, b)
+
   def sign(:infinity), do: 1
   def sign(:negative_infinity), do: -1
   def sign(value) when is_number(value), do: if(value < 0 or (value == 0 and negative_zero?(value)), do: -1, else: 1)
@@ -186,4 +212,48 @@ defmodule Pulso.PromQL.Number do
   def format(:nan), do: "NaN"
   def format(:infinity), do: "+Inf"
   def format(:negative_infinity), do: "-Inf"
+
+  # count_values uses Go's shortest fixed decimal for floats and shortest
+  # general format for histogram text. Neither uses the HTTP sample cutoffs.
+  def format(value, _mode) when is_atom(value), do: format(value)
+
+  def format(value, :open_metrics) do
+    text = if value == 0, do: "0", else: format(value, :general)
+    if String.contains?(text, [".", "e"]), do: text, else: text <> ".0"
+  end
+
+  def format(value, mode) do
+    raw = :erlang.float_to_binary(value / 1, [:short])
+    {sign, raw} = if String.starts_with?(raw, "-"), do: {"-", String.trim_leading(raw, "-")}, else: {"", raw}
+    [mantissa | exp] = String.split(raw, "e")
+    exponent = if exp == [], do: 0, else: String.to_integer(hd(exp))
+    point = mantissa |> String.split(".") |> hd() |> byte_size()
+    all = String.replace(mantissa, ".", "")
+    rest = String.trim_leading(all, "0")
+    digits = String.trim_trailing(rest, "0")
+    exponent = point + exponent - (byte_size(all) - byte_size(rest)) - 1
+    sign <> decimal(digits, exponent, mode)
+  end
+
+  defp decimal("", _, _), do: "0"
+
+  defp decimal(digits, exponent, :general) when exponent < -4 or exponent >= 6 do
+    <<first::binary-size(1), tail::binary>> = digits
+    tail = if tail == "", do: "", else: "." <> tail
+    sign = if exponent < 0, do: "-", else: "+"
+    first <> tail <> "e" <> sign <> String.pad_leading(Integer.to_string(abs(exponent)), 2, "0")
+  end
+
+  defp decimal(digits, exponent, _) when exponent < 0, do: "0." <> String.duplicate("0", -exponent - 1) <> digits
+
+  defp decimal(digits, exponent, _) do
+    point = exponent + 1
+
+    if point >= byte_size(digits) do
+      String.pad_trailing(digits, point, "0")
+    else
+      <<left::binary-size(^point), right::binary>> = digits
+      left <> "." <> right
+    end
+  end
 end

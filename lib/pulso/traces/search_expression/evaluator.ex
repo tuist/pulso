@@ -10,7 +10,7 @@ defmodule Pulso.Traces.SearchExpression.Evaluator do
   end
 
   defp prepare_leaf({scope, key, op, value}) when op in ["=~", "!~"] do
-    {:ok, regex} = NIF.compile_metric_capture_regex(value)
+    {:ok, regex} = NIF.compile_log_regex(Pulso.QueryRegex.anchor(value))
     {scope, key, op, regex}
   end
 
@@ -83,7 +83,7 @@ defmodule Pulso.Traces.SearchExpression.Evaluator do
   end
 
   defp match_value({:string, value}, op, wanted) when op in ["=~", "!~"] do
-    positive = NIF.metric_regex_captures(wanted, value) != nil
+    positive = NIF.match_log_regex(wanted, value)
     if op == "!~", do: not positive, else: positive
   end
 

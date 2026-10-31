@@ -224,7 +224,7 @@ defmodule Pulso.Traces.TempoRootDiscovery do
 
   defp prepare({scope, key, "=~", pattern}) do
     :ok = NIF.validate_metric_regex(pattern)
-    {:ok, regex} = NIF.compile_metric_capture_regex(pattern)
+    {:ok, regex} = NIF.compile_log_regex(Pulso.QueryRegex.anchor(pattern))
     {scope, key, "=~", regex}
   end
 
@@ -236,7 +236,7 @@ defmodule Pulso.Traces.TempoRootDiscovery do
 
     Enum.all?(predicates, fn {scope, key, op, value} ->
       actual = Map.get(if(scope == "resource", do: resource, else: attrs), key)
-      is_binary(actual) and if(op == "=", do: actual == value, else: NIF.metric_regex_captures(value, actual) != nil)
+      is_binary(actual) and if(op == "=", do: actual == value, else: NIF.match_log_regex(value, actual))
     end)
   end
 

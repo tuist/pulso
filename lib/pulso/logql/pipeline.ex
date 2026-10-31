@@ -17,11 +17,15 @@ defmodule Pulso.LogQL.Pipeline do
   alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Entry
+  alias Pulso.LogQL.Pipeline.IP
+  alias Pulso.LogQL.Pipeline.Json
   alias Pulso.LogQL.Pipeline.Logfmt
   alias Pulso.LogQL.Pipeline.Pattern
   alias Pulso.LogQL.Pipeline.Template
   alias Pulso.LogQL.Quantity
   alias Pulso.LogQL.StreamMatchers
+  alias Pulso.PromQL.FloatParser
+  alias Pulso.PromQL.Number
 
   @type stage :: struct()
   @type result :: {:keep, Entry.t()} | :drop
@@ -39,6 +43,29 @@ defmodule Pulso.LogQL.Pipeline do
   def compile(stages) when is_list(stages) do
     Enum.map(stages, &compile_stage/1)
   end
+
+  @doc false
+  # This is query syntax, never a caller-supplied __preserve_error__ label.
+  # As in Loki's stage hints, any string filter asking for errored lines
+  # covers errors raised both before and after that filter in the pipeline.
+  def preserves_errors?(stages) do
+    Enum.any?(stages, fn
+      %AST.LabelFilter{expr: expr} -> preserves_error_filter?(compile_label_filter(expr))
+      _ -> false
+    end)
+  end
+
+  defp preserves_error_filter?({op, left, right}) when op in [:and, :or],
+    do: preserves_error_filter?(left) or preserves_error_filter?(right)
+
+  defp preserves_error_filter?({:cmp, "__error__", op, {type, _} = value})
+       when op in [:eq, :neq, :re, :nre] and type in [:string, :re] do
+    errors = ~w(JSONParserErr LogfmtParserErr SampleExtractionErr LabelFilterErr TemplateFormatErr)
+
+    not eval_cmp(op, "", value) or Enum.any?(errors, &eval_cmp(op, &1, value))
+  end
+
+  defp preserves_error_filter?(_), do: false
 
   @doc "Apply every compiled stage to a stream of entries."
   @spec run([term()], Enumerable.t(Entry.t())) :: Enumerable.t(Entry.t())
@@ -78,12 +105,31 @@ defmodule Pulso.LogQL.Pipeline do
     {:label_filter, compile_label_filter(expr)}
   end
 
+  defp compile_stage(%AST.JsonParser{fields: []}), do: {:json, []}
+
   defp compile_stage(%AST.JsonParser{fields: fields}) do
-    {:json, fields}
+    paths =
+      Enum.map(fields, fn {label, source} ->
+        {:ok, path} = Json.expression(source)
+        {label, path}
+      end)
+
+    {:json, paths}
   end
 
   defp compile_stage(%AST.LogfmtParser{fields: fields, flags: flags}) do
-    {:logfmt, fields, :keep_empty in flags}
+    fields =
+      Enum.map(fields, fn {label, source} ->
+        {:ok, key} = Logfmt.expression(source)
+        {label, key}
+      end)
+
+    fields = Map.new(fields)
+
+    # The pinned Go parser selects one destination through map iteration.
+    # Choose one valid owner deterministically when aliases share a source.
+    sources = fields |> Enum.sort() |> Enum.reduce(%{}, fn {label, source}, acc -> Map.put_new(acc, source, label) end)
+    {:logfmt, fields, sources, :keep_empty in flags, :strict in flags}
   end
 
   defp compile_stage(%AST.RegexpParser{pattern: pattern}) do
@@ -91,20 +137,26 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp compile_stage(%AST.PatternParser{pattern: pattern}) do
-    {:pattern, Pattern.compile(pattern)}
+    {:ok, template} = Pattern.compile_parser(pattern)
+    {:pattern, template}
   end
 
   defp compile_stage(%AST.UnpackParser{}), do: :unpack
 
   defp compile_stage(%AST.LineFormat{template: t}) do
-    {:line_format, Template.compile(t)}
+    {:ok, template} = Template.compile(t)
+    {:line_format, template}
   end
 
   defp compile_stage(%AST.LabelFormat{entries: entries}) do
     compiled =
       Enum.map(entries, fn
-        {name, {:template, t}} -> {name, {:template, Template.compile(t)}}
-        {name, {:rename, src}} -> {name, {:rename, src}}
+        {name, {:template, t}} ->
+          {:ok, template} = Template.compile(t)
+          {name, {:template, template}}
+
+        {name, {:rename, src}} ->
+          {name, {:rename, src}}
       end)
 
     {:label_format, compiled}
@@ -125,15 +177,16 @@ defmodule Pulso.LogQL.Pipeline do
   defp compile_line_filter_value({:string, s}), do: {:string, s}
   defp compile_line_filter_value({:re, pat}), do: {:re, compile_regex(pat)}
 
+  defp compile_line_filter_value({:or, values}), do: {:or, Enum.map(values, &compile_line_filter_value/1)}
+
   defp compile_line_filter_value({:pattern, pattern}) do
     {:ok, parts} = Pattern.compile_filter(pattern)
     {:pattern, parts}
   end
 
-  # IP line filters are rejected by `Pulso.LogQL.QueryValidation` before
-  # the pipeline compiles, so this clause exists only as a safety net.
-  defp compile_line_filter_value({:ip, _cidr}) do
-    raise ArgumentError, "ip(...) line filters are not yet supported"
+  defp compile_line_filter_value({:ip, pattern}) do
+    {:ok, matcher} = IP.compile(pattern)
+    {:ip, matcher}
   end
 
   defp compile_regex(pat) do
@@ -159,6 +212,11 @@ defmodule Pulso.LogQL.Pipeline do
     {:cmp, name, op, {:re, compile_label_regex(pat)}}
   end
 
+  defp compile_label_filter({:cmp, name, op, {:ip, pattern}}) do
+    {:ok, matcher} = IP.compile(pattern)
+    {:cmp, name, op, {:ip, matcher}}
+  end
+
   defp compile_label_filter({:cmp, name, op, value}) do
     {:cmp, name, op, value}
   end
@@ -172,24 +230,49 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp apply_stage({:label_filter, tree}, %Entry{} = e) do
-    if eval_label_filter(tree, e.labels), do: {:keep, e}, else: :drop
-  end
-
-  defp apply_stage({:json, fields}, %Entry{} = e) do
-    case decode_json(e.line) do
-      {:ok, map} when is_map(map) ->
-        extracted = extract_json_fields(map, fields)
-        {:keep, extract_labels(e, extracted)}
-
-      _ ->
-        {:keep, e}
+    case eval_label_filter(tree, e) do
+      {true, entry} -> {:keep, entry}
+      {false, _} -> :drop
     end
   end
 
-  defp apply_stage({:logfmt, fields, keep_empty?}, %Entry{} = e) do
-    pairs = Logfmt.parse(e.line, keep_empty?)
-    extracted = extract_logfmt_fields(pairs, fields)
-    {:keep, extract_labels(e, extracted)}
+  defp apply_stage({:json, []}, %Entry{} = e) do
+    case decode_json_labels(e.line) do
+      {:ok, fields} ->
+        {:keep, extract_labels(e, fields)}
+
+      {:error, details} ->
+        {:keep,
+         e
+         |> Entry.put_label("__error__", "JSONParserErr", :parsed)
+         |> Entry.put_label("__error_details__", details, :parsed)}
+    end
+  end
+
+  defp apply_stage({:json, _fields}, %Entry{line: ""} = e), do: {:keep, e}
+
+  defp apply_stage({:json, fields}, %Entry{line: <<char, _::binary>>} = e) when char in [?{, ?[, ?"],
+    do: {:keep, extract_json_fields(e, fields)}
+
+  defp apply_stage({:json, _fields}, %Entry{} = e),
+    do: {:keep, Entry.put_label(e, "__error__", "JSONParserErr", :parsed)}
+
+  defp apply_stage({:logfmt, fields, sources, keep_empty?, strict?}, %Entry{} = e) do
+    mode = if map_size(fields) == 0, do: :all, else: :explicit
+    {pairs, error} = Logfmt.decode(e.line, strict?, mode)
+    pairs = if keep_empty? or mode == :explicit, do: pairs, else: Enum.reject(pairs, &(elem(&1, 1) == ""))
+    {e, stopped?} = extract_logfmt_fields(pairs, fields, sources, e)
+
+    e =
+      if error && not stopped? do
+        e
+        |> Entry.put_label("__error__", "LogfmtParserErr", :parsed)
+        |> Entry.put_label("__error_details__", error, :parsed)
+      else
+        e
+      end
+
+    {:keep, e}
   end
 
   defp apply_stage({:regexp, regex}, %Entry{} = e) do
@@ -204,33 +287,64 @@ defmodule Pulso.LogQL.Pipeline do
     end
   end
 
-  defp apply_stage(:unpack, %Entry{} = e) do
-    case decode_json(e.line) do
-      {:ok, map} when is_map(map) ->
-        {new_line, extras} = Map.pop(map, "_entry", e.line)
-        new_line = if is_binary(new_line), do: new_line, else: Pulso.JSON.encode!(new_line)
-        stringified = Map.new(extras, fn {k, v} -> {k, to_string_val(v)} end)
-        {:keep, extract_labels(%{e | line: new_line}, stringified)}
+  defp apply_stage(:unpack, %Entry{line: ""} = e), do: {:keep, e}
 
-      _ ->
+  defp apply_stage(:unpack, %Entry{} = e) do
+    with {:ok, pairs} <- unpack_fields(e.line),
+         {_, line} <- Enum.find(Enum.reverse(pairs), fn {key, value} -> key == "_entry" and is_binary(value) end) do
+      # Unpack buffers fields before publication. Duplicates in this
+      # object keep their last value; earlier parser extractions survive.
+      fields =
+        for {key, value} <- pairs,
+            key != "_entry",
+            is_binary(value),
+            target = Entry.extraction_name(e, key),
+            not Entry.extracted?(e, target),
+            do: {logfmt_key(target), String.replace(value, "�", " ")}
+
+      entry =
+        Enum.reduce(fields, %{e | line: line}, fn {key, value}, acc ->
+          Entry.put_label(acc, key, value, :parsed)
+        end)
+
+      {:keep, entry}
+    else
+      nil ->
         {:keep, e}
+
+      {:error, details} ->
+        {:keep,
+         e
+         |> Entry.put_label("__error__", "JSONParserErr", :parsed)
+         |> Entry.put_label("__error_details__", details, :parsed)}
     end
   end
 
   defp apply_stage({:line_format, tmpl}, %Entry{} = e) do
-    {:keep, %{e | line: Template.render(tmpl, e.labels)}}
+    case Template.render(tmpl, e.labels, e.line, e.timestamp_ns) do
+      {:ok, line} -> {:keep, %{e | line: line}}
+      {:error, details} -> {:keep, template_error(e, details)}
+    end
   end
 
   defp apply_stage({:label_format, entries}, %Entry{} = e) do
-    formatted =
-      Enum.reduce(entries, e, fn
-        {name, {:template, t}}, acc ->
-          Entry.put_label(acc, name, Template.render(t, acc.labels), :parsed)
+    {formatted, _snapshot} =
+      Enum.reduce(entries, {e, %{}}, fn
+        {name, {:template, t}}, {acc, snapshot} ->
+          snapshot = if map_size(snapshot) == 0, do: acc.labels, else: snapshot
 
-        {name, {:rename, src}}, acc ->
+          formatted =
+            case Template.render(t, snapshot, e.line, e.timestamp_ns) do
+              {:ok, value} -> Entry.put_label(acc, name, value, :parsed)
+              {:error, details} -> template_error(acc, details)
+            end
+
+          {formatted, snapshot}
+
+        {name, {:rename, src}}, {acc, snapshot} ->
           case Map.fetch(acc.labels, src) do
-            {:ok, value} -> acc |> Entry.delete_label(src) |> Entry.put_label(name, value, :parsed)
-            :error -> acc
+            {:ok, value} -> {acc |> Entry.put_label(name, value, :parsed) |> Entry.delete_label(src), snapshot}
+            :error -> {acc, snapshot}
           end
       end)
 
@@ -269,9 +383,21 @@ defmodule Pulso.LogQL.Pipeline do
     {:keep, e}
   end
 
+  defp template_error(entry, details) do
+    entry
+    |> Entry.put_label("__error__", "TemplateFormatErr", :parsed)
+    |> Entry.put_label("__error_details__", details, :parsed)
+  end
+
   # ---------------------------------------------------------------------------
   # Predicates
   # ---------------------------------------------------------------------------
+
+  # Negative OR rejects the union: every individual negative must pass.
+  defp line_matches?(op, {:or, values}, line) when op in [:not_contains, :not_match_re, :not_match_pattern],
+    do: Enum.all?(values, &line_matches?(op, &1, line))
+
+  defp line_matches?(op, {:or, values}, line), do: Enum.any?(values, &line_matches?(op, &1, line))
 
   defp line_matches?(:contains, {:string, s}, line), do: String.contains?(line, s)
   defp line_matches?(:not_contains, {:string, s}, line), do: not String.contains?(line, s)
@@ -279,49 +405,72 @@ defmodule Pulso.LogQL.Pipeline do
   defp line_matches?(:not_match_re, {:re, re}, line), do: not NIF.match_log_regex(re, line)
   defp line_matches?(:match_pattern, {:pattern, parts}, line), do: Pattern.filter_match?(parts, line)
   defp line_matches?(:not_match_pattern, {:pattern, parts}, line), do: not Pattern.filter_match?(parts, line)
+  defp line_matches?(:contains, {:ip, matcher}, line), do: IP.matches?(matcher, line)
+  defp line_matches?(:not_contains, {:ip, matcher}, line), do: not IP.matches?(matcher, line)
 
-  defp eval_label_filter({:and, l, r}, labels), do: eval_label_filter(l, labels) and eval_label_filter(r, labels)
-  defp eval_label_filter({:or, l, r}, labels), do: eval_label_filter(l, labels) or eval_label_filter(r, labels)
+  # AND evaluates both operands even when the left is false. The right operand
+  # can set an error that a surrounding OR subsequently reads. OR short-circuits.
+  defp eval_label_filter({:and, l, r}, entry) do
+    {left, entry} = eval_label_filter(l, entry)
+    {right, entry} = eval_label_filter(r, entry)
+    {left and right, entry}
+  end
 
-  defp eval_label_filter({:cmp, name, op, value}, labels) do
-    actual = Map.get(labels, name, "")
-    eval_cmp(op, actual, value)
+  defp eval_label_filter({:or, l, r}, entry) do
+    case eval_label_filter(l, entry) do
+      {true, entry} -> {true, entry}
+      {false, entry} -> eval_label_filter(r, entry)
+    end
+  end
+
+  defp eval_label_filter({:cmp, name, op, {:ip, matcher}}, entry) do
+    result =
+      cond do
+        Map.get(entry.labels, "__error__", "") != "" -> true
+        not Map.has_key?(entry.labels, name) -> false
+        op == :eq -> IP.matches?(matcher, entry.labels[name])
+        op == :neq -> not IP.matches?(matcher, entry.labels[name])
+      end
+
+    {result, entry}
+  end
+
+  defp eval_label_filter({:cmp, name, op, {type, expected}}, entry) when type in [:number, :duration_ns, :bytes] do
+    actual = Map.get(entry.labels, name)
+
+    case {actual, parse_filter_value(type, actual)} do
+      {nil, _} ->
+        {false, entry}
+
+      {_, {:ok, value}} ->
+        expected = if type == :number, do: expected / 1, else: expected
+        {compare_number(op, value, expected), entry}
+
+      {_, {:error, details}} ->
+        {true, label_conversion_error(entry, details)}
+
+      {actual, :error} ->
+        kind = Atom.to_string(type)
+        {true, label_conversion_error(entry, "invalid #{kind} value " <> Pulso.JSON.encode!(actual))}
+    end
+  end
+
+  defp eval_label_filter({:cmp, name, op, value}, entry) do
+    {eval_cmp(op, Map.get(entry.labels, name, ""), value), entry}
   end
 
   defp eval_cmp(:eq, actual, {:string, v}), do: actual == v
   defp eval_cmp(:neq, actual, {:string, v}), do: actual != v
   defp eval_cmp(:re, actual, {:re, re}), do: NIF.match_log_regex(re, actual)
   defp eval_cmp(:nre, actual, {:re, re}), do: not NIF.match_log_regex(re, actual)
-
-  defp eval_cmp(op, actual, {:number, n}) when op in [:eq, :neq, :lt, :lte, :gt, :gte] do
-    case parse_number(actual) do
-      {:ok, num} -> compare_number(op, num, n)
-      :error -> false
-    end
-  end
-
-  defp eval_cmp(op, actual, {:duration_ns, ns}) when op in [:eq, :neq, :lt, :lte, :gt, :gte] do
-    case parse_duration_ns(actual) do
-      {:ok, dur} -> compare_number(op, dur, ns)
-      :error -> false
-    end
-  end
-
-  defp eval_cmp(op, actual, {:bytes, bytes}) when op in [:eq, :neq, :lt, :lte, :gt, :gte] do
-    case parse_bytes(actual) do
-      {:ok, b} -> compare_number(op, b, bytes)
-      :error -> false
-    end
-  end
-
   defp eval_cmp(_, _, _), do: false
 
-  defp compare_number(:eq, a, b), do: a == b
-  defp compare_number(:neq, a, b), do: a != b
-  defp compare_number(:lt, a, b), do: a < b
-  defp compare_number(:lte, a, b), do: a <= b
-  defp compare_number(:gt, a, b), do: a > b
-  defp compare_number(:gte, a, b), do: a >= b
+  defp compare_number(:eq, a, b), do: Number.compare("==", a, b)
+  defp compare_number(:neq, a, b), do: Number.compare("!=", a, b)
+  defp compare_number(:lt, a, b), do: Number.compare("<", a, b)
+  defp compare_number(:lte, a, b), do: Number.compare("<=", a, b)
+  defp compare_number(:gt, a, b), do: Number.compare(">", a, b)
+  defp compare_number(:gte, a, b), do: Number.compare(">=", a, b)
 
   defp drop_matches?(:any, _v), do: true
   defp drop_matches?(_, nil), do: false
@@ -340,71 +489,159 @@ defmodule Pulso.LogQL.Pipeline do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # The original bag is shared, not copied. Parser-to-parser overwrites remain
-  # allowed; only names present before the pipeline receive one suffix, even
-  # after drop/rename. Do not recursively invent unused suffix names.
-  defp extract_labels(entry, extracted) do
+  # Stream and current metadata owners keep their names. Ordinary parsers
+  # retain the first parsed target, including across later drops; explicit
+  # expression parsers may replace an earlier extraction.
+  defp extract_labels(entry, extracted, overwrite? \\ false) do
     Enum.reduce(extracted, entry, fn {name, value}, acc ->
-      target = if Map.has_key?(entry.base_labels, name), do: name <> "_extracted", else: name
-      Entry.put_label(acc, target, value, :parsed)
+      target = Entry.extraction_name(acc, name)
+
+      if overwrite? or not Entry.extracted?(acc, target),
+        do: Entry.put_label(acc, target, value, :parsed),
+        else: acc
     end)
   end
 
-  defp decode_json(""), do: :error
+  defp unpack_fields(<<"{", _::binary>> = line) do
+    decoders = [
+      object_finish: fn pairs, acc -> {{:object, Enum.reverse(pairs)}, acc} end,
+      integer: fn _ -> :number end,
+      float: fn _ -> :number end
+    ]
 
-  defp decode_json(line) do
-    {:ok, Pulso.JSON.decode!(line)}
-  rescue
-    _ -> :error
-  end
-
-  # No field list means extract every top-level string-ish key.
-  defp extract_json_fields(map, []) do
-    Map.new(map, fn {k, v} -> {to_string(k), to_string_val(v)} end)
-  end
-
-  defp extract_json_fields(map, fields) do
-    Map.new(fields, fn {label, path} ->
-      {label, path |> String.split(".") |> Enum.reduce(map, &nested_get/2) |> to_string_val()}
-    end)
-  end
-
-  defp nested_get(_key, nil), do: nil
-  defp nested_get(key, %{} = m), do: Map.get(m, key)
-  defp nested_get(_key, _), do: nil
-
-  defp extract_logfmt_fields(pairs, []) do
-    Map.new(pairs, fn {k, v} -> {k, v} end)
-  end
-
-  defp extract_logfmt_fields(pairs, fields) do
-    map = Map.new(pairs)
-    Map.new(fields, fn {label, source} -> {label, Map.get(map, source, "")} end)
-  end
-
-  defp to_string_val(v) when is_binary(v), do: v
-  defp to_string_val(v) when is_integer(v), do: Integer.to_string(v)
-  defp to_string_val(v) when is_float(v), do: Float.to_string(v)
-  defp to_string_val(true), do: "true"
-  defp to_string_val(false), do: "false"
-  defp to_string_val(nil), do: ""
-  defp to_string_val(v), do: Pulso.JSON.encode!(v)
-
-  defp parse_number(str) do
-    case Integer.parse(str) do
-      {i, ""} ->
-        {:ok, i}
-
-      _ ->
-        case Float.parse(str) do
-          {f, ""} -> {:ok, f}
-          _ -> :error
-        end
+    case JSON.decode(line, nil, decoders) do
+      {{:object, pairs}, _, _rest} -> {:ok, pairs}
+      _ -> {:error, json_object_error(line)}
     end
   end
 
-  defp parse_duration_ns(str), do: Quantity.duration(str)
-  defp parse_bytes(str), do: Quantity.bytes(str)
+  defp unpack_fields(_), do: {:error, "expecting json object(6), but it is not"}
+
+  # Preserve object order/duplicates and numeric lexemes before flattening.
+  # Arrays and nulls are not labels; unlike explicit extraction they are skipped.
+  defp decode_json_labels(line) do
+    decoders = [object_finish: fn pairs, acc -> {{:object, Enum.reverse(pairs)}, acc} end]
+
+    case JSON.decode(quote_json_numbers(line), nil, decoders) do
+      {{:object, pairs}, _, _rest} -> {:ok, flatten_json_labels(pairs, nil)}
+      _ -> {:error, json_object_error(line)}
+    end
+  end
+
+  defp quote_json_numbers(line) do
+    # OTP normalizes -0 and inserts .0 before exponents even with number
+    # callbacks. Quote numeric tokens first, leaving complete strings untouched;
+    # label values are strings either way. JSON still validates the structure.
+    Regex.replace(~r/"(?:\\.|[^"\\])*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/s, line, fn
+      <<?", _::binary>> = string -> string
+      number -> "\"" <> number <> "\""
+    end)
+  end
+
+  defp flatten_json_labels(pairs, prefix) do
+    Enum.flat_map(pairs, fn {key, value} ->
+      name = json_label_name(prefix, key)
+
+      case value do
+        {:object, nested} -> flatten_json_labels(nested, name)
+        value when is_binary(value) and (prefix != nil or name != "") -> [{name, String.replace(value, "�", " ")}]
+        value when is_boolean(value) and (prefix != nil or name != "") -> [{name, to_string(value)}]
+        _ -> []
+      end
+    end)
+  end
+
+  defp json_label_name(prefix, key) when prefix in [nil, ""], do: logfmt_key(key)
+
+  defp json_label_name(prefix, key) do
+    case String.trim(key) do
+      "" -> prefix
+      key -> prefix <> "_" <> String.replace(key, ~r/[^a-zA-Z0-9_]/u, "_")
+    end
+  end
+
+  defp json_object_error(line) do
+    case skip_json_space(line) do
+      <<"{", rest::binary>> ->
+        case skip_json_space(rest) do
+          <<byte, _::binary>> when byte not in [?", ?}] -> "Value looks like object, but can't find closing '}' symbol"
+          _ -> "Malformed JSON error"
+        end
+
+      _ ->
+        "Value looks like object, but can't find closing '}' symbol"
+    end
+  end
+
+  defp skip_json_space(<<byte, rest::binary>>) when byte in [32, 9, 10, 13], do: skip_json_space(rest)
+  defp skip_json_space(line), do: line
+
+  defp extract_json_fields(entry, fields) do
+    matches =
+      for {{label, path}, index} <- Enum.with_index(fields),
+          {:ok, value, position} <- [Json.fetch(entry.line, path)],
+          do: {position, index, label, value}
+
+    extracted = matches |> Enum.sort() |> Enum.map(fn {_, _, label, value} -> {label, value} end)
+    entry = extract_labels(entry, extracted, true)
+
+    Enum.reduce(fields, entry, fn {label, _path}, acc ->
+      if Map.has_key?(acc.labels, label), do: acc, else: Entry.put_label(acc, label, "", :parsed)
+    end)
+  end
+
+  defp extract_logfmt_fields(pairs, fields, _sources, entry) when map_size(fields) == 0 do
+    extracted = for {key, value} <- pairs, name = logfmt_key(key), name != "", do: {name, value}
+    {extract_labels(entry, extracted), false}
+  end
+
+  defp extract_logfmt_fields(pairs, fields, sources, entry) do
+    entry =
+      Enum.reduce(fields, entry, fn {label, _source}, acc ->
+        if Entry.extraction_name(acc, label) == label, do: Entry.put_label(acc, label, "", :parsed), else: acc
+      end)
+
+    Enum.reduce_while(pairs, {entry, false}, fn {key, value}, {acc, _stopped?} ->
+      key = logfmt_key(key)
+      destination = Map.get(sources, key, key)
+      target = Entry.extraction_name(acc, destination)
+
+      cond do
+        key == "" or not Map.has_key?(fields, destination) ->
+          {:cont, {acc, false}}
+
+        not Map.has_key?(fields, key) and Entry.extracted?(acc, key) ->
+          {:cont, {acc, false}}
+
+        target != destination and Entry.extracted?(acc, target) ->
+          {:halt, {acc, true}}
+
+        true ->
+          {:cont, {Entry.put_label(acc, target, value, :parsed), false}}
+      end
+    end)
+  end
+
+  defp logfmt_key(key) do
+    key = String.trim(key)
+    key = if Regex.match?(~r/\A[0-9]/, key), do: "_" <> key, else: key
+    String.replace(key, ~r/[^a-zA-Z0-9_]/u, "_")
+  end
+
+  defp parse_filter_value(:number, str), do: FloatParser.parse_with_error(str)
+  defp parse_filter_value(:duration_ns, str), do: Quantity.duration_value(str)
+  defp parse_filter_value(:bytes, str), do: Quantity.bytes_value(str)
+
+  # Conversion failures keep the line and the first error, allowing later
+  # __error__ filters to decide its fate. Details come from the same converters
+  # used by unwrap, retaining their original Go diagnostics.
+  defp label_conversion_error(%{labels: %{"__error__" => error}} = entry, _) when error != "", do: entry
+
+  defp label_conversion_error(entry, details) do
+    entry
+    |> Entry.put_label("__error__", "LabelFilterErr", :parsed)
+    |> Entry.put_label("__error_details__", details, :parsed)
+  end
 
   # Strip ANSI CSI sequences: ESC[ ... final-byte (a byte in 0x40-0x7E).
   defp strip_ansi(line) do

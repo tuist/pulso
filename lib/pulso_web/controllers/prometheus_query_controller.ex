@@ -46,6 +46,21 @@ defmodule PulsoWeb.PrometheusQueryController do
           "Ranking requires a scalar other than NaN and below the signed int64 maximum."
         )
 
+      {:error, {:invalid_smoothing_factor, name, value}} ->
+        {factor, parameter} = if name == :smoothing, do: {"smoothing", "sf"}, else: {"trend", "tf"}
+
+        value =
+          if is_number(value),
+            do: IO.iodata_to_binary(:io_lib.format(~c"~.6f", [value * 1.0])),
+            else: Evaluator.format_value(value)
+
+        error(
+          conn,
+          :unprocessable_entity,
+          "execution",
+          "invalid #{factor} factor. Expected: 0 < #{parameter} < 1, got: #{value}"
+        )
+
       {:error, :query_overloaded} ->
         error(conn, :too_many_requests, "execution", "Query capacity is busy; retry later.")
 

@@ -4,10 +4,11 @@ defmodule Pulso.PromQL.NativeHistogram do
   (`Pulso.Record.NativeHistogram`).
 
   Ported from Prometheus v3.5.0 (Apache-2.0, Copyright The Prometheus
-  Authors), which Pulso follows exactly:
+  Authors), with Mimir dd039cdd's NaN-sum quantile correction, compensated
+  histogram aggregation, reset detection and bucket trimming described below:
 
     * `model/histogram/float_histogram.go` — `Add`, `Sub`, `Mul`, `Div`,
-      `ReduceResolution`, `Compact(0)`, `DetectReset`, `Equals`, the zero
+      `TrimBuckets`, `ReduceResolution`, `Compact(0)`, `DetectReset`, `Equals`, the zero
       bucket reconciliation and the bucket iterators.
     * `model/histogram/generic.go` — `getBound` (including the precomputed
       `exponentialBounds` table and the `math.MaxFloat64` special case), bucket
@@ -22,9 +23,15 @@ defmodule Pulso.PromQL.NativeHistogram do
   bit-identical to Prometheus's amd64 release builds rather than to whatever
   the platform's libm returns.
 
-  Prometheus 3.5.0's quirks are kept on purpose: `detect_reset?/2` only weighs
-  the previous bucket it stopped at once the current buckets run out, and a
-  quantile of a histogram with a NaN sum interpolates in the last bucket.
+  `detect_reset?/2` follows Mimir's complete previous-bucket traversal and
+  compensated zero-threshold widening. Differing custom layouts use plain
+  common-bound rollups to detect decreases, not layout changes. NaN-sum
+  quantiles instead follow Mimir dd039cdd's corrected interpolation in the
+  selected bucket, rather than Prometheus 3.5.0's last-bucket quirk. Addition
+  and subtraction of differing custom layouts coarsen both inputs to their
+  common bounds. `trim/3` follows Mimir's logarithmic/linear interpolation,
+  biased zero buckets and explicit infinite-bound rules. Changed populations
+  recompute totals in source order; no-op trims retain the original totals.
 
   Values Prometheus would compute as NaN or ±Inf use the atoms of
   `Pulso.PromQL.Number` (`:nan`, `:infinity`, `:negative_infinity`).
@@ -597,29 +604,272 @@ defmodule Pulso.PromQL.NativeHistogram do
   @doc """
   Adds `b` to `a` (Prometheus's `FloatHistogram.Add`): reconciles to the lower
   schema and the larger zero threshold, merges buckets and resolves the
-  counter reset hint.
+  counter reset hint. Differing custom bounds coarsen as in Mimir.
   """
   @spec add(Histogram.t(), Histogram.t()) ::
-          {:ok, Histogram.t()} | {:error, :incompatible_schema | :incompatible_bounds}
+          {:ok, Histogram.t()} | {:error, :incompatible_schema}
   def add(%Histogram{} = a, %Histogram{} = b) do
-    with :ok <- compatible(a, b) do
-      {:ok, combine(%{a | counter_reset_hint: add_hint(a.counter_reset_hint, b.counter_reset_hint)}, b, false)}
+    a = %{a | counter_reset_hint: add_hint(a.counter_reset_hint, b.counter_reset_hint)}
+
+    case compatible(a, b) do
+      :ok -> {:ok, combine(a, b, false)}
+      {:error, :incompatible_bounds} -> {:ok, combine_custom(a, b, false)}
+      error -> error
     end
   end
 
-  @doc "Subtracts `b` from `a` (`FloatHistogram.Sub`); the hint of `a` is kept."
-  @spec sub(Histogram.t(), Histogram.t()) ::
-          {:ok, Histogram.t()} | {:error, :incompatible_schema | :incompatible_bounds}
-  def sub(%Histogram{} = a, %Histogram{} = b) do
-    with :ok <- compatible(a, b), do: {:ok, combine(a, b, true)}
+  @doc """
+  Mimir dd039cdd's `KahanAdd`. Keeps a separate compensation histogram across
+  additions and layout changes; callers add it only when finishing aggregation.
+  Ordinary binary `add/2` deliberately keeps its uncompensated semantics.
+  """
+  def compensated_add(h, other, correction \\ nil) do
+    if custom?(h) == custom?(other) do
+      correction = correction || zero_compensation(h)
+      {h, correction} = if custom?(h), do: {h, correction}, else: compensated_zero(h, other, correction)
+      {count, count_c} = Number.compensated_add(other.count, h.count, correction.count)
+      {sum, sum_c} = Number.compensated_add(other.sum, h.sum, correction.sum)
+      h = %{h | count: count, sum: sum, counter_reset_hint: add_hint(h.counter_reset_hint, other.counter_reset_hint)}
+      correction = %{correction | count: count_c, sum: sum_c}
+      {h, correction} = compensated_sides(h, other, correction)
+      {:ok, h, correction}
+    else
+      {:error, :incompatible_schema}
+    end
   end
 
-  @doc "Multiplies the zero count, count, sum and every bucket by `factor` (`Mul`)."
+  @doc "Whether any histogram count, sum, bucket or custom bound has overflowed."
+  def overflow?(h) do
+    Enum.any?([h.count, h.sum, h.zero_count | h.positive_buckets ++ h.negative_buckets ++ h.custom_values], fn value ->
+      value in [:infinity, :negative_infinity]
+    end)
+  end
+
+  defp zero_compensation(h) do
+    %{
+      h
+      | count: 0.0,
+        sum: 0.0,
+        zero_count: 0.0,
+        positive_buckets: Enum.map(h.positive_buckets, fn _ -> 0.0 end),
+        negative_buckets: Enum.map(h.negative_buckets, fn _ -> 0.0 end)
+    }
+  end
+
+  defp compensated_sides(%{schema: @custom_schema} = h, other, c) do
+    if floats_match?(h.custom_values, other.custom_values) do
+      positive = merge_compensated(paired_entries(h, c, :positive), paired_entries(other, nil, :positive))
+      put_compensated_sides(h, c, positive, [])
+    else
+      bounds = intersect_bounds(h.custom_values, other.custom_values)
+      counts = map_compensated_custom(h, c, bounds, %{})
+      counts = map_compensated_custom(other, nil, bounds, counts)
+
+      positive =
+        for index <- 0..length(bounds),
+            {sum, c} = Map.get(counts, index, {0.0, 0.0}),
+            not zero?(sum) or not zero?(c),
+            do: {index, {sum, c}}
+
+      put_compensated_sides(%{h | custom_values: bounds}, %{c | custom_values: bounds}, positive, [])
+    end
+  end
+
+  defp compensated_sides(h, other, c) do
+    schema = min(h.schema, other.schema)
+
+    [positive, negative] =
+      Enum.map([:positive, :negative], fn side ->
+        left = reduce_compensated(paired_entries(h, c, side), h.schema, schema)
+
+        right =
+          other
+          |> paired_entries(nil, side)
+          |> reduce_compensated(other.schema, schema)
+          |> Enum.drop_while(fn {index, _} -> le?(bound(index, schema, {}), h.zero_threshold) end)
+
+        merge_compensated(left, right)
+      end)
+
+    put_compensated_sides(%{h | schema: schema}, %{c | schema: schema}, positive, negative)
+  end
+
+  defp paired_entries(h, nil, side), do: Enum.map(entries(h, side), fn {index, value} -> {index, {value, 0.0}} end)
+
+  defp paired_entries(h, c, side) do
+    Enum.zip_with(entries(h, side), entries(c, side), fn {index, value}, {index, correction} ->
+      {index, {value, correction}}
+    end)
+  end
+
+  defp put_compensated_sides(h, c, positive, negative) do
+    {positive_spans, positive_values} = to_spans(positive)
+    {negative_spans, negative_values} = to_spans(negative)
+    h = %{h | positive_spans: positive_spans, negative_spans: negative_spans}
+    c = %{c | positive_spans: positive_spans, negative_spans: negative_spans, zero_threshold: h.zero_threshold}
+
+    {%{
+       h
+       | positive_buckets: Enum.map(positive_values, &elem(&1, 0)),
+         negative_buckets: Enum.map(negative_values, &elem(&1, 0))
+     },
+     %{
+       c
+       | positive_buckets: Enum.map(positive_values, &elem(&1, 1)),
+         negative_buckets: Enum.map(negative_values, &elem(&1, 1))
+     }}
+  end
+
+  defp merge_compensated(left, right), do: merge_compensated(left, right, [])
+  defp merge_compensated([], right, acc), do: Enum.reverse(acc, right)
+  defp merge_compensated(left, [], acc), do: Enum.reverse(acc, left)
+
+  defp merge_compensated([{index, {sum, c}} | left], [{index, {value, correction}} | right], acc) do
+    {sum, c} = Number.compensated_add(value, sum, c)
+    result = if zero?(correction), do: {sum, c}, else: Number.compensated_add(correction, sum, c)
+    merge_compensated(left, right, [{index, result} | acc])
+  end
+
+  defp merge_compensated([{index, _} = entry | left], [{other, _} | _] = right, acc) when index < other,
+    do: merge_compensated(left, right, [entry | acc])
+
+  defp merge_compensated(left, [entry | right], acc), do: merge_compensated(left, right, [entry | acc])
+
+  defp reduce_compensated(entries, schema, schema), do: entries
+
+  defp reduce_compensated(entries, schema, target) do
+    entries
+    |> Enum.reduce([], fn {index, {value, c}}, acc ->
+      index = target_index(index, schema, target)
+
+      case acc do
+        [{^index, {sum, correction}} | rest] ->
+          {sum, correction} = Number.compensated_add(value, sum, correction)
+          [{index, Number.compensated_add(c, sum, correction)} | rest]
+
+        rest ->
+          [{index, {value, c}} | rest]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp map_compensated_custom(h, c, bounds, counts) do
+    source = List.to_tuple(h.custom_values)
+
+    h
+    |> paired_entries(c, :positive)
+    |> Enum.reduce({bounds, 0, counts}, fn {index, {value, correction}}, {bounds, target, counts} ->
+      upper = if index < tuple_size(source), do: elem(source, index), else: :infinity
+      {passed, bounds} = Enum.split_while(bounds, &lt?(&1, upper))
+      target = target + length(passed)
+      {sum, total_c} = Map.get(counts, target, {0.0, 0.0})
+      {sum, total_c} = Number.compensated_add(value, sum, total_c)
+      total = if c, do: Number.compensated_add(correction, sum, total_c), else: {sum, total_c}
+      {bounds, target, Map.put(counts, target, total)}
+    end)
+    |> elem(2)
+  end
+
+  defp compensated_zero(h, other, c) do
+    {h, c, other_count, other_c} = reconcile_compensated_zero(h, other, c, other.zero_count, other.zero_threshold, 0.0)
+    {count, correction} = Number.compensated_add(other_count, h.zero_count, c.zero_count)
+    {count, correction} = Number.compensated_add(other_c, count, correction)
+    {%{h | zero_count: count}, %{c | zero_count: correction}}
+  end
+
+  defp reconcile_compensated_zero(%{zero_threshold: threshold} = h, _other, c, count, threshold, correction),
+    do: {h, c, count, correction}
+
+  defp reconcile_compensated_zero(h, other, c, count, threshold, correction) do
+    {count, threshold, correction} =
+      if gt?(h.zero_threshold, threshold),
+        do: larger_compensated_zero(other, nil, h.zero_threshold, 0.0),
+        else: {count, threshold, correction}
+
+    {h, c} =
+      if gt?(threshold, h.zero_threshold) do
+        {zero, threshold, zero_c} = larger_compensated_zero(h, c, threshold, c.zero_count)
+        trim_compensated_zero(%{h | zero_count: zero, zero_threshold: threshold}, %{c | zero_count: zero_c})
+      else
+        {h, c}
+      end
+
+    reconcile_compensated_zero(h, other, c, count, threshold, correction)
+  end
+
+  defp trim_compensated_zero(h, c) do
+    [positive, negative] =
+      Enum.map([:positive, :negative], fn side ->
+        h
+        |> paired_entries(c, side)
+        |> Enum.reject(fn {index, {value, correction}} ->
+          lt?(bound(index - 1, h.schema, {}), h.zero_threshold) or (zero?(value) and zero?(correction))
+        end)
+      end)
+
+    put_compensated_sides(h, c, positive, negative)
+  end
+
+  # Widening may restart when a negative bucket crosses the new boundary.
+  # As in upstream, the compensation carries across that restart.
+  defp larger_compensated_zero(h, c, threshold, correction) do
+    if threshold == h.zero_threshold do
+      {h.zero_count, threshold, correction}
+    else
+      {count, correction, threshold} = absorb_compensated_zero(h, c, :positive, h.zero_count, correction, threshold)
+      {count, correction, larger} = absorb_compensated_zero(h, c, :negative, count, correction, threshold)
+
+      if larger > threshold,
+        do: larger_compensated_zero(h, c, larger, correction),
+        else: {count, threshold, correction}
+    end
+  end
+
+  defp absorb_compensated_zero(h, c, side, count, correction, threshold) do
+    h
+    |> paired_entries(c, side)
+    |> Enum.reduce_while({count, correction, threshold}, &absorb_compensated_bucket(&1, &2, h.schema, c != nil))
+  end
+
+  defp absorb_compensated_bucket({index, {value, value_c}}, {count, correction, threshold}, schema, correction?) do
+    lower = bound(index - 1, schema, {})
+    upper = bound(index, schema, {})
+
+    if ge?(lower, threshold) do
+      {:halt, {count, correction, threshold}}
+    else
+      {count, correction} = Number.compensated_add(value, count, correction)
+
+      {count, correction} =
+        if correction?, do: Number.compensated_add(value_c, count, correction), else: {count, correction}
+
+      larger = if zero?(value), do: threshold, else: upper
+
+      if gt?(upper, threshold),
+        do: {:halt, {count, correction, larger}},
+        else: {:cont, {count, correction, threshold}}
+    end
+  end
+
+  @doc "Subtracts `b` from `a`, reconciling custom bounds as in Mimir; the hint of `a` is kept."
+  @spec sub(Histogram.t(), Histogram.t()) ::
+          {:ok, Histogram.t()} | {:error, :incompatible_schema}
+  def sub(%Histogram{} = a, %Histogram{} = b) do
+    case compatible(a, b) do
+      :ok -> {:ok, combine(a, b, true)}
+      {:error, :incompatible_bounds} -> {:ok, combine_custom(a, b, true)}
+      error -> error
+    end
+  end
+
+  @doc "Multiplies every count and sum by `factor`; negative factors produce gauges (`Mul`)."
   @spec scale(Histogram.t(), value()) :: Histogram.t()
   def scale(%Histogram{} = h, factor) do
     %{
       h
-      | zero_count: Number.multiply(h.zero_count, factor),
+      | counter_reset_hint: if(lt?(factor, 0), do: :gauge, else: h.counter_reset_hint),
+        zero_count: Number.multiply(h.zero_count, factor),
         count: Number.multiply(h.count, factor),
         sum: Number.multiply(h.sum, factor),
         positive_buckets: Enum.map(h.positive_buckets, &Number.multiply(&1, factor)),
@@ -629,7 +879,8 @@ defmodule Pulso.PromQL.NativeHistogram do
 
   @doc """
   Divides like `scale/2` (`Div`). Dividing by zero turns the zero count, count
-  and sum into ±Inf or NaN and removes every bucket, as Prometheus does.
+  and sum into ±Inf or NaN and removes every bucket, without changing the hint.
+  Negative nonzero divisors produce gauges, as in Mimir dd039cdd.
   """
   @spec divide(Histogram.t(), value()) :: Histogram.t()
   def divide(%Histogram{} = h, divisor) do
@@ -645,10 +896,205 @@ defmodule Pulso.PromQL.NativeHistogram do
     else
       %{
         h
-        | positive_buckets: Enum.map(h.positive_buckets, &Number.divide(&1, divisor)),
+        | counter_reset_hint: if(lt?(divisor, 0), do: :gauge, else: h.counter_reset_hint),
+          positive_buckets: Enum.map(h.positive_buckets, &Number.divide(&1, divisor)),
           negative_buckets: Enum.map(h.negative_buckets, &Number.divide(&1, divisor))
       }
     end
+  end
+
+  @doc """
+  Mimir's `TrimBuckets`: retain values below `cutoff` when `upper?` is true,
+  above it otherwise, estimating split bucket populations and retained sums.
+  No-op trims preserve the original totals, layout and reset hint.
+  """
+  @spec trim(Histogram.t(), value(), boolean()) :: Histogram.t()
+  def trim(%Histogram{} = h, cutoff, upper?) do
+    {positive, totals, has_positive?} = trim_side(h, :positive, cutoff, upper?, {0.0, 0.0, false})
+    {negative, {count, sum, changed?}, has_negative?} = trim_side(h, :negative, cutoff, upper?, totals)
+
+    {zero, count, sum, changed?} =
+      if gt?(h.zero_count, 0) do
+        {zero, midpoint} = trim_zero(h, cutoff, upper?, has_positive?, has_negative?)
+
+        {zero, Number.add(count, zero), Number.add(sum, Number.multiply(midpoint, zero)),
+         changed? or Number.compare("!=", zero, h.zero_count)}
+      else
+        {h.zero_count, count, sum, changed?}
+      end
+
+    if changed? do
+      h = %{h | positive_buckets: positive, negative_buckets: negative, zero_count: zero, count: count, sum: sum}
+      compact(h)
+    else
+      h
+    end
+  end
+
+  defp trim_side(h, side, cutoff, upper?, totals) do
+    {buckets, {totals, populated?}} =
+      h
+      |> side_buckets(side)
+      |> Enum.map_reduce({totals, false}, fn bucket, {{count, sum, changed?} = totals, populated?} ->
+        if zero?(bucket.count) do
+          {bucket.count, {totals, populated?}}
+        else
+          {keep, midpoint} = trim_bucket(bucket, cutoff, upper?, side == :positive, custom?(h))
+
+          totals =
+            {Number.add(count, keep), Number.add(sum, Number.multiply(midpoint, keep)),
+             changed? or Number.compare("!=", keep, bucket.count)}
+
+          {keep, {totals, true}}
+        end
+      end)
+
+    {buckets, totals, populated?}
+  end
+
+  defp trim_bucket(bucket, cutoff, upper?, positive?, linear?) do
+    keep_all? = if upper?, do: le?(bucket.upper, cutoff), else: ge?(bucket.lower, cutoff)
+    contains? = if upper?, do: lt?(bucket.lower, cutoff), else: gt?(bucket.upper, cutoff)
+
+    cond do
+      keep_all? ->
+        {bucket.count, trim_midpoint(bucket.lower, bucket.upper, positive?, linear?)}
+
+      not contains? ->
+        {0.0, 0.0}
+
+      bucket.lower == :negative_infinity or bucket.upper == :infinity ->
+        trim_infinite(bucket, cutoff, upper?)
+
+      true ->
+        below = trim_split(bucket, cutoff, linear?)
+
+        if upper?,
+          do: {below, trim_midpoint(bucket.lower, cutoff, positive?, linear?)},
+          else: {minus(bucket.count, below), trim_midpoint(cutoff, bucket.upper, positive?, linear?)}
+    end
+  end
+
+  defp trim_infinite(%{lower: :negative_infinity} = b, rhs, true) do
+    cond do
+      ge?(rhs, b.upper) ->
+        {b.count, 0.0}
+
+      gt?(rhs, 0) and gt?(b.upper, 0) and b.upper != :infinity ->
+        {Number.divide(Number.multiply(b.count, rhs), b.upper), Number.divide(rhs, 2.0)}
+
+      le?(b.upper, 0) ->
+        {b.count, rhs}
+
+      true ->
+        {0.0, zero_if_infinite(b.upper)}
+    end
+  end
+
+  defp trim_infinite(%{lower: :negative_infinity} = b, rhs, false) do
+    cond do
+      rhs == :negative_infinity ->
+        {b.count, 0.0}
+
+      ge?(rhs, 0) and gt?(b.upper, rhs) and b.upper != :infinity ->
+        {Number.multiply(b.count, minus(1.0, Number.divide(rhs, b.upper))),
+         Number.divide(Number.add(rhs, b.upper), 2.0)}
+
+      true ->
+        {0.0, zero_if_infinite(b.upper)}
+    end
+  end
+
+  defp trim_infinite(b, rhs, upper?) do
+    cond do
+      upper? -> {0.0, zero_if_infinite(b.lower)}
+      ge?(rhs, b.lower) -> {b.count, rhs}
+      true -> {0.0, zero_if_infinite(b.lower)}
+    end
+  end
+
+  defp zero_if_infinite(value) when value in [:infinity, :negative_infinity], do: 0.0
+  defp zero_if_infinite(value), do: value
+
+  defp trim_split(b, cutoff, linear?) do
+    cond do
+      le?(cutoff, b.lower) ->
+        0.0
+
+      ge?(cutoff, b.upper) ->
+        b.count
+
+      linear? ->
+        Number.multiply(b.count, Number.divide(minus(cutoff, b.lower), minus(b.upper, b.lower)))
+
+      true ->
+        lower = b.lower |> abs_value() |> log2()
+        upper = b.upper |> abs_value() |> log2()
+        value = cutoff |> abs_value() |> log2()
+
+        fraction =
+          if gt?(cutoff, 0),
+            do: Number.divide(minus(value, lower), minus(upper, lower)),
+            else: minus(1.0, Number.divide(minus(value, upper), minus(lower, upper)))
+
+        Number.multiply(b.count, fraction)
+    end
+  end
+
+  defp trim_zero(h, cutoff, upper?, has_positive?, has_negative?) do
+    lower = if has_positive? and not has_negative?, do: 0.0, else: Number.negate(h.zero_threshold)
+    upper = if has_negative? and not has_positive?, do: 0.0, else: h.zero_threshold
+    trim_zero_interval(lower, upper, h.zero_count, cutoff, upper?)
+  end
+
+  defp trim_zero_interval(lower, upper, count, cutoff, true) do
+    cond do
+      le?(cutoff, lower) ->
+        {0.0, 0.0}
+
+      ge?(cutoff, upper) ->
+        {count, Number.divide(Number.add(lower, upper), 2.0)}
+
+      true ->
+        {Number.multiply(count, Number.divide(minus(cutoff, lower), minus(upper, lower))),
+         Number.divide(Number.add(lower, cutoff), 2.0)}
+    end
+  end
+
+  defp trim_zero_interval(lower, upper, count, cutoff, false) do
+    cond do
+      le?(cutoff, lower) ->
+        {count, Number.divide(Number.add(lower, upper), 2.0)}
+
+      ge?(cutoff, upper) ->
+        {0.0, 0.0}
+
+      true ->
+        {Number.multiply(count, Number.divide(minus(upper, cutoff), minus(upper, lower))),
+         Number.divide(Number.add(cutoff, upper), 2.0)}
+    end
+  end
+
+  defp trim_midpoint(lower, upper, _positive?, _linear?) when lower in [:negative_infinity, :infinity] do
+    cond do
+      upper in [:negative_infinity, :infinity] ->
+        0.0
+
+      gt?(upper, 0) ->
+        Number.divide(upper, 2.0)
+
+      true ->
+        upper
+    end
+  end
+
+  defp trim_midpoint(lower, upper, _positive?, _linear?) when upper in [:negative_infinity, :infinity], do: lower
+
+  defp trim_midpoint(lower, upper, _positive?, true), do: Number.divide(Number.add(lower, upper), 2.0)
+
+  defp trim_midpoint(lower, upper, positive?, false) do
+    midpoint = lower |> Number.multiply(upper) |> abs_value() |> sqrt()
+    if positive?, do: midpoint, else: Number.negate(midpoint)
   end
 
   @doc """
@@ -689,7 +1135,8 @@ defmodule Pulso.PromQL.NativeHistogram do
   Whether `current` holds a counter reset relative to `previous`
   (`DetectReset`): the `:yes`/`:no` hints decide directly, otherwise any
   decreased count, zero bucket, bucket, increased resolution, decreased zero
-  threshold or changed custom bounds is a reset.
+  threshold or changed bucket family is a reset. Differing custom bounds
+  compare bucket totals rolled up to their common boundaries, including +Inf.
   """
   @spec detect_reset?(Histogram.t(), Histogram.t()) :: boolean()
   def detect_reset?(%Histogram{counter_reset_hint: :yes}, %Histogram{}), do: true
@@ -699,15 +1146,40 @@ defmodule Pulso.PromQL.NativeHistogram do
     cond do
       lt?(h.count, previous.count) -> true
       custom?(h) != custom?(previous) -> true
-      custom?(h) and not floats_match?(h.custom_values, previous.custom_values) -> true
+      custom?(h) and not floats_match?(h.custom_values, previous.custom_values) -> custom_reset?(h, previous)
       h.schema > previous.schema -> true
       lt?(h.zero_threshold, previous.zero_threshold) -> true
       true -> detect_bucket_reset?(h, previous)
     end
   end
 
+  defp custom_reset?(h, previous) do
+    bounds = intersect_bounds(h.custom_values, previous.custom_values)
+
+    h
+    |> custom_rollups(bounds)
+    |> Enum.zip(custom_rollups(previous, bounds))
+    |> Enum.any?(fn {current, previous} -> lt?(current, previous) end)
+  end
+
+  defp custom_rollups(h, bounds) do
+    source = List.to_tuple(h.custom_values)
+
+    {counts, _} =
+      Enum.map_reduce(bounds ++ [:infinity], entries(h, :positive), fn upper, entries ->
+        {included, remaining} =
+          Enum.split_while(entries, fn {index, _} -> le?(bound(index, @custom_schema, source), upper) end)
+
+        # Reset detection uses plain source-ordered addition, unlike subtraction.
+        sum = Enum.reduce(included, 0.0, fn {_, count}, sum -> Number.add(sum, count) end)
+        {sum, remaining}
+      end)
+
+    counts
+  end
+
   defp detect_bucket_reset?(h, previous) do
-    {previous_zero_count, threshold} = zero_count_for_larger_threshold(previous, h.zero_threshold)
+    {previous_zero_count, threshold, _correction} = larger_compensated_zero(previous, nil, h.zero_threshold, 0.0)
 
     cond do
       threshold != h.zero_threshold -> true
@@ -722,11 +1194,10 @@ defmodule Pulso.PromQL.NativeHistogram do
     entries_reset?(current, previous)
   end
 
-  # Once the current buckets run out, Prometheus's detectReset keeps checking
-  # the previous bucket it stopped at (it never re-reads the ones after it),
-  # so only that bucket decides.
+  # Exhausting current buckets does not prove a reset until a remaining
+  # previous bucket has nonzero population; leading empty buckets cannot hide it.
   defp entries_reset?(_current, []), do: false
-  defp entries_reset?([], [{_, count} | _]), do: not zero?(count)
+  defp entries_reset?([], previous), do: Enum.any?(previous, fn {_, count} -> not zero?(count) end)
 
   defp entries_reset?([{index, _} | current], [{previous_index, _} | _] = previous) when index < previous_index,
     do: entries_reset?(current, previous)
@@ -905,9 +1376,6 @@ defmodule Pulso.PromQL.NativeHistogram do
         do: [:nan_skew],
         else: []
 
-    # Prometheus's NaN check drains the iterator into the same `bucket`
-    # variable, so with a NaN sum the interpolation uses the last bucket.
-    bucket = if h.sum == :nan and rest != [], do: List.last(rest), else: bucket
     fraction = Number.divide(rank, bucket.count)
     {interpolate(h, bucket, fraction), infos}
   end
@@ -968,9 +1436,7 @@ defmodule Pulso.PromQL.NativeHistogram do
 
   defp fraction_ranks([bucket | rest], lower, upper, h, state) do
     state = %{state | count: Number.add(state.count, bucket.count)}
-    zero_bucket? = le?(bucket.lower, 0) and ge?(bucket.upper, 0)
-    bucket = if zero_bucket?, do: zero_bucket_bounds(h, bucket), else: bucket
-    linear? = custom?(h) or zero_bucket?
+    {bucket, linear?} = fraction_bucket(h, bucket)
 
     state =
       state
@@ -991,6 +1457,21 @@ defmodule Pulso.PromQL.NativeHistogram do
     end
   end
 
+  defp fraction_bucket(%{schema: @custom_schema}, bucket) do
+    bucket =
+      if bucket.lower == :negative_infinity and gt?(bucket.upper, 0),
+        do: %{bucket | lower: 0.0},
+        else: bucket
+
+    {bucket, true}
+  end
+
+  defp fraction_bucket(h, bucket) do
+    zero_bucket? = le?(bucket.lower, 0) and ge?(bucket.upper, 0)
+    bucket = if zero_bucket?, do: zero_bucket_bounds(h, bucket), else: bucket
+    {bucket, zero_bucket?}
+  end
+
   defp set_rank_at_bound(state, :lower, true, rank) when not state.lower_set?,
     do: %{state | lower_rank: resolve(rank), lower_set?: true}
 
@@ -1004,9 +1485,13 @@ defmodule Pulso.PromQL.NativeHistogram do
 
   defp inside?(bucket, value), do: lt?(bucket.lower, value) and gt?(bucket.upper, value)
 
+  # Finite values cannot interpolate an infinite-width first custom bucket.
+  # Its full population lies below any finite interior bound, as in Mimir.
+  defp rank_at(%{lower: :negative_infinity} = bucket, _value, _rank, true), do: bucket.count
+
   defp rank_at(bucket, value, rank, true = _linear?) do
-    position = bucket.count |> Number.multiply(minus(value, bucket.lower))
-    Number.add(rank, Number.divide(position, minus(bucket.upper, bucket.lower)))
+    fraction = Number.divide(minus(value, bucket.lower), minus(bucket.upper, bucket.lower))
+    Number.add(rank, Number.multiply(bucket.count, fraction))
   end
 
   defp rank_at(bucket, value, rank, false = _linear?) do
@@ -1042,6 +1527,47 @@ defmodule Pulso.PromQL.NativeHistogram do
   defp boundary_rule(%{upper_inclusive?: true}), do: 0
   defp boundary_rule(_bucket), do: 2
 
+  # FloatHistogram.String uses the individual side iterators, not the
+  # zero-clipped AllBucketIterator used by the HTTP histogram envelope.
+  def value_text(%Histogram{} = h) do
+    zero =
+      if zero?(h.zero_count),
+        do: [],
+        else: [
+          %{
+            lower: Number.negate(h.zero_threshold),
+            upper: h.zero_threshold,
+            count: h.zero_count,
+            lower_inclusive?: true,
+            upper_inclusive?: true
+          }
+        ]
+
+    buckets = Enum.reverse(side_buckets(h, :negative), zero ++ side_buckets(h, :positive))
+
+    [
+      "{count:",
+      Number.format(h.count, :general),
+      ", sum:",
+      Number.format(h.sum, :general),
+      for(bucket <- buckets, not zero?(bucket.count), do: bucket_text(bucket)),
+      "}"
+    ]
+  end
+
+  defp bucket_text(bucket) do
+    [
+      ", ",
+      if(bucket.lower_inclusive?, do: "[", else: "("),
+      Number.format(bucket.lower, :general),
+      ",",
+      Number.format(bucket.upper, :general),
+      if(bucket.upper_inclusive?, do: "]", else: ")"),
+      ":",
+      Number.format(bucket.count, :general)
+    ]
+  end
+
   ## Add and Sub
 
   defp compatible(a, b) do
@@ -1050,6 +1576,55 @@ defmodule Pulso.PromQL.NativeHistogram do
       custom?(a) and not floats_match?(a.custom_values, b.custom_values) -> {:error, :incompatible_bounds}
       true -> :ok
     end
+  end
+
+  # Mimir's intersectCustomBucketBounds/addCustomBucketsWithMismatches.
+  # Roll each input bucket up to the next common upper bound (or +Inf),
+  # preserving source order and Neumaier compensation across both inputs.
+  defp combine_custom(a, b, subtract?) do
+    op = if subtract?, do: "-", else: "+"
+    bounds = intersect_bounds(a.custom_values, b.custom_values)
+    counts = a |> map_custom(bounds, %{}, false) |> then(&map_custom(b, bounds, &1, subtract?))
+
+    entries =
+      for index <- 0..length(bounds),
+          {sum, correction} = Map.get(counts, index, {0.0, 0.0}),
+          not zero?(sum) or not zero?(correction),
+          do: {index, sum}
+
+    {spans, buckets} = to_spans(entries)
+
+    %{
+      a
+      | count: Number.binary(op, a.count, b.count),
+        sum: Number.binary(op, a.sum, b.sum),
+        custom_values: bounds,
+        positive_spans: spans,
+        positive_buckets: buckets
+    }
+  end
+
+  defp intersect_bounds([], _), do: []
+  defp intersect_bounds(_, []), do: []
+  defp intersect_bounds([a | as], [b | bs]) when a == b, do: [a | intersect_bounds(as, bs)]
+  defp intersect_bounds([a | as], [b | _] = bs) when a < b, do: intersect_bounds(as, bs)
+  defp intersect_bounds(as, [_ | bs]), do: intersect_bounds(as, bs)
+
+  defp map_custom(h, bounds, counts, subtract?) do
+    source = List.to_tuple(h.custom_values)
+
+    h
+    |> entries(:positive)
+    |> Enum.reduce({bounds, 0, counts}, fn {index, value}, {bounds, target, counts} ->
+      upper = if index < tuple_size(source), do: elem(source, index), else: :infinity
+      {passed, bounds} = Enum.split_while(bounds, &lt?(&1, upper))
+      target = target + length(passed)
+      {sum, correction} = Map.get(counts, target, {0.0, 0.0})
+      value = if subtract?, do: Number.negate(value), else: value
+      counts = Map.put(counts, target, Number.compensated_add(value, sum, correction))
+      {bounds, target, counts}
+    end)
+    |> elem(2)
   end
 
   defp add_hint(hint, hint), do: hint

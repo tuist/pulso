@@ -3,13 +3,15 @@ defmodule Pulso.PromQL.Parser do
   Parser for Pulso's initial Prometheus Query Language subset.
 
   Supports named and label-only selectors, range functions, nested vector
-  aggregations with by/without grouping, parentheses, and positive offsets.
+  aggregations with by/without grouping, parentheses, signed offsets and fixed
+  evaluation times.
   Unsupported syntax fails rather than being interpreted as another language.
   """
   import NimbleParsec
 
   alias Pulso.Codec.NIF
   alias Pulso.PromQL.FloatParser
+  alias Pulso.PromQL.Time
 
   comment = string("#") |> repeat(utf8_char(not: ?\n))
   ws = ignore(repeat(choice([ascii_char([?\s, ?\t, ?\r, ?\n]), comment])))
@@ -105,29 +107,148 @@ defmodule Pulso.PromQL.Parser do
     |> choice(Enum.map(["ms", "s", "m", "h", "d", "w", "y"], &string/1))
     |> reduce({__MODULE__, :duration_component, []})
 
-  duration = times(component, min: 1) |> reduce({__MODULE__, :duration, []})
+  seconds =
+    choice([
+      ascii_string([?0..?9], min: 1) |> optional(string(".") |> optional(ascii_string([?0..?9], min: 1))),
+      string(".") |> ascii_string([?0..?9], min: 1)
+    ])
+    |> optional(
+      choice([string("e"), string("E")])
+      |> optional(choice([string("+"), string("-")]))
+      |> ascii_string([?0..?9], min: 1)
+    )
+    |> reduce({IO, :iodata_to_binary, []})
+
+  digits = ascii_string([?0..?9], 1) |> optional(ascii_string([?0..?9, ?_], min: 1))
+  hex_digits = ascii_string([?0..?9, ?a..?f, ?A..?F, ?_], min: 1)
+  exponent = optional(choice([string("+"), string("-")])) |> concat(digits)
+
+  decimal_number =
+    choice([
+      digits |> optional(string(".") |> optional(digits)),
+      string(".") |> concat(digits)
+    ])
+    |> optional(choice([string("e"), string("E")]) |> concat(exponent))
+
+  hex_number = choice([string("0x"), string("0X")]) |> concat(hex_digits)
+  numeric_text = choice([hex_number, decimal_number]) |> reduce({IO, :iodata_to_binary, []})
+  number = numeric_text |> reduce({__MODULE__, :number, []})
+
+  unit_duration = times(component, min: 1) |> reduce({__MODULE__, :duration, []})
+  # HTTP duration parameters retain their literal decimal/unit grammar.
+  duration = choice([unit_duration, seconds |> reduce({__MODULE__, :seconds_duration, []})])
   defcombinatorp(:duration, duration)
+
+  duration_call =
+    choice([
+      choice([keyword.("step"), keyword.("range")])
+      |> parsec(:ws)
+      |> ignore(string("("))
+      |> parsec(:ws)
+      |> ignore(string(")")),
+      choice([keyword.("min_of"), keyword.("max_of")])
+      |> parsec(:ws)
+      |> ignore(string("("))
+      |> parsec(:duration_expression)
+      |> ignore(string(","))
+      |> parsec(:duration_expression)
+      |> ignore(string(")"))
+    ])
+    |> reduce({__MODULE__, :call, []})
+
+  defcombinatorp(
+    :duration_atom,
+    parsec(:ws)
+    |> choice([
+      duration_call,
+      ignore(string("(")) |> parsec(:duration_expression) |> ignore(string(")")),
+      unit_duration |> reduce({__MODULE__, :duration_literal, []}),
+      numeric_text |> reduce({__MODULE__, :duration_number, []})
+    ])
+    |> parsec(:ws)
+  )
+
+  # An unparenthesized offset ends before any arithmetic operator, including
+  # power: `x offset -2 ^ 2` is `(x offset -2) ^ 2`.
+  defcombinatorp(
+    :duration_signed_atom,
+    optional(choice([string("+"), string("-")]) |> parsec(:ws))
+    |> parsec(:duration_atom)
+    |> reduce({__MODULE__, :duration_unary, []})
+  )
+
+  defcombinatorp(
+    :duration_power,
+    parsec(:duration_atom)
+    |> optional(string("^") |> parsec(:duration_unary_expression))
+    |> reduce({__MODULE__, :duration_power, []})
+  )
+
+  defcombinatorp(
+    :duration_unary_expression,
+    parsec(:ws)
+    |> choice([
+      choice([string("+"), string("-")])
+      |> parsec(:ws)
+      |> parsec(:duration_unary_expression)
+      |> reduce({__MODULE__, :duration_unary, []}),
+      parsec(:duration_power)
+    ])
+  )
+
+  for {name, operand, operators} <- [
+        {:duration_product, :duration_unary_expression, ["*", "/", "%"]},
+        {:duration_expression, :duration_product, ["+", "-"]}
+      ] do
+    defcombinatorp(
+      name,
+      parsec(operand)
+      |> repeat(choice(Enum.map(operators, &string/1)) |> parsec(operand) |> wrap())
+      |> reduce({__MODULE__, :duration_binary, []})
+    )
+  end
+
+  duration_expression = parsec(:duration_expression) |> reduce({__MODULE__, :duration_expression, []})
 
   offset =
     parsec(:ws)
     |> ignore(keyword.("offset"))
     |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
     |> parsec(:ws)
-    |> concat(duration)
+    |> parsec(:duration_signed_atom)
+    |> reduce({__MODULE__, :duration_expression, []})
+    |> unwrap_and_tag(:offset)
 
-  instant = selector |> optional(offset) |> reduce({__MODULE__, :instant, []})
+  anchor =
+    parsec(:ws)
+    |> ignore(string("@"))
+    |> parsec(:ws)
+    |> choice([
+      choice([keyword.("start"), keyword.("end")])
+      |> parsec(:ws)
+      |> ignore(string("("))
+      |> parsec(:ws)
+      |> ignore(string(")")),
+      optional(choice([string("+"), string("-")]) |> parsec(:ws))
+      |> choice([unit_duration, numeric_text])
+      |> reduce({__MODULE__, :anchor_timestamp, []})
+    ])
+    |> unwrap_and_tag(:at)
+
+  temporal = repeat(choice([offset, anchor])) |> reduce({__MODULE__, :temporal, []})
+  instant = selector |> concat(temporal) |> reduce({__MODULE__, :instant, []})
 
   range =
     selector
     |> parsec(:ws)
     |> ignore(string("["))
-    |> concat(duration)
+    |> concat(duration_expression)
     |> ignore(string("]"))
-    |> optional(offset)
+    |> concat(temporal)
     |> reduce({__MODULE__, :range, []})
 
   functions =
-    ~w(rate increase irate delta sum_over_time avg_over_time min_over_time max_over_time count_over_time stddev_over_time stdvar_over_time absent_over_time)
+    ~w(rate increase irate idelta delta changes resets deriv sum_over_time avg_over_time min_over_time max_over_time count_over_time stddev_over_time stdvar_over_time mad_over_time absent_over_time present_over_time first_over_time last_over_time ts_of_first_over_time ts_of_last_over_time ts_of_min_over_time ts_of_max_over_time)
 
   function =
     choice(Enum.map(functions, &(string(&1) |> replace(String.to_existing_atom(&1)))))
@@ -147,8 +268,8 @@ defmodule Pulso.PromQL.Parser do
     |> ignore(string("("))
     |> parsec(:ws)
     |> optional(
-      identifier
-      |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:ws) |> concat(identifier))
+      choice([label_identifier, quoted])
+      |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:ws) |> choice([label_identifier, quoted]))
       |> optional(parsec(:ws) |> ignore(string(",")))
     )
     |> parsec(:ws)
@@ -157,7 +278,7 @@ defmodule Pulso.PromQL.Parser do
 
   aggregate =
     choice(
-      Enum.map(~w(sum avg min max count group), fn op ->
+      Enum.map(~w(sum avg min max count group stddev stdvar), fn op ->
         op
         |> String.to_charlist()
         |> Enum.reduce(empty(), fn char, acc -> concat(acc, ascii_char([char, char - 32])) end)
@@ -174,26 +295,14 @@ defmodule Pulso.PromQL.Parser do
     |> optional(parsec(:ws) |> concat(grouping))
     |> reduce({__MODULE__, :aggregate, []})
 
-  digits = ascii_string([?0..?9], 1) |> optional(ascii_string([?0..?9, ?_], min: 1))
-  hex_digits = ascii_string([?0..?9, ?a..?f, ?A..?F, ?_], min: 1)
-  exponent = optional(choice([string("+"), string("-")])) |> concat(digits)
-
-  decimal_number =
-    choice([
-      digits |> optional(string(".") |> optional(digits)),
-      string(".") |> concat(digits)
-    ])
-    |> optional(choice([string("e"), string("E")]) |> concat(exponent))
-
-  hex_number = choice([string("0x"), string("0X")]) |> concat(hex_digits)
-
-  number = choice([hex_number, decimal_number]) |> reduce({__MODULE__, :number, []})
-
   aggregation_prefix =
     choice(
-      Enum.map(~w(sum avg min max count group topk bottomk), fn op ->
-        keyword.(op) |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
-      end)
+      Enum.map(
+        ~w(sum avg min max count group stddev stdvar topk bottomk quantile count_values limitk limit_ratio),
+        fn op ->
+          keyword.(op) |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:]))
+        end
+      )
     )
 
   generic_function =
@@ -208,7 +317,7 @@ defmodule Pulso.PromQL.Parser do
     |> reduce({__MODULE__, :call, []})
 
   parameter_aggregate =
-    choice([keyword.("topk"), keyword.("bottomk")])
+    choice(Enum.map(~w(topk bottomk quantile count_values limitk limit_ratio), keyword))
     |> parsec(:ws)
     |> optional(grouping |> parsec(:ws))
     |> ignore(string("("))
@@ -226,11 +335,12 @@ defmodule Pulso.PromQL.Parser do
 
   subquery_suffix =
     ignore(string("["))
-    |> concat(duration)
+    |> concat(duration_expression)
     |> ignore(string(":"))
-    |> concat(duration)
+    |> choice([duration_expression, empty() |> replace(nil)])
+    |> parsec(:ws)
     |> ignore(string("]"))
-    |> optional(offset)
+    |> concat(temporal)
     |> wrap()
 
   primary =
@@ -241,8 +351,11 @@ defmodule Pulso.PromQL.Parser do
       function,
       generic_function,
       special_number,
+      quoted |> reduce({__MODULE__, :string_argument, []}),
       ignore(string("(")) |> parsec(:expression) |> ignore(string(")")),
+      unit_duration |> reduce({__MODULE__, :duration_scalar, []}),
       number,
+      range,
       instant
     ])
     |> parsec(:ws)
@@ -253,9 +366,21 @@ defmodule Pulso.PromQL.Parser do
   defcombinatorp(:primary, primary)
 
   defcombinatorp(
+    :range_argument,
+    choice([
+      range,
+      ignore(string("("))
+      |> parsec(:ws)
+      |> parsec(:range_argument)
+      |> parsec(:ws)
+      |> ignore(string(")"))
+    ])
+  )
+
+  defcombinatorp(
     :argument,
     parsec(:ws)
-    |> choice([range, quoted |> reduce({__MODULE__, :string_argument, []}), parsec(:expression)])
+    |> choice([parsec(:range_argument), quoted |> reduce({__MODULE__, :string_argument, []}), parsec(:expression)])
     |> parsec(:ws)
   )
 
@@ -279,7 +404,11 @@ defmodule Pulso.PromQL.Parser do
   label_list =
     ignore(string("("))
     |> parsec(:ws)
-    |> optional(identifier |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:ws) |> concat(identifier)))
+    |> optional(
+      choice([label_identifier, quoted])
+      |> repeat(parsec(:ws) |> ignore(string(",")) |> parsec(:ws) |> choice([label_identifier, quoted]))
+      |> optional(parsec(:ws) |> ignore(string(",")))
+    )
     |> parsec(:ws)
     |> ignore(string(")"))
     |> wrap()
@@ -308,22 +437,26 @@ defmodule Pulso.PromQL.Parser do
   defcombinatorp(:modifiers, modifiers)
 
   for {name, operand, operators} <- [
-        {:product, :unary, ["*", "/", "%"]},
+        {:product, :unary, ["*", "/", "%", "atan2"]},
         {:addition, :product, ["+", "-"]},
-        {:comparison, :addition, ["==", "!=", ">=", "<=", ">", "<"]},
+        {:comparison, :addition, ["==", "!=", ">=", "<=", ">/", "</", ">", "<"]},
         {:intersection, :comparison, ["and", "unless"]},
         {:expression, :intersection, ["or"]}
       ] do
-    operator =
-      case operators do
-        [op] -> keyword.(op)
-        _ -> choice(Enum.map(operators, keyword))
-      end
+    choices =
+      Enum.map(operators, fn op ->
+        token = keyword.(op)
+
+        if op in ["atan2", "and", "unless", "or"],
+          do: token |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:])),
+          else: token
+      end)
 
     operator =
-      if name in [:intersection, :expression],
-        do: operator |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?:])),
-        else: operator
+      case choices do
+        [only] -> only
+        many -> choice(many)
+      end
 
     defcombinatorp(
       name,
@@ -341,7 +474,11 @@ defmodule Pulso.PromQL.Parser do
     :rate,
     :increase,
     :irate,
+    :idelta,
     :delta,
+    :changes,
+    :resets,
+    :deriv,
     :sum_over_time,
     :avg_over_time,
     :min_over_time,
@@ -349,13 +486,23 @@ defmodule Pulso.PromQL.Parser do
     :count_over_time,
     :stddev_over_time,
     :stdvar_over_time,
+    :mad_over_time,
     :absent_over_time,
+    :present_over_time,
+    :first_over_time,
+    :last_over_time,
+    :ts_of_first_over_time,
+    :ts_of_last_over_time,
+    :ts_of_min_over_time,
+    :ts_of_max_over_time,
     :sum,
     :avg,
     :min,
     :max,
     :count,
-    :group
+    :group,
+    :stddev,
+    :stdvar
   ]
   @factors %{
     "ms" => 1_000_000,
@@ -370,11 +517,7 @@ defmodule Pulso.PromQL.Parser do
   def parse(input) when is_binary(input) and byte_size(input) <= 16_384 do
     case do_parse(input) do
       {:ok, [expr], "", _, _, _} ->
-        cond do
-          not bounded?(expr) -> {:error, :query_expression_limit}
-          type(expr) == :range -> {:error, :invalid_range}
-          true -> validate(expr)
-        end
+        if bounded?(expr), do: validate(expr), else: {:error, :query_expression_limit}
 
       _ ->
         {:error, :invalid_or_unsupported_query}
@@ -450,6 +593,89 @@ defmodule Pulso.PromQL.Parser do
   end
 
   @doc false
+  def seconds_duration([text]) do
+    case literal_time(text) do
+      {:ok, ns} when ns <= 31_536_000_000_000_000 -> ns
+      _ -> raise(ArgumentError)
+    end
+  end
+
+  @doc false
+  def signed_duration(["-", value]), do: -value
+  def signed_duration(["+", value]), do: value
+  def signed_duration([value]), do: value
+
+  @doc false
+  def duration_scalar([ns]), do: {:scalar, Time.seconds(ns)}
+  @doc false
+  def duration_literal([ns]), do: {:duration_literal, ns}
+  @doc false
+  def duration_number([text]) do
+    seconds_duration([text])
+    {:duration_number, text}
+  end
+
+  @doc false
+  def duration_expression([{:duration_literal, ns}]), do: ns
+  def duration_expression([{:duration_number, text}]), do: seconds_duration([text])
+  def duration_expression([{:unary, "-", {:duration_number, text}}]), do: -seconds_duration([text])
+  def duration_expression([expr]), do: {:duration, expr}
+  @doc false
+  def duration_unary([expr]), do: expr
+  def duration_unary(["+", expr]), do: expr
+  def duration_unary(["-", {:duration_literal, ns}]), do: {:duration_literal, -ns}
+  def duration_unary([op, expr]), do: {:unary, op, expr}
+  @doc false
+  def duration_power([expr]), do: expr
+  def duration_power([left, "^", right]), do: {:binary, "^", [], left, right}
+  @doc false
+  def duration_binary([left | rest]),
+    do: Enum.reduce(rest, left, fn [op, right], left -> {:binary, op, [], left, right} end)
+
+  @doc false
+  def anchor_timestamp(parts) do
+    case List.last(parts) do
+      ns when is_integer(ns) ->
+        signed_duration(parts)
+
+      _ ->
+        case literal_time(IO.iodata_to_binary(parts)) do
+          {:ok, ns} -> ns
+          _ -> raise(ArgumentError)
+        end
+    end
+  end
+
+  # Keep PromQL's leading-zero octal integers, but parse decimal seconds
+  # exactly instead of rounding contemporary timestamps through a float.
+  defp literal_time(text) when byte_size(text) <= 128 do
+    if not match?({:ok, _}, FloatParser.parse(text, :literal)), do: raise(ArgumentError)
+    plain = String.replace(text, "_", "")
+
+    case Regex.run(~r/\A([+-]?)(?:0[xX]([0-9a-fA-F]+)|(0[0-7]+))\z/, plain) do
+      [_, sign, hex] ->
+        value = String.to_integer(hex, 16)
+        Time.parse_seconds(if(sign == "-", do: -value, else: value))
+
+      [_, sign, "", octal] ->
+        value = String.to_integer(octal, 8)
+        Time.parse_seconds(if(sign == "-", do: -value, else: value))
+
+      _ ->
+        Time.parse_seconds(plain)
+    end
+  end
+
+  defp literal_time(_), do: {:error, :invalid_timestamp}
+
+  @doc false
+  def temporal(parts) do
+    if length(parts) != length(Enum.uniq_by(parts, &elem(&1, 0))), do: raise(ArgumentError)
+    shift = Keyword.get(parts, :offset, 0)
+    if Keyword.has_key?(parts, :at), do: {:at, Keyword.fetch!(parts, :at), shift}, else: shift
+  end
+
+  @doc false
   def instant([matchers]), do: {:selector, matchers, 0}
   def instant([matchers, offset]), do: {:selector, matchers, offset}
   @doc false
@@ -509,7 +735,7 @@ defmodule Pulso.PromQL.Parser do
   def type({:range, _, _, _}), do: :range
   def type({:subquery, _, _, _, _}), do: :range
   def type({:unary, _, inner}), do: type(inner)
-  def type({:call, name, _}) when name in ["time", "scalar"], do: :scalar
+  def type({:call, name, _}) when name in ~w(time scalar pi start end step range min_of max_of), do: :scalar
 
   def type({:binary, _, _, left, right}),
     do: if(type(left) == :scalar and type(right) == :scalar, do: :scalar, else: :vector)
@@ -520,7 +746,15 @@ defmodule Pulso.PromQL.Parser do
   defp ast_size(_expr, depth) when depth > 64, do: 257
   defp ast_size({:binary, _, _, left, right}, depth), do: 1 + ast_size(left, depth + 1) + ast_size(right, depth + 1)
   defp ast_size({:aggregate, _, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
-  defp ast_size({:subquery, inner, _, _, _}, depth), do: 1 + ast_size(inner, depth + 1)
+  defp ast_size({:selector, _, offset}, depth), do: 1 + ast_size(offset, depth + 1)
+  defp ast_size({:range, _, window, offset}, depth), do: 1 + ast_size(window, depth + 1) + ast_size(offset, depth + 1)
+
+  defp ast_size({:subquery, inner, window, step, offset}, depth),
+    do: 1 + Enum.sum(Enum.map([inner, window, step, offset], &ast_size(&1, depth + 1)))
+
+  defp ast_size({:function, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
+  defp ast_size({:at, _, offset}, depth), do: ast_size(offset, depth + 1)
+  defp ast_size({:duration, inner}, depth), do: ast_size(inner, depth + 1)
   defp ast_size({:unary, _, inner}, depth), do: 1 + ast_size(inner, depth + 1)
 
   defp ast_size({:parameter_aggregate, _, _, parameter, inner}, depth),
@@ -529,7 +763,7 @@ defmodule Pulso.PromQL.Parser do
   defp ast_size({:call, _, args}, depth), do: 1 + Enum.sum(Enum.map(args, &ast_size(&1, depth + 1)))
   defp ast_size(_, _), do: 1
 
-  defp validate({:scalar, _} = expr), do: {:ok, expr}
+  defp validate({type, _} = expr) when type in [:scalar, :string], do: {:ok, expr}
 
   defp validate({:unary, _, inner} = expr) do
     with {:ok, _} <- validate(inner),
@@ -547,14 +781,30 @@ defmodule Pulso.PromQL.Parser do
       "histogram_avg" => [:vector],
       "histogram_stddev" => [:vector],
       "histogram_stdvar" => [:vector],
+      "clamp" => [:vector, :scalar, :scalar],
       "clamp_min" => [:vector, :scalar],
       "clamp_max" => [:vector, :scalar],
       "vector" => [:scalar],
       "scalar" => [:vector],
       "time" => [],
+      "pi" => [],
+      "start" => [],
+      "end" => [],
+      "step" => [],
+      "range" => [],
+      "min_of" => [:scalar, :scalar],
+      "max_of" => [:scalar, :scalar],
       "label_replace" => [:vector, :string, :string, :string, :string],
       "sort_desc" => [:vector],
       "sort" => [:vector],
+      "year" => [:vector],
+      "month" => [:vector],
+      "day_of_month" => [:vector],
+      "day_of_week" => [:vector],
+      "day_of_year" => [:vector],
+      "days_in_month" => [:vector],
+      "hour" => [:vector],
+      "minute" => [:vector],
       "round" => [:vector],
       "abs" => [:vector],
       "sgn" => [:vector],
@@ -565,13 +815,34 @@ defmodule Pulso.PromQL.Parser do
       "ln" => [:vector],
       "log2" => [:vector],
       "log10" => [:vector],
+      "deg" => [:vector],
+      "rad" => [:vector],
+      "asin" => [:vector],
+      "acos" => [:vector],
+      "atan" => [:vector],
+      "sin" => [:vector],
+      "cos" => [:vector],
+      "tan" => [:vector],
+      "sinh" => [:vector],
+      "cosh" => [:vector],
+      "tanh" => [:vector],
+      "asinh" => [:vector],
+      "acosh" => [:vector],
+      "atanh" => [:vector],
       "timestamp" => [:vector],
       "absent" => [:vector],
       "predict_linear" => [:range, :scalar],
+      "quantile_over_time" => [:scalar, :range],
+      "double_exponential_smoothing" => [:range, :scalar, :scalar],
+      "holt_winters" => [:range, :scalar, :scalar],
       "rate" => [:range],
       "increase" => [:range],
       "irate" => [:range],
+      "idelta" => [:range],
       "delta" => [:range],
+      "changes" => [:range],
+      "resets" => [:range],
+      "deriv" => [:range],
       "sum_over_time" => [:range],
       "avg_over_time" => [:range],
       "min_over_time" => [:range],
@@ -579,21 +850,33 @@ defmodule Pulso.PromQL.Parser do
       "count_over_time" => [:range],
       "stddev_over_time" => [:range],
       "stdvar_over_time" => [:range],
-      "absent_over_time" => [:range]
+      "mad_over_time" => [:range],
+      "absent_over_time" => [:range],
+      "present_over_time" => [:range],
+      "first_over_time" => [:range],
+      "last_over_time" => [:range],
+      "ts_of_first_over_time" => [:range],
+      "ts_of_last_over_time" => [:range],
+      "ts_of_min_over_time" => [:range],
+      "ts_of_max_over_time" => [:range]
     }
 
-    expected = if name == "round" and length(args) == 2, do: [:vector, :scalar], else: Map.get(signatures, name)
-
-    valid =
-      Enum.all?(args, fn
-        {:string, _} -> true
-        arg -> match?({:ok, _}, validate(arg))
-      end)
+    expected = call_types(name, length(args), signatures)
+    valid = Enum.all?(args, &match?({:ok, _}, validate(&1)))
 
     if valid and expected == Enum.map(args, &type/1),
       do: validate_call(expr),
       else: {:error, :invalid_function_arguments}
   end
+
+  defp validate({:parameter_aggregate, "count_values", group, {:string, name}, inner} = expr) do
+    with true <- name != "",
+         {:ok, _} <- validate({:aggregate, :sum, group, inner}),
+         do: {:ok, expr},
+         else: (_ -> {:error, :invalid_aggregation})
+  end
+
+  defp validate({:parameter_aggregate, "count_values", _, _, _}), do: {:error, :invalid_aggregation}
 
   defp validate({:parameter_aggregate, _, group, parameter, inner} = expr) do
     with {:ok, _} <- validate(parameter),
@@ -625,20 +908,24 @@ defmodule Pulso.PromQL.Parser do
          else: (_ -> {:error, :invalid_grouping})
   end
 
-  defp validate({:function, _, {:range, matchers, window, _}} = expr) when window > 0 do
-    with :ok <- validate_matchers(matchers), do: {:ok, expr}
+  defp validate({:function, _, range} = expr) do
+    with {:ok, _} <- validate(range), do: {:ok, expr}
   end
 
-  defp validate({:subquery, inner, window, step, _} = expr) when window > 0 and step > 0 do
-    with {:ok, _} <- validate(inner), true <- type(inner) == :vector do
+  defp validate({:subquery, inner, window, step, _} = expr) do
+    with {:ok, _} <- validate(inner),
+         true <- type(inner) == :vector and positive_duration?(window) and (is_nil(step) or positive_duration?(step)) do
       {:ok, expr}
     else
       _ -> {:error, :invalid_subquery}
     end
   end
 
-  defp validate({:range, matchers, window, _} = expr) when window > 0 do
-    with :ok <- validate_matchers(matchers), do: {:ok, expr}
+  defp validate({:range, matchers, window, _} = expr) do
+    with true <- positive_duration?(window),
+         :ok <- validate_matchers(matchers),
+         do: {:ok, expr},
+         else: (_ -> {:error, :invalid_range})
   end
 
   defp validate({:selector, matchers, _} = expr) do
@@ -647,8 +934,41 @@ defmodule Pulso.PromQL.Parser do
 
   defp validate(_), do: {:error, :invalid_range}
 
+  defp positive_duration?({:duration, _}), do: true
+  defp positive_duration?(ns), do: ns > 0
+
+  defp call_types(name, count, signatures) do
+    case {name, count} do
+      {"round", 2} ->
+        [:vector, :scalar]
+
+      {"label_join", count} when count >= 3 ->
+        [:vector | List.duplicate(:string, count - 1)]
+
+      {"histogram_quantiles", count} when count >= 3 ->
+        [:vector, :string | List.duplicate(:scalar, count - 2)]
+
+      {name, count} when name in ["sort_by_label", "sort_by_label_desc"] and count >= 1 ->
+        [:vector | List.duplicate(:string, count - 1)]
+
+      {name, 0} when name in ~w(year month day_of_month day_of_week day_of_year days_in_month hour minute) ->
+        []
+
+      _ ->
+        Map.get(signatures, name)
+    end
+  end
+
   defp validate_call({:call, "label_replace", [_, {:string, dst}, _, _, {:string, regex}]} = expr) do
     if label_name?(dst) and valid_regex?(regex), do: {:ok, expr}, else: {:error, :invalid_label_replace}
+  end
+
+  defp validate_call({:call, "label_join", [_, {:string, dst}, _ | sources]} = expr) do
+    # String decoding already validates UTF-8. Label-join names use the modern
+    # nonempty UTF-8 vocabulary, not the legacy identifier-only grammar.
+    if dst != "" and Enum.all?(sources, fn {:string, name} -> name != "" end),
+      do: {:ok, expr},
+      else: {:error, :invalid_function_arguments}
   end
 
   defp validate_call(expr), do: {:ok, expr}
@@ -668,8 +988,11 @@ defmodule Pulso.PromQL.Parser do
 
     comparisons = op in ["==", "!=", ">", "<", ">=", "<="]
     sets = op in ["and", "or", "unless"]
+    # Upstream scalar-only trim reaches an unsupported scalar engine operation.
+    # Reject that form at admission rather than executing an invalid operation.
+    trim_valid = op not in ["</", ">/"] or left == :vector or right == :vector
 
-    valid_names and valid_operator_types?(comparisons, sets, boolean, left, right) and
+    valid_names and trim_valid and valid_operator_types?(comparisons, sets, boolean, left, right) and
       valid_matching?(sets, matching, grouping, left, right)
   end
 
@@ -677,7 +1000,7 @@ defmodule Pulso.PromQL.Parser do
     boolean_valid? = not boolean? or comparison?
     scalar_valid? = valid_scalar_comparison?(comparison?, boolean?, left, right)
     set_valid? = not set? or (left == :vector and right == :vector and not boolean?)
-    boolean_valid? and scalar_valid? and set_valid?
+    left in [:scalar, :vector] and right in [:scalar, :vector] and boolean_valid? and scalar_valid? and set_valid?
   end
 
   defp valid_scalar_comparison?(true, false, :scalar, :scalar), do: false
@@ -707,7 +1030,7 @@ defmodule Pulso.PromQL.Parser do
 
   defp valid_regex?(value) do
     byte_size(value) <= 1024 and NIF.validate_metric_regex(value) == :ok and
-      NIF.validate_metric_regex("(?s:\\A(?:#{value})\\z)") == :ok
+      NIF.validate_metric_regex(Pulso.QueryRegex.anchor(value)) == :ok
   end
 
   defp excludes_empty?({_, :eq, value}), do: value != ""
@@ -715,12 +1038,12 @@ defmodule Pulso.PromQL.Parser do
 
   defp excludes_empty?({_, op, value}) do
     if NIF.validate_metric_regex(value) == :ok do
-      matched = NIF.match_metric_regex("(?s:\\A(?:#{value})\\z)", "")
+      matched = NIF.match_metric_regex(Pulso.QueryRegex.anchor(value), "")
       if op == :re, do: not matched, else: matched
     else
       false
     end
   end
 
-  defp label_name?(name), do: Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*\z/, name)
+  defp label_name?(name), do: name != "" and String.valid?(name)
 end

@@ -29,5 +29,5 @@ defmodule Pulso.Traces.RegexFilters do
   end
 
   defp valid?(_), do: false
-  defp anchored(pattern), do: "(?s:\\A(?:#{pattern})\\z)"
+  defp anchored(pattern), do: Pulso.QueryRegex.anchor(pattern)
 end

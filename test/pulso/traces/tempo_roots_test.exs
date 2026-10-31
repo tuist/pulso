@@ -134,7 +134,8 @@ defmodule Pulso.Traces.TempoRootsTest do
 
     assert native([escaped], "rootName", []) == {:error, :query_resource_limit}
     assert TempoRootDiscovery.json(escaped, "rootName", []) == {:error, :query_resource_limit}
-    assert native(List.duplicate([root], 1025), "rootName", []) == {:error, :query_resource_limit}
+    # Exercise every source admission without re-encoding the same fixture.
+    assert native(List.duplicate([blob([root])], 1025), "rootName", []) == {:error, :query_resource_limit}
   end
 
   test "closed target grammar and callback fences never dispatch roots to span-local adapters", %{rows: rows} do

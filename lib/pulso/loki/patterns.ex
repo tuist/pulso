@@ -28,7 +28,7 @@ defmodule Pulso.Loki.Patterns do
   @spec query(String.t(), AST.LogQuery.t(), window()) ::
           {:ok, [{binary(), [{integer(), pos_integer()}]}]} | {:error, term()}
   def query(tenant, %AST.LogQuery{} = query, window) do
-    opts = %{start_ts_ns: window.start_ns, end_ts_ns: window.end_ns}
+    opts = Map.merge(Map.take(window, [:timeout_ms]), %{start_ts_ns: window.start_ns, end_ts_ns: window.end_ns})
 
     QueryRunner.run(
       tenant,

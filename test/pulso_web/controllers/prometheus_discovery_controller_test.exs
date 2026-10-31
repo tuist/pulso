@@ -93,7 +93,7 @@ defmodule PulsoWeb.PrometheusDiscoveryControllerTest do
     for pairs <- [
           [{"match[]", ~s(requests{host=~"#{String.duplicate("a", 1025)}"})}],
           [{"match[]", ~s(requests{#{String.duplicate("a", 257)}="a"})}],
-          [{"match[]", ~s(requests{host=~"[a-z&&b]"})}],
+          [{"match[]", ~s(requests{host=~"[z-a]"})}],
           [{"match[]", "sum(requests)"}],
           [{"match[]", "requests[5m]"}],
           [{"match[]", ~s({host=~".*"})}],

@@ -32,11 +32,19 @@ defmodule Pulso.Codec.MetricRegexParityTest do
     refute NIF.match_metric_regex("\\s", "\u00A0")
   end
 
-  test "Rust character-class extensions are rejected rather than changing label matches" do
-    for pattern <- ["[a&&b]", "[a--b]", "[a~~b]", "[[ab]]", "[]a&&b]", "[^]a&&b]"] do
+  test "unsupported classes reject while Go literal members never become set operators" do
+    for pattern <- ["[a--b]", "[z-a]"] do
       assert :error = NIF.validate_metric_regex(pattern)
     end
 
+    for pattern <- ["[a&&b]", "[a~~b]", "[]a&&b]", "[^]a&&b]", "[[ab]]", "[--x]"] do
+      assert :ok = NIF.validate_metric_regex(pattern)
+    end
+
+    for value <- ["a", "&", "b"], do: assert(NIF.match_metric_regex("[a&&b]", value))
+    refute NIF.match_metric_regex("[a&&b]", "z")
+    assert NIF.match_metric_regex("[[ab]]", "a]")
+    refute NIF.match_metric_regex("[[ab]]", "a")
     assert :ok = NIF.validate_metric_regex("[[:alpha:]]")
     assert NIF.match_metric_regex("[[:alpha:]]", "a")
     assert :ok = NIF.validate_metric_regex("a&&b")

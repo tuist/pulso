@@ -154,18 +154,33 @@ fn encode_outcome<'a>(env: Env<'a>, outcome: Outcome) -> Term<'a> {
 // Run `work` on the runtime and send `{reference, result}` to the calling
 // process when it finishes. A caller that exited meanwhile simply never
 // receives it. A panic still answers, so a waiting caller is never stranded.
-fn spawn<F>(env: Env, reference: Term, work: F) -> Atom
+fn spawn<F, Fut>(env: Env, reference: Term, config: StoreConfig, work: F) -> Atom
 where
-    F: Future<Output = Outcome> + Send + 'static,
+    F: FnOnce(Arc<dyn ObjectStore>) -> Fut + Send + 'static,
+    Fut: Future<Output = Outcome> + Send + 'static,
 {
     let pid = env.pid();
     let mut owned = OwnedEnv::new();
     let reference = owned.save(reference);
     RUNTIME.spawn(async move {
-        let outcome = AssertUnwindSafe(work)
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| Err(nif_error("object store request panicked")));
+        let outcome = AssertUnwindSafe(async move {
+            // Neither a cold TLS trust-store load nor a cache lock held by
+            // another builder may block a BEAM or Tokio event-loop thread.
+            let cached = STORES
+                .try_lock()
+                .ok()
+                .and_then(|stores| stores.get(&config).cloned());
+            let store = match cached {
+                Some(store) => store,
+                None => tokio::task::spawn_blocking(move || build_store(&config))
+                    .await
+                    .map_err(nif_error)??,
+            };
+            work(store).await
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(nif_error("object store request panicked")));
         let _ = owned.send_and_clear(&pid, |env| {
             (reference.load(env), encode_outcome(env, outcome)).encode(env)
         });
@@ -177,7 +192,8 @@ where
 // per call created a fresh HTTP connection pool every time, so every PUT
 // and GET paid a new TCP (and TLS) handshake; a cached store keeps
 // connections alive. A config change (e.g. rotated credentials) is a new
-// key and gets its own client. Building a client performs no I/O.
+// key and gets its own client. Cold construction can read local TLS trust
+// stores and is confined to the runtime's blocking pool, including lock waits.
 static STORES: Lazy<Mutex<HashMap<StoreConfig, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -270,9 +286,8 @@ fn put_with(
     data: Binary,
     opts: PutOptions,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
     let payload = payload_from_binary(data);
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let result = store
             .put_opts(&Path::from(key), payload, opts)
             .await
@@ -326,9 +341,8 @@ fn verify<'a>(
     if timeout_ms == 0 {
         return Err(Failure::Atom(atoms::timeout()).into());
     }
-    let store = build_store(&config)?;
     let expected = bytes_from_binary(expected);
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms.min(15_000)),
             async {
@@ -436,8 +450,7 @@ async fn read_body(obj: object_store::GetResult) -> Result<(String, OwnedBinary)
 
 #[rustler::nif]
 fn get<'a>(env: Env<'a>, reference: Term<'a>, config: StoreConfig, key: String) -> NifResult<Atom> {
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let obj = store
             .get(&Path::from(key))
             .await
@@ -487,12 +500,11 @@ fn get_limited(
     etag: String,
     limit: Option<u64>,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
     let opts = GetOptions {
         if_none_match: if etag.is_empty() { None } else { Some(etag) },
         ..GetOptions::default()
     };
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         // 304 comes back as `ObjectStoreError::NotModified`, mapped to
         // `:not_modified`. Callers pattern-match on that and skip parsing.
         let obj = store
@@ -524,8 +536,7 @@ fn discover_tenants<'a>(
     if limit == 0 || limit > 64 {
         return Err(nif_error("invalid discovery limit").into());
     }
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let prefix = Path::from("tenants/");
         let mut cursor = if after.is_empty() { None } else { Some(after) };
         let mut tenants = Vec::new();
@@ -573,8 +584,7 @@ fn list_page<'a>(
     if limit == 0 || limit > 1000 {
         return Err(nif_error("invalid list page limit").into());
     }
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let path = Path::from(prefix);
         let offset = Path::from(after);
         let stream = if offset.as_ref().is_empty() {
@@ -616,7 +626,6 @@ fn delete_bounded<'a>(
     config: StoreConfig,
     key: String,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
     RETENTION_DELETES
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             if n < 4 {
@@ -627,7 +636,7 @@ fn delete_bounded<'a>(
         })
         .map_err(|_| Error::from(Failure::Atom(atoms::retention_overloaded())))?;
     let slot = DeleteSlot;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let _slot = slot;
         store
             .delete(&Path::from(key))
@@ -644,8 +653,7 @@ fn delete<'a>(
     config: StoreConfig,
     key: String,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         store
             .delete(&Path::from(key))
             .await
@@ -661,8 +669,7 @@ fn list<'a>(
     config: StoreConfig,
     prefix: String,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let path = if prefix.is_empty() {
             None
         } else {
@@ -686,8 +693,7 @@ fn list_prefixes<'a>(
     config: StoreConfig,
     prefix: String,
 ) -> NifResult<Atom> {
-    let store = build_store(&config)?;
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         let result = store
             .list_with_delimiter(Some(&Path::from(prefix)))
             .await

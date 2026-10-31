@@ -39,6 +39,22 @@ defmodule PulsoWeb.CompatControllerTest do
             {"sum by()(up)", "sum by () (up)"},
             {"sum without()(up)", "sum without () (up)"},
             {"up/ON(job)GROUP_LEFT(region)other", "up / on (job) group_left (region) other"},
+            {"up ATAN2 ON(job) GROUP_LEFT(region) other", "up atan2 on (job) group_left (region) other"},
+            {~s|sort_by_label_desc(year(up),"zone")|, ~s|sort_by_label_desc(year(up), "zone")|},
+            {"up offset -60 @ END()", "up @ end() offset -1m"},
+            {"sum_over_time(up[600] offset -.25 @ start())", "sum_over_time(up[10m] @ start() offset -250ms)"},
+            {"sum_over_time(up[60:10] @ 1790000000.000000001)", "sum_over_time(up[1m:10s] @ 1790000000.000000001)"},
+            {"sum_over_time(up[130: ])", "sum_over_time(up[2m10s:])"},
+            {"up @ 0X_10 offset 1_0", "up @ 16 offset 10s"},
+            {"sum_over_time(up[(0x10+1_4):])", "sum_over_time(up[(0x10 + 1_4):])"},
+            {~s|sum by ('zone😀',) (up)|, ~s|sum by ("zone😀") (up)|},
+            {~s|up + on ('zone😀',) group_left (`owner name`,) other|,
+             ~s|up + on ("zone😀") group_left ("owner name") other|},
+            {"sum_over_time(up[STEP()+1ms])", "sum_over_time(up[(step() + 1ms)])"},
+            {"up offset -(RANGE()+2m)", "up offset (-(range() + 2m))"},
+            {"vector(1h30m+2.5)", "vector(5400 + 2.5)"},
+            {"up @ -0.000000001 offset -1e-9", "up @ -0.000000001 offset -0.000000001"},
+            {"min_of( end()-start(),max_of(step(),range()))", "min_of(end() - start(), max_of(step(), range()))"},
             {"up>BOOL IGNORING(instance)GROUP_RIGHT other", "up > bool ignoring (instance) group_right other"},
             {"up/ON(job)GROUP_LEFT()other", "up / on (job) group_left () other"},
             {"up and ON() other or third unless fourth", "up and on () other or third unless fourth"},
@@ -94,7 +110,7 @@ defmodule PulsoWeb.CompatControllerTest do
         assert Parser.parse(formatted) === {:ok, parsed}
       end
 
-      operators = ["+", "-", "*", "/", "%", "^", "==", "!=", ">", "<", ">=", "<=", "and", "unless", "or"]
+      operators = ["+", "-", "*", "/", "%", "atan2", "^", "==", "!=", ">", "<", ">=", "<=", "and", "unless", "or"]
 
       for outer <- operators,
           inner <- operators,
@@ -111,7 +127,7 @@ defmodule PulsoWeb.CompatControllerTest do
                build_conn() |> get("/api/v1/format_query", %{"query" => "sum(("}) |> json_response(400)
 
       for method <- [:get, :post],
-          query <- ["", "unknown(up)", "up @ 123", "sum by(job,job)(up)", String.duplicate(" ", 16_385) <> "up"] do
+          query <- ["", "unknown(up)", "up @ time()", "sum by(job,job)(up)", String.duplicate(" ", 16_385) <> "up"] do
         assert %{"status" => "error", "errorType" => "bad_data"} = format_query(query, method, 400)
       end
 

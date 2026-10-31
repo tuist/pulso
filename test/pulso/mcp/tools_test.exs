@@ -601,6 +601,24 @@ defmodule Pulso.MCP.ToolsTest do
   end
 
   describe "query_logql" do
+    @tag :loki_scalars_batch
+    test "scalar literals and vectors retain distinct wire types without log data" do
+      for {query, kind, result} <- [
+            {"0x1.8p3", "scalar", [60.0, "12"]},
+            {"7 > 2", "scalar", [60.0, "1"]},
+            {"10 / 0", "scalar", [60.0, "NaN"]},
+            {"vector(2)", "vector", [%{"metric" => %{}, "value" => [60.0, "2"]}]}
+          ] do
+        assert {:ok, [%{"text" => text}]} =
+                 Tools.call("query_logql", %{"tenant" => "acme", "query" => query, "end_ts_ns" => 60_000_000_000})
+
+        assert JSON.decode!(text) == %{
+                 "status" => "success",
+                 "data" => %{"resultType" => kind, "result" => result, "stats" => %{}}
+               }
+      end
+    end
+
     test "returns a Loki-shaped streams envelope for a log query" do
       :ok =
         Storage.append(:logs, "acme", [

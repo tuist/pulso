@@ -26,12 +26,13 @@ checks are Pulso regressions, not additional upstream integration cases.
 mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs
 ```
 
-Fifty-nine async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
+Sixty-five async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
 owned Bandit listener, persist native Parquet through Pulso's S3 adapter against
 an owned loopback object store, restart manifest supervision, and query JSON and
 protobuf responses. Default tests need no Go, Docker, remote services or network
-downloads. All data and expectations are checked in. The latest additions are
-fifteen public engine-table rows and two separately labelled Pulso controls.
+downloads. All data and expectations are checked in. Additional sections below
+describe the public engine step rows, arithmetic tables and separately labelled
+Pulso controls.
 
 The upstream harness converts Jaeger batches to OTLP/gRPC and queries both live
 and flushed backend data. This port expresses the same resource/span attributes
@@ -45,6 +46,24 @@ lists and protobuf default omission are compared through their protocol shapes.
 Protobuf expectations use Pulso's existing encoder; this tests content
 negotiation/transport consistency, not independent wire conformance (covered by
 the separate public protobuf fixtures).
+
+### Special-character test deadlines
+
+The original Go test uses separate `t.Run` cases for each key, scope and
+WAL/backend phase. The Elixir port retains all 19 enabled pairs together in each
+fixture but separates resource/span scopes and retained/explicit windows into
+four independently owned tests. Each ingests all 19 batches and restarts
+manifest supervision before querying. JSON and protobuf assertions, the full
+expected responses and the separate encoded/raw-slash test are unchanged.
+There are still 152 retrievals, now 38 per test instead of 152 sharing one
+60-second deadline. This adds three fixture setups; it is not a query-speed
+improvement or a production timeout change.
+
+Run this subset with `mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs --only special_characters`.
+An instrumented replay of the formerly failing seed617 passed all four tests
+in 1.8–5.3 seconds each with `timeout=60000` and `trace=false`. That confirms
+the ordinary deadline was retained, not relaxed by tracing/slow-test options.
+It does not prove the cause of every historical timeout or provider capacity.
 
 ## Failures reproduced and fixed
 
@@ -364,6 +383,106 @@ expression arithmetic, streaming, deployed clients or provider/capacity parity.
 | Selected lines 35–65 (`TestDefaultQueryRangeStep`) | `b4c1bf93cbfc446f35d2a87c9f4e227524adb9bd7227fd226533f3490b1c19bf` |
 | Inspected `pkg/traceql/engine_metrics.go` (policy at lines 37–81) | `cd05466f788a7a0705578fd79aa47d38a1408ca9609cdbd9b9e6fa8493058e01` |
 
+## Metric arithmetic and scalar-filter continuation
+
+`metrics-math.json` freezes the complete selected test tables at the same
+revision. `Pulso.Traces.MetricExpressionConformanceTest` replays all rows;
+`PulsoWeb.TempoUpstreamIntegrationTest` additionally sends all 87 scalar queries
+through authenticated HTTP and native Parquet against isolated loopback S3.
+Ordinary ExUnit replay needs neither Go nor a downloaded source tree.
+
+| Source | Selection | Replay |
+| --- | --- | --- |
+| `pkg/traceql/engine_metrics_test.go:1044–1707`, `TestScalarMath` | All 87 cases, original 11 spans and exact nanosecond durations; all 522 dense expected values | Memory/native and HTTP/Parquet; NaN slots omitted at response serialization; float/int constant division, precedence, operand order, filters and infinity retained |
+| `tempodb/tempodb_metrics_test.go:1289–2644`, every `math_` row | All 23 cases, 100 original single-span traces, complete L1/L2/L3 expectations | Native batch/final evaluator, asserting L3 samples and labels; not a literal HTTP port |
+| `pkg/traceql/parse_test.go:1966–2179`, `TestMetricsMathExpression{Errors}` | All 18 positive and 6 negative rows | Public metrics parser acceptance/rejection; stored expected Go ASTs are provenance, not asserted Elixir AST shapes |
+
+The storage tests retain start **1 ns**, end **50 s**, step **15 s** and spans
+51–100. The final bucket timestamp of **60 s** does not change the scan end.
+Two identical input sets simulate the original engine's two additive L1
+observations, preserving doubled counts/rates and unchanged maxima before
+arithmetic. HTTP aligns the end to 60 s and would admit additional spans, so
+these 23 storage oracles intentionally bypass HTTP window alignment. L1/L2
+arrays are preserved for provenance; replay asserts the original final L3.
+Random IDs become deterministic while the original fixed trace-30 ID remains.
+Incidental producer fields unused by these queries are omitted.
+
+The AGPL-licensed `metrics-math-producer.go.txt` reproduces the complete JSON
+using only Go's standard library. It executes the original scalar **test-table
+transform closures**, and evaluates original storage expected-value expressions
+with data-only stand-ins. This is not execution of Tempo's engine. Independent
+source-AST checks verified all scalar values (including signed zero/nonfinite
+classes), 376 storage samples across all phases, 163 selected-range hashes and
+the three complete source-file hashes. Both generated files retain attribution;
+no Tempo runtime implementation is copied.
+
+| Artifact or complete source | SHA-256 |
+| --- | --- |
+| `metrics-math.json` | `06f0fe58b96d42e15d8f6c8de7a4a30e5343a016c0cacda1d983e47d917d5738` |
+| `metrics-math-producer.go.txt` | `d0b67faf3bc9cdda5e1ad978c164601abace0789c56c3ed816bd4edb80246ffc` |
+| `pkg/traceql/engine_metrics_test.go` | `6568615e285b21b5094c218444d1a93aa8996d2fda82b5eb65d44f9e1637fe49` |
+| `tempodb/tempodb_metrics_test.go` | `e4315a0ebb5d7ef3fc03097718c8bca7a8a826a4436964b85e4ca77397bf8f1f` |
+| `pkg/traceql/parse_test.go` | `3eef0b3f465ed516623b34568ddd11023739d27612df74c2e26b75916f8dd1af` |
+
+Pulso controls cover instant span-weighted arithmetic, two branches sharing
+exactly one GET per Parquet object, fail-whole HTTP scan quotas, shared native
+series ceilings (5000 groups across two leaves succeed, 5001 fail), typed label
+identity/order/missing groups and invalid-query rejection before storage.
+Integer literal/folding overflow deliberately rejects rather than using Go's
+machine-int wraparound. JSON infinities use Pulso's established string encoding,
+not a claim about Tempo's HTTP nonfinite encoding. Native trace metrics
+capability **3** is required; trace storage/search tuples and keyed bytes do not
+change. Exemplars, full TraceQL, streaming, provider capacity and deployed-client
+acceptance remain separate gaps.
+
+## Shared regex literal controls
+
+The local `:regex_literals_batch` wrapper replays eight quote/octal patterns
+over eight OTLP-ingested one-span traces through native Parquet/S3, after
+restarting local manifest authority. Independent whole-label answers come from
+[`regex/go-controls.json`](../../regex/go-controls.json), not Pulso or inferred
+Tempo results. Both resource/span retained search and JSON/protobuf filtered
+discovery run through HTTP; authenticated HTTP MCP exercises window-local
+`search_traces` and both resource/span raw `query_traces` regex filters.
+Unfinished literal quotes remain fully anchored. Shared fixture provenance
+preserves the complete Go parser-table patterns and independently executed
+matching answers. These local controls use the Tempo integration harness, but
+are not additional upstream integration rows or full client/provider/capacity
+acceptance. Existing trace tuples, storage/keyed bytes and resource ceilings
+are unchanged; upgrade every query-serving app/native pair for these forms.
+
+The local `:regex_admission_batch` replays all 53 shared Go admission patterns
+over eight OTLP-ingested traces through resource/span retained search and
+native Parquet/S3. Independent whole-label expectations distinguish counted
+repetition bounds from literal braces; invalid patterns reject before storage.
+[`regex/README.md`](../../regex/README.md) preserves the eight original Go
+parser-table patterns, local controls, source hashes and matching provenance.
+These are not additional Tempo integration rows or a full regex parity claim.
+
+The same wrapper also replays 32 local literal-class cases from
+[`regex/class-controls.json`](../../regex/class-controls.json), preserving
+`&&`/`~~` members with negation, folding, POSIX classes and adjacent ranges.
+All three protocol wrappers reject valid classes before implementation
+(seed 669); the affected 370-test suites pass seed 670. Trace tuples and all
+resource ceilings stay unchanged; complete class grammar remains open.
+
+The same wrapper also replays 72 local literal-bracket/hyphen-range cases from
+[`regex/range-controls.json`](../../regex/range-controls.json). Independent Go
+answers preserve scalar ranges, literal `[`/POSIX-token boundaries and
+whole-value anchoring, with no storage requests for invalid ranges, escapes,
+groups, flags or counts. All three HTTP wrappers rejected valid `[[]` before
+this fix (seed 673). These are local controls, not extra upstream integration
+rows or full regex/client/capacity acceptance; trace tuples and limits are unchanged.
+
+The same wrapper replays 44 raw-header and 58 inline-flag cases from
+[`regex/name-controls.json`](../../regex/name-controls.json) and
+[`regex/flag-controls.json`](../../regex/flag-controls.json), for both resource
+and span predicates. Invalid headers reject before storage; empty/repeated
+flags preserve whole-value matching and scope. The shared matcher also checks
+actual Go anchored capture maps and `U`/lazy greediness. All three wrappers
+failed the respective baselines (seeds 680/682). These are independent Go
+controls, not extra Tempo integration exports; see the [regex provenance](../../regex/README.md).
+
 ## Explicit remaining gaps
 
 Not imported: intrinsic-name filters, partial/invalid-query fallback, unscoped
@@ -375,7 +494,7 @@ established by these double-quoted fixtures.
 
 Also not ported here: gRPC streaming queries, broader trace-by-ID filters/diffs, partial
 search time bounds, structural/spanset queries, metrics
-exemplars and expression combinations, tenant federation, overrides, receiver
+exemplars and `compare()`, tenant federation, overrides, receiver
 variants, fault/restart/limit matrices, metrics generation, and Tempo-specific
 Kafka/WAL/livestore/block orchestration and cloud-provider tests. Existing Pulso
 trace/export/search/metric tests remain separate evidence, not transplanted

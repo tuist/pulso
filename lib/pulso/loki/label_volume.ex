@@ -17,12 +17,17 @@ defmodule Pulso.Loki.LabelVolume do
   @max_name_bytes 1_048_576
 
   def query(tenant, %AST.LogQuery{stages: []} = query, times, targets, limit, step) do
-    QueryRunner.run(tenant, :logql, fn deadline ->
-      Process.put(:query_deadline_ms, deadline)
-      Process.put(:promql_deadline_ms, deadline)
-      Process.put(:promql_budget, %{work: 0, log_samples: 0, materialized: 0, points: 0})
-      collect(tenant, query, times, targets, limit, step)
-    end)
+    QueryRunner.run(
+      tenant,
+      :logql,
+      fn deadline ->
+        Process.put(:query_deadline_ms, deadline)
+        Process.put(:promql_deadline_ms, deadline)
+        Process.put(:promql_budget, %{work: 0, log_samples: 0, materialized: 0, points: 0})
+        collect(tenant, query, times, targets, limit, step)
+      end,
+      times
+    )
   end
 
   def query(_tenant, _query, _times, _targets, _limit, _step), do: {:error, {:invalid_query_parameter, "query"}}

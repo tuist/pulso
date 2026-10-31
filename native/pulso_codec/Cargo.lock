@@ -715,6 +715,7 @@ dependencies = [
  "memchr",
  "parquet",
  "regex",
+ "regex-syntax",
  "rustler",
  "ryu",
  "simdutf8",

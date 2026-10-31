@@ -53,7 +53,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
     for expression <- [
           ~s/{app="a"} | latency > 9223372036854775808ns/,
           ~s/count_over_time({app="a"} | latency > 9223372036854775807ns1ns [1m])/,
-          ~s/{app="a"} | size > 9223372036854775808B/
+          ~s/{app="a"} | size > 18446744073709551616B/
         ],
         path <- ["/loki/api/v1/query", "/loki/api/v1/query_range"] do
       response = conn |> get(path, %{"query" => expression}) |> json_response(400)

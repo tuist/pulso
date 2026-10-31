@@ -58,9 +58,370 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
     %{store: store}
   end
 
+  @tag :regex_hex_batch
+  test "Pulso controls: braced hex repetition matches Go through remote write and Parquet", %{store: store} do
+    inputs = ["a", "aa", "aaa", "aab", "aabb", "éé", "Éé", "Ā"]
+    samples = inputs |> Enum.with_index(1) |> Map.new()
+
+    bytes =
+      Enum.map_join(inputs, fn input ->
+        field(1, series([{"__name__", "regex_hex"}, {"x", input}], [{@start, samples[input]}]))
+      end)
+
+    assert post_write(bytes).status == 204
+
+    controls =
+      "test/fixtures/regex/go-controls.json"
+      |> File.read!()
+      |> Pulso.JSON.decode!()
+      |> Enum.filter(
+        &(&1["value"] in inputs and String.contains?(&1["pattern"], "\\x{") and String.ends_with?(&1["pattern"], "$"))
+      )
+      |> Enum.group_by(& &1["pattern"])
+
+    for {pattern, rows} <- controls, {operator, matches?} <- [{"=~", true}, {"!~", false}] do
+      query = "regex_hex{x" <> operator <> Pulso.JSON.encode!(pattern) <> "}"
+
+      expected =
+        for row <- rows, row["match"] == matches? do
+          input = row["value"]
+          %{"metric" => %{"__name__" => "regex_hex", "x" => input}, "value" => [@start, to_string(samples[input])]}
+        end
+
+      assert %{"resultType" => "vector", "result" => actual} = data("/api/v1/query", query: query, time: @start)
+      assert Enum.sort(actual) == Enum.sort(expected), query
+
+      response =
+        conn()
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> post("/api/v1/query", URI.encode_query(query: query, time: @start))
+
+      assert %{"data" => %{"result" => actual}} = json_response(response, 200)
+      assert Enum.sort(actual) == Enum.sort(expected), query
+    end
+
+    # Independently checked with Go 1.25.10 regexp.Compile; these are not lazy
+    # forms. Only the first question mark after a repetition is its lazy suffix.
+    for pattern <- ["a???", "a{2}??", ~S"\x{61}{2}??", ~S"\x{61}???", ~S"\x{61}+??", ~S"\x{61}*??"] do
+      params = [query: "regex_hex{x=~" <> Pulso.JSON.encode!(pattern) <> "}", time: @start]
+      assert %{"errorType" => "bad_data"} = conn() |> get("/api/v1/query", params) |> json_response(400)
+
+      response =
+        conn()
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> post("/api/v1/query", URI.encode_query(params))
+
+      assert %{"errorType" => "bad_data"} = json_response(response, 400)
+    end
+
+    assert_parquet(store)
+  end
+
+  @tag :regex_literals_batch
+  test "Go quoted and octal regex literals match whole labels through Parquet", %{store: store} do
+    inputs = [
+      "a",
+      "aa",
+      "ab",
+      "abb",
+      "a.b",
+      "axb",
+      ~S"\d",
+      "\\",
+      "\\\\",
+      "+|*?{[",
+      "+",
+      "++",
+      "ĀĀ",
+      "\na",
+      "prefixabsuffix"
+    ]
+
+    samples = inputs |> Enum.with_index(1) |> Map.new()
+
+    bytes =
+      Enum.map_join(inputs, fn input ->
+        exemplar = field(1, field(1, "trace_id") <> field(2, "literal")) <> double(2, 123) <> uint(3, @start * 1000)
+
+        field(
+          1,
+          series([{"__name__", "regex_literals"}, {"x", input}], [{@start, samples[input]}]) <> field(3, exemplar)
+        )
+      end)
+
+    assert post_write(bytes).status == 204
+
+    controls =
+      "test/fixtures/regex/go-controls.json"
+      |> File.read!()
+      |> Pulso.JSON.decode!()
+      |> Enum.filter(&(Map.has_key?(&1, "label_match") and &1["value"] in inputs))
+      |> Enum.group_by(& &1["pattern"])
+
+    assert map_size(controls) == 30
+
+    for {pattern, rows} <- controls, {operator, matches?} <- [{"=~", true}, {"!~", false}] do
+      query = "regex_literals{x" <> operator <> Pulso.JSON.encode!(pattern) <> "}"
+
+      expected =
+        for row <- rows, row["label_match"] == matches? do
+          input = row["value"]
+          %{"metric" => %{"__name__" => "regex_literals", "x" => input}, "value" => [@start, to_string(samples[input])]}
+        end
+
+      assert %{"resultType" => "vector", "result" => actual} = data("/api/v1/query", query: query, time: @start)
+      assert Enum.sort(actual) == Enum.sort(expected), query
+
+      response =
+        conn()
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> post("/api/v1/query", URI.encode_query(query: query, time: @start))
+
+      assert %{"data" => %{"result" => actual}} = json_response(response, 200)
+      assert Enum.sort(actual) == Enum.sort(expected), query
+    end
+
+    assert %{"result" => [%{"metric" => %{"__name__" => "regex_literals", "x" => "a.b", "out" => "hit"}}]} =
+             data("/api/v1/query",
+               query: ~S'label_replace(regex_literals{x="a.b"}, "out", "hit", "x", "\\Qa.b")',
+               time: @start
+             )
+
+    selector = ~S'regex_literals{x=~"\\Qa.b"}'
+    labels = %{"__name__" => "regex_literals", "x" => "a.b"}
+    assert discovery("/api/v1/series", [start: @start, end: @start + 1], [selector]) == [labels]
+    assert discovery("/api/v1/label/x/values", [start: @start, end: @start + 1], [selector]) == ["a.b"]
+
+    assert data("/api/v1/query_exemplars", query: selector, start: @start, end: @start + 1) == [
+             %{
+               "seriesLabels" => labels,
+               "exemplars" => [%{"labels" => %{"trace_id" => "literal"}, "value" => "123", "timestamp" => @start}]
+             }
+           ]
+
+    assert_parquet(store)
+  end
+
+  @tag :regex_admission_batch
+  test "Go repetition classes and raw headers agree through remote write and Parquet", %{store: store} do
+    inputs = [
+      "x",
+      String.duplicate("x", 999),
+      String.duplicate("x", 1000),
+      String.duplicate("x", 1001),
+      String.duplicate("y", 500),
+      "x{0001}",
+      "x{1001",
+      "x{,1001}"
+    ]
+
+    samples = inputs |> Enum.with_index(1) |> Map.new()
+
+    bytes =
+      Enum.map_join(inputs, fn input ->
+        field(1, series([{"__name__", "regex_admission"}, {"x", input}], [{@start, samples[input]}]))
+      end)
+
+    assert post_write(bytes).status == 204
+
+    cases =
+      Enum.flat_map(
+        [
+          "admission-controls.json",
+          "class-controls.json",
+          "range-controls.json",
+          "name-controls.json",
+          "flag-controls.json",
+          "unicode-controls.json",
+          "nested-repetition-controls.json",
+          "selector-name-controls.json"
+        ],
+        fn file ->
+          ("test/fixtures/regex/" <> file) |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases")
+        end
+      )
+
+    for row <- cases, {operator, matches?} <- [{"=~", true}, {"!~", false}] do
+      query = "regex_admission{x" <> operator <> Pulso.JSON.encode!(row["pattern"]) <> "}"
+      params = [query: query, time: @start]
+      before_reads = Agent.get(store, &{&1.reads, &1.lists, &1.requests})
+      status = if row["valid"], do: 200, else: 400
+      result = conn() |> get("/api/v1/query", params) |> json_response(status)
+
+      form =
+        conn()
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> post("/api/v1/query", URI.encode_query(params))
+        |> json_response(status)
+
+      assert form == result
+
+      if row["valid"] do
+        expected =
+          for value <- row["values"],
+              input = String.duplicate(value["text"], value["repeat"]),
+              input in inputs and value["label_match"] == matches?,
+              do: %{
+                "metric" => %{"__name__" => "regex_admission", "x" => input},
+                "value" => [@start, to_string(samples[input])]
+              }
+
+        assert Enum.sort(result["data"]["result"]) == Enum.sort(expected), query
+      else
+        assert Agent.get(store, &{&1.reads, &1.lists, &1.requests}) == before_reads
+      end
+    end
+
+    assert_parquet(store)
+  end
+
+  @tag :regex_properties_batch
+  test "Unicode properties and scalar complements match upstream through remote write and Parquet", %{store: store} do
+    inputs = [
+      "x",
+      "X",
+      "K",
+      "α",
+      "\uA7CE",
+      "\uA7CF",
+      "\u{16EA0}",
+      "\u{16EBB}",
+      "\u{11DB0}",
+      "\u0378",
+      "XxX",
+      "\u0345",
+      "\u0399",
+      "\uD7FE",
+      "\uD7FF",
+      "\uE000",
+      "\uE001"
+    ]
+
+    samples = inputs |> Enum.with_index(1) |> Map.new()
+
+    bytes =
+      Enum.map_join(inputs, fn input ->
+        field(1, series([{"__name__", "regex_properties"}, {"x", input}], [{@start, samples[input]}]))
+      end)
+
+    assert post_write(bytes).status == 204
+
+    for path <- ["unicode-property-controls.json", "scalar-complement-controls.json"],
+        row <- ("test/fixtures/regex/" <> path) |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases"),
+        Map.get(row, "http", true),
+        {operator, matches?} <- [{"=~", true}, {"!~", false}] do
+      query = "regex_properties{x" <> operator <> Pulso.JSON.encode!(row["pattern"]) <> "}"
+      params = [query: query, time: @start]
+      before_reads = Agent.get(store, &{&1.reads, &1.lists, &1.requests})
+      status = if row["valid"], do: 200, else: 400
+      response = conn() |> get("/api/v1/query", params) |> json_response(status)
+
+      assert conn()
+             |> put_req_header("content-type", "application/x-www-form-urlencoded")
+             |> post("/api/v1/query", URI.encode_query(params))
+             |> json_response(status) == response
+
+      if row["valid"] do
+        expected =
+          for value <- row["values"], value["text"] in inputs, value["label_match"] == matches? do
+            %{
+              "metric" => %{"__name__" => "regex_properties", "x" => value["text"]},
+              "value" => [@start, to_string(samples[value["text"]])]
+            }
+          end
+
+        assert Enum.sort(response["data"]["result"]) == Enum.sort(expected), query
+      else
+        assert Agent.get(store, &{&1.reads, &1.lists, &1.requests}) == before_reads
+      end
+    end
+
+    assert_parquet(store)
+  end
+
+  @tag :regex_selector_names_batch
+  test "label_replace expands numeric and repeated aliases like Go through Parquet", %{store: store} do
+    inputs = ["x", "y", "xy", "hi", "bye", "aba", "xx"]
+    samples = inputs |> Enum.with_index(1) |> Map.new()
+
+    bytes =
+      Enum.map_join(inputs, fn input ->
+        field(1, series([{"__name__", "regex_names"}, {"x", input}, {"out", "existing"}], [{@start, samples[input]}]))
+      end)
+
+    assert post_write(bytes).status == 204
+    fixture = "test/fixtures/regex/selector-name-controls.json" |> File.read!() |> Pulso.JSON.decode!()
+
+    for row <- fixture["cases"], row["valid"] do
+      query =
+        ~s(label_replace(regex_names, "out", #{Pulso.JSON.encode!(fixture["replacement"])}, "x", ) <>
+          Pulso.JSON.encode!(row["pattern"]) <> ")"
+
+      expected =
+        for value <- row["values"], value["text"] in inputs do
+          %{
+            "metric" => %{"__name__" => "regex_names", "x" => value["text"], "out" => value["expanded"] || "existing"},
+            "value" => [@start, to_string(samples[value["text"]])]
+          }
+        end
+
+      params = [query: query, time: @start]
+      response = conn() |> get("/api/v1/query", params) |> json_response(200)
+      assert Enum.sort(response["data"]["result"]) == Enum.sort(expected), query
+
+      assert conn()
+             |> put_req_header("content-type", "application/x-www-form-urlencoded")
+             |> post("/api/v1/query", URI.encode_query(params))
+             |> json_response(200) == response
+    end
+
+    assert_parquet(store)
+  end
+
   # integration/api_endpoints_test.go: TestFormatQueryAPIEndpoint.
   test "TestFormatQueryAPIEndpoint", %{store: store} do
     assert data("/api/v1/format_query", query: "count(up)by(foo)") == "count by (foo) (up)"
+    assert Agent.get(store, & &1.requests) == []
+  end
+
+  # integration/query_frontend_test.go: testQueryFrontend, user-0's scalar and
+  # range-vector results. Freeze the source generator's random float to 0.5.
+  @tag :result_types_batch
+  test "testQueryFrontend / scalar and range-vector results", %{store: store} do
+    bytes = field(1, series([{"__name__", "series_1"}], [{@start, 0.5}]))
+    assert post_write(bytes, :v1, [{"x-scope-orgid", "user-0"}]).status == 204
+
+    assert data("/api/v1/query", [query: "scalar(series_1)", time: @start], "user-0") ==
+             %{"resultType" => "scalar", "result" => [@start, "0.5"]}
+
+    assert data("/api/v1/query", [query: "series_1[5m]", time: @start], "user-0") ==
+             %{
+               "resultType" => "matrix",
+               "result" => [%{"metric" => %{"__name__" => "series_1"}, "values" => [[@start, "0.5"]]}]
+             }
+
+    assert_parquet(store)
+  end
+
+  @tag :result_types_batch
+  test "Pulso rejects range and string results in range requests before storage", %{store: store} do
+    for query <- [~s("text"), "series_1[5m]", "series_1[5m:]"],
+        finish <- [@start, @start + 60],
+        method <- [:get, :post] do
+      params = [query: query, start: @start, end: finish, step: "1m"]
+
+      response =
+        if method == :get,
+          do: get(conn(), "/api/v1/query_range", params),
+          else:
+            conn()
+            |> put_req_header("content-type", "application/x-www-form-urlencoded")
+            |> post("/api/v1/query_range", URI.encode_query(params))
+
+      assert %{"status" => "error", "errorType" => "bad_data", "error" => "Invalid or unsupported query parameters."} ==
+               json_response(response, 400)
+    end
+
     assert Agent.get(store, & &1.requests) == []
   end
 
@@ -634,7 +995,7 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
   # requests. Preserve HTTP/status/errorType, but assert Pulso's complete generic
   # diagnostic envelope, not upstream error-message parity. QueryRangeRaw sends
   # numeric seconds (including -60), not duration strings. The last row's omitted
-  # subquery resolution rejects as unsupported syntax, not range-vector typing.
+  # resolution is valid inside range functions, but a top-level range result rejects.
   for {name, query, first, last, step} <- [
         {"maximum resolution error", "unknown", @start - 86_400, @start, "1"},
         {"negative step", "unknown", @start - 3600, @start, "-60"},

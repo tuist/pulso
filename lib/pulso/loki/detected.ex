@@ -98,7 +98,14 @@ defmodule Pulso.Loki.Detected do
   # -- sampling ---------------------------------------------------------------
 
   defp sample(tenant, query, window, line_limit) do
-    opts = %{start_ts_ns: window.start_ns, end_ts_ns: window.end_ns, limit: line_limit, direction: :backward}
+    opts =
+      Map.merge(Map.take(window, [:timeout_ms]), %{
+        start_ts_ns: window.start_ns,
+        end_ts_ns: window.end_ns,
+        limit: line_limit,
+        direction: :backward
+      })
+
     Evaluator.select_entries(query, tenant, opts, &sample_input/2, fn {entry, record} -> observe(entry, record) end)
   end
 

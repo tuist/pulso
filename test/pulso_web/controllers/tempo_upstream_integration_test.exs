@@ -15,6 +15,7 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Test.CompactionStore
+  alias Pulso.Test.MCPMessages
   alias Pulso.Test.OTLPTraceFixture
   alias Pulso.Test.RuntimePlug
   alias Pulso.Traces.Protobuf
@@ -26,6 +27,11 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
          |> Path.expand(__DIR__)
          |> File.read!()
          |> Pulso.JSON.decode!()
+
+  @math "../../fixtures/traces/tempo_integration/metrics-math.json"
+        |> Path.expand(__DIR__)
+        |> File.read!()
+        |> Pulso.JSON.decode!()
 
   setup do
     store =
@@ -67,6 +73,7 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     Runtime.put_env(:pulso, Storage, adapter: S3)
     Runtime.put_env(:pulso, S3, config)
     start_supervised!(ManifestSupervision)
+    Runtime.share()
 
     server =
       start_supervised!(
@@ -80,8 +87,203 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
       url: "http://127.0.0.1:#{port}",
       headers: [{"authorization", "Bearer " <> token}, {"x-scope-orgid", tenant}],
       tenant: tenant,
+      store: store,
       now: System.system_time(:second)
     }
+  end
+
+  @tag :regex_literals_batch
+  test "Go quoted and octal literals agree across retained search discovery and raw queries", ctx do
+    inputs = ["ab", "abb", "a.b", ~S"\d", "ĀĀ", "\na", "+", "++"]
+
+    ingest(
+      ctx,
+      for input <- inputs do
+        %{
+          "spanCount" => 1,
+          "name" => "regex-literals",
+          "resourceAttr" => "x",
+          "resourceAttVal" => input,
+          "spanAttr" => "x",
+          "spanAttVal" => input
+        }
+      end
+    )
+
+    patterns = [
+      ~S"\Qab\E+",
+      ~S"\Qa.b",
+      ~S"\Q\d\E",
+      ~S"\141+",
+      ~S"\400{2}",
+      ~S"[\012-\234]\141",
+      ~S"\Q+\E+",
+      ~S"\Q(?P<fake>x)[\d]{2}\E"
+    ]
+
+    controls =
+      "test/fixtures/regex/go-controls.json"
+      |> File.read!()
+      |> Pulso.JSON.decode!()
+      |> Enum.filter(&(Map.has_key?(&1, "label_match") and &1["value"] in inputs and &1["pattern"] in patterns))
+      |> Enum.group_by(& &1["pattern"])
+
+    assert map_size(controls) == 8
+
+    for {pattern, rows} <- controls do
+      matches = for row <- rows, row["label_match"], do: row["value"]
+      ids = for {input, index} <- Enum.with_index(inputs, 1), input in matches, do: Integer.to_string(index, 16)
+
+      for scope <- ["resource", "span"] do
+        query = "{ #{scope}.x =~ " <> Pulso.JSON.encode!(pattern) <> " }"
+        response = get(ctx, "/api/search", %{"q" => query})
+        assert Enum.sort(Enum.map(response["traces"], & &1["traceID"])) == Enum.sort(ids), query
+        assert_values(ctx, 2, "span.x", Enum.sort(matches), %{"q" => query})
+      end
+
+      query = "{ resource.x =~ " <> Pulso.JSON.encode!(pattern) <> " }"
+
+      args = %{
+        "tenant" => ctx.tenant,
+        "query" => query,
+        "start_ts_ns" => (ctx.now - 10) * 1_000_000_000,
+        "end_ts_ns" => ctx.now * 1_000_000_000
+      }
+
+      result = call_tool(ctx, "search_traces", args)
+      expected = Enum.map(ids, &String.pad_leading(&1, 32, "0")) |> Enum.sort()
+
+      assert result |> Map.fetch!("traces") |> Enum.map(& &1["trace_id"]) |> Enum.sort() ==
+               expected
+
+      for field <- ["resource_regex", "attributes_regex"] do
+        args = %{"tenant" => ctx.tenant, "fields" => ["trace_id"], field => %{"x" => pattern}}
+        assert call_tool(ctx, "query_traces", args) |> Enum.map(& &1["trace_id"]) |> Enum.sort() == expected
+      end
+    end
+  end
+
+  @tag :regex_admission_batch
+  test "Go repetition classes and raw headers agree in retained trace predicates", ctx do
+    inputs = [
+      "x",
+      String.duplicate("x", 999),
+      String.duplicate("x", 1000),
+      String.duplicate("x", 1001),
+      String.duplicate("y", 500),
+      "x{0001}",
+      "x{1001",
+      "x{,1001}"
+    ]
+
+    ingest(
+      ctx,
+      for input <- inputs do
+        %{
+          "spanCount" => 1,
+          "name" => "regex-admission",
+          "resourceAttr" => "x",
+          "resourceAttVal" => input,
+          "spanAttr" => "x",
+          "spanAttVal" => input
+        }
+      end
+    )
+
+    cases =
+      Enum.flat_map(
+        [
+          "admission-controls.json",
+          "class-controls.json",
+          "range-controls.json",
+          "name-controls.json",
+          "flag-controls.json",
+          "unicode-controls.json",
+          "nested-repetition-controls.json",
+          "selector-name-controls.json"
+        ],
+        fn file ->
+          ("test/fixtures/regex/" <> file) |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases")
+        end
+      )
+
+    for row <- cases, scope <- ["resource", "span"] do
+      query = "{ #{scope}.x =~ " <> Pulso.JSON.encode!(row["pattern"]) <> " }"
+      before_reads = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = Req.get!(ctx.url <> "/api/search", headers: ctx.headers, params: %{"q" => query})
+
+      if row["valid"] do
+        assert response.status == 200, query
+        matches = for value <- row["values"], value["label_match"], do: String.duplicate(value["text"], value["repeat"])
+        ids = for {input, index} <- Enum.with_index(inputs, 1), input in matches, do: Integer.to_string(index, 16)
+        assert Enum.sort(Enum.map(response.body["traces"], & &1["traceID"])) == Enum.sort(ids), query
+      else
+        assert response.status == 400, query
+        assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before_reads
+      end
+    end
+  end
+
+  @tag :regex_properties_batch
+  test "Unicode properties and scalar complements match upstream in retained trace search", ctx do
+    inputs = [
+      "x",
+      "X",
+      "K",
+      "α",
+      "\uA7CE",
+      "\uA7CF",
+      "\u{16EA0}",
+      "\u{16EBB}",
+      "\u{11DB0}",
+      "\u0378",
+      "XxX",
+      "\u0345",
+      "\u0399",
+      "\uD7FE",
+      "\uD7FF",
+      "\uE000",
+      "\uE001"
+    ]
+
+    ingest(
+      ctx,
+      for input <- inputs do
+        %{
+          "spanCount" => 1,
+          "name" => "regex-properties",
+          "resourceAttr" => "x",
+          "resourceAttVal" => input,
+          "spanAttr" => "x",
+          "spanAttVal" => input
+        }
+      end
+    )
+
+    for path <- ["unicode-property-controls.json", "scalar-complement-controls.json"],
+        row <- ("test/fixtures/regex/" <> path) |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases"),
+        Map.get(row, "http", true),
+        scope <- ["resource", "span"] do
+      query = "{ #{scope}.x =~ " <> Pulso.JSON.encode!(row["pattern"]) <> " }"
+      before_reads = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = Req.get!(ctx.url <> "/api/search", headers: ctx.headers, params: %{"q" => query})
+
+      if row["valid"] do
+        assert response.status == 200, query
+        matches = for value <- row["values"], value["label_match"], do: value["text"]
+
+        ids =
+          for {input, index} <- Enum.with_index(inputs, 1),
+              input in matches,
+              do: index |> Integer.to_string(16) |> String.downcase()
+
+        actual = Enum.sort(Enum.map(response.body["traces"], & &1["traceID"]))
+        assert actual == Enum.sort(ids), inspect({query, actual, Enum.sort(ids)})
+      else
+        assert response.status == 400, query
+        assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before_reads
+      end
+    end
   end
 
   test "TestTagEndpoints: v1 unscoped names and service values from persisted data", ctx do
@@ -159,25 +361,30 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     end
   end
 
-  test "TestTagValuesWithSpecialCharacters: all 19 attribute/value pairs in both original scopes", ctx do
-    batches =
+  for scope <- ["resource", "span"], {window_name, window_index} <- [{"retained", 0}, {"explicit", 1}] do
+    @tag :special_characters
+    test "TestTagValuesWithSpecialCharacters: all 19 pairs in #{scope} with #{window_name} bounds", ctx do
+      batches =
+        for [key, value] <- @cases["specialCharacters"] do
+          %{
+            "spanCount" => 1,
+            "name" => "test-service",
+            "resourceAttr" => key,
+            "resourceAttVal" => value,
+            "spanAttr" => key,
+            "spanAttVal" => value
+          }
+        end
+
+      # Retain all 19 pairs together, but give each scope/window its own deadline.
+      ingest(ctx, batches)
+      window = Enum.at(windows(ctx), unquote(window_index))
+
       for [key, value] <- @cases["specialCharacters"] do
-        %{
-          "spanCount" => 1,
-          "name" => "test-service",
-          "resourceAttr" => key,
-          "resourceAttVal" => value,
-          "spanAttr" => key,
-          "spanAttVal" => value
-        }
+        # Tempo quotes identifiers containing TraceQL delimiters, not URL delimiters.
+        identifier = if Regex.match?(~r/[\s{}()=~!<>&|^,]/u, key), do: Pulso.JSON.encode!(key), else: key
+        assert_values(ctx, 2, unquote(scope) <> "." <> identifier, [value], window)
       end
-
-    ingest(ctx, batches)
-
-    for window <- windows(ctx), [key, value] <- @cases["specialCharacters"], scope <- ["resource", "span"] do
-      # Tempo quotes identifiers containing TraceQL delimiters, not URL delimiters.
-      identifier = if Regex.match?(~r/[\s{}()=~!<>&|^,]/u, key), do: Pulso.JSON.encode!(key), else: key
-      assert_values(ctx, 2, scope <> "." <> identifier, [value], window)
     end
   end
 
@@ -844,6 +1051,135 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     assert response.status == 400
   end
 
+  @tag :trace_math_batch
+  test "TestScalarMath: every engine oracle survives authenticated HTTP and native Parquet", ctx do
+    batches =
+      for span <- @math["scalar"]["spans"] do
+        [%{"name" => "foo", "value" => value}] = span["span_attributes"]
+
+        %{
+          "spanCount" => 1,
+          "name" => "span",
+          "resourceAttr" => "unused",
+          "resourceAttVal" => "unused",
+          "spanAttr" => "foo",
+          "spanAttVal" => value,
+          "startNs" => span["start_time_unix_nano"],
+          "durationNs" => span["duration_nano"]
+        }
+      end
+
+    ingest(ctx, batches)
+
+    for row <- @math["scalar"]["cases"] do
+      # Eleven digits select integer nanoseconds even near the Unix epoch.
+      response =
+        get(ctx, "/api/metrics/query_range", %{
+          "q" => row["query"],
+          "start" => "00000000001",
+          "end" => "0003000000000",
+          "step" => "1s"
+        })
+
+      actual =
+        Map.new(response["series"], fn series ->
+          assert [%{"key" => "span.foo", "value" => %{"stringValue" => value}}] = series["labels"]
+          {value, Enum.map(series["samples"], &{String.to_integer(&1["timestampMs"]), &1["value"]})}
+        end)
+
+      expected =
+        Map.new(row["expected"], fn {key, values} ->
+          {key, Enum.zip(@math["scalar"]["timestamps_ms"], values) |> Enum.reject(&(elem(&1, 1) == "NaN"))}
+        end)
+        |> Map.reject(fn {_, values} -> values == [] end)
+
+      assert length(response["series"]) == map_size(expected), row["query"]
+      assert Enum.sort(Map.keys(actual)) == Enum.sort(Map.keys(expected)), row["query"]
+
+      for {key, samples} <- expected do
+        assert Enum.map(actual[key], &elem(&1, 0)) == Enum.map(samples, &elem(&1, 0)), row["query"]
+
+        for {{_, value}, {_, expected}} <- Enum.zip(actual[key], samples) do
+          case expected do
+            "+Inf" -> assert value == "Infinity"
+            "-Inf" -> assert value == "-Infinity"
+            number -> assert_in_delta value, number, max(abs(number) * 1.0e-12, 1.0e-12), row["query"]
+          end
+        end
+      end
+    end
+  end
+
+  @tag :trace_math_batch
+  test "Pulso metric expression controls: branches share object reads and fail-whole scan quotas", ctx do
+    batches =
+      for {offset, count, duration} <- [{1, 2, 100_000_000}, {15, 1, 900_000_000}] do
+        %{
+          "spanCount" => count,
+          "name" => "span",
+          "resourceAttr" => "unused",
+          "resourceAttVal" => "unused",
+          "spanAttr" => "foo",
+          "spanAttVal" => "bar",
+          "startNs" => (1000 + offset) * 1_000_000_000,
+          "durationNs" => duration
+        }
+      end
+
+    ingest(ctx, batches)
+    query = "({} | sum_over_time(duration)) / ({} | count_over_time())"
+    params = %{"q" => query, "start" => 1000, "end" => 1060, "step" => "10s"}
+    before = Agent.get(ctx.store, &length(&1.reads))
+    assert %{"series" => [series]} = get(ctx, "/api/metrics/query_range", params)
+    assert Enum.map(series["samples"], & &1["timestampMs"]) == ["1010000", "1020000"]
+    assert [first, second] = Enum.map(series["samples"], & &1["value"])
+    assert_in_delta first, 0.1, 1.0e-12
+    assert_in_delta second, 0.9, 1.0e-12
+
+    reads =
+      Agent.get(ctx.store, &Enum.take(&1.reads, length(&1.reads) - before))
+      |> Enum.filter(&String.ends_with?(&1, ".parquet"))
+
+    assert length(reads) == 2
+    assert length(Enum.uniq(reads)) == 2
+
+    assert %{"series" => [%{"value" => value}]} = get(ctx, "/api/metrics/query", params)
+    assert_in_delta value, 1.1 / 3, 1.0e-12
+
+    Runtime.put_env(:pulso, Pulso.QueryRunner, max_scan_rows: 2)
+    response = Req.get!(ctx.url <> "/api/metrics/query_range", headers: ctx.headers, params: params)
+    assert response.status == 422
+  end
+
+  @tag :trace_math_batch
+  test "Pulso metric expression controls: invalid and over-complex queries reject before storage", ctx do
+    before = Agent.get(ctx.store, & &1.requests)
+
+    extra = [
+      "1 + 2",
+      "-({} | rate())",
+      "({} | rate()) == 1",
+      "1 > ({} | rate())",
+      "({} | rate()) > ({} | rate())",
+      "({} | rate()) % 2",
+      "({} | rate()) ^ 2",
+      "({} | rate()) * (1/0)",
+      String.duplicate("(", 33) <> "{} | rate()" <> String.duplicate(")", 33)
+    ]
+
+    for query <- Enum.map(@math["grammar"]["negative"], & &1["query"]) ++ extra do
+      response =
+        Req.get!(ctx.url <> "/api/metrics/query",
+          headers: ctx.headers,
+          params: %{"q" => query, "start" => 1, "end" => 3}
+        )
+
+      assert response.status == 400, query
+    end
+
+    assert Agent.get(ctx.store, & &1.requests) == before
+  end
+
   defp ingest_metric_batches(ctx) do
     batches =
       for tick <- 0..19,
@@ -970,5 +1306,23 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     response = Req.get!(ctx.url <> path, headers: ctx.headers, params: params)
     assert response.status == 200, "#{path}: #{inspect(response.body)}"
     response.body
+  end
+
+  defp call_tool(ctx, name, args) do
+    headers =
+      ctx.headers ++
+        [
+          {"accept", "application/json, text/event-stream"},
+          {"mcp-protocol-version", MCPMessages.version()},
+          {"mcp-method", "tools/call"},
+          {"mcp-name", name}
+        ]
+
+    body = MCPMessages.request(1, "tools/call", %{"name" => name, "arguments" => args})
+    response = Req.post!(ctx.url <> "/mcp", headers: headers, json: body)
+    assert response.status == 200
+    refute response.body["result"]["isError"], inspect(response.body)
+    [%{"text" => text}] = response.body["result"]["content"]
+    Pulso.JSON.decode!(text)
   end
 end

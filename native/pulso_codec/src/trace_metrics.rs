@@ -17,7 +17,7 @@ use crate::tempo_expression::Expression;
 use crate::trace_search::{field, object, result, string, Error, Res};
 use arrow::array::{Array, Int64Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use rustler::{Binary, Env, ListIterator, ResourceArc, Term};
+use rustler::{Binary, Env, ListIterator, NewBinary, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
@@ -149,10 +149,22 @@ struct State {
     // Second stage: `topk(k)` (true) or `bottomk(k)` (false).
     second: Option<(bool, usize)>,
     series: HashMap<Key, Series>,
-    work: usize,
 }
 
-pub struct Metrics(Mutex<Option<State>>);
+#[derive(Default)]
+struct Budget {
+    series: usize,
+    points: usize,
+    work: usize,
+    label_bytes: usize,
+}
+
+struct Batch {
+    states: Vec<State>,
+    budget: Budget,
+}
+
+pub struct Metrics(Mutex<Option<Batch>>);
 
 #[rustler::resource_impl]
 impl rustler::Resource for Metrics {}
@@ -173,7 +185,7 @@ fn lookup(scope: &str, key: &str) -> Res<Lookup> {
 
 #[rustler::nif]
 fn trace_metrics_api_version() -> u32 {
-    2
+    3
 }
 
 /// `program` is a `tempo_expression` program or nil; `op` an operation name;
@@ -248,7 +260,7 @@ fn trace_metrics_new<'a>(
         let needs_attributes = value.as_ref().is_some_and(Lookup::original)
             || by.iter().any(|(lookup, _)| lookup.original());
         let requires_originals = needs_attributes || program.is_some();
-        Ok(ResourceArc::new(Metrics(Mutex::new(Some(State {
+        let state = State {
             program,
             root_only,
             needs_attributes,
@@ -265,7 +277,48 @@ fn trace_metrics_new<'a>(
             },
             second,
             series: HashMap::new(),
-            work: 0,
+        };
+        Ok(ResourceArc::new(Metrics(Mutex::new(Some(Batch {
+            states: vec![state],
+            budget: Budget::default(),
+        })))))
+    };
+    result(env, build())
+}
+
+/// A single storage scan feeds every unique expression leaf. Consuming fresh
+/// accumulators prevents aliasing their mutable states or resetting budgets.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn trace_metrics_batch_new<'a>(env: Env<'a>, leaves: Vec<ResourceArc<Metrics>>) -> Term<'a> {
+    let build = || {
+        if leaves.is_empty() || leaves.len() > 16 {
+            return Err(Error::Budget);
+        }
+        let mut states = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let batch = leaf
+                .0
+                .try_lock()
+                .map_err(|_| Error::Invalid)?
+                .take()
+                .ok_or(Error::Invalid)?;
+            if batch.states.len() != 1 || batch.budget.series != 0 {
+                return Err(Error::Invalid);
+            }
+            Extend::extend(&mut states, batch.states);
+        }
+        let window = &states[0].mapper;
+        if states.iter().any(|s| {
+            s.mapper.start != window.start
+                || s.mapper.end != window.end
+                || s.mapper.step != window.step
+                || s.mapper.instant != window.instant
+        }) {
+            return Err(Error::Invalid);
+        }
+        Ok(ResourceArc::new(Metrics(Mutex::new(Some(Batch {
+            states,
+            budget: Budget::default(),
         })))))
     };
     result(env, build())
@@ -282,8 +335,11 @@ fn trace_metrics_add<'a>(
 ) -> Term<'a> {
     let add = || {
         let mut lock = metrics.0.try_lock().map_err(|_| Error::Budget)?;
-        let state = lock.as_mut().ok_or(Error::Invalid)?;
-        let outcome = state.scan(crate::erlang_bytes::from_binary(blob), floor);
+        let batch = lock.as_mut().ok_or(Error::Invalid)?;
+        let bytes = crate::erlang_bytes::from_binary(blob);
+        let outcome = batch.states.iter_mut().try_fold(0, |_, state| {
+            state.scan(bytes.clone(), floor, &mut batch.budget)
+        });
         if outcome.is_err() {
             *lock = None;
         }
@@ -297,19 +353,81 @@ fn trace_metrics_add<'a>(
 #[rustler::nif(schedule = "DirtyCpu")]
 fn trace_metrics_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -> Term<'a> {
     let finish = || {
-        let state = metrics
+        let mut batch = metrics
             .0
             .lock()
             .map_err(|_| Error::Invalid)?
             .take()
             .ok_or(Error::Invalid)?;
-        state.finish(env)
+        if batch.states.len() != 1 {
+            return Err(Error::Invalid);
+        }
+        batch.states.remove(0).finish(env)
+    };
+    result(env, finish())
+}
+
+/// Complete interval arrays, including IEEE NaNs, without JSON round trips or
+/// timestamp joins that lose sub-millisecond slots. Values are big-endian f64.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn trace_metrics_batch_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -> Term<'a> {
+    let finish = || {
+        let batch = metrics
+            .0
+            .try_lock()
+            .map_err(|_| Error::Invalid)?
+            .take()
+            .ok_or(Error::Invalid)?;
+        let mut points = 0usize;
+        let mut bytes = 0usize;
+        let mut leaves = Vec::with_capacity(batch.states.len());
+        for mut state in batch.states {
+            // Bound quantile expansion before allocating final arrays. This
+            // conservative bound also includes buckets and empty identities.
+            let expansion = match &state.op {
+                Op::Quantile(qs) => qs.len(),
+                _ => 1,
+            };
+            points =
+                points.saturating_add(state.series.len().max(1) * state.mapper.count * expansion);
+            if points > MAX_POINTS {
+                return Err(Error::Budget);
+            }
+            let mut finals = state.final_series()?;
+            state.series = HashMap::new();
+            if let Some((top, k)) = state.second {
+                finals = select_k(finals, top, k, state.mapper.count);
+            }
+            let mut series = Vec::with_capacity(finals.len());
+            for (labels, values) in finals {
+                bytes = bytes.saturating_add(values.len() * 8);
+                bytes = bytes.saturating_add(labels.iter().map(|(k, v)| k.len() + v.len()).sum());
+                if bytes > MAX_OUTPUT {
+                    return Err(Error::Budget);
+                }
+                let mut packed = NewBinary::new(env, values.len() * 8);
+                for (slot, value) in packed.as_mut_slice().chunks_exact_mut(8).zip(values) {
+                    slot.copy_from_slice(&value.to_be_bytes());
+                }
+                let labels: Vec<_> = labels
+                    .into_iter()
+                    .map(|(key, raw)| {
+                        let mut value = NewBinary::new(env, raw.len());
+                        value.as_mut_slice().copy_from_slice(&raw);
+                        (key, Binary::from(value))
+                    })
+                    .collect();
+                series.push((labels, Binary::from(packed)));
+            }
+            leaves.push(series);
+        }
+        Ok(leaves)
     };
     result(env, finish())
 }
 
 impl State {
-    fn scan(&mut self, blob: bytes::Bytes, floor: i64) -> Res<usize> {
+    fn scan(&mut self, blob: bytes::Bytes, floor: i64, budget: &mut Budget) -> Res<usize> {
         let reader = ParquetRecordBatchReaderBuilder::try_new(blob)
             .map_err(|_| Error::Invalid)?
             .with_batch_size(1024)
@@ -347,7 +465,7 @@ impl State {
                 let payload = payloads.value(i).as_bytes();
                 let fields =
                     crate::tempo_search::validate_row(ids.value(i), start, ends.value(i), payload)?;
-                self.observe(&fields, interval, start, ends.value(i))?;
+                self.observe(&fields, interval, start, ends.value(i), budget)?;
             }
         }
         Ok(rows)
@@ -359,6 +477,7 @@ impl State {
         interval: usize,
         start: i64,
         end: i64,
+        budget: &mut Budget,
     ) -> Res<()> {
         if self.requires_originals && field(fields, b"otlp").unwrap_or(b"null") == b"null" {
             return Err(Error::Unknown);
@@ -367,7 +486,7 @@ impl State {
             return Ok(());
         }
         if let Some(program) = &self.program {
-            if !program.evaluate(fields, &mut self.work, false)?.matched {
+            if !program.evaluate(fields, &mut budget.work, false)?.matched {
                 return Ok(());
             }
         }
@@ -404,14 +523,21 @@ impl State {
             value
         };
         let key = (labels, bucket);
-        let full = self.series.len() >= MAX_SERIES
-            || (self.series.len() + 1) * self.mapper.count > MAX_POINTS;
+        let full = budget.series >= MAX_SERIES
+            || budget.points.saturating_add(self.mapper.count) > MAX_POINTS;
         let series = match self.series.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 if full {
                     return Err(Error::Groups);
                 }
+                let label_bytes = entry.key().0.iter().flatten().map(Vec::len).sum::<usize>();
+                budget.label_bytes = budget.label_bytes.saturating_add(label_bytes);
+                if budget.label_bytes > MAX_OUTPUT {
+                    return Err(Error::Budget);
+                }
+                budget.series += 1;
+                budget.points += self.mapper.count;
                 let fill = if self.op.zero_filled() { 0.0 } else { f64::NAN };
                 entry.insert(Series {
                     values: vec![fill; self.mapper.count],

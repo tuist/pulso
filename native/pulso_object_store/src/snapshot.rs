@@ -63,7 +63,6 @@ fn get_snapshot<'a>(
     {
         return Err(nif_error("invalid snapshot bounds").into());
     }
-    let store = build_store(&config)?;
     let opts = GetOptions {
         if_match: if etag.is_empty() {
             None
@@ -77,7 +76,7 @@ fn get_snapshot<'a>(
         },
         ..GetOptions::default()
     };
-    Ok(spawn(env, reference, async move {
+    Ok(spawn(env, reference, config, move |store| async move {
         tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
             let obj = store
                 .get_opts(&Path::from(key), opts)

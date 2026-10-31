@@ -72,7 +72,7 @@ defmodule Pulso.Traces.Search do
   defp match_pair?(%{"value" => %{"stringValue" => value}}, "=", wanted), do: value == wanted
 
   defp match_pair?(%{"value" => %{"stringValue" => value}}, "=~", wanted),
-    do: NIF.match_metric_regex("(?s:\\A(?:#{wanted})\\z)", value)
+    do: NIF.match_metric_regex(Pulso.QueryRegex.anchor(wanted), value)
 
   defp match_pair?(_, _, _), do: false
 

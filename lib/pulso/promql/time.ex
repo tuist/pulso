@@ -1,11 +1,44 @@
 defmodule Pulso.PromQL.Time do
-  @moduledoc "Exact decimal-second parsing at the metrics query boundary."
+  @moduledoc "Exact query timestamp parsing and UTC calendar extraction."
   @max_ns 9_223_372_036_854_775_807
+  @absolute_epoch Calendar.ISO.date_to_iso_days(-292_277_022_400, 3, 1)
+  @unix_to_absolute (Calendar.ISO.date_to_iso_days(1970, 1, 1) - @absolute_epoch) * 86_400
 
   # Prometheus stores millisecond timestamps. Avoid a preliminary float
   # rounding of the much larger ns integer for remote-write-aligned values.
   def seconds(ns) when rem(ns, 1_000_000) == 0, do: div(ns, 1_000_000) / 1000
   def seconds(ns), do: ns / 1_000_000_000
+
+  def calendar(name, value) do
+    # Go's UTC time.Unix uses unsigned seconds from this absolute epoch.
+    # Preserve its wrap at int64 extremes instead of DateTime's year limits.
+    absolute = Integer.mod(calendar_seconds(value) + @unix_to_absolute, 18_446_744_073_709_551_616)
+    days = div(absolute, 86_400) + @absolute_epoch
+    {year, month, day} = Calendar.ISO.date_from_iso_days(days)
+
+    result =
+      case name do
+        "year" -> year
+        "month" -> month
+        "day_of_month" -> day
+        "day_of_week" -> Integer.mod(days + 6, 7)
+        "day_of_year" -> days - Calendar.ISO.date_to_iso_days(year, 1, 1) + 1
+        "days_in_month" -> Calendar.ISO.days_in_month(year, month)
+        "hour" -> div(rem(absolute, 86_400), 3600)
+        "minute" -> div(rem(absolute, 3600), 60)
+      end
+
+    result * 1.0
+  end
+
+  # Freeze Go 1.25 arm64's float-to-int64 conversion, whose nonfinite and
+  # out-of-range behavior is architecture-dependent in Go. Fractions truncate.
+  defp calendar_seconds(:nan), do: 0
+  defp calendar_seconds(:infinity), do: @max_ns
+  defp calendar_seconds(:negative_infinity), do: -@max_ns - 1
+  defp calendar_seconds(value) when value >= @max_ns, do: @max_ns
+  defp calendar_seconds(value) when value <= -@max_ns - 1, do: -@max_ns - 1
+  defp calendar_seconds(value), do: trunc(value)
 
   def parse_seconds(value) when is_integer(value), do: bounded(value * 1_000_000_000)
   def parse_seconds(value) when is_float(value), do: parse_seconds(Float.to_string(value))

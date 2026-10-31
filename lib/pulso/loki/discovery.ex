@@ -33,15 +33,21 @@ defmodule Pulso.Loki.Discovery do
   @spec query(String.t(), mode(), String.t(), [AST.Selector.t()], map()) :: {:ok, binary()} | {:error, term()}
   def query(tenant, mode, key, selectors, times) when mode in [:names, :values, :series] do
     with :ok <- validate(mode, key, selectors) do
-      QueryRunner.run(tenant, :discovery, fn deadline ->
-        base =
-          [start_ts: times[:start_ns], end_ts: times[:end_ns]] ++ QueryRunner.storage_opts(deadline, @reference_records)
+      QueryRunner.run(
+        tenant,
+        :discovery,
+        fn deadline ->
+          base =
+            [start_ts: times[:start_ns], end_ts: times[:end_ns]] ++
+              QueryRunner.storage_opts(deadline, @reference_records)
 
-        selectors
-        |> branches()
-        |> Enum.reduce_while({:ok, []}, &discover_branch(&1, &2, tenant, mode, key, base))
-        |> merge(mode)
-      end)
+          selectors
+          |> branches()
+          |> Enum.reduce_while({:ok, []}, &discover_branch(&1, &2, tenant, mode, key, base))
+          |> merge(mode)
+        end,
+        times
+      )
       |> budget_error()
     end
   end

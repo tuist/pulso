@@ -9,8 +9,10 @@ defmodule PulsoWeb.LokiQueryController do
   across ingest and query.
 
   Finite reads accept `X-Loki-Query-Limits: {"maxQueryLength":"1m"}` as
-  an additional request-local time-window ceiling. No other policy fields
-  are supported; invalid/ambiguous policies reject rather than run unlimited.
+  an additional request-local time-window ceiling. Queries also support
+  `maxQueryInterval`, `maxEntriesLimitPerQuery`, `requiredLabels` and
+  `minimumLabelsNumber`. `maxQueryTime` tightens worker deadlines for finite
+  reads; invalid/ambiguous or unsupported policies reject rather than run unlimited.
   Existing server admission and resource budgets always remain authoritative.
 
   Endpoints:
@@ -67,8 +69,11 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- parse_query(query_str),
          {:ok, opts} <- build_opts(params, mode),
-         :ok <- query_length_limit(conn, query_window_start(ast, opts), opts.end_ts_ns) do
-      dispatch_eval(conn, ast, tenant, opts)
+         {:ok, limits} <- request_query_limits(conn),
+         :ok <- validate_query_length(limits, query_window_start(ast, opts), opts.end_ts_ns),
+         :ok <- query_expression_limits(ast, opts, limits),
+         :ok <- query_matcher_limits(ast, limits) do
+      dispatch_eval(conn, ast, tenant, query_timeout(opts, limits))
     else
       err -> render_error(conn, err)
     end
@@ -90,6 +95,7 @@ defmodule PulsoWeb.LokiQueryController do
     case Evaluator.evaluate_metric(ast, tenant, opts) do
       {:ok, {:matrix, series}} -> json(conn, Envelope.matrix(series, flags))
       {:ok, {:vector, series}} -> json(conn, Envelope.vector(series, flags))
+      {:ok, {:scalar, series}} -> json(conn, Envelope.scalar(series, flags))
       {:error, reason} -> render_query_error(conn, reason)
     end
   end
@@ -126,7 +132,7 @@ defmodule PulsoWeb.LokiQueryController do
     with :ok <- Auth.verify(conn, tenant),
          {:ok, selectors} <- discovery_selectors(params, selector_param),
          {:ok, times} <- discovery_times(params),
-         :ok <- query_length_limit(conn, times.start_ns, times.end_ns),
+         {:ok, times} <- query_window_limits(conn, times),
          {:ok, json} <- Discovery.query(tenant, mode, key, selectors, times) do
       conn
       |> put_resp_content_type("application/json")
@@ -196,7 +202,7 @@ defmodule PulsoWeb.LokiQueryController do
     with :ok <- Auth.verify(conn, tenant),
          {:ok, selectors} <- discovery_selectors(params, "query"),
          {:ok, times} <- discovery_times(params),
-         :ok <- query_length_limit(conn, times.start_ns, times.end_ns),
+         {:ok, times} <- query_window_limits(conn, times),
          {:ok, stats} <- index_stats(tenant, selectors, times) do
       json(conn, %{"streams" => 0, "chunks" => stats.segments, "entries" => stats.entries, "bytes" => stats.bytes})
     else
@@ -211,11 +217,16 @@ defmodule PulsoWeb.LokiQueryController do
         _ -> nil
       end
 
-    QueryRunner.run(tenant, :discovery, fn deadline ->
-      opts = [start_ts: times.start_ns, end_ts: times.end_ns] ++ QueryRunner.storage_opts(deadline)
-      opts = if service, do: Keyword.put(opts, :service, service), else: opts
-      Storage.log_index_stats(tenant, opts)
-    end)
+    QueryRunner.run(
+      tenant,
+      :discovery,
+      fn deadline ->
+        opts = [start_ts: times.start_ns, end_ts: times.end_ns] ++ QueryRunner.storage_opts(deadline)
+        opts = if service, do: Keyword.put(opts, :service, service), else: opts
+        Storage.log_index_stats(tenant, opts)
+      end,
+      times
+    )
   end
 
   @doc """
@@ -243,7 +254,7 @@ defmodule PulsoWeb.LokiQueryController do
     with {:ok, query, selector} <- volume_selector(params),
          {:ok, ast} <- Parser.parse(query),
          {:ok, times} <- discovery_times(params),
-         :ok <- query_length_limit(conn, times.start_ns, times.end_ns),
+         {:ok, times} <- query_window_limits(conn, times),
          {:ok, limit} <- volume_limit(params["limit"]),
          {:ok, targets} <- label_volume_targets(params["targetLabels"], selector),
          {:ok, step} <- label_volume_step(mode, params["step"], times),
@@ -281,7 +292,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp series_volume(conn, params, mode) do
     with {:ok, query, selector} <- volume_selector(params),
          {:ok, times} <- discovery_times(params),
-         :ok <- query_length_limit(conn, times.start_ns, times.end_ns),
+         {:ok, times} <- query_window_limits(conn, times),
          {:ok, limit} <- volume_limit(params["limit"]),
          :ok <- volume_aggregation(params["aggregateBy"]),
          {:ok, labels} <- volume_labels(params["targetLabels"], selector) do
@@ -355,7 +366,7 @@ defmodule PulsoWeb.LokiQueryController do
     with :ok <- Auth.verify(conn, tenant),
          {:ok, selectors} <- discovery_selectors(params, "query"),
          {:ok, window} <- detected_window(params),
-         :ok <- query_length_limit(conn, window.start_ns, window.end_ns),
+         {:ok, window} <- query_window_limits(conn, window),
          {:ok, labels} <- Detected.labels(tenant, selectors, window) do
       json(conn, %{"detectedLabels" => Enum.map(labels, &%{"label" => &1.label, "cardinality" => &1.cardinality})})
     else
@@ -405,10 +416,13 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, ast} <- tail_query(query_str),
          :ok <- tail_validate(ast),
          {:ok, window} <- detected_window(params),
-         :ok <- query_length_limit(conn, window.start_ns, window.end_ns),
+         {:ok, limits} <- request_query_limits(conn),
+         :ok <- validate_query_length(limits, window.start_ns, window.end_ns),
          {:ok, line_limit} <- detected_limit(params["line_limit"], 100, "line_limit"),
-         {:ok, limit} <- detected_limit(params["limit"] || params["field_limit"], 1000, "limit") do
-      {:ok, tenant, ast, window, line_limit, limit}
+         {:ok, limit} <- detected_limit(params["limit"] || params["field_limit"], 1000, "limit"),
+         :ok <- query_expression_limits(ast, %{limit: line_limit}, limits),
+         :ok <- query_matcher_limits(ast, limits) do
+      {:ok, tenant, ast, query_timeout(window, limits), line_limit, limit}
     end
   end
 
@@ -464,9 +478,11 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- tail_query(query_str),
          {:ok, window} <- detected_window(params),
-         :ok <- query_length_limit(conn, window.start_ns, window.end_ns),
+         {:ok, limits} <- request_query_limits(conn),
+         :ok <- validate_query_length(limits, window.start_ns, window.end_ns),
+         :ok <- query_matcher_limits(ast, limits),
          {:ok, step} <- patterns_step(params["step"], window),
-         {:ok, patterns} <- Patterns.query(tenant, ast, Map.put(window, :step_ns, step)) do
+         {:ok, patterns} <- Patterns.query(tenant, ast, window |> Map.put(:step_ns, step) |> query_timeout(limits)) do
       data =
         Enum.map(patterns, fn {pattern, samples} ->
           %{"pattern" => pattern, "samples" => Enum.map(samples, fn {ts, n} -> [div(ts, 1_000_000_000), n] end)}
@@ -778,20 +794,99 @@ defmodule PulsoWeb.LokiQueryController do
   defp query_window_start(%AST.LogQuery{}, opts), do: Map.get(opts, :start_ts_ns)
   defp query_window_start(_ast, opts), do: Map.get(opts, :start_ts_ns, opts.end_ts_ns)
 
-  defp query_length_limit(conn, start, finish) do
-    with {:ok, limit} <- request_query_length(conn) do
-      cond do
-        limit == 0 -> :ok
-        start == nil -> {:error, {:invalid_query_limits, "a positive maxQueryLength requires a finite start"}}
-        finish - start > limit -> {:error, {:query_length_exceeded, finish - start, limit}}
-        true -> :ok
-      end
+  defp query_window_limits(conn, times) do
+    with {:ok, limits} <- request_query_limits(conn),
+         :ok <- validate_query_length(limits, times.start_ns, times.end_ns) do
+      {:ok, query_timeout(times, limits)}
     end
   end
 
-  defp request_query_length(conn) do
+  # Model durations have millisecond precision. Zero leaves the server timeout
+  # intact; QueryRunner caps every positive request at that server timeout.
+  defp query_timeout(opts, limits) do
+    case Map.get(limits, "maxQueryTime", 0) do
+      0 -> opts
+      ns -> Map.put(opts, :timeout_ms, div(ns, 1_000_000))
+    end
+  end
+
+  defp validate_query_length(limits, start, finish) do
+    limit = Map.get(limits, "maxQueryLength", 0)
+
+    cond do
+      limit == 0 -> :ok
+      start == nil -> {:error, {:invalid_query_limits, "a positive maxQueryLength requires a finite start"}}
+      finish - start > limit -> {:error, {:query_length_exceeded, finish - start, limit}}
+      true -> :ok
+    end
+  end
+
+  # Entry limits reject oversized log requests, never silently truncate them.
+  # Metric result points and range-selector intervals are separate policies.
+  defp query_expression_limits(%AST.LogQuery{}, opts, limits) do
+    limit = Map.get(limits, "maxEntriesLimitPerQuery", 0)
+
+    if limit > 0 and opts.limit > limit,
+      do:
+        {:error,
+         {:query_policy_exceeded,
+          "max entries limit per query exceeded, limit > max_entries_limit_per_query (#{opts.limit} > #{limit})"}},
+      else: :ok
+  end
+
+  defp query_expression_limits(ast, _opts, limits),
+    do: query_interval_limit(ast, Map.get(limits, "maxQueryInterval", 0))
+
+  defp query_interval_limit(_, 0), do: :ok
+
+  defp query_interval_limit(%AST.RangeAgg{range_ns: range}, limit) when range > limit,
+    do: {:error, {:query_policy_exceeded, "[interval] value exceeds limit: [#{range}ns] > [#{limit}ns]"}}
+
+  defp query_interval_limit(%AST.BinaryOp{left: left, right: right}, limit) do
+    with :ok <- query_interval_limit(left, limit), do: query_interval_limit(right, limit)
+  end
+
+  defp query_interval_limit(%AST.VectorAgg{inner: inner}, limit), do: query_interval_limit(inner, limit)
+  defp query_interval_limit(%AST.LabelReplace{inner: inner}, limit), do: query_interval_limit(inner, limit)
+  defp query_interval_limit(_, _), do: :ok
+
+  # Each selector must satisfy the policy independently. Pipeline filters and
+  # aggregation labels do not supply stream matchers. Loki counts repeated
+  # matcher names toward minimumLabelsNumber, but requiredLabels is a set.
+  defp query_matcher_limits(%AST.LogQuery{selector: selector}, limits) do
+    present = Enum.map(selector.matchers, & &1.name)
+    missing = Enum.reject(Map.get(limits, "requiredLabels", []), &(&1 in present))
+    minimum = Map.get(limits, "minimumLabelsNumber", 0)
+    labels = Enum.join(present, ", ")
+
+    cond do
+      missing != [] ->
+        {:error,
+         {:query_policy_exceeded,
+          "stream selector is missing required matchers [#{Enum.join(missing, ", ")}], labels present in the query were [#{labels}]"}}
+
+      length(present) < minimum ->
+        {:error,
+         {:query_policy_exceeded,
+          "stream selector has less label matchers than required: (present: [#{labels}], number_present: #{length(present)}, required_number_label_matchers: #{minimum})"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp query_matcher_limits(%AST.BinaryOp{left: left, right: right}, limits) do
+    with :ok <- query_matcher_limits(left, limits), do: query_matcher_limits(right, limits)
+  end
+
+  defp query_matcher_limits(%AST.RangeAgg{inner: inner}, limits), do: query_matcher_limits(inner, limits)
+  defp query_matcher_limits(%AST.VectorAgg{inner: inner}, limits), do: query_matcher_limits(inner, limits)
+  defp query_matcher_limits(%AST.LabelReplace{inner: inner}, limits), do: query_matcher_limits(inner, limits)
+  defp query_matcher_limits(_, _), do: :ok
+
+  defp request_query_limits(conn) do
     case get_req_header(conn, "x-loki-query-limits") do
-      [] -> {:ok, 0}
+      [] -> {:ok, %{}}
       [header] when byte_size(header) <= 1024 -> parse_query_limits(header)
       _ -> {:error, {:invalid_query_limits, "expected one policy of at most 1024 bytes"}}
     end
@@ -808,13 +903,49 @@ defmodule PulsoWeb.LokiQueryController do
     ]
 
     case JSON.decode(header, nil, options) do
-      {{:object, []}, nil, ""} -> {:ok, 0}
-      {{:object, [{"maxQueryLength", duration}]}, nil, ""} -> query_limit_duration(duration)
-      _ -> {:error, {:invalid_query_limits, "expected only maxQueryLength, without duplicate keys"}}
+      {{:object, pairs}, nil, ""} -> parse_query_limit_fields(pairs)
+      _ -> {:error, {:invalid_query_limits, "expected a policy object"}}
     end
   rescue
     JSON.DecodeError -> {:error, {:invalid_query_limits, "malformed JSON policy"}}
   end
+
+  defp parse_query_limit_fields(pairs) do
+    Enum.reduce_while(pairs, {:ok, %{}}, fn {key, value}, {:ok, limits} ->
+      with false <- Map.has_key?(limits, key),
+           {:ok, value} <- query_limit_value(key, value) do
+        {:cont, {:ok, Map.put(limits, key, value)}}
+      else
+        true -> {:halt, {:error, {:invalid_query_limits, "duplicate policy field"}}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp query_limit_value(key, value) when key in ["maxQueryLength", "maxQueryInterval", "maxQueryTime"] do
+    case query_limit_duration(value) do
+      {:ok, value} -> {:ok, value}
+      :error -> {:error, {:invalid_query_limits, "invalid #{key} duration"}}
+    end
+  end
+
+  defp query_limit_value(key, value)
+       when key in ["maxEntriesLimitPerQuery", "minimumLabelsNumber"] and is_integer(value) and value >= 0 and
+              value <= 9_223_372_036_854_775_807, do: {:ok, value}
+
+  defp query_limit_value(key, _) when key in ["maxEntriesLimitPerQuery", "minimumLabelsNumber"],
+    do: {:error, {:invalid_query_limits, "invalid #{key} integer"}}
+
+  defp query_limit_value("requiredLabels", value) when is_list(value) do
+    if Enum.all?(value, &is_binary/1),
+      do: {:ok, Enum.uniq(value)},
+      else: {:error, {:invalid_query_limits, "invalid requiredLabels string array"}}
+  end
+
+  defp query_limit_value("requiredLabels", _),
+    do: {:error, {:invalid_query_limits, "invalid requiredLabels string array"}}
+
+  defp query_limit_value(_, _), do: {:error, {:invalid_query_limits, "unsupported policy field"}}
 
   # Prometheus model.Duration grammar used by the pinned Loki header: ordered,
   # unrepeated integer y/w/d/h/m/s/ms components, or a bare zero. Quantity owns
@@ -830,11 +961,11 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, duration} <- Quantity.duration_literal(text) do
       {:ok, duration}
     else
-      _ -> {:error, {:invalid_query_limits, "invalid maxQueryLength duration"}}
+      _ -> :error
     end
   end
 
-  defp query_limit_duration(_), do: {:error, {:invalid_query_limits, "invalid maxQueryLength duration"}}
+  defp query_limit_duration(_), do: :error
 
   defp tenant_from(conn) do
     case Plug.Conn.get_req_header(conn, "x-scope-orgid") do
@@ -854,6 +985,9 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp render_error(conn, {:error, {:invalid_query_limits, reason}}),
     do: error_json(conn, :bad_request, "invalid_parameter", "X-Loki-Query-Limits: " <> reason)
+
+  defp render_error(conn, {:error, {:query_policy_exceeded, reason}}),
+    do: error_json(conn, :bad_request, "query_limit", reason)
 
   defp render_error(conn, {:error, {:query_length_exceeded, length, limit}}),
     do:

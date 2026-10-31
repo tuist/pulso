@@ -5,6 +5,7 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
 
   alias Pulso.LogQL.MetricEval
   alias Pulso.LogQL.Parser
+  alias Pulso.LogQL.QueryValidation
   alias Pulso.Record.Log
   alias Pulso.Storage
   alias Pulso.Test.MetricEvalReference
@@ -16,7 +17,7 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
       for i <- 1..300 do
         # Coarse timestamps make equal-time entries common.
         ts = Enum.random(0..120) * @second
-        dur = Enum.random(["#{Enum.random(1..500)}", "#{Enum.random(1..500)}", "oops", nil])
+        dur = Enum.random(["#{Enum.random(1..500)}", "#{Enum.random(1..500)}", "oops", "", nil])
         body = "level=info " <> if(dur, do: "dur=#{dur} ", else: "") <> "code=#{Enum.random([200, 500])} n=#{i}"
 
         %Log{
@@ -36,12 +37,11 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
 
     op =
       Enum.random(
-        ~w(count_over_time rate bytes_over_time bytes_rate absent_over_time) ++
-          if(unwrap?,
-            do: ~w(sum_over_time avg_over_time min_over_time max_over_time first_over_time last_over_time
-                   stddev_over_time stdvar_over_time quantile_over_time),
-            else: ~w(first_over_time last_over_time)
-          )
+        if(unwrap?,
+          do: ~w(sum_over_time avg_over_time min_over_time max_over_time first_over_time last_over_time
+                 stddev_over_time stdvar_over_time quantile_over_time absent_over_time rate),
+          else: ~w(count_over_time rate bytes_over_time bytes_rate absent_over_time)
+        )
       )
 
     pipeline = if unwrap?, do: ~s{| logfmt | dur != "oops" or code="500" | unwrap dur}, else: ~s{|= "level"}
@@ -49,7 +49,13 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
     range = Enum.random(["10s", "30s", "1m"])
     offset = Enum.random(["", " offset 15s"])
     param = if op == "quantile_over_time", do: "0.9, ", else: ""
-    grouping = if op != "absent_over_time" and :rand.uniform(3) == 1, do: " by (pod)", else: ""
+
+    grouping =
+      if op in ~w(avg_over_time min_over_time max_over_time first_over_time last_over_time stddev_over_time
+                  stdvar_over_time quantile_over_time) and :rand.uniform(3) == 1,
+        do: " by (pod)",
+        else: ""
+
     inner = "#{op}(#{param}#{selector} #{pipeline} [#{range}]#{offset})#{grouping}"
 
     case :rand.uniform(3) do
@@ -115,6 +121,7 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
     for _ <- 1..150 do
       text = query()
       {:ok, ast} = Parser.parse(text)
+      assert :ok = QueryValidation.validate(ast)
 
       opts =
         Enum.random([

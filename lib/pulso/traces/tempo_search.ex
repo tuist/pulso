@@ -225,7 +225,7 @@ defmodule Pulso.Traces.TempoSearch do
   # per-row compilation. Aggregation/metadata rendering remain independent.
   defp prepare({scope, key, "=~", value}) do
     :ok = NIF.validate_metric_regex(value)
-    {:ok, regex} = NIF.compile_metric_capture_regex(value)
+    {:ok, regex} = NIF.compile_log_regex(Pulso.QueryRegex.anchor(value))
     {scope, key, "=~", regex}
   end
 
@@ -236,7 +236,7 @@ defmodule Pulso.Traces.TempoSearch do
       actual = Map.get(if(scope == "resource", do: resource, else: attrs), key)
 
       is_binary(actual) and
-        if(op == "=", do: actual == value, else: NIF.metric_regex_captures(value, actual) != nil)
+        if(op == "=", do: actual == value, else: NIF.match_log_regex(value, actual))
     end)
   end
 

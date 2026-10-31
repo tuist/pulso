@@ -258,13 +258,12 @@ fn stage(term: Term<'_>) -> Res<Stage> {
             regex: pcre_compatible(&text(parts[1])?)?,
         })
     } else if tag == atoms::regexp() {
-        let regex = pcre_compatible(&text(parts[1])?)?;
-        let names = regex
-            .capture_names()
-            .enumerate()
-            .filter_map(|(i, name)| name.map(|n| (n.to_owned(), i)))
-            .collect();
-        Ok(Stage::Regexp { regex, names })
+        let (regex, metadata) = crate::query_regex::bytes_with_metadata(&text(parts[1])?)
+            .map_err(|_| Error::Fallback)?;
+        Ok(Stage::Regexp {
+            regex,
+            names: metadata.into_parser_names().ok_or(Error::Fallback)?,
+        })
     } else if tag == atoms::label_filter() {
         Ok(Stage::Labels(filter(parts[1], 0)?))
     } else {
@@ -281,7 +280,7 @@ fn names(term: Term<'_>) -> Res<Vec<String>> {
 
 #[rustler::nif]
 fn log_metric_api_version() -> u32 {
-    3
+    16
 }
 
 /// `stages` is the pipeline after pushdown; `value` is `:count`, `:bytes` or
@@ -537,6 +536,7 @@ type Labels = BTreeMap<String, String>;
 struct EntryLabels {
     labels: Labels,
     stream_keys: HashSet<String>,
+    metadata_keys: HashSet<String>,
 }
 // A row's stream identity within one batch: resource, attributes, service, level.
 type StreamKey<'b> = (&'b str, &'b str, Option<&'b str>, Option<&'b str>);
@@ -632,8 +632,7 @@ impl State {
                     }
                 };
                 if let Some(labels) = self.pipeline(&matched, &base)? {
-                    kept += 1;
-                    self.observe(ts, &matched, &labels)?;
+                    kept += usize::from(self.observe(ts, &matched, &labels)?);
                 }
             }
         }
@@ -647,6 +646,7 @@ impl State {
         base: &'l EntryLabels,
     ) -> Res<Option<std::borrow::Cow<'l, Labels>>> {
         let mut labels = std::borrow::Cow::Borrowed(&base.labels);
+        let mut extracted = HashSet::new();
         for stage in &self.stages {
             match stage {
                 Stage::Line { negate, finder } => {
@@ -663,18 +663,23 @@ impl State {
                     let pairs = logfmt(line)?;
                     let owned = labels.to_mut();
                     for (k, v) in pairs {
-                        let target = parsed_name(&base.stream_keys, k);
-                        owned.insert(target, v);
+                        let target = parsed_name(base, &extracted, k);
+                        if extracted.insert(target.clone()) {
+                            owned.insert(target, v);
+                        }
                     }
                 }
                 Stage::Regexp { regex, names } => {
                     if let Some(captures) = regex.captures(line) {
                         let owned = labels.to_mut();
                         for (name, index) in names {
-                            let value = captures.get(*index).map_or(&b""[..], |m| m.as_bytes());
-                            let value =
-                                String::from_utf8(value.to_vec()).map_err(|_| Error::Fallback)?;
-                            owned.insert(parsed_name(&base.stream_keys, name.clone()), value);
+                            let target = parsed_name(base, &extracted, name.clone());
+                            if extracted.insert(target.clone()) {
+                                let value = captures.get(*index).map_or(&b""[..], |m| m.as_bytes());
+                                let value = String::from_utf8(value.to_vec())
+                                    .map_err(|_| Error::Fallback)?;
+                                owned.insert(target, value);
+                            }
                         }
                     }
                 }
@@ -688,14 +693,21 @@ impl State {
         Ok(Some(labels))
     }
 
-    fn observe(&mut self, ts: i64, line: &[u8], labels: &Labels) -> Res<()> {
+    fn observe(&mut self, ts: i64, line: &[u8], labels: &Labels) -> Res<bool> {
         if labels.get("__error__").is_some_and(|e| !e.is_empty()) {
             return Err(Error::Pipeline);
         }
         let sample = match &self.value {
             Value::Count => Sample::Float(1.0),
             Value::Bytes => Sample::Int(i64::try_from(line.len()).map_err(|_| Error::Fallback)?),
-            Value::Unwrap(name) => unwrap_value(labels.get(name))?,
+            Value::Unwrap(name) => {
+                // Selected rows still spend work, but absent/empty values do
+                // not create series or consume the retained sample budget.
+                let Some(value) = labels.get(name).filter(|v| !v.is_empty()) else {
+                    return Ok(false);
+                };
+                unwrap_value(Some(value))?
+            }
         };
         let key: Vec<(String, String)> = labels
             .iter()
@@ -712,14 +724,16 @@ impl State {
             return Err(Error::Limit);
         }
         self.series.entry(key).or_default().push((ts, sample));
-        Ok(())
+        Ok(true)
     }
 }
 
-// Parser collisions use the immutable entry labels, not previously extracted
-// labels. Exactly one suffix matches the Elixir pipeline's provenance rule.
-fn parsed_name(base: &HashSet<String>, mut name: String) -> String {
-    if base.contains(&name) {
+// A parsed write can replace a suffixed metadata owner. Later stages then see
+// that name as parsed, while stream owners remain protected in this pipeline.
+fn parsed_name(base: &EntryLabels, extracted: &HashSet<String>, mut name: String) -> String {
+    if base.stream_keys.contains(&name)
+        || (base.metadata_keys.contains(&name) && !extracted.contains(&name))
+    {
         name.push_str("_extracted");
     }
     name
@@ -760,8 +774,8 @@ fn selected(
     })
 }
 
-// `Entry.from_record/1`: resource, attributes over it, then promoted fields
-// only where absent. Only flat string values reproduce its stringification.
+// Stream labels precede sorted metadata. Collisions get one suffix; an already
+// occupied suffixed name is preserved. Non-string values use the BEAM path.
 fn entry_labels(
     resource: &str,
     attributes: &str,
@@ -770,16 +784,13 @@ fn entry_labels(
 ) -> Res<EntryLabels> {
     let mut labels = Labels::new();
     let mut stream_keys = HashSet::new();
-    for (index, json) in [resource, attributes].into_iter().enumerate() {
-        if json.is_empty() {
-            continue;
-        }
-        for (k, v) in query_filter::strict_string_pairs(json.as_bytes()).ok_or(Error::Fallback)? {
+    if !resource.is_empty() {
+        for (k, v) in
+            query_filter::strict_string_pairs(resource.as_bytes()).ok_or(Error::Fallback)?
+        {
             let k = String::from_utf8(k.into_owned()).map_err(|_| Error::Fallback)?;
             let v = String::from_utf8(v.into_owned()).map_err(|_| Error::Fallback)?;
-            if index == 0 {
-                stream_keys.insert(k.clone());
-            }
+            stream_keys.insert(k.clone());
             labels.insert(k, v);
         }
     }
@@ -796,59 +807,99 @@ fn entry_labels(
                 .or_insert_with(|| value.to_owned());
         }
     }
+    let mut metadata = Labels::new();
+    if !attributes.is_empty() {
+        for (k, v) in
+            query_filter::strict_string_pairs(attributes.as_bytes()).ok_or(Error::Fallback)?
+        {
+            let k = String::from_utf8(k.into_owned()).map_err(|_| Error::Fallback)?;
+            let v = String::from_utf8(v.into_owned()).map_err(|_| Error::Fallback)?;
+            metadata.insert(k, v);
+        }
+    }
+    let mut metadata_keys = HashSet::new();
+    for (mut name, value) in metadata {
+        if stream_keys.contains(&name) {
+            name.push_str("_extracted");
+            if labels.contains_key(&name) {
+                continue;
+            }
+        }
+        metadata_keys.insert(name.clone());
+        labels.insert(name, value);
+    }
     Ok(EntryLabels {
         labels,
         stream_keys,
+        metadata_keys,
     })
 }
 
-// `Pulso.LogQL.Pipeline.Logfmt.parse(line, false)`.
+// The unflagged Elixir logfmt stage: recover after malformed tokens, omit
+// empty values and retain the first normalized key. Unicode decoding stays
+// in the reference pipeline, including surrogate/replacement-rune policies.
 fn logfmt(line: &[u8]) -> Res<Vec<(String, String)>> {
+    if !line.is_ascii() {
+        return Err(Error::Fallback);
+    }
     let mut pairs = Vec::new();
+    let mut seen = HashSet::new();
     let n = line.len();
     let mut i = 0;
-    loop {
-        while i < n && matches!(line[i], b' ' | b'\t') {
+    while i < n {
+        while i < n && line[i] <= b' ' {
             i += 1;
         }
         if i >= n {
             break;
         }
         let key_start = i;
-        while i < n && !matches!(line[i], b'=' | b' ' | b'\t') {
+        while i < n && line[i] > b' ' && !matches!(line[i], b'=' | b'"') {
             i += 1;
         }
-        if i == key_start {
-            break;
+        if i == key_start || (i < n && line[i] == b'"') {
+            logfmt_skip_token(line, &mut i);
+            continue;
         }
         let key = &line[key_start..i];
-        if i < n && line[i] == b'=' {
-            i += 1;
-            let value = if i < n && line[i] == b'"' {
+        if i == n || line[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        if i == n || line[i] <= b' ' {
+            continue;
+        }
+        let value = if line[i] == b'"' {
+            logfmt_quoted(line, &mut i)?
+        } else {
+            let start = i;
+            while i < n && line[i] > b' ' && !matches!(line[i], b'=' | b'"') {
                 i += 1;
-                let mut value = Vec::new();
-                while i < n && line[i] != b'"' {
-                    if line[i] == b'\\' && i + 1 < n {
-                        value.push(line[i + 1]);
-                        i += 2;
-                    } else {
-                        value.push(line[i]);
-                        i += 1;
-                    }
-                }
-                if i < n {
-                    i += 1;
-                }
-                value
+            }
+            if i < n && matches!(line[i], b'=' | b'"') {
+                logfmt_skip_token(line, &mut i);
+                None
             } else {
-                let start = i;
-                while i < n && !matches!(line[i], b' ' | b'\t') {
-                    i += 1;
-                }
-                line[start..i].to_vec()
-            };
+                Some(line[start..i].to_vec())
+            }
+        };
+        let Some(value) = value.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let mut normalized = String::with_capacity(key.len() + 1);
+        if key[0].is_ascii_digit() {
+            normalized.push('_');
+        }
+        for &c in key {
+            normalized.push(if c.is_ascii_alphanumeric() || c == b'_' {
+                char::from(c)
+            } else {
+                '_'
+            });
+        }
+        if seen.insert(normalized.clone()) {
             pairs.push((
-                String::from_utf8(key.to_vec()).map_err(|_| Error::Fallback)?,
+                normalized,
                 String::from_utf8(value).map_err(|_| Error::Fallback)?,
             ));
         }
@@ -856,9 +907,55 @@ fn logfmt(line: &[u8]) -> Res<Vec<(String, String)>> {
     Ok(pairs)
 }
 
+fn logfmt_skip_token(line: &[u8], i: &mut usize) {
+    while *i < line.len() && line[*i] > b' ' {
+        *i += 1;
+    }
+}
+
+fn logfmt_quoted(line: &[u8], i: &mut usize) -> Res<Option<Vec<u8>>> {
+    *i += 1;
+    let start = *i;
+    while *i < line.len() && line[*i] != b'"' {
+        *i += if line[*i] == b'\\' { 2 } else { 1 };
+    }
+    if *i >= line.len() {
+        *i = line.len();
+        return Ok(None);
+    }
+    let body = &line[start..*i];
+    *i += 1;
+    let mut value = Vec::with_capacity(body.len());
+    let mut cursor = 0;
+    while cursor < body.len() {
+        if body[cursor] == b'\\' {
+            cursor += 1;
+            let decoded = match body[cursor] {
+                b'"' | b'\\' | b'/' | b'\'' => body[cursor],
+                b'b' => 8,
+                b'f' => 12,
+                b'n' => 10,
+                b'r' => 13,
+                b't' => 9,
+                b'u' => return Err(Error::Fallback),
+                _ => return Ok(None),
+            };
+            value.push(decoded);
+        } else {
+            value.push(body[cursor]);
+        }
+        cursor += 1;
+    }
+    Ok(Some(value))
+}
+
 fn evaluate(filter: &Filter, labels: &Labels) -> Res<bool> {
     Ok(match filter {
-        Filter::And(l, r) => evaluate(l, labels)? && evaluate(r, labels)?,
+        Filter::And(l, r) => {
+            let left = evaluate(l, labels)?;
+            let right = evaluate(r, labels)?;
+            left && right
+        }
         Filter::Or(l, r) => evaluate(l, labels)? || evaluate(r, labels)?,
         Filter::Str {
             name,
@@ -870,17 +967,17 @@ fn evaluate(filter: &Filter, labels: &Labels) -> Res<bool> {
             negate,
             regex,
         } => regex.is_match(labels.get(name).map_or(&b""[..], |v| v.as_bytes())) != *negate,
-        Filter::Num { name, op, value } => {
-            match label_number(labels.get(name).map_or("", String::as_str))? {
-                None => false,
-                Some(actual) => compare(*op, actual, *value)?,
-            }
-        }
+        Filter::Num { name, op, value } => match labels.get(name) {
+            None => false,
+            Some(text) => compare(*op, label_number(text)?, *value)?,
+        },
     })
 }
 
-// `Integer.parse` then `Float.parse`, each requiring the whole string.
-fn label_number(text: &str) -> Res<Option<Number>> {
+// Ordinary decimal values use float comparisons, as Go ParseFloat does.
+// Every other spelling or conversion failure needs the Elixir pipeline,
+// including its error labels, first-error preservation and boolean state.
+fn label_number(text: &str) -> Res<Number> {
     let bytes = text.as_bytes();
     let digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
     let unsigned = bytes
@@ -890,7 +987,7 @@ fn label_number(text: &str) -> Res<Option<Number>> {
     if digits(unsigned) {
         return text
             .parse::<i64>()
-            .map(|i| Some(Number::Int(i)))
+            .map(Number::Int)
             .map_err(|_| Error::Fallback);
     }
     let (mantissa, exponent) = match unsigned.iter().position(|b| matches!(b, b'e' | b'E')) {
@@ -909,28 +1006,22 @@ fn label_number(text: &str) -> Res<Option<Number>> {
         )
     });
     if !digits(whole) || !fraction.is_none_or(digits) || !exponent_ok {
-        return Ok(None);
+        return Err(Error::Fallback);
     }
     let value: f64 = text.parse().map_err(|_| Error::Fallback)?;
     if value.is_finite() {
-        Ok(Some(Number::Float(value)))
+        Ok(Number::Float(value))
     } else {
         Err(Error::Fallback)
     }
 }
 
-// Erlang numeric comparison; mixed int/float only where floats are exact.
+// Both operands are float64, including integers beyond exact float precision.
 fn compare(op: CmpOp, actual: Number, expected: Number) -> Res<bool> {
-    let exact = |n: Number| {
-        matches!(n, Number::Float(_)) || matches!(n, Number::Int(i) if i.unsigned_abs() <= 1 << 53)
-    };
-    let ordering = match (actual, expected) {
-        (Number::Int(a), Number::Int(b)) => a.cmp(&b),
-        (a, b) if exact(a) && exact(b) => {
-            a.float().partial_cmp(&b.float()).ok_or(Error::Fallback)?
-        }
-        _ => return Err(Error::Fallback),
-    };
+    let ordering = actual
+        .float()
+        .partial_cmp(&expected.float())
+        .ok_or(Error::Fallback)?;
     use std::cmp::Ordering::*;
     Ok(match op {
         CmpOp::Eq => ordering == Equal,

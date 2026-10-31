@@ -4,7 +4,7 @@ defmodule Pulso.LogQL.Parser do
 
   `parse/1` turns a LogQL string into the AST rooted under
   `Pulso.LogQL.AST.*`. Log queries return a `LogQuery`; metric queries
-  return a `RangeAgg`, `VectorAgg`, `BinaryOp`, or `NumberLit`. The
+  return a `RangeAgg`, `VectorAgg`, `LabelReplace`, `BinaryOp`, or literal. The
   discriminator is the returned struct's module.
 
   The grammar covers every construct documented at
@@ -25,6 +25,7 @@ defmodule Pulso.LogQL.Parser do
       leading-scalar form.
     * Vector aggregations (`sum`, `topk`, …) with `by`/`without` on
       either side of the argument list.
+    * `label_replace` over metric expressions with whole-value captures.
     * Binary operators with PromQL precedence, right-associative `^`,
       unary `-`, `bool` modifier on comparisons, and `on`/`ignoring`
       matching with `group_left`/`group_right`.
@@ -38,21 +39,30 @@ defmodule Pulso.LogQL.Parser do
   import NimbleParsec
 
   alias Pulso.LogQL.AST
+  alias Pulso.LogQL.Limits
+  alias Pulso.LogQL.Quantity
+  alias Pulso.PromQL.FloatParser
 
   # ---------------------------------------------------------------------------
   # Public entry point
   # ---------------------------------------------------------------------------
 
-  alias Pulso.LogQL.Limits
-  alias Pulso.LogQL.Quantity
-
   @spec parse(String.t()) ::
-          {:ok, AST.LogQuery.t() | AST.RangeAgg.t() | AST.VectorAgg.t() | AST.BinaryOp.t() | AST.NumberLit.t()}
+          {:ok,
+           AST.LogQuery.t()
+           | AST.RangeAgg.t()
+           | AST.VectorAgg.t()
+           | AST.LabelReplace.t()
+           | AST.BinaryOp.t()
+           | AST.NumberLit.t()
+           | AST.VectorLit.t()}
           | {:error, term()}
   def parse(input) when is_binary(input) do
     with :ok <- Limits.input(input), do: parse_bounded(input)
   catch
     :invalid_quantity -> {:error, :invalid_quantity}
+    :invalid_string_escape -> {:error, :invalid_string_escape}
+    :invalid_range_placement -> {:error, :invalid_range_placement}
   end
 
   def parse(_), do: {:error, :query_expression_limit}
@@ -109,91 +119,103 @@ defmodule Pulso.LogQL.Parser do
 
   defcombinatorp(:identifier, identifier)
 
-  # LogQL supports three string forms: double-quoted with escapes,
-  # single-quoted with escapes, and backtick-quoted raw. The AST stores the
-  # decoded contents; the pretty-printer re-encodes with whichever quoting is
-  # convenient.
-  # LogQL string escapes: the C-style ones plus `\xHH` for a byte. For
-  # everything else — most commonly regex escapes like `\d`, `\w`, `\s` inside
-  # `|~ "..."` — we preserve both the backslash and the following character
-  # verbatim so the pattern reaches the regex engine unchanged.
+  # Loki's scanner admits double-quoted and backtick strings, not character
+  # literals. Escaped bytes stay bytes; Unicode escapes encode runes. Unknown
+  # escapes reject, so regex backslashes must be doubled or use raw strings.
+  hex_digit = ascii_char([?0..?9, ?a..?f, ?A..?F])
+
   escape_char =
     ignore(string("\\"))
     |> choice([
+      string("a") |> replace(7),
+      string("b") |> replace(8),
+      string("f") |> replace(12),
       string("n") |> replace(?\n),
       string("t") |> replace(?\t),
       string("r") |> replace(?\r),
+      string("v") |> replace(11),
       string("\\") |> replace(?\\),
       string("\"") |> replace(?"),
-      string("'") |> replace(?'),
-      string("0") |> replace(0),
       ignore(string("x"))
-      |> ascii_char([?0..?9, ?a..?f, ?A..?F])
-      |> ascii_char([?0..?9, ?a..?f, ?A..?F])
-      |> reduce({__MODULE__, :hex_pair_to_byte, []}),
-      utf8_char([]) |> reduce({__MODULE__, :keep_backslash, []})
+      |> times(hex_digit, 2)
+      |> reduce({__MODULE__, :escaped_byte, [16]}),
+      times(ascii_char([?0..?7]), 3)
+      |> reduce({__MODULE__, :escaped_byte, [8]}),
+      choice([
+        ignore(string("u")) |> times(hex_digit, 4),
+        ignore(string("U")) |> times(hex_digit, 8)
+      ])
+      |> reduce({__MODULE__, :unicode_escape, []})
     ])
-
-  @doc false
-  def keep_backslash([char]) do
-    IO.iodata_to_binary([?\\, char])
-  end
 
   double_string =
     ignore(string("\""))
     |> repeat(
       choice([
         escape_char,
-        utf8_char(not: ?", not: ?\\)
+        utf8_string([not: ?", not: ?\\, not: ?\n, not: 0], min: 1)
       ])
     )
     |> ignore(string("\""))
-    |> reduce({List, :to_string, []})
-
-  single_string =
-    ignore(string("'"))
-    |> repeat(
-      choice([
-        escape_char,
-        utf8_char(not: ?', not: ?\\)
-      ])
-    )
-    |> ignore(string("'"))
-    |> reduce({List, :to_string, []})
+    |> reduce({IO, :iodata_to_binary, []})
 
   raw_string =
     ignore(string("`"))
-    |> repeat(utf8_char(not: ?`))
+    |> utf8_string([not: ?`, not: 0], min: 0)
     |> ignore(string("`"))
-    |> reduce({List, :to_string, []})
 
-  string_literal = choice([raw_string, double_string, single_string])
+  string_literal = choice([raw_string, double_string])
 
   defcombinatorp(:string_literal, string_literal)
 
   @doc false
-  def hex_pair_to_byte([hi, lo]) do
-    List.to_integer([hi, lo], 16)
+  def escaped_byte(digits, base) do
+    value = List.to_integer(digits, base)
+    if value > 255, do: throw(:invalid_string_escape), else: <<value>>
   end
 
-  # Numeric literal: integer or float, optional sign. Metric queries also
-  # accept the special tokens `+Inf`, `-Inf`, `NaN`, though we do not surface
-  # them in the AST — they'd only appear on the right of a comparison, which
-  # the evaluator does not yet need.
+  @doc false
+  def unicode_escape(digits) do
+    value = List.to_integer(digits, 16)
+
+    cond do
+      # strutil accumulates into int32; wrapped negatives take its byte branch.
+      value >= 0x80000000 -> <<rem(value, 256)>>
+      value > 0x10FFFF -> throw(:invalid_string_escape)
+      # Prometheus strutil.Unquote passes surrogates to utf8.EncodeRune.
+      # Loki therefore produces a replacement per escape, not a UTF-16 pair.
+      value in 0xD800..0xDFFF -> "�"
+      true -> <<value::utf8>>
+    end
+  end
+
+  # Loki uses Go ParseFloat, not PromQL's integer-literal grammar: hexadecimal
+  # floats require a p exponent; hexadecimal integers and 0b/0o forms reject.
   int_digits = ascii_string([?0..?9], min: 1)
+  float_digits = ascii_string([?0..?9, ?_], min: 1)
+
+  decimal =
+    choice([
+      float_digits |> optional(string(".") |> optional(float_digits)),
+      string(".") |> concat(float_digits)
+    ])
+    |> optional(ascii_char([?e, ?E]) |> optional(ascii_char([?-, ?+])) |> concat(float_digits))
+
+  hex_digits = ascii_string([?0..?9, ?a..?f, ?A..?F, ?_], min: 1)
+
+  hexadecimal =
+    choice([string("0x"), string("0X")])
+    |> choice([
+      hex_digits |> optional(string(".") |> optional(hex_digits)),
+      string(".") |> concat(hex_digits)
+    ])
+    |> ascii_char([?p, ?P])
+    |> optional(ascii_char([?-, ?+]))
+    |> concat(float_digits)
 
   number_literal =
-    optional(ascii_char([?-, ?+]))
-    |> concat(int_digits)
-    |> optional(
-      string(".")
-      |> concat(int_digits)
-    )
-    |> optional(
-      ascii_char([?e, ?E])
-      |> optional(ascii_char([?-, ?+]))
-      |> concat(int_digits)
-    )
+    optional(ascii_char([?-, ?+]) |> parsec(:ws))
+    |> choice([hexadecimal, decimal])
     |> reduce({__MODULE__, :chars_to_number, []})
 
   defcombinatorp(:number_literal, number_literal)
@@ -202,82 +224,89 @@ defmodule Pulso.LogQL.Parser do
   def chars_to_number(chars) do
     str = IO.iodata_to_binary(chars)
 
-    case Integer.parse(str) do
-      {int, ""} ->
-        int
+    case FloatParser.parse(str) do
+      {:ok, float} ->
+        case Integer.parse(str) do
+          {int, ""} when int != 0 -> int
+          _ -> float
+        end
 
-      _ ->
-        {float, ""} = Float.parse(str)
-        float
+      :error ->
+        throw(:invalid_quantity)
     end
   end
 
-  # Duration literal: sequence of `<int><unit>` pairs summed together.
-  # Supported units: ns, us/µs, ms, s, m, h, d, w, y. Loki accepts fractional
-  # values (`1.5h`) — we accept them too.
-  duration_unit =
-    choice([
-      string("ns"),
-      string("us"),
-      string("µs"),
-      string("ms"),
-      string("s"),
-      string("m"),
-      string("h"),
-      string("d"),
-      string("w"),
-      string("y")
-    ])
-
-  duration_component =
-    int_digits
-    |> optional(string(".") |> concat(int_digits))
-    |> concat(duration_unit)
-    |> reduce({__MODULE__, :duration_component_to_ns, []})
-
+  # Keep the full token together: Loki tries model.Duration first, then Go's
+  # duration converter. Parsing each component separately would admit fractional
+  # days and out-of-order week/day combinations that both converters reject.
   duration_literal =
-    times(duration_component, min: 1)
-    |> reduce({__MODULE__, :sum_ints, []})
+    choice([
+      # A leading '-' starts Loki's duration scan even for unitless zero.
+      string("-0") |> lookahead_not(utf8_char([?0..?9, ?a..?z, ?A..?Z, ?_, ?., ?µ, ?μ])),
+      optional(string("-"))
+      |> choice([
+        int_digits |> optional(string(".") |> optional(int_digits)),
+        string(".") |> concat(int_digits)
+      ])
+      |> utf8_string([?0..?9, ?., ?n, ?u, ?µ, ?m, ?s, ?h, ?d, ?w, ?y], min: 1)
+    ])
+    |> reduce({__MODULE__, :duration_token_to_ns, []})
 
   defcombinatorp(:duration_literal, duration_literal)
 
   @doc false
-  def sum_ints(list), do: quantity_value(Quantity.sum_components(list))
+  def duration_token_to_ns(chars), do: chars |> IO.iodata_to_binary() |> Quantity.duration_query() |> quantity_value()
 
   @doc false
-  def duration_component_to_ns(chars),
-    do: chars |> IO.iodata_to_binary() |> Quantity.duration_literal() |> quantity_value()
+  def range_token_to_ns(chars), do: chars |> IO.iodata_to_binary() |> Quantity.duration_literal() |> quantity_value()
 
   defp quantity_value({:ok, value}), do: value
+  defp quantity_value({:error, _details}), do: throw(:invalid_quantity)
   defp quantity_value(:error), do: throw(:invalid_quantity)
 
-  # Byte size literal used in label filters: 5MB, 1KiB, 2GB, 100B.
+  # The lexer admits only these case-sensitive suffix runes, even though the
+  # runtime producer converter also accepts lowercase suffixes, E, and spaces.
   byte_unit =
     choice([
       string("PiB"),
+      string("Pi"),
       string("TiB"),
+      string("Ti"),
       string("GiB"),
+      string("Gi"),
       string("MiB"),
+      string("Mi"),
       string("KiB"),
+      string("Ki"),
+      string("kiB"),
+      string("ki"),
       string("PB"),
       string("TB"),
       string("GB"),
       string("MB"),
       string("KB"),
       string("kB"),
-      string("B")
+      string("B"),
+      string("P"),
+      string("T"),
+      string("G"),
+      string("M"),
+      string("K"),
+      string("k")
     ])
 
   bytes_literal =
-    int_digits
-    |> optional(string(".") |> concat(int_digits))
+    choice([
+      int_digits |> optional(string(".") |> optional(int_digits)),
+      string(".") |> concat(int_digits)
+    ])
     |> concat(byte_unit)
     |> reduce({__MODULE__, :bytes_component_to_bytes, []})
 
   defcombinatorp(:bytes_literal, bytes_literal)
 
   @doc false
-  def bytes_component_to_bytes(chars), do: chars |> IO.iodata_to_binary() |> Quantity.bytes() |> quantity_value()
+  def bytes_component_to_bytes(chars), do: chars |> IO.iodata_to_binary() |> Quantity.bytes_value() |> quantity_value()
 
   # ---------------------------------------------------------------------------
   # Selector
@@ -343,7 +372,9 @@ defmodule Pulso.LogQL.Parser do
     ])
 
   ip_matcher =
-    ignore(string("ip("))
+    ignore(ascii_char([?i, ?I]) |> ascii_char([?p, ?P]))
+    |> parsec(:ws)
+    |> ignore(string("("))
     |> parsec(:ws)
     |> parsec(:string_literal)
     |> parsec(:ws)
@@ -361,25 +392,35 @@ defmodule Pulso.LogQL.Parser do
     |> concat(line_filter_op)
     |> concat(parsec(:ws))
     |> concat(line_filter_value)
+    |> repeat(
+      parsec(:ws)
+      |> ignore(ascii_char([?o, ?O]) |> ascii_char([?r, ?R]))
+      |> lookahead_not(identifier_cont)
+      |> concat(parsec(:ws))
+      |> concat(line_filter_value)
+    )
     |> reduce({__MODULE__, :build_line_filter, []})
 
   @doc false
-  def build_line_filter([op, {:ip, ip}]) do
-    %AST.LineFilter{op: op, value: {:ip, ip}}
+  def build_line_filter([op | values]) do
+    value =
+      case Enum.map(values, &line_filter_value(op, &1)) do
+        [value] -> value
+        alternatives -> {:or, alternatives}
+      end
+
+    %AST.LineFilter{op: op, value: value}
   end
 
-  # Regex ops keep the value tagged as `:re`; substring ops as `:string`.
-  def build_line_filter([op, {:string, s}]) when op in [:match_re, :not_match_re] do
-    %AST.LineFilter{op: op, value: {:re, s}}
-  end
+  # Every alternative inherits the primary operator, including its string
+  # interpretation. IP retains its tag so unsupported operators still reject.
+  defp line_filter_value(_, {:ip, ip}), do: {:ip, ip}
 
-  def build_line_filter([op, {:string, s}]) when op in [:match_pattern, :not_match_pattern] do
-    %AST.LineFilter{op: op, value: {:pattern, s}}
-  end
+  defp line_filter_value(op, {:string, s}) when op in [:match_re, :not_match_re], do: {:re, s}
 
-  def build_line_filter([op, {:string, s}]) do
-    %AST.LineFilter{op: op, value: {:string, s}}
-  end
+  defp line_filter_value(op, {:string, s}) when op in [:match_pattern, :not_match_pattern], do: {:pattern, s}
+
+  defp line_filter_value(_, {:string, s}), do: {:string, s}
 
   # --- Label filter ---------------------------------------------------------
 
@@ -397,11 +438,17 @@ defmodule Pulso.LogQL.Parser do
 
   # A single label predicate. The value's tag drives evaluator dispatch, so we
   # tag every branch here rather than reconstruct at eval time.
-  label_filter_value =
+  numeric_filter_value =
     choice([
       parsec(:duration_literal) |> unwrap_and_tag(:duration_ns),
       parsec(:bytes_literal) |> unwrap_and_tag(:bytes),
-      parsec(:number_literal) |> unwrap_and_tag(:number),
+      parsec(:number_literal) |> unwrap_and_tag(:number)
+    ])
+
+  label_filter_value =
+    choice([
+      ip_matcher,
+      numeric_filter_value,
       parsec(:string_literal) |> unwrap_and_tag(:string)
     ])
 
@@ -409,15 +456,19 @@ defmodule Pulso.LogQL.Parser do
     parsec(:ws)
     |> parsec(:identifier)
     |> concat(parsec(:ws))
-    |> concat(cmp_op)
-    |> concat(parsec(:ws))
-    |> concat(label_filter_value)
+    |> choice([
+      # Loki permits == only for typed numeric/quantity filters, not strings,
+      # stream selectors or drop/keep matchers.
+      string("==") |> replace(:eq) |> concat(parsec(:ws)) |> concat(numeric_filter_value),
+      cmp_op |> concat(parsec(:ws)) |> concat(label_filter_value)
+    ])
     |> reduce({__MODULE__, :build_label_cmp, []})
 
   @doc false
   def build_label_cmp([name, op, {tag, value}]) do
     tagged =
       cond do
+        tag == :ip -> {:ip, value}
         op in [:re, :nre] -> {:re, value}
         tag == :string -> {:string, value}
         true -> {tag, value}
@@ -426,8 +477,9 @@ defmodule Pulso.LogQL.Parser do
     {:cmp, name, op, tagged}
   end
 
-  # Label filter is a chain: `foo=1 and bar=2 or baz=3`. `and` binds tighter
-  # than `or`. Parentheses group.
+  # Explicit AND binds tighter than OR. Loki's comma/implicit conjunctions
+  # instead attach the remaining expression on their right: a,b or c means
+  # a AND (b OR c), while a or b,c means a OR (b AND c). Parentheses group.
   label_filter_expr =
     parsec(:label_filter_or)
     |> reduce({__MODULE__, :wrap_label_filter, []})
@@ -439,7 +491,7 @@ defmodule Pulso.LogQL.Parser do
     parsec(:label_filter_and)
     |> repeat(
       parsec(:ws)
-      |> ignore(string("or"))
+      |> ignore(ascii_char([?o, ?O]) |> ascii_char([?r, ?R]))
       |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
       |> concat(parsec(:label_filter_and))
       |> reduce({__MODULE__, :label_filter_or_pair, []})
@@ -452,9 +504,12 @@ defmodule Pulso.LogQL.Parser do
     parsec(:label_filter_atom)
     |> repeat(
       parsec(:ws)
-      |> ignore(string("and"))
-      |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
-      |> concat(parsec(:label_filter_atom))
+      |> choice([
+        ignore(ascii_char([?a, ?A]) |> ascii_char([?n, ?N]) |> ascii_char([?d, ?D]))
+        |> lookahead_not(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
+        |> concat(parsec(:label_filter_atom)),
+        optional(ignore(string(","))) |> parsec(:label_filter_or)
+      ])
       |> reduce({__MODULE__, :label_filter_and_pair, []})
     )
     |> reduce({__MODULE__, :fold_label_filter_left, []})
@@ -851,9 +906,8 @@ defmodule Pulso.LogQL.Parser do
   range_bracket =
     parsec(:ws)
     |> ignore(string("["))
-    |> parsec(:ws)
-    |> parsec(:duration_literal)
-    |> parsec(:ws)
+    |> ascii_string([?0..?9, ?a..?z], min: 1)
+    |> reduce({__MODULE__, :range_token_to_ns, []})
     |> ignore(string("]"))
     |> unwrap_and_tag(:range)
 
@@ -865,27 +919,75 @@ defmodule Pulso.LogQL.Parser do
     |> parsec(:ws)
     |> ignore(string(","))
 
-  # Range aggregator body: an optional leading parameter, the log query,
-  # `[duration]`, and optional offset / @ modifiers. Each sub-part emits either
-  # a `%LogQuery{}` or a tagged tuple so `build_range_body` can identify them.
+  # Loki permits the pipeline before or after the range/offset, parentheses
+  # around the source, and recursively wrapped whole ranges. Source parentheses
+  # permit only a trailing unwrap, not a new parser pipeline after the bracket.
+  range_source =
+    choice([
+      parsec(:log_query),
+      ignore(string("("))
+      |> parsec(:log_query)
+      |> parsec(:ws)
+      |> ignore(string(")"))
+      |> unwrap_and_tag(:parenthesized_source)
+    ])
+
+  range_primary =
+    range_source
+    |> concat(range_bracket)
+    |> optional(offset_modifier)
+    |> optional(at_modifier)
+    |> repeat(parsec(:pipeline_stage))
+    |> reduce({__MODULE__, :build_log_range, []})
+
+  defcombinatorp(
+    :log_range,
+    choice([
+      range_primary,
+      ignore(string("("))
+      |> parsec(:ws)
+      |> parsec(:log_range)
+      |> parsec(:ws)
+      |> ignore(string(")"))
+    ])
+  )
+
+  @doc false
+  def build_log_range(parts) do
+    {prefix, stages} = Enum.split_while(parts, &(not is_struct(&1) or match?(%AST.LogQuery{}, &1)))
+    wrapped? = Enum.any?(prefix, &match?({:parenthesized_source, _}, &1))
+
+    body =
+      Enum.reduce(prefix, %{range: nil, offset: nil, at: nil, inner: nil}, fn
+        {:range, r}, acc -> %{acc | range: r}
+        {:offset, o}, acc -> %{acc | offset: o}
+        {:at, a}, acc -> %{acc | at: trunc(a * 1_000_000_000)}
+        {:parenthesized_source, q}, acc -> %{acc | inner: q}
+        %AST.LogQuery{} = q, acc -> %{acc | inner: q}
+      end)
+
+    case {body.inner.stages, stages, wrapped?} do
+      {_, [], _} -> :ok
+      {[], [%AST.Unwrap{} | _], _} -> :ok
+      {[], _, false} -> :ok
+      _ -> throw(:invalid_range_placement)
+    end
+
+    %{body | inner: %{body.inner | stages: body.inner.stages ++ stages}}
+  end
+
   range_body =
     parsec(:ws)
     |> optional(range_leading_param)
     |> parsec(:ws)
-    |> concat(parsec(:log_query))
-    |> concat(range_bracket)
-    |> optional(offset_modifier)
-    |> optional(at_modifier)
+    |> parsec(:log_range)
     |> reduce({__MODULE__, :build_range_body, []})
 
   @doc false
   def build_range_body(parts) do
     Enum.reduce(parts, %{param: nil, range: nil, offset: nil, at: nil, inner: nil}, fn
       {:param, p}, acc -> %{acc | param: p}
-      {:range, r}, acc -> %{acc | range: r}
-      {:offset, o}, acc -> %{acc | offset: o}
-      {:at, a}, acc -> %{acc | at: trunc(a * 1_000_000_000)}
-      %AST.LogQuery{} = q, acc -> %{acc | inner: q}
+      range, acc -> Map.merge(acc, range)
     end)
   end
 
@@ -1113,22 +1215,29 @@ defmodule Pulso.LogQL.Parser do
     %AST.BinaryOp{op: :pow, left: lhs, right: rhs, matching: matching}
   end
 
-  unary_expr =
-    parsec(:ws)
-    |> choice([
-      ignore(string("-"))
-      |> parsec(:atom_expr)
-      |> reduce({__MODULE__, :apply_unary_minus, []}),
-      parsec(:atom_expr)
-    ])
+  # A sign belongs to NUMBER only; unlike PromQL it cannot negate a vector or
+  # parenthesized expression. It binds before exponentiation: -2^2 == 4.
+  defcombinatorp(:unary_expr, parsec(:atom_expr))
 
-  defcombinatorp(:unary_expr, unary_expr)
+  label_replace =
+    ignore(string("label_replace"))
+    |> parsec(:ws)
+    |> ignore(string("("))
+    |> parsec(:metric_expr)
+    |> times(
+      parsec(:ws)
+      |> ignore(string(","))
+      |> parsec(:ws)
+      |> parsec(:string_literal),
+      4
+    )
+    |> parsec(:ws)
+    |> ignore(string(")"))
+    |> reduce({__MODULE__, :build_label_replace, []})
 
   @doc false
-  def apply_unary_minus([%AST.NumberLit{value: v}]), do: %AST.NumberLit{value: -v}
-
-  def apply_unary_minus([expr]) do
-    %AST.BinaryOp{op: :sub, left: %AST.NumberLit{value: 0}, right: expr}
+  def build_label_replace([inner, dst, replacement, src, regex]) do
+    %AST.LabelReplace{inner: inner, dst: dst, replacement: replacement, src: src, regex: regex}
   end
 
   # `atom` in metric context: range agg, vector agg, number literal, or a
@@ -1140,6 +1249,7 @@ defmodule Pulso.LogQL.Parser do
     |> choice([
       range_agg,
       vector_agg,
+      label_replace,
       ignore(string("("))
       |> parsec(:metric_expr)
       |> concat(parsec(:ws))

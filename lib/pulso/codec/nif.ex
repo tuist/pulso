@@ -33,8 +33,8 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {1, 1, 3} do
-      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels or mine log patterns; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
+    if version != {1, 1, 16} do
+      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership or preserve scalar class complements; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
     end
 
     :ok
@@ -77,6 +77,8 @@ defmodule Pulso.Codec.NIF do
 
   def trace_metrics_add(_metrics, _blob, _floor), do: :erlang.nif_error(:nif_not_loaded)
   def trace_metrics_finish(_metrics), do: :erlang.nif_error(:nif_not_loaded)
+  def trace_metrics_batch_new(_leaves), do: :erlang.nif_error(:nif_not_loaded)
+  def trace_metrics_batch_finish(_metrics), do: :erlang.nif_error(:nif_not_loaded)
   def log_discovery_new(_mode, _key, _start, _finish, _service, _matchers), do: :erlang.nif_error(:nif_not_loaded)
   def log_discovery_add(_state, _blob), do: :erlang.nif_error(:nif_not_loaded)
   def log_discovery_finish(_state), do: :erlang.nif_error(:nif_not_loaded)
@@ -93,10 +95,10 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {{2, 1, 3, 5, 12}, 2},
+    if version != {{2, 1, 3, 5, 12}, 3},
       do:
         raise(
-          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with span-ID grouping; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with shared expression budgets; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
         )
 
     :ok
@@ -253,7 +255,13 @@ defmodule Pulso.Codec.NIF do
   def compile_log_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)
   def filter_log_regex(_regex, _rows, _negate), do: :erlang.nif_error(:nif_not_loaded)
   def match_log_regex(_regex, _value), do: :erlang.nif_error(:nif_not_loaded)
+  def log_regex_named_capture?(_regex), do: :erlang.nif_error(:nif_not_loaded)
   def log_regex_named_captures(_regex, _value), do: :erlang.nif_error(:nif_not_loaded)
+  def log_regex_count(_pattern, _value, _max_work), do: :erlang.nif_error(:nif_not_loaded)
+
+  def log_regex_replace(_pattern, _value, _replacement, _literal?, _max_work, _max_output),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def metric_regex_captures(_regex, _value), do: :erlang.nif_error(:nif_not_loaded)
   def validate_metric_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)
   def validate_log_regex(_pattern), do: :erlang.nif_error(:nif_not_loaded)

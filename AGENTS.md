@@ -17,6 +17,572 @@ owners. Omitted or paired-zero HTTP search bounds scan bounded retained context,
 not an ingester-only tier; partial bounds reject. Discovery/window-local grammar,
 storage formats and resource ceilings are unchanged. See `docs/trace-query-expressions.md`.
 
+Trace metrics capability **3** adds bounded scalar/vector arithmetic and
+value-preserving scalar filters. All unique leaves share one provider scan and
+native series/point/selector-work/group-byte budgets; native decode repeats per
+leaf, and arithmetic runs in the bounded BEAM query worker. Match ordered typed
+group labels, broadcast only truly ungrouped series, omit NaNs and fail whole on
+storage/budget errors without resetting scan budgets. Upgrade all serving
+app/native pairs; trace/storage/keyed tuples are unchanged. See `docs/querying.md`.
+
+Current log codec tuple is `{1,1,16}`, superseding the log API snapshots below.
+Regexp-parser admission inspects native named-capture metadata instead of
+compiling PCRE, preserving supported Go flag/quantifier grammar. Missing real
+named captures still reject before storage. Upgrade all serving app/native pairs;
+storage/keyed bytes are unchanged. Original capture names and indices survive
+zero repetitions and impossible alternatives; erased groups extract empty values
+without shifting later groups or relinquishing first-extraction ownership.
+Predicate, template-helper and regexp/indexed-extraction schemas have an independent 1 MiB logical
+ceiling (32 bytes per original group plus raw name bytes), even for tiny optimized
+programs. Template replacements index aliases after shared schema admission;
+counting does not allocate capture names.
+Metadata is built once during existing validation; Boolean compiler paths do not
+allocate names, log captures borrow input binaries, and native metric stages skip
+copying values already owned by earlier extractions.
+Shared query regexes accept leading-caret Unicode property negation, including
+double negation, classes, folding and quantifiers. Flag-separated repetitions
+nest the preceding quantified atom without adding captures or changing earlier
+flags, subsequent scope or U/lazy greediness. Original counted-product and
+program/schema/work limits still apply; directly adjacent quantifiers reject.
+Normalization defers wrapper insertion to avoid repeated prefix copies; existing
+compiled match loops and thread pools are unchanged. Numeric/repeated ASCII
+names work in selectors and label_replace; Go-style expansion uses the first
+participating named capture and gives decimal indices precedence over aliases.
+Regexp parsers still reject repeated raw names; numeric labels gain an underscore
+before collision suffixing, with first-declaration ownership after normalization.
+Native preparation strips headers once without changing capture indices, and
+aliases share detached metric values rather than copying them again. Property
+escapes use Go 1.27.3 Unicode 17 category/script membership, aliases, ASCII/Any/
+Assigned and loose ASCII case/space/underscore/hyphen spelling. Static native
+ranges include property-specific folds before negation; preparation rejects
+above a 1 MiB logical expansion charge (21 bytes/range plus 24/property) before
+union/zero-repeat simplification, with separately bounded emitted text.
+Non-property matching loops and thread pools are unchanged. Full regex/case-fold/
+capacity parity remains open; property support does not update literal folding.
+Negated scalar classes exclude both U+D7FF/U+E000 when separately listed or
+used as range endpoints, without reintroducing them across the surrogate hole.
+Preparation bridges only these already-present adjacent scalars; ordinary
+classes stay borrowed, without extra class expansion or matching-time copies.
+All unwrap aggregations skip missing/empty fields without charging retained
+samples. Post-unwrap label filters run after conversion, before grouping;
+explicit query error selection can retain failed conversions as zero-valued
+error-labeled samples. These queries use the bounded Elixir evaluator, not the
+native metric path. Selected scan/pipeline work and unpreserved pipeline-error
+guards remain. Typed numeric/duration/byte filters retain malformed/empty values
+as LabelFilterErr, preserving earlier errors; missing labels do not match.
+Numeric comparisons use float64 including NaN/Inf and rounded large integers;
+typed equality accepts =/==. AND evaluates both sides and threads error labels;
+OR short-circuits. Native scans fall back for conversion/error handling.
+Runtime duration/byte values follow Go signed-int64 duration and go-humanize
+unsigned-uint64 byte profiles, including fractional rounding, Greek-mu units,
+case-insensitive byte suffixes/spacing/commas and overflow rejection. Duration
+unwrap splits seconds/remainders before float conversion. Signed bytes and
+runtime days now reject. Query thresholds/offsets use model.Duration then Go
+duration conversion, with signed hours/fractions but no fractional d/w/y;
+byte thresholds use uint64 and runtime rounding under Loki's restricted suffix
+runes. Bracket windows require ordered unrepeated integer y/w/d/h/m/s/ms;
+former fractional/ns/us bracket extensions now reject. Source/evaluation times
+retain nanosecond precision. Exact shared quantities stay unchanged. 0B remains
+accepted despite a pinned scanner/test contradiction. Complete parser errors
+remain open, not general quantity-converter or string-literal feature gaps.
+Duration filters and unwrap expose Go-compatible invalid/missing/
+unknown-unit diagnostics with byte-oriented hex quoting and unchanged first-error
+and explicit error-preservation policies. Byte filters/unwrap expose go-humanize
+numeric-prefix/unknown-suffix/overflow details and precedence, including its
+rune-count/byte-slice diagnostics and simple Unicode suffix lowercasing.
+Numeric filters/plain unwrap expose strconv.ParseFloat syntax/range diagnostics
+with complete original values and Go Unicode 17 quoting; malformed overflow
+retains syntax precedence. Missing/empty unwrap values still skip.
+LogQL double-quoted/raw literals follow pinned Loki Scanner + strutil.Unquote,
+not Go Unquote: named escapes, raw hex/octal bytes, fixed-width Unicode,
+one replacement per escaped surrogate, literal CR/raw LF preservation and
+signed-int32 U-escape overflow to low byte. Single quotes, unknown/incomplete
+escapes, octal >255, literal NUL/invalid UTF-8 and positive out-of-range Unicode
+reject. Regex backslashes require doubling or raw backticks. Frozen upstream
+table inputs plus controls replay through HTTP/Parquet/S3; no full parser-error
+or client acceptance claim. Upgrade query-serving apps for changed literals.
+Upgrade every query-serving app/native pair; storage/keyed bytes are unchanged.
+
+LogQL `ip(...)` line (`|=`/`!=`) and label (`=`/`!=`) filters accept IPv4/IPv6
+addresses, host-bearing CIDRs and inclusive same-family ranges. Both scan for
+embedded addresses with pinned Loki candidate boundaries, distinct mapped IPv6,
+missing/empty-label and prior-error policies. Invalid patterns/operators reject
+before storage. IP filters stay in the bounded Elixir pipeline, never native
+pushdown; native/storage/keyed formats and resource ceilings are unchanged.
+Upgrade query-serving apps. See `docs/querying.md` and Loki fixture provenance.
+
+LogQL logfmt decoding skips malformed pairs and resumes by default; `--strict`
+stops at the first error, retains earlier fields and publishes LogfmtParserErr
+with one-based byte positions. Empty values/bare keys require `--keep-empty`
+outside explicit field extraction; extract-all parsing keeps the first retained
+value for each normalized key.
+Quoted values decode JSON-style escapes plus escaped apostrophes and Unicode
+surrogate pairs; replacement runes become spaces in extract-all parsing and
+empty the entire value in explicit extraction. Native unflagged ASCII decoding
+shares these semantics; Unicode falls back to the bounded Elixir pipeline.
+All 60 selected upstream unit/engine evaluations replay through HTTP/Parquet/S3.
+Explicit source grammar/admission, normalized-key lookup and missing-source
+defaults add 15 frozen table rows and HTTP controls. Missing sources do not
+invent empty suffixes for original stream labels. Duplicate destinations use
+their final source definition after validating every expression; ordered source
+remapping precedes destination-key capture, with last matching values retained.
+Nineteen source-derived HTTP controls match the actual pinned Loki parser;
+13,104 additional strict/non-strict runtime comparisons agree. Expression stages
+stay in Elixir. Stream/metadata collisions use one suffix; drops release stream
+names, parsed history survives drops, and ordinary parsers keep first extractions.
+Explicit JSON overwrites; colliding explicit-logfmt suffix history halts scanning
+before later strict errors. Shared-source aliases choose one lexical destination,
+not exact Go map iteration. Thirteen formerly omitted upstream evaluations replay
+through HTTP/Parquet/S3; 1512 additional actual-pipeline comparisons agree.
+Hint-driven early exits and broader JSON/parser grammar remain open. Upgrade every
+query-serving app/native pair to log tuple `{1,1,7}`; storage/keyed bytes and
+resource ceilings are unchanged.
+
+Plain LogQL JSON parsing preserves ordered nested scalar flattening, first
+duplicate/sanitized-key ownership, original numeric spelling, null/array omission
+and replacement-character values. Missing explicit sources preserve existing
+destinations; present nulls extract empty values. All 16 pinned upstream table
+rows and 42 engine evaluations replay through GET/form POST and native
+Parquet/S3; 1216 additional actual-pipeline comparisons agree. This is not full
+malformed partial-extraction/diagnostic or hint parity. Execution
+stays in the bounded Elixir evaluator; no further tuple/storage/keyed-byte change.
+
+Explicit JSON accepts dot/bracket keys, UTF-8 quoted keys, root/nested arrays and
+int64 indices. Numbers/objects preserve source text; arrays unescape as whole
+strings. First path matches and source-order repeated destinations retain
+ownership/defaults; empty lines do not add defaults. Fifty-six original table,
+grammar/admission and engine evaluations replay through HTTP/Parquet/S3; the
+ambiguous empty-path grammar row stays provenance, while Pulso rejects it.
+Another 3072 actual pinned pipeline comparisons agree. Complete parser-error,
+malformed-value and hint parity remain open. No native/storage/keyed-byte change.
+
+LogQL range pipelines can precede or follow brackets/offsets; source and recursive
+whole-range parentheses retain pipeline/unwrap order. Split pipelines and invalid
+post-unwrap stages reject before storage, with unchanged expression/depth limits.
+Seventeen upstream first/last engine oracles replay in six placements; 336 actual
+pinned parser admission comparisons agree. No native/storage/keyed-byte change.
+
+LogQL `label_replace` supports instant/range metric label rewriting after
+stream/metadata/parser ownership resolution, whole-value capture matching,
+empty-source defaults and destination deletion. Regex dot is non-dot-all as
+in Loki; values are never summed by rewriting. All 19 pinned engine evaluations
+replay through HTTP/Parquet/S3, plus newline/capture/collision and nested-policy
+controls. Existing budgets and native/storage/keyed bytes are unchanged; upgrade
+query-serving applications. Full parser-error/distributed/client parity remains open.
+
+Regexp/pattern parser admission, partial short-line captures and string-only
+unpack with required string `_entry` replay all 30 remaining pinned parser-engine
+evaluations through HTTP/Parquet/S3. Constructor tables, nine unhinted unpack
+rows and 528 actual pinned pipeline comparisons cover duplicates, ownership,
+Unicode and huge-number skipping. Complete malformed-input diagnostics and hint
+early exits remain open. Existing budgets and native/storage/keyed bytes are
+unchanged; upgrade query-serving applications.
+
+LogQL label_format validates unique/non-error destinations before storage;
+ordered renames delete self-renames, while templates share the first-template
+label snapshot within a stage. Seven original validation/basic-assignment rows
+replay through HTTP/Parquet/S3; 723 actual pinned pipeline comparisons agree,
+including Unicode literal prefixes for line/label templates.
+String templates additionally support bounded pipelines/parentheses, quoted
+UTF-8 strings, booleans, signed-int64 literals, simple Go case conversion, trim/prefix/suffix predicates,
+Unicode cutset trimming, literal/counted replacement, repetition, indentation,
+Unicode-scalar alignment, byte-based truncation/slicing, historical Go title casing,
+query-form URL escaping and Base64 encoding/decoding, default and current-line
+lookup, with legacy aliases. Conditional if/else-if/else, lazy and/or, not,
+typed comparisons and byte len validate all branches before storage while only
+selected branches execute under one shared output cap. Another 32,298 actual
+pinned runtime comparisons agree, excluding exact error details. Literal ASCII
+whitespace trim markers and non-nesting comments follow Go delimiter rules;
+rendered values/Unicode spaces never trim. Fifteen underlying Go lexer/parser
+rows replay through HTTP/Parquet/S3, separate from the Loki source-row total;
+29,826 actual pinned runtime comparisons agree, excluding exact error details.
+Integer helpers int/add/sub/mul/div/mod/min/max coerce strings/booleans with
+base-zero parsing and exact decimal truncation; invalid/overflowing conversions
+return zero, arithmetic wraps signed64 and division by zero preserves inputs
+with TemplateFormatErr. Another 20,826 actual pinned pipeline comparisons agree,
+including 1,458 runtime errors, excluding exact error details.
+Quantity helpers bytes/duration/duration_seconds preserve typed finite floats,
+Go general rendering, numeric-zero truthiness/defaults and float comparisons.
+Integer helpers truncate in-range float inputs; out-of-range float-to-int rejects
+instead of choosing Go's implementation-dependent overflow. Of 66,570 actual
+pinned pipeline comparisons, 66,438 agree exactly (excluding error details) and
+132 deliberately reject those nonportable casts; no unexpected differences.
+Regex count returns bounded integer non-overlapping match counts using the
+non-backtracking native Go-style regex profile, including Unicode scalar
+empty-match progress, ASCII word boundaries and Unicode script properties.
+Invalid executed patterns preserve inputs with TemplateFormatErr. Accepted
+matches plus one final probe spend shared metric work or request-local stream
+work across entries/actions; work exhaustion fails whole, never as a preservable
+formatting error. Upgrade query-serving apps/native artifacts to log tuple
+{1,1,10}; storage/keyed bytes are unchanged.
+Another 29,952 actual pinned Loki pipeline comparisons agree, including 3,120
+runtime errors, excluding exact error details.
+Regex replacement expands Go-style whole-match/numbered/named captures, dollar
+escapes and malformed/unknown references; its literal variant never expands.
+Both share counting work across entries/actions. Byte-admission and rendering
+passes each charge probes/dollar scanning and capture-name bytes even for
+unknown names, without retaining matches; complete
+output fits 16 MiB before allocation even under later truncation. Work/output
+exhaustion fails whole. Another 107,520 actual pinned Loki pipeline comparisons
+agree, including 15,360 runtime errors, excluding exact error details. All 87 Go
+replacement table rows retain their oracles across 135 successful mode evaluations,
+including ten formerly rejected repeated-name cases. Template count/replacement
+accept numeric/repeated ASCII capture names in both Go spellings and literal
+\Q...\E runs, including EOF termination. Named expansion takes the first
+participating capture, including empty matches; numbered references preserve
+positions and Go's one-billion/leading-zero rules. Extra duplicate lookups spend
+shared work even when they emit nothing. Selector/regexp-parser admission is
+unchanged. Template helpers additionally accept Go octal escapes: up to three
+digits, a required second digit after nonzero first digits, and Unicode scalar
+rather than byte semantics through 0777. Classes, quantifiers, capture numbering
+and quoted/escaped literals retain their meanings; lone nonzero backreferences
+still reject. Full Go regexp syntax/capacity parity remains open.
+Unknown functions and
+unclosed actions reject before storage; argument failures attach TemplateFormatErr
+and preserve inputs. Sixty-five source formatter evaluations replay through
+HTTP/Parquet/S3. Formatting caps output at 16 MiB per entry/template and nesting
+at 64; expanding functions check intermediate sizes before allocation, and output
+overflow fails whole, never as a preservable error. Base64 corruption returns ordinary
+Go byte-offset diagnostic strings. Decoded/sliced non-UTF-8 values become formatting
+errors until byte-aware downstream handling exists. Generic JSON object/array
+values, array/channel/function iteration, other functions, non-UTF-8 byte literals and
+exact error text/positions/ownership remain open. Native/storage/keyed bytes
+are unchanged; upgrade all query-serving applications. See docs/querying.md.
+
+Template rune literals now retain integer Unicode code points, including Go
+hex/octal byte escapes without creating non-UTF-8 strings. Eight original
+number oracles, three original rejection rows and all seven selected lexer
+tokens replay through HTTP/Parquet/S3; 10,400 actual pinned Loki comparisons
+agree, including 2,600 runtime errors, excluding exact error details. Malformed
+constants reject before storage even in skipped branches; existing type/error/
+budget policies remain.
+Upgrade query-serving apps; no additional native/storage/keyed-byte change.
+
+Finite template float constants accept Go decimal/scientific/hexadecimal spelling,
+separators and signed zero. Direct integral in-range literals satisfy integer
+arguments; parenthesized/piped floats require explicit int conversion. Ten original
+Go number oracles replay through HTTP/Parquet/S3. Of 6912 actual pinned Loki pipeline
+comparisons, 6874 agree excluding exact error details and 38 deliberately reject
+nonportable out-of-range casts (including rounded positive int64 literal boundary);
+no unexpected differences. Existing budgets/native/storage/keyed bytes are unchanged.
+Upgrade query-serving applications.
+
+Finite complex template constants preserve signed components, truthiness,
+complex-only equality, generic numeric coercion to zero and contextual typed
+numeric arguments for zero-imaginary direct constants. Seven original Go
+number oracles and separate controls replay through HTTP/Parquet/S3;
+8,240 actual pinned Loki comparisons agree, including 4,744 runtime errors,
+excluding exact diagnostics. Malformed/overflowing components reject before
+storage. These are supplementary Go rows, not more Loki formatter-source rows.
+Existing nonportable integer-cast exclusions, resource ceilings and native/
+storage/keyed bytes are unchanged; upgrade query-serving apps.
+
+Template root maps and index support arbitrary string-key label access,
+missing-key empty strings, lexical map rendering/length/truthiness and
+successive string-byte indexing. Bytes retain uint8 type boundaries for
+comparisons, casts and typed arguments. Two original Go comparison regressions
+replay through HTTP/Parquet/S3; 7638 actual pinned Loki pipeline comparisons
+agree, including 4442 runtime errors, excluding exact diagnostics. Map output
+overflow fails whole before later drops/error selection. Generic arrays/JSON
+objects remain open; this is not full built-in parity. Existing
+resource ceilings and native/storage/keyed bytes are unchanged; upgrade query apps.
+
+Template slice supports default/exclusive string byte ranges, empty results
+and integer/uint8 indices, with runtime type/bounds errors. Six original Go
+string cases replay through HTTP/Parquet/S3; of 4240 actual pinned Loki pipeline
+comparisons, 4076 agree excluding diagnostics and 164 deliberately reject
+non-UTF-8 intermediate strings, with no unexpected differences. Array slicing
+and byte-string propagation remain open. Existing resource ceilings and native/
+storage/keyed bytes are unchanged; upgrade query-serving apps.
+
+Template print/println/html/urlquery accept variadic existing value types,
+with Go spacing/newlines and explicit HTML/query-form escaping. Seven original
+Go cases and seventeen controls replay through HTTP/Parquet/S3; 8504 actual
+pinned Loki pipeline comparisons agree, including 1488 runtime errors,
+excluding diagnostics. Combined text and escaping preserve fail-whole 16 MiB
+bounds; dense HTML replacement uses bounded chunks within the worker heap.
+Printf, typed-interface/pointer values and non-UTF-8 byte propagation remain
+open. Existing ceilings/native/storage/keyed bytes are unchanged; upgrade query apps.
+
+Template js supports Go JavaScript text escaping with typed/nil joining, ASCII
+controls and Unicode 17 printability. Eight original Go rows plus fourteen
+successful controls and three runtime errors replay through HTTP/Parquet/S3.
+All 19060 actual pinned Loki pipeline comparisons agree, including 304 runtime
+errors, excluding diagnostics; grouped inputs cover all 1112064 Unicode scalars.
+Exact 16 MiB output and fail-whole intermediate overflow work on log/top-k/metric
+paths. Go's minimum-four-digit escapes are not JSON quoting or context-aware
+sanitization. Existing budgets/native/storage/keyed bytes are unchanged; upgrade
+query-serving applications.
+
+Template with/else-with actions change dot only for successful branches, restore
+outer dots afterward and preserve the stage's root label snapshot through $.
+Ten original Go cases plus nested/typed/error/admission controls replay through
+HTTP/Parquet/S3; all 2387 actual pinned Loki comparisons agree, including 516
+runtime errors, excluding diagnostics. Six syntax/function rejections also
+match actual Loki. Exact 16 MiB output and accumulated outer/branch overflow
+retain fail-whole policies and the existing nesting ceiling. Generic object
+iteration remains open. Existing ceilings/native/storage/keyed bytes are
+unchanged; upgrade query-serving applications.
+
+Template action and if/with-header variables support declarations, nearest
+assignments, shadowing/restoration, typed values and saved-map fields. Fresh
+bindings per template/destination/entry keep root reassignment local. Three
+original Go rows plus 26 success/ten runtime-error and admission/budget controls
+replay through HTTP/Parquet/S3. All 6198 actual pinned Loki comparisons agree,
+including 1454 runtime errors, excluding diagnostics. Eight upstream admission
+failures agree. Parenthesized-pipeline bindings now thread effects left to right,
+with lazy skipping and forward-reference rejection: 16,622 actual pinned Loki
+comparisons agree, including 3764 runtime errors, excluding diagnostics. Field
+chains support saved label maps/functions/parenthesized results with distinct
+empty-string/nil behavior and skipped nil-receiver arguments. Four unchanged Go
+rows plus HTTP/Parquet/S3 controls replay; the combined 18,838 actual pinned Loki
+comparisons agree, including 5278 runtime errors, excluding diagnostics. Generic
+JSON objects/arrays are covered by the continuation below; methods and date/other
+functions remain open.
+Accumulated/intermediate caps and native/storage/keyed bytes are unchanged;
+upgrade query-serving applications.
+
+Template range supports sorted label maps and integer/uint8 values, scoped
+single/two-variable declarations/assignments, empty/nil else and nested
+break/continue. Ten unchanged Go parser rows plus 26 success/ten runtime-error
+and admission/budget controls replay through HTTP/Parquet/S3. All 21,304 combined
+actual pinned Loki comparisons agree, including 5388 runtime errors, excluding
+diagnostics; 29 constructor failures agree. Every executed iteration charges
+shared metric work or request-local stream-template work alongside regex helpers,
+even without output; early break charges actual iterations, not cardinality.
+Work/output exhaustion fails whole. Existing 64-depth/16 MiB caps and native/
+storage/keyed bytes/dependencies are unchanged. The following JSON continuation
+adds container values/iteration; channels/function iteration and date/other
+functions remain open; upgrade query apps.
+
+Template fromJson decodes typed nested objects/arrays, float64 numbers, strings,
+booleans and nil. Missing/null object members retain interface-field errors,
+distinct from empty string labels and nil function-result propagation. Printing,
+index/field access, len/truthiness, numeric coercion and iteration preserve types;
+duplicate keys replace earlier values. Both complete Sprig TestFromJson oracles
+plus 29 successful/19 runtime-error controls replay through HTTP/Parquet/S3;
+10,292 actual pinned Loki comparisons agree, including 3874 runtime errors,
+excluding diagnostics. Numeric overflow-to-zero follows the actual pinned
+Go 1.27.3 decoder, not older Go behavior. Input bytes spend shared metric or
+request-local stream-template work before expansion; input/normalized bytes cap
+at 16 MiB, containers at 64 levels. Growth/work/depth exhaustion fails whole,
+including explicit error selection. Methods, channel/function
+iteration, date/other functions, byte-string propagation and exact diagnostics
+remain open. No native/storage/keyed-byte/dependency change; upgrade query apps.
+
+Template array slice supports default/exclusive/three-bound indices, retained
+decoded backing elements and explicit reduced capacity without array copying.
+Ten original Go rows plus 18 success/13 error controls and two spare-capacity
+rejections replay through HTTP/Parquet/S3. Of 5984 actual pinned Loki comparisons,
+5980 agree, including 4304 runtime errors; four deliberately reject Go allocator
+spare cells, with no unexpected differences excluding diagnostics. Initial
+capacity equals decoded element count, not Go allocator capacity; spare-cell
+access remains a compatibility gap. Public work/exact-16-MiB/overflow controls
+cover log/top-k/metric paths despite error selection or later shrinking. Existing
+ceilings/native/storage/keyed bytes/dependencies are unchanged; upgrade query apps.
+
+Template timestamp helpers __timestamp__/unixToTime/unixEpoch/unixEpochMillis/
+unixEpochNanos retain typed time and original source nanoseconds across line
+rewrites, variables and scopes. Unix input units depend on byte length, with
+signed-int64 admission/wrapping and floor-based epoch seconds/milliseconds.
+Seven pinned Loki formatter rows and two invalid-time inputs replay through
+HTTP/Parquet/S3; 28,292 comparisons against actual Loki/Sprig helpers through Go
+text/template agree, including 100 runtime errors, excluding diagnostics.
+Time renders in UTC deliberately, not the host-local timezone. Arbitrary date
+layouts, named zones, time methods and now remain open. Existing native/storage/
+keyed bytes, dependencies and ceilings are unchanged; upgrade query apps.
+
+Template untyped nil supports false truthiness/defaults, equality, zero numeric
+coercion, function-result <no value> rendering and distinct print/escape text and
+spacing. Bare nil commands and wrong typed arguments fail at execution with
+TemplateFormatErr; missing string labels remain empty, never nil. Three original
+Go rows plus HTTP/Parquet/S3 controls replay; 7528 actual pinned Loki pipeline
+comparisons agree, including 812 runtime errors, excluding diagnostics. Existing
+budgets and native/storage/keyed bytes are unchanged; upgrade query-serving apps.
+
+Template float64/minf/maxf/ceil/floor/round support coercion, runtime signed-zero/
+nonfinite classes, integer precision and typed float thresholds. Three original
+Loki rows replay through HTTP/Parquet/S3; 27,928 actual pinned pipeline comparisons
+agree, including 30 runtime errors, excluding exact diagnostics. Go-template
+gt/ge use inverted tests even for NaN. Rounding follows the pinned Go 1.27.3
+fused fractional residual: round 123.5555 3 yields 123.555, unlike Sprig's static
+test, not a cross-compiler/platform bit-parity claim. Nonportable float-to-int
+casts still reject. Existing budgets/native/storage/keyed bytes are unchanged;
+upgrade query-serving apps.
+
+Template addf/subf/mulf/divf coerce float64 then fold shortest-decimal values,
+rounding back to float64 only on function return. Division rounds every step to
+16 decimal places, halfway away from zero. Two original Loki rows replay through
+HTTP/Parquet/S3; all 14,012 actual pinned pipeline comparisons agree, including
+1,524 runtime errors, excluding diagnostics. Exact zero loses signed zero;
+nonzero results can underflow/overflow, but nonfinite operands/zero divisors
+preserve inputs with TemplateFormatErr. Existing query/worker/output ceilings
+and native/storage/keyed bytes are unchanged; upgrade query-serving apps.
+
+Loki request-local query policies support `maxQueryLength`, `maxQueryInterval`,
+`maxEntriesLimitPerQuery`, `requiredLabels`, `minimumLabelsNumber` and
+`maxQueryTime`. Each
+selector/range leaf validates before storage; entry ceilings reject requested
+log limits or detected-field `line_limit`, never silently truncate results.
+Required names are deduplicated, matcher minima count repeated names, and
+pipeline/group labels do not satisfy selector policies. Parenthesized source
+pipelines before range brackets work. Twenty-five pinned admission cases replay
+through 64 HTTP requests, with separate nonempty Parquet/S3 controls. This is
+optional client tightening, not operator quotas or selectivity proof. Existing
+server budgets remain authoritative; positive request deadlines shorten every
+finite read's worker timeout, while zero/omission preserves the server cap.
+Blocked-adapter and native S3 GET controls cover timeout/admission recovery;
+already-dispatched provider/native work can outlive callers. Lookback/byte/sharding fields reject.
+Upgrade query applications; no further native/storage/keyed-byte change.
+
+LogQL line filters accept case-insensitive `or` alternatives inheriting their
+primary substring/regex/pattern operator; string/IP alternatives can mix under
+`|=`/`!=`. Positive groups keep any match; negatives reject any match. All
+branches validate before storage, including unreachable invalid alternatives;
+adjacent filters and line-format ordering stay intact. Alternative groups use
+the bounded Elixir pipeline without native pushdown. Frozen upstream matcher
+tables (27 queries/121 line decisions) and 29 engine cases replay through
+HTTP/Parquet/S3, not full LogQL/client/capacity proof. Existing limits and
+native/storage/keyed bytes are unchanged; upgrade query-serving applications.
+
+LogQL label filters accept comma/implicit conjunctions with the pinned parser's
+right-attaching grammar (`a,b or c` means `a AND (b OR c)`), distinct from
+explicit AND-before-OR precedence. Both keywords are case-insensitive; pipeline
+boundaries, eager conjunctions, short-circuit OR and first-error ownership remain.
+All 36 selected engine evaluations replay through HTTP/Parquet/S3, with separate
+truth-table/admission controls. Existing evaluation paths, budgets, generic
+metric-error envelopes and native/storage/keyed bytes are unchanged. Upgrade
+query-serving apps; full parser errors and client/capacity acceptance remain open.
+
+PromQL sampling supports `limitk` and `limit_ratio`, preserving names and complete
+float/native-histogram samples. Ratio selection uses the pinned default upstream
+full-label hash, never storage StableHash; k uses deterministic hash ordering,
+not exact Mimir iteration-order subsets. Existing budgets and storage remain
+unchanged; upgrade query-serving applications. See `docs/querying.md`.
+
+PromQL duration arithmetic supports windows, explicit/default-minute subquery resolutions and
+signed offsets with outer-context `step()`/`range()` and nested `min_of`/`max_of`.
+Unit-bearing scalar arguments work too. Resolve once per batch source before
+storage reads; preserve offset precedence and exact bare time literals. One-year
+literal/result ceilings, nanosecond rounding and shared AST/work/scan/sample/
+intermediate/result limits apply, not upstream millisecond truncation. No native,
+storage or keyed-byte change; upgrade query-serving apps. See `docs/querying.md`.
+
+PromQL query time literals accept hexadecimal integers and digit separators,
+with exact decimal nanoseconds and unchanged one-year/int64 bounds. Omitted
+subquery resolutions use one-minute epoch grids, never the outer query step.
+Quoted UTF-8 grouping/matching/include labels and UTF-8 `label_replace`
+destinations work; empty/duplicate/overlapping decoded names still reject.
+Formatter round trips preserve identities and omitted resolutions. HTTP time
+parameter grammar and native/storage/keyed formats are unchanged.
+
+PromQL histogram quantiles warn on invalid/NaN bounds, omit same-input-identity
+classic/native pairs per step, and publish real monotonic-repair info while
+silently correcting tiny increases/decreases. Native quantile/fraction NaN
+notices survive into query-local responses. Twelve unchanged Mimir evaluations
+replay through HTTP/Parquet/S3. `histogram_quantiles(vector,"label",q0,...)`
+adds per-step OpenMetrics quantile labels, overwrite/name-removal semantics and
+same-step duplicate rejection; nine more unchanged Mimir evaluations replay.
+Fan-out reserves shared intermediate samples before construction; bucket and
+generated-label work accumulate across sources. Limits are unchanged, but
+histogram work may bind earlier. Classic `histogram_fraction` now linearly
+interpolates sorted/coalesced buckets without quantile monotonicity repairs;
+three further unchanged Mimir evaluations and 14,400 actual pinned Go comparisons
+cover it. Eight further unchanged Mimir evaluations cover corrected selected-bucket
+native NaN-sum interpolation and ±Inf sums without NaN observations. This
+intentionally replaces Prometheus 3.5.0's last-bucket quirk. Native counter
+rate/increase also use Mimir's count-based zero-point extrapolation, scaling
+the whole histogram from the original first count and reset-corrected change;
+eight further unchanged evaluations and public reset/bucket/gauge controls replay.
+PromQL idelta subtracts the last nonstale pair without resets/scaling/extrapolation;
+the complete ten-evaluation Mimir block covers floats/native histograms, gauge/
+mixed-type/schema warnings and custom bounds. Native subtraction reconciles
+custom layouts to common bounds, with 4,983 actual pinned Go helper comparisons;
+custom reset detection compares plain interval sums at common bounds including
++Inf, matching 9,950 actual pinned Go DetectReset comparisons. Eleven further
+unchanged irate evaluations cover gauge/mixed-pair warnings and layout changes
+without false resets; reset branches emit no unexecuted subtraction notices.
+Four unchanged delta evaluations cover gauges/mixed windows; public controls
+prove endpoint-only histogram schema/hint checks, custom reconciliation and
+batch isolation. All three difference functions charge native endpoint work.
+Addition now coarsens custom layouts with source-ordered compensated sums;
+9,950 actual pinned FloatHistogram.Add comparisons match geometry, finite
+count/sum/bucket bits and reset hints. Eleven unchanged Mimir arithmetic
+evaluations cover sum/avg, sampling/set/count controls and binary +/- notices.
+Binary subtraction produces gauges through nested queries; binary histogram
+work shares query/batch limits. Twenty-one further unchanged range/group
+aggregation evaluations cover sum/avg and their over-time forms. They report
+custom reconciliation, mixed inputs, incompatible families and original
+reset/no-reset conflicts, even through intervening gauge/unknown hints.
+Bucket/bound work shares query/batch limits; notices stop at the first failed
+family and preserve original metric names. Seven further unchanged counter
+evaluations cover gauge/schema warnings, nested histogram-count and first-pair
+layout resets. Rate/increase report actual subtraction/reset-addition
+reconciliation under bounded constant-size notice sets; middle-schema errors
+replace earlier window gauge notices without erasing other windows/sources.
+Native bucket/bound work charges before resets/mapping. Twenty-six unchanged
+precision evaluations cover compensated histogram sum/avg and their over-time
+forms, cancellation, field overflow and singletons. Separate compensation
+survives resolution, zero-threshold and custom-bound changes; averages switch
+from direct sums to weighted incremental means only on field overflow. Another
+55,112 actual pinned KahanAdd executions over 10,000 chains match geometry,
+finite bits and nonfinite classes, separate from upstream engine replay.
+Ordinary binary addition remains uncompensated. Implicit iterator reset hints
+and complete annotation parity remain gaps; matching-layout/exponential reset
+detection now checks every remaining previous bucket, including zero-prefixed
+tails, with pinned compensated zero widening. Fifty thousand actual pinned Go
+DetectReset comparisons agree; public resets/irate/rate/increase controls replay
+on both adapters. Twenty-five unchanged scaling/mixed-arithmetic evaluations
+replay through HTTP/Parquet/S3. Negative multiplication/division and unary
+negation produce gauges, preserved by later scaling/double negation. Signed
+zero/NaN factors retain hints; zero division removes ordinary buckets without
+changing hints. Another 26,000 actual pinned Mul/Div comparisons agree on
+geometry, finite bits, nonfinite classes and hints, separate from engine replay.
+Mimir histogram trims `</` and `>/` add 124 unchanged HTTP/Parquet/S3 evaluations:
+histogram-left/float-right matching, exponential/custom/biased-zero interpolation,
+infinite endpoints, original totals on no-op trims and preserved names/reset hints.
+Invalid matched types omit with info; bool and scalar-only trims reject before
+storage. Bucket/bound work shares existing query/batch limits. Another 49,840
+actual pinned Go TrimBuckets calls match geometry, hints, finite bits and
+nonfinite classes with FMA disabled, matching the existing unfused math profile,
+not default arm64 Go FMA bit parity. Another 37 unchanged property/dispersion and
+bucket-retention evaluations cover empty histograms, sparse signed buckets,
+nonfinite sums and bucket-sensitive equality/changes/distinct counts beneath
+scalar wrappers. Native variance/deviation and equality now charge bucket/bound
+traversal to shared query/batch work, including empty slots and false/bool
+comparisons; constant-time count/sum/average remain exempt. Another 212 unchanged
+evaluations cover repeated/accumulating histograms, resolution changes,
+signed/zero/custom buckets, bucket-only resets, quantile/fraction interpolation
+and inverses, and constant-histogram rates. Scaling/nonzero division and unary
+negation now charge bucket work before traversal, including empty slots and
+zero multiplication; scalar wrappers, repeated steps and shared batches cannot
+evade it. Unary plus/zero division and unused custom bounds do not pay for
+unexecuted scaling traversal. All seven source ramps/149 input samples match
+actual pinned Go Copy/Add independently of production arithmetic. Another 25
+unchanged native/mixed binary evaluations cover matching, scaling, full mixed
+timestamp grids and type/layout/reconciliation notices. Binary +/- now warn on
+incompatible schemas without inventing samples; successful explicit reset/no-reset
+collisions retain values with warnings. Schema errors precede hint diagnostics;
+unknown/gauge hints alone do not collide. Per-query/batch notice isolation remains.
+The complete classic-histogram file adds 183 unchanged paired classic/native
+quantile/fraction, aggregation/rate and boundary evaluations. Custom fraction
+buckets crossing zero retain their bounds; first -Inf buckets contribute their
+full count at finite interior bounds. Linear interpolation computes the width
+fraction before population scaling to avoid intermediate overflow/underflow.
+Another 24 unchanged evaluations cover paired NaN fractions, cross-schema
+subtraction, anchored subqueries, full mixed-type range grids, shared-source
+property/quantile queries and custom irate reconciliation versus resets.
+Five more unchanged range evaluations cover custom equality/inequality,
+unsupported ordering info and mixed-schema aggregation omission. Classic
+quantile repair uses the upstream strict tolerance, minimum-normal absolute
+floor and maximum-float-capped relative scale; large finite counts no longer
+fail arithmetic and subnormals normalize correctly. Six public HTTP controls
+and 10,030 actual pinned Go quantile/repair comparisons cover the extremes.
+Selected Mimir engine corpus is now 1590 evaluations/85 files/5770 memory/S3 HTTP
+requests. Other native arithmetic and extended repair summaries/AST positions
+remain open. Upgrade query
+apps; no native/storage/keyed-byte change. See `docs/querying.md`.
+
 Early scaffolding. In place:
 
 - Phoenix 1.8 headless app (no HTML, no assets, no Ecto)
@@ -38,7 +604,7 @@ Early scaffolding. In place:
 - `PulsoWeb.CompressedBodyReader` — gzip-aware Plug.Parsers body reader, so JSON receivers accept compressed bodies
 - `Pulso.Storage` — signal-generic behaviour (`append(signal, tenant, records, opts)` / `query(signal, tenant, opts)` with `signal :: :logs | :metrics | :traces`), with an in-memory adapter for tests and `Pulso.Storage.S3` for dev/prod. S3 objects are Apache Parquet segments (logs via `Pulso.Codec.NIF.{encode,decode}_log_segment_parquet`, metrics via `encode_metric_segment_parquet` / `decode_metric_segment_parquet`, traces via `encode_trace_segment_parquet` / `decode_trace_segment_parquet`), keyed as `tenants/<t>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`, sorted by `(service, timestamp_ns)` for logs/traces and `(series_id, timestamp_ns)` for metrics, coordinated per `(tenant, signal)` through an S3-CAS manifest (`Pulso.Storage.S3.Manifest`, `Pulso.Storage.S3.ManifestOwner`, `Pulso.Storage.S3.ManifestCache`).
 - `native/pulso_codec/src/stable_hash.rs` — Pulso's port of Prometheus's `labels.StableHash` (xxhash64 over `name<0xff>value<0xff>…` across labels sorted by name). Byte-exact with the Go reference; conformance-tested in-crate.
-- `Pulso.PromQL` — bounded [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/) subset: float selectors/range functions, grouped aggregations, scalar/vector arithmetic, comparisons, set operators and matching, classic histogram quantiles, clamps, label replacement, ranking/sorting, rounding, absence, timestamps, deviation/regression, explicit-resolution epoch-aligned subqueries, and positive offsets. Stale markers and IEEE non-finite values survive remote write, Parquet, and compaction. Native histograms (rate/increase/irate/delta, sum/avg, `histogram_*` functions, histogram arithmetic; `Pulso.PromQL.NativeHistogram` ports Prometheus 3.5.0 float histograms, `Pulso.PromQL.NativeRange` its range functions) and exemplars (`Pulso.Exemplars`, `/api/v1/query_exemplars`) are supported and checked against Prometheus with `mix pulso.parity`. Exposed by `query_promql` and `/api/v1/query{,_range}`.
+- `Pulso.PromQL` — bounded [Prometheus Query Language](https://prometheus.io/docs/prometheus/latest/querying/basics/) subset: float selectors/range functions, grouped aggregations, scalar/vector arithmetic, comparisons, set operators and matching, classic histogram quantiles, clamps, label replacement, ranking/sorting, rounding, absence, timestamps, deviation/regression, explicit-resolution epoch-aligned subqueries, signed offsets, unitless durations and numeric/`start()`/`end()` `@` anchors. Stale markers and IEEE non-finite values survive remote write, Parquet, and compaction. Native histograms (rate/increase/irate/delta, sum/avg, `histogram_*` functions, histogram arithmetic; `Pulso.PromQL.NativeHistogram` ports Prometheus 3.5.0 float histograms, `Pulso.PromQL.NativeRange` its range functions) and exemplars (`Pulso.Exemplars`, `/api/v1/query_exemplars`) are supported and checked against Prometheus with `mix pulso.parity`. Exposed by `query_promql` and `/api/v1/query{,_range}`.
 - `discover_metrics` and GET/form-POST `/api/v1/labels`, `/api/v1/label/:name/values`, `/api/v1/series` provide complete sample-backed discovery: OR selectors, exact inclusive sample bounds, empty-valued labels projected as absent, no raw-record rewrite. Native timestamp/canonical-label projection and bounded dictionary-key reuse avoid BEAM sample expansion; hard 1024-source/128MiB/1M actual-footer-row, 5000-entry/1MiB dictionary/result and 5M-work/16MiB-probe bounds fail whole. Serving codec tuple is `{2,2,1,1,1}` (metadata/start timestamps, OTLP, postings, discovery, footer planning); discovery remains whole-object and has no external indexes. See `docs/metric-discovery.md` for POST/selector limits, TSDB differences and upgrade requirements.
 - Metrics manifests carry complete, bounded metric-name and low-cardinality label-value sets for exact-match pruning, dictionary-deduplicated with independent budgets. Log manifests carry bounded nonempty promoted-service sets. Trace manifests carry versioned complete service sets, adaptive small-batch ID blooms (new up to 1 KiB, legacy up to 8 KiB), and canonical 2 KiB wide-set blooms. Managed leaf summaries combine complete prefix hashes or identical canonical geometries, capped at 2 KiB bloom / 512 encoded service bytes and 4 KiB per reference; unknown/legacy summaries scan and bloom false positives only add reads.
 

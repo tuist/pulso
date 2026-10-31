@@ -27,10 +27,38 @@ defmodule Pulso.LogQL.ParserTest do
   end
 
   describe "selector" do
+    @tag :byte_diagnostics_batch
+    @tag :string_literals_batch
     test "single equality matcher" do
       assert {:ok, %AST.LogQuery{selector: sel, stages: []}} = Parser.parse("{svc=\"api\"}")
 
       assert %AST.Selector{matchers: [%AST.Matcher{name: "svc", op: :eq, value: "api"}]} = sel
+
+      # Unicode rows from Go 1.27.3 strconv/quote_test.go:251-253,299,310-311,
+      # Copyright 2009 The Go Authors, BSD-3-Clause; see Go-LICENSE in the
+      # Loki fixtures. Surrogate expectations follow Loki's strutil decoder,
+      # not Go's rejecting Unquote. NUL/boundary/malformed controls are local.
+      for {escaped, expected} <- [
+            {~S/\u1234/, "ሴ"},
+            {~S/\U00010111/, <<0x10111::utf8>>},
+            {~S/\U0001011111/, <<0x10111::utf8, "11">>},
+            {~S/\u0000/, <<0>>},
+            {~S/\uD7FF/, <<0xD7FF::utf8>>},
+            {~S/\uE000/, <<0xE000::utf8>>},
+            {~S/\udead/, "�"},
+            {~S/\ud83d\ude4f/, "��"},
+            {~S/\U0010FFFF/, <<0x10FFFF::utf8>>}
+          ] do
+        assert {:ok, %AST.LogQuery{selector: %{matchers: [%AST.Matcher{value: ^expected}]}}} =
+                 Parser.parse("{svc=\"" <> escaped <> "\"}")
+      end
+
+      for escaped <- [~S/\u/, ~S/\u12/, ~S/\uGGGG/, ~S/\U0000000/, ~S/\U12345678/] do
+        assert {:error, _reason} = Parser.parse("{svc=\"" <> escaped <> "\"}")
+      end
+
+      assert {:ok, %AST.LogQuery{selector: %{matchers: [%AST.Matcher{value: ~S/\u1234/}]}}} =
+               Parser.parse(~S/{svc=`\u1234`}/)
     end
 
     test "all four match operators" do
@@ -47,6 +75,34 @@ defmodule Pulso.LogQL.ParserTest do
 
     test "rejects a query without a selector" do
       assert {:error, _} = Parser.parse("|= \"foo\"")
+    end
+  end
+
+  # Go table inputs; expectations from the actual pinned Loki Scanner and
+  # Prometheus strutil.Unquote, not strconv.Unquote. See fixture provenance.
+  @tag :string_literals_batch
+  test "quoted and raw literals preserve decoder bytes and lexer rejection" do
+    cases =
+      "test/fixtures/logs/loki-upstream/string-literals.jsonl"
+      |> File.stream!()
+      |> Enum.map(&Pulso.JSON.decode!/1)
+
+    assert length(cases) == 104
+
+    for row <- cases do
+      literal = Base.decode64!(row["literal_base64"])
+      query = "{svc=" <> literal <> "}"
+
+      case row["value_base64"] do
+        nil ->
+          assert {:error, _reason} = Parser.parse(query), inspect(literal)
+
+        encoded ->
+          expected = Base.decode64!(encoded)
+
+          assert {:ok, %AST.LogQuery{selector: %{matchers: [%AST.Matcher{value: ^expected}]}}} =
+                   Parser.parse(query)
+      end
     end
   end
 
@@ -80,6 +136,25 @@ defmodule Pulso.LogQL.ParserTest do
                Parser.parse("{s=\"a\"} | size < 5MB")
 
       assert {:cmp, "size", :lt, {:bytes, 5_000_000}} = expr
+    end
+
+    @tag :label_conversion_batch
+    test "typed equality admits both spellings without changing string or selector grammar" do
+      for {literal, expected} <- [
+            {"1s", {:duration_ns, 1_000_000_000}},
+            {"5MB", {:bytes, 5_000_000}},
+            {"2", {:number, 2}}
+          ],
+          operator <- ["=", "=="] do
+        assert {:ok, %AST.LogQuery{stages: [%AST.LabelFilter{expr: expr}]}} =
+                 Parser.parse(~s/{s="a"} | n#{operator}#{literal}/)
+
+        assert expr == {:cmp, "n", :eq, expected}
+      end
+
+      for text <- [~s/{s=="a"}/, ~s/{s="a"} | n=="2"/, ~s/{s="a"} | drop n=="2"/, ~s/{s="a"} | keep n=="2"/] do
+        assert {:error, _} = Parser.parse(text)
+      end
     end
 
     test "and binds tighter than or" do
@@ -254,9 +329,10 @@ defmodule Pulso.LogQL.ParserTest do
       assert {:ok, %AST.NumberLit{value: -5}} = Parser.parse("-5")
     end
 
-    test "unary minus on an expression rewrites as 0 - x" do
-      assert {:ok, %AST.BinaryOp{op: :sub, left: %AST.NumberLit{value: 0}}} =
-               Parser.parse("-rate({s=\"a\"}[5m])")
+    test "a sign cannot negate a vector or parenthesized expression" do
+      for query <- ["-rate({s=\"a\"}[5m])", "-vector(2)", "-(1 + 2)", "+(1 + 2)"] do
+        assert {:error, _} = Parser.parse(query)
+      end
     end
   end
 

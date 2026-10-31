@@ -954,12 +954,8 @@ pub(crate) fn attribute_filters<'a>(env: Env<'a>, filters: Term<'a>) -> Res<Attr
                     return Err(Error::Invalid);
                 }
                 // Share Prometheus/Tempo's full-string, dot-all RE2 subset.
-                crate::metric_segment_parquet::compile_metric_regex(&pattern)
-                    .map_err(|_| Error::Invalid)?;
-                let compiled = crate::metric_segment_parquet::compile_metric_regex(&format!(
-                    "(?s:\\A(?:{pattern})\\z)"
-                ))
-                .map_err(|_| Error::Invalid)?;
+                let compiled =
+                    crate::query_regex::anchored(&pattern).map_err(|_| Error::Invalid)?;
                 values.push((key, compiled));
             }
             regex_filters.push((field, values));

@@ -5,8 +5,8 @@ Revision: **`dd039cdd4ba466adb5d28280bf1b8a374a98432e`**.
 The executable fixtures are embedded in
 [`mimir_service_conformance_test.exs`](../../../../pulso_web/controllers/mimir_service_conformance_test.exs).
 They are ports of the public request/response portions of actual Mimir service
-integration tests, not invented cases labelled upstream. This is **49 selected
-scenario replays**, plus 21 separately named Pulso regression/control tests,
+integration tests, not invented cases labelled upstream. This is **51 selected
+scenario replays**, plus 22 separately named Pulso regression/control tests,
 not the complete Mimir integration suite. The existing math corpus in the parent
 directory is separate and remains unchanged.
 
@@ -24,7 +24,8 @@ All links below are pinned to the revision above.
 | [`TestDistributor_NameValidation` → `testDistributorNameValidation`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/distributor_test.go#L1353-L1615) | All three rows (`legacy metric name`, `utf8 metric name`, `utf8 label name`), each with RW1 and RW2, selecting **UTF8Validation only** | 6 |
 | [`TestIngesterQuerying`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/ingester_test.go#L23-L582) | All seven table entries: `float series`; `integer histogram series`; `float histogram series`; `series switching from float to integer histogram to float histogram`; `series including float and native histograms at same timestamp`; `float series where sample timestamps don't align with query step`; `query that returns no results` | 7 |
 | [`TestQueryFrontendWithExplicitLookbackDelta` → `queryLookbackDeltaTest`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L1067-L1203) | Default 5m lookback at sample+3m / sample+6m; explicit 10m / 1m at sample+6m. Each checks instant and range queries with the upstream ±100m / 100m step geometry. | 4 |
-| [`TestQueryFrontendErrorMessageParity` → `testQueryFrontendErrorMessageParityScenario`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L566-L905) | Eight portable invalid range requests: maximum resolution; negative step; unknown function; range vector instead of instant vector; start after end; malformed step; malformed start; range query with range vector. Exact HTTP/status/errorType, explicitly adapted diagnostic text, and weaker omitted-resolution syntax rejection (details below). | 8 |
+| [`testQueryFrontend`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L359-L454) | User-0's `scalar(series_1)` and `series_1[5m]` instant requests, preserving complete type, timestamp and value assertions | 2 |
+| [`TestQueryFrontendErrorMessageParity` → `testQueryFrontendErrorMessageParityScenario`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L566-L905) | Eight portable invalid range requests: maximum resolution; negative step; unknown function; range vector instead of instant vector; start after end; malformed step; malformed start; range query with range vector. Exact HTTP/status/errorType and explicitly adapted diagnostic text (details below). | 8 |
 | [`TestQuerierWithBlocksStorageRunningInSingleBinaryMode`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L311-L517) → [`testMetadataQueriesWithBlocksStorage`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L573-L790) | All four helper time windows: inside head; inside ingester/outside head; partially inside ingester; entirely outside ingester. Every series lookup, metric-name values selector (including OR), and label-name expectation in that helper is retained: 29 discovery requests. | 4 |
 | [`TestHashCollisionHandling`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L983-L1068) | One RW1 push containing both `fingerprint_collision` series under `user-0`, then the complete instant vector at the shared sample timestamp | 1 |
 | [`TestFormatQueryAPIEndpoint`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/api_endpoints_test.go#L89-L112) | Exact GET expression `count(up)by(foo)`, HTTP 200 and expected `data="count by (foo) (up)"`; no storage request | 1 |
@@ -68,6 +69,12 @@ All links below are pinned to the revision above.
   on both requests, the exact query and the complete ordered two-series vector.
   No sorting, count-only assertion or Pulso-generated result oracle replaces
   upstream's full-vector equality.
+- The scalar/range frontend cases retain tenant `user-0`, `series_1`, both
+  exact queries and complete scalar/matrix responses. The source random float
+  is frozen to 0.5 and the source clock to the harness timestamp. They replay
+  one portable input, not Mimir's multi-user/concurrent deployment permutations,
+  histogram users or ring/frontend synchronization. The scalar case is a
+  pre-existing-behavior control; the raw range result closes a reproduced gap.
 - Expected successful responses come from the upstream tables and assertion
   rules, never from querying Pulso to regenerate an oracle. Sorting the
   histogram's two bucket series ignores response ordering only; every
@@ -160,10 +167,11 @@ including the shortest-roundtrip spellings of `18.4 * float64(i+1)` sums.
     seeded metric series and tenant policy/sharding/remote-execution/client
     permutations are omitted: none is needed for these pre-storage rejections.
     Diagnostic text is explicitly adapted to Pulso's existing generic message;
-    this is **not upstream error-message parity**. The omitted-resolution
-    subquery rejects unsupported syntax, a weaker reason than upstream's
-    range-vector result-type validation. No unrelated controls or runtime
-    changes are added for this increment.
+    this is **not upstream error-message parity**. Omitted-resolution subqueries
+    and instant top-level range results are now supported. Range-query requests
+    still reject range expressions, including the last selected row, even with
+    equal bounds. A separate Pulso control checks GET/form POST and verifies
+    that invalid result types cause no provider requests.
 
 ## Gaps reproduced and fixed
 
@@ -356,11 +364,11 @@ keys, rather than a status-only or partial-map match:
 {"status":"error","errorType":"bad_data","error":"Invalid or unsupported query parameters."}
 ```
 
-In particular, `(sum(rate(up[1m])))[5m:]` is rejected because Pulso requires
-explicit subquery resolution. A direct existing-parser diagnostic returns
-`{:error, :invalid_or_unsupported_query}`. This is **weaker unsupported-syntax
-rejection**, not proof of upstream's range-vector result-type validation.
-Omitted-resolution subquery support and exact diagnostic parity remain gaps.
+Initially `(sum(rate(up[1m])))[5m:]` rejected because omitted resolutions were
+unsupported. The grammar and result-type batches now support them inside range
+functions and as top-level instant results. The selected range request still
+rejects, now with `{:error, :invalid_result_type}`.
+Exact diagnostic parity remains a gap.
 No selected row unexpectedly succeeded or returned a different HTTP status.
 
 Each test uses the existing async, owned loopback S3 provider/native
@@ -453,6 +461,59 @@ remote-read, tenant federation, cardinality analysis, exact upstream printer lay
 streaming transport and Mimir-specific sharding/caching/limits/failure topology.
 Passing this selection is not full PromQL, full Mimir service or deployed-client
 compatibility evidence.
+
+## Shared hexadecimal regex controls
+
+The separately tagged `:regex_hex_batch` is a local control, not an extra Mimir
+integration port. It sends eight distinct label values through remote write and
+queries native Parquet/S3 with 18 anchored patterns, positive/negative matchers
+and GET/form POST. Expected selections come from independently executed Go
+answers in [`regex/go-controls.json`](../../../regex/go-controls.json), not Pulso.
+The original unanchored Go syntax-table pattern stays in the matcher corpus:
+its substring oracle is not a whole-label HTTP expectation.
+
+Both this Mimir wrapper and the analogous Loki wrapper reject valid braced-hex
+repetition before the shared guard fix (seed643). Malformed escapes and real
+nested/possessive repetitions remain invalid. Six additional Go-checked
+malformed lazy-repetition controls must return HTTP400 through GET/form POST.
+Before that second fix, `a???` returned HTTP200 and selected the `a` row
+(seed646), while valid optional/counted lazy forms remain in the matching
+oracles. Native ABI, storage/keyed bytes and resource limits do not change;
+all query-serving native artifacts need the
+fix. This batch does not establish full Go regex, Tempo or deployed-client parity.
+
+The local `:regex_admission_batch` additionally replays all 53 shared Go
+admission patterns over eight remote-written label values through positive/
+negative selectors and GET/form POST against native Parquet/S3. Independent
+whole-label expectations distinguish 999/1,000/1,001 counts from literal braces.
+Invalid patterns must return HTTP400 without storage requests. The separate
+[`regex/admission-controls.json`](../../../regex/admission-controls.json)
+retains eight original Go parser patterns plus local controls; it is not an
+additional Mimir integration export or full regex conformance claim.
+
+The same batch also replays 32 local literal-class cases from
+[`regex/class-controls.json`](../../../regex/class-controls.json): `&&`/`~~`
+remain ordinary members with negation, folding, POSIX classes and ranges.
+All three protocol wrappers reject valid classes before implementation
+(seed 669); the affected 370-test suites pass seed 670. Existing scan/work
+ceilings and storage/keyed bytes are unchanged; this is not full class grammar.
+
+The wrapper also replays 72 local bracket/range admission cases from
+[`regex/range-controls.json`](../../../regex/range-controls.json), retaining
+independent whole-label Go answers and no-storage assertions for invalid
+patterns. Literal brackets and left-to-right scalar hyphen ranges never become
+Rust nested classes or set subtraction. All three protocol wrappers rejected
+valid `[[]` before this fix (seed 673). These are local controls, not additional
+Mimir integration exports; the three older fixtures and existing limits are unchanged.
+
+The wrapper also replays 44 raw-header and 58 inline-flag cases from
+[`regex/name-controls.json`](../../../regex/name-controls.json) and
+[`regex/flag-controls.json`](../../../regex/flag-controls.json). Invalid raw
+names/headers reject before storage; empty/repeated flags preserve matching
+and scope. All three wrappers failed the respective baselines (seeds 680/682).
+The shared matcher additionally checks Go's complete anchored capture maps,
+including `U`/lazy greediness. These independent Go controls are not additional
+Mimir integration exports; see the [regex provenance](../../../regex/README.md).
 
 ## Offline replay
 

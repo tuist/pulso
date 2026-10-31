@@ -77,6 +77,6 @@ defmodule Pulso.Exemplars do
   defp selectors(_leaf, acc), do: acc
 
   # PromQL regex matchers are fully anchored, as the evaluator applies them.
-  defp anchored({name, op, pattern}) when op in [:re, :nre], do: {name, op, "(?s:\\A(?:#{pattern})\\z)"}
+  defp anchored({name, op, pattern}) when op in [:re, :nre], do: {name, op, Pulso.QueryRegex.anchor(pattern)}
   defp anchored(matcher), do: matcher
 end

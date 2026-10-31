@@ -309,7 +309,7 @@ defmodule Pulso.LogQL.EvaluatorTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Static validation: bad regex and ip(...) get clean errors, not silent
+  # Static validation: bad regex and IP patterns get clean errors, not silent
   # wrong answers or crashes.
   # ---------------------------------------------------------------------------
 
@@ -342,9 +342,17 @@ defmodule Pulso.LogQL.EvaluatorTest do
                run(~s({service="api"} | regexp "("))
     end
 
-    test "ip line filter returns :unsupported" do
-      assert {:error, {:unsupported, :ip_line_filter, _cidr}} =
-               run(~s[{service="api"} |= ip("10.0.0.0/8")])
+    @tag :ip_filters_batch
+    test "IP line filters select records and reject invalid patterns" do
+      log("acme", [
+        record(timestamp_ns: 10, service: "api", body: "10.1.2.3"),
+        record(timestamp_ns: 20, service: "api", body: "110.1.2.3")
+      ])
+
+      assert {:ok, [{_, [{10, "10.1.2.3"}]}]} = run(~s[{service="api"} |= ip("10.0.0.0/8")])
+
+      assert {:error, {:invalid_ip_pattern, "10.0.0.0/33"}} =
+               run(~s[{service="api"} |= ip("10.0.0.0/33")])
     end
   end
 

@@ -26,10 +26,11 @@ defmodule Pulso.Alerting.NativeThresholdTest do
     validated = rule()
     assert validated["enabled"] == false
     assert validated["no_data_policy"] == "keep_last"
+    assert rule(%{"query" => ~s'rate_counter({service="api"} | unwrap n [1m])'})["enabled"] == false
 
     for change <- [
           %{"query" => ~s'{service="api"}'},
-          %{"query" => ~s'rate_counter({service="api"} | unwrap n [1m])'},
+          %{"query" => ~s'rate_counter({service="api"}[1m])'},
           %{"query" => String.duplicate("1", 16_385)},
           %{"no_data_policy" => "alerting"},
           %{"base_url" => "https://not-contacted.invalid"},

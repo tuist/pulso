@@ -27,13 +27,93 @@ defmodule Pulso.PromQL.RangeMath do
     end
   end
 
+  def quantile(:nan, _samples), do: :nan
+  def quantile(q, _samples) when q == :negative_infinity or (is_number(q) and q < 0), do: :negative_infinity
+  def quantile(q, _samples) when q == :infinity or (is_number(q) and q > 1), do: :infinity
+
+  def quantile(q, samples) do
+    values = samples |> Enum.map(& &1.value) |> Enum.sort(fn a, b -> N.nan?(a) or N.compare("<=", a, b) end)
+    rank = q * (length(values) - 1)
+    lower = trunc(rank)
+    weight = rank - lower
+
+    # An exact rank reads only that observation: zero times an adjacent
+    # infinity or NaN would otherwise contaminate a finite result or -0.
+    if weight == 0,
+      do: Enum.at(values, lower),
+      else: N.add(N.multiply(Enum.at(values, lower), 1 - weight), N.multiply(Enum.at(values, lower + 1), weight))
+  end
+
+  def smooth([first, second | _] = samples, sf, tf) do
+    initial_trend = N.binary("-", second.value, first.value)
+
+    {_, level, _} =
+      Enum.reduce(tl(samples), {nil, first.value, initial_trend}, fn sample, {previous, level, trend} ->
+        weighted = N.multiply(sf, sample.value)
+
+        trend =
+          if is_nil(previous),
+            do: trend,
+            else: N.add(N.multiply(tf, N.binary("-", level, previous)), N.multiply(N.binary("-", 1, tf), trend))
+
+        next = N.add(weighted, N.multiply(N.binary("-", 1, sf), N.add(level, trend)))
+        {level, next, trend}
+      end)
+
+    level
+  end
+
+  def smooth(_, _, _), do: nil
+
+  def mad(samples) do
+    values = Enum.map(samples, & &1.value)
+
+    if Enum.any?(values, &N.nan?/1) do
+      :nan
+    else
+      center = median(values)
+      values |> Enum.map(&absolute_difference(&1, center)) |> median()
+    end
+  end
+
+  defp median(values) do
+    sorted = Enum.sort(values, fn a, b -> N.nan?(a) or N.compare("<=", a, b) end)
+    count = length(sorted)
+    upper = div(count, 2)
+
+    if rem(count, 2) == 1,
+      do: Enum.at(sorted, upper),
+      else: N.add(N.multiply(Enum.at(sorted, upper - 1), 0.5), N.multiply(Enum.at(sorted, upper), 0.5))
+  end
+
+  defp absolute_difference(value, center) do
+    case N.binary("-", value, center) do
+      value when is_number(value) -> abs(value)
+      :negative_infinity -> :infinity
+      value -> value
+    end
+  end
+
   def predict(samples, origin, horizon) when length(samples) >= 2 do
+    {slope, intercept} = regression(samples, origin)
+    N.add(N.multiply(slope, horizon), intercept)
+  end
+
+  def predict(_, _, _), do: nil
+
+  def deriv([first, _ | _] = samples) do
+    {slope, _} = regression(samples, first.timestamp_ns)
+    slope
+  end
+
+  def deriv(_), do: nil
+
+  defp regression(samples, origin) do
     values = Enum.map(samples, & &1.value)
     first = hd(values)
 
     if Enum.all?(values, &N.compare("==", &1, first)) do
-      intercept = if is_number(first), do: first, else: :nan
-      N.add(N.multiply(0.0, horizon), intercept)
+      if is_number(first), do: {0.0, first}, else: {:nan, :nan}
     else
       {sx, sy, sxy, sx2} = sums(samples, origin)
       n = length(samples)
@@ -41,11 +121,9 @@ defmodule Pulso.PromQL.RangeMath do
       variance = N.binary("-", sx2, N.divide(N.multiply(sx, sx), n))
       slope = N.divide(covariance, variance)
       intercept = N.binary("-", N.divide(sy, n), N.divide(N.multiply(slope, sx), n))
-      N.add(N.multiply(slope, horizon), intercept)
+      {slope, intercept}
     end
   end
-
-  def predict(_, _, _), do: nil
 
   defp sums(samples, origin) do
     initial = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}}

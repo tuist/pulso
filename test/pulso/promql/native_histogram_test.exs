@@ -9,9 +9,12 @@ defmodule Pulso.PromQL.NativeHistogramTest do
   # (inputs and expected values verbatim). Quantile, fraction and variance
   # expectations come from promql/promqltest/testdata/native_histograms.test,
   # which compares sample values with a relative tolerance of 1e-6.
+  # Exception: differing custom-bound addition/subtraction now use Mimir dd039cdd's
+  # common-bound reconciliation instead of Prometheus 3.5.0's rejection;
+  # mismatched-bound reset detection likewise compares reconciled bucket totals.
 
   describe "add/2 and sub/2" do
-    test "match Prometheus's TestFloatHistogramAdd in both operand orders" do
+    test "match FloatHistogramAdd with Mimir custom-bound reconciliation in both operand orders" do
       for {name, a, b, expected, error} <- add_cases() do
         if error do
           assert NativeHistogram.add(a, b) == {:error, error}, name
@@ -25,7 +28,7 @@ defmodule Pulso.PromQL.NativeHistogramTest do
       end
     end
 
-    test "match Prometheus's TestFloatHistogramSub, including the negated reverse" do
+    test "match FloatHistogramSub with Mimir custom-bound reconciliation, including the negated reverse" do
       for {name, a, b, expected, error} <- sub_cases() do
         if error do
           assert NativeHistogram.sub(a, b) == {:error, error}, name
@@ -36,6 +39,8 @@ defmodule Pulso.PromQL.NativeHistogramTest do
 
           assert {:ok, result} = NativeHistogram.sub(b, a), name
           negated = expected |> NativeHistogram.scale(-1.0) |> NativeHistogram.compact()
+          # Primitive Sub preserves its receiver's hint; Mul(-1) now produces a gauge.
+          negated = %{negated | counter_reset_hint: b.counter_reset_hint}
           assert NativeHistogram.compact(result) == negated, name
         end
       end
@@ -147,14 +152,16 @@ defmodule Pulso.PromQL.NativeHistogramTest do
   end
 
   describe "scale/2 and divide/2" do
-    test "match Prometheus's TestFloatHistogramMul" do
+    test "matches TestFloatHistogramMul values with Mimir's negative-scaling gauge hints" do
       for {name, input, factor, expected} <- mul_cases() do
+        expected = if factor < 0, do: %{expected | counter_reset_hint: :gauge}, else: expected
         assert NativeHistogram.scale(input, factor) == expected, name
       end
     end
 
-    test "match Prometheus's TestFloatHistogramDiv, which drops buckets when dividing by zero" do
+    test "matches TestFloatHistogramDiv values with Mimir's negative-divisor gauge hints" do
       for {name, input, divisor, expected} <- div_cases() do
+        expected = if divisor < 0, do: %{expected | counter_reset_hint: :gauge}, else: expected
         assert NativeHistogram.divide(input, divisor) == expected, name
       end
     end
@@ -174,6 +181,7 @@ defmodule Pulso.PromQL.NativeHistogramTest do
 
       assert NativeHistogram.scale(input, -3.0) ==
                h(
+                 counter_reset_hint: :gauge,
                  count: -90.0,
                  sum: -99.0,
                  zero_count: -9.0,
@@ -186,6 +194,7 @@ defmodule Pulso.PromQL.NativeHistogramTest do
 
       assert NativeHistogram.divide(input, -3.0) ==
                h(
+                 counter_reset_hint: :gauge,
                  count: -10.0,
                  sum: -11.0,
                  zero_count: -1.0,
@@ -245,14 +254,80 @@ defmodule Pulso.PromQL.NativeHistogramTest do
       refute NativeHistogram.detect_reset?(%{bigger | counter_reset_hint: :gauge}, smaller)
     end
 
-    # Prometheus 3.5.0's detectReset stops re-reading previous buckets once the
-    # current ones run out; these results were checked against its code.
-    test "only weighs the previous bucket reached when the current buckets run out" do
+    test "custom layout changes compare plain interval sums, including missing and infinite buckets" do
+      previous =
+        h(
+          schema: -53,
+          count: 20.0,
+          custom_values: [1.0, 3.0],
+          positive_spans: [{0, 3}],
+          positive_buckets: [4.0, 6.0, 10.0]
+        )
+
+      for {counts, count, reset?} <- [
+            {[1.0, 3.0, 2.0, 4.0, 10.0], 20.0, false},
+            {[1.0, 2.0, 2.0, 5.0, 12.0], 22.0, true},
+            {[1.0, 4.0, 3.0, 7.0, 9.0], 24.0, true},
+            {[1.0, 4.0, 3.0, 17.0], 25.0, true}
+          ] do
+        current =
+          h(
+            schema: -53,
+            count: count,
+            custom_values: [0.0, 1.0, 2.0, 3.0],
+            positive_spans: [{0, length(counts)}],
+            positive_buckets: counts
+          )
+
+        assert NativeHistogram.detect_reset?(current, previous) == reset?
+        refute NativeHistogram.detect_reset?(%{current | counter_reset_hint: :no}, previous)
+        assert NativeHistogram.detect_reset?(%{current | counter_reset_hint: :yes}, previous)
+      end
+
+      # No common finite boundary: every bucket joins the final +Inf interval.
+      current =
+        h(
+          schema: -53,
+          count: 20.0,
+          custom_values: [-1.0, 2.0],
+          positive_spans: [{0, 3}],
+          positive_buckets: [3.0, 8.0, 9.0]
+        )
+
+      refute NativeHistogram.detect_reset?(current, previous)
+      assert NativeHistogram.detect_reset?(%{current | count: 19.0}, previous)
+
+      # Compensated summation would incorrectly erase this plain-sum decrease.
+      previous =
+        h(
+          schema: -53,
+          count: 1.0e20,
+          custom_values: [2.0],
+          positive_spans: [{0, 1}],
+          positive_buckets: [10_000_000_000_000_002.0]
+        )
+
+      current =
+        h(
+          schema: -53,
+          count: 1.0e20,
+          custom_values: [-1.0, 0.0, 1.0],
+          positive_spans: [{0, 3}],
+          positive_buckets: [1.0e16, 1.0, 1.0]
+        )
+
+      assert NativeHistogram.detect_reset?(current, previous)
+      refute NativeHistogram.detect_reset?(previous, current)
+    end
+
+    # Mimir's pinned DetectReset keeps visiting the previous iterator after
+    # current exhaustion, unlike the older Prometheus 3.5.0 behavior.
+    test "checks every remaining previous bucket when the current buckets run out" do
       previous = h(count: 5.0, positive_spans: [{0, 2}], positive_buckets: [0.0, 5.0])
-      refute NativeHistogram.detect_reset?(h(count: 10.0), previous)
+      assert NativeHistogram.detect_reset?(h(count: 10.0), previous)
 
       previous = h(count: 5.0, positive_spans: [{0, 3}], positive_buckets: [1.0, 0.0, 4.0])
-      refute NativeHistogram.detect_reset?(h(count: 10.0, positive_spans: [{0, 1}], positive_buckets: [6.0]), previous)
+      assert NativeHistogram.detect_reset?(h(count: 10.0, positive_spans: [{0, 1}], positive_buckets: [6.0]), previous)
     end
   end
 
@@ -609,11 +684,44 @@ defmodule Pulso.PromQL.NativeHistogramTest do
       assert NativeHistogram.fraction_with_info(:negative_infinity, :infinity, some_nan) == {0.8, [:nan_observations]}
     end
 
-    # With a NaN sum, Prometheus 3.5.0 drains the iterator into the bucket it
-    # interpolates in, so the last bucket's bounds win (checked against its code).
-    test "interpolates NaN-sum quantiles in the last bucket like Prometheus" do
-      histogram = h(count: 10.0, sum: :nan, positive_spans: [{0, 2}], positive_buckets: [4.0, 4.0])
-      assert NativeHistogram.quantile_with_info(0.25, histogram) == {1.542210825407941, [:nan_skew]}
+    test "retains the selected bucket for NaN-sum interpolation like corrected Mimir" do
+      positive = h(count: 10.0, sum: :nan, positive_spans: [{0, 2}], positive_buckets: [4.0, 4.0])
+      negative = h(count: 10.0, sum: :nan, negative_spans: [{0, 2}], negative_buckets: [4.0, 4.0])
+
+      zero = %{
+        positive
+        | zero_count: 4.0,
+          zero_threshold: 0.001,
+          positive_spans: [{0, 1}],
+          positive_buckets: [4.0]
+      }
+
+      custom =
+        h(
+          schema: -53,
+          count: 3.0,
+          sum: :nan,
+          positive_spans: [{1, 3}],
+          positive_buckets: [1.0, 1.0, 1.0],
+          custom_values: [1.0, 2.0, 4.0]
+        )
+
+      # Rank 2.5/4 in the first bucket: exponential interpolation on each
+      # side, linear interpolation in the zero bucket. Later buckets only
+      # contribute to NaN detection, never to these bounds or denominators.
+      for {histogram, expected} <- [
+            {positive, :math.pow(2, -0.375)},
+            {negative, -:math.pow(2, 0.375)},
+            {zero, 0.000625}
+          ] do
+        assert {value, [:nan_skew]} = NativeHistogram.quantile_with_info(0.25, histogram)
+        assert_almost(expected, value)
+      end
+
+      # NaN in the sum alone does not prove NaN observations. Custom buckets
+      # include NaNs in +Inf, so total bucket population still equals count.
+      assert {value, []} = NativeHistogram.quantile_with_info(0.2, custom)
+      assert_almost(1.6, value)
     end
   end
 
@@ -734,6 +842,25 @@ defmodule Pulso.PromQL.NativeHistogramTest do
 
       for {histogram, expectations} <- cases, {lower, upper, expected} <- expectations do
         assert_almost(expected, NativeHistogram.fraction(lower, upper, histogram))
+      end
+    end
+
+    test "interpolates before multiplying large or tiny bucket populations" do
+      for {population, width} <- [{1.0e308, 1.0e100}, {1.0e-200, 1.0e-200}] do
+        custom =
+          h(
+            schema: -53,
+            count: population,
+            custom_values: [width],
+            positive_spans: [{0, 1}],
+            positive_buckets: [population]
+          )
+
+        zero = h(count: population, zero_threshold: width, zero_count: population)
+
+        assert NativeHistogram.fraction(0.0, width / 2, custom) == 0.5
+        assert NativeHistogram.fraction(-width, 0.0, zero) == 0.5
+        assert NativeHistogram.fraction(0.0, width, zero) == 0.5
       end
     end
 
@@ -1381,7 +1508,15 @@ defmodule Pulso.PromQL.NativeHistogramTest do
          positive_spans: [{0, 2}, {1, 3}],
          positive_buckets: [0.0, 0.0, 2.0, 3.0, 6.0],
          custom_values: [1.0, 2.0, 3.0, 4.0, 5.0]
-       ), nil, :incompatible_bounds},
+       ),
+       h(
+         schema: -53,
+         count: 26.0,
+         sum: 3.579,
+         positive_spans: [{0, 1}, {2, 2}],
+         positive_buckets: [1.0, 5.0, 20.0],
+         custom_values: [1.0, 2.0, 3.0, 4.0]
+       ), nil},
       {"mix exponential and custom buckets histograms",
        h(
          zero_threshold: 0.01,
@@ -1510,7 +1645,15 @@ defmodule Pulso.PromQL.NativeHistogramTest do
          positive_spans: [{0, 2}, {1, 3}],
          positive_buckets: [0.0, 0.0, 2.0, 3.0, 6.0],
          custom_values: [1.0, 2.0, 3.0, 4.0, 5.0]
-       ), nil, :incompatible_bounds},
+       ),
+       h(
+         schema: -53,
+         count: 4.0,
+         sum: 11.0,
+         positive_spans: [{0, 1}, {2, 2}],
+         positive_buckets: [1.0, 1.0, 2.0],
+         custom_values: [1.0, 2.0, 3.0, 4.0]
+       ), nil},
       {"mix exponential and custom buckets histograms",
        h(
          zero_threshold: 0.01,

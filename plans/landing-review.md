@@ -381,6 +381,9 @@ follow-ups, not independently reviewed final lines.
   not manufacture empty destination labels. Blocked concurrent-evaluator tests
   now terminate owned supervisor children in cleanup, rather than hanging on a
   consumed Task monitor or leaving blocked test work alive after an assertion.
+  The self-rename assertion above is historical and was subsequently corrected
+  against actual pinned Loki execution: `label_format x=x` deletes `x`.
+  See the [formatter continuation](protocol-breadth.md#label-formatter-assignment-continuation).
 
 ### Validation and preserved failures
 
@@ -571,4 +574,3 @@ oversized-write test setup were corrected before the final green run. This is
 merge-integration validation, not a fifth independent review or an update to the
 historical fourth-pass archive. No provider, deployment, capacity or optional
 external-client exercise was added; existing limitations remain open.
-

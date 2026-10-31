@@ -28,6 +28,8 @@ defmodule Pulso.LogQL.NativeRange do
   """
   def collect(inner, spec, tenant, query_opts) do
     with true <- spec.op in @ops,
+         true <- Map.get(spec, :post_filter, []) == [],
+         false <- Map.get(spec, :preserve_errors, false),
          true <- Storage.native_log_metric?(),
          :ok <- QueryValidation.validate(inner),
          {storage_opts, stages} = Evaluator.push_down(inner, query_opts),

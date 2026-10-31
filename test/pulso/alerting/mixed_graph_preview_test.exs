@@ -74,6 +74,14 @@ defmodule Pulso.Alerting.MixedGraphPreviewTest do
     :ok
   end
 
+  @tag :loki_scalars_batch
+  test "LogQL scalar sources remain scalars in expression previews" do
+    scalar = put_in(source(), ["model", "expr"], "7 > 2")
+    assert {:ok, result} = GraphPreview.preview(%{"condition" => "A", "data" => [scalar]}, "acme", @now)
+    assert result["result"] == %{"type" => "scalar", "value" => "1.0"}
+    assert result["executable"] == false
+  end
+
   test "native logs and metrics join only in the authorized tenant and remain non-executable" do
     assert {:ok, result} = GraphPreview.preview(graph(), "acme", @now)
     assert result["result"] == %{"type" => "numbers", "frames" => [%{"labels" => %{"pod" => "one"}, "value" => "1.0"}]}

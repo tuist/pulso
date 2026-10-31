@@ -17,6 +17,94 @@ defmodule Pulso.PromQL.BatchTest do
   defp sample(name, value),
     do: %MetricSample{series_id: 1, timestamp_ns: 10, value: value, labels: %{"__name__" => name}}
 
+  @tag :loki_scalars_batch
+  test "LogQL scalar result types preserve shared work and point quotas" do
+    scalar = {"scalar", "2", %{end_ts_ns: 10, language: :logql}}
+    vector = {"vector", "vector(4)", %{end_ts_ns: 10, language: :logql}}
+
+    for queries <- [[scalar, vector], [vector, scalar]] do
+      assert {:ok, {results, _}} = Evaluator.query_batch(queries, "loki-scalar", &finish/2)
+      assert results["scalar"] == {:logql, :scalar, [{%{}, {10, 2.0}}]}
+      assert results["vector"] == {:logql, :vector, [{%{}, {10, 4.0}}]}
+    end
+
+    for {setting, reason} <- [max_work: :query_work_limit, max_result_points: :query_result_limit] do
+      Runtime.put_env(:pulso, Evaluator, [{setting, 1}])
+      for query <- [scalar, vector], do: assert({:ok, _} = Evaluator.query_batch([query], "loki-scalar", &finish/2))
+
+      for queries <- [[scalar, vector], [vector, scalar]] do
+        assert {:error, ^reason} =
+                 Evaluator.query_batch(queries, "loki-scalar", fn _, _ -> flunk("partial scalar result") end)
+      end
+    end
+  end
+
+  test "string and raw-range results share the batch's result quota in either order" do
+    assert :ok = Storage.append(:metrics, "raw-result", [sample("one", 4.0)])
+    queries = [{"text", ~s("literal"), %{end_ts_ns: 10}}, {"raw", "one[1s]", %{end_ts_ns: 10}}]
+
+    for batch <- [queries, Enum.reverse(queries)] do
+      assert {:ok, {results, _}} = Evaluator.query_batch(batch, "raw-result", &finish/2)
+      assert results["text"]["data"] == %{"resultType" => "string", "result" => [1.0e-8, "literal"]}
+
+      assert results["raw"]["data"] == %{
+               "resultType" => "matrix",
+               "result" => [%{"metric" => %{"__name__" => "one"}, "values" => [[1.0e-8, "4"]]}]
+             }
+    end
+
+    Runtime.put_env(:pulso, Evaluator, max_result_points: 1)
+    for query <- queries, do: assert({:ok, _} = Evaluator.query_batch([query], "raw-result", &finish/2))
+
+    for batch <- [queries, Enum.reverse(queries)] do
+      assert {:error, :query_result_limit} =
+               Evaluator.query_batch(batch, "raw-result", fn _, _ -> flunk("partial callback") end)
+    end
+  end
+
+  test "query context is local to each batch source while scalar work and points accumulate" do
+    expression = "start() + end() + step() + range()"
+
+    assert {:ok, %{"data" => %{"result" => [_, "1"]}}} =
+             Evaluator.query("start() == bool time()", "context")
+
+    queries = [
+      {"range", expression, %{start_ts_ns: 10_000_000_000, end_ts_ns: 15_000_000_000, step_ns: 2_000_000_000}},
+      {"instant", expression, %{end_ts_ns: 7_000_000_000}},
+      {"single", expression, %{start_ts_ns: 3_000_000_000, end_ts_ns: 3_000_000_000, step_ns: 5_000_000_000}}
+    ]
+
+    for batch <- [queries, Enum.reverse(queries)] do
+      assert {:ok, {results, _}} = Evaluator.query_batch(batch, "context", &finish/2)
+      assert results["instant"]["data"] == %{"resultType" => "scalar", "result" => [7.0, "14"]}
+
+      assert results["range"]["data"]["result"] == [
+               %{"metric" => %{}, "values" => [[10.0, "32"], [12.0, "32"], [14.0, "32"]]}
+             ]
+
+      assert results["single"]["data"]["result"] == [%{"metric" => %{}, "values" => [[3.0, "6"]]}]
+    end
+
+    for expression <- ["start()", "end()", "step()", "range()", "min_of(2, 3)", "max_of(2, 3)"],
+        {setting, reason} <- [max_work: :query_work_limit, max_result_points: :query_result_limit] do
+      query = {"one", expression, %{end_ts_ns: 0}}
+
+      assert {:ok, cost} =
+               Evaluator.query_batch([query], "context", fn _, _ -> {:ok, Process.get(:promql_budget)} end)
+
+      key = if setting == :max_work, do: :work, else: :points
+      Runtime.put_env(:pulso, Evaluator, [{setting, Map.fetch!(cost, key)}])
+      assert {:ok, _} = Evaluator.query_batch([query], "context", &finish/2)
+
+      assert {:error, ^reason} =
+               Evaluator.query_batch([query, {"two", expression, %{end_ts_ns: 1}}], "context", fn _, _ ->
+                 flunk("partial callback")
+               end)
+
+      Runtime.put_env(:pulso, Evaluator, [])
+    end
+  end
+
   test "lookback overrides apply per source, including timestamp, and never leak into defaults" do
     assert :ok = Storage.append(:metrics, "acme", [sample("one", 4.0)])
     time = 360_000_000_000

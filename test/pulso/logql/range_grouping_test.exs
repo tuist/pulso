@@ -73,7 +73,8 @@ defmodule Pulso.LogQL.RangeGroupingTest do
   test "unsupported range semantics reject instead of silently ignoring modifiers or counting counters" do
     for query <- [
           ~s'count_over_time({service="web"}[5m]) by (pod)',
-          ~s'rate_counter({service="web"} | logfmt | unwrap lcp [5m])',
+          ~s'rate_counter({service="web"}[5m])',
+          ~s'rate_counter({service="web"} | logfmt | unwrap lcp [5m]) by (pod)',
           ~s'count_over_time({service="web"}[5m] @ 10)',
           ~s'quantile_over_time({service="web"} | logfmt | unwrap lcp [5m])',
           ~s'sum_over_time({service="web"}[5m])'

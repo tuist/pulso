@@ -20,6 +20,11 @@ defmodule Pulso.Traces.Metrics do
   `status`, `kind` and `span:id`, and at most five attributes. `with (...)` hints are
   accepted and ignored, so sampling hints yield exact results.
 
+  Parenthesized pipelines compose with `+`, `-`, `*`, `/` and scalar constants.
+  Scalar-right comparisons filter values; all branches share one storage scan
+  and native series/point/work budgets. Arithmetic runs in the bounded query
+  worker after native aggregation.
+
   Spans are reduced natively per segment (`trace_metrics.rs`); see that
   module for the interval, labeling and quantile semantics.
   """
@@ -27,12 +32,14 @@ defmodule Pulso.Traces.Metrics do
   alias Pulso.Codec.NIF
   alias Pulso.QueryRunner
   alias Pulso.Storage
+  alias Pulso.Traces.MetricExpression
   alias Pulso.Traces.SearchExpression
 
   @functions ~w(rate count_over_time min_over_time max_over_time sum_over_time avg_over_time quantile_over_time histogram_over_time)
   @attribute ~r/\A(?:(span|resource)\.([A-Za-z_][A-Za-z0-9_.\-]*)|\.([A-Za-z_][A-Za-z0-9_.\-]*)|(?:span:)?(duration|name|status|kind))\z/
 
-  @type query :: %{
+  @type query :: pipeline() | %{expression: tuple(), leaves: [pipeline()]}
+  @type pipeline :: %{
           program: list() | nil,
           root_only: boolean(),
           op: String.t(),
@@ -66,11 +73,32 @@ defmodule Pulso.Traces.Metrics do
 
     with {:ok, metrics} <- new(parsed, window) do
       case Storage.trace_metrics_scan(tenant, opts, metrics) do
-        {:ok, _rows} -> native(NIF.trace_metrics_finish(metrics))
-        {:error, :native_fallback} when attempts > 1 -> run(tenant, parsed, window, storage_opts, attempts - 1)
-        {:error, :native_fallback} -> {:error, :query_execution_failed}
-        {:error, _} = error -> error
+        {:ok, _rows} ->
+          finish(parsed, metrics, window)
+
+        {:error, :native_fallback} when attempts > 1 and not is_map_key(parsed, :expression) ->
+          run(tenant, parsed, window, storage_opts, attempts - 1)
+
+        {:error, :native_fallback} ->
+          {:error, :query_execution_failed}
+
+        {:error, _} = error ->
+          error
       end
+    end
+  end
+
+  defp new(%{leaves: leaves}, window) do
+    leaves
+    |> Enum.reduce_while({:ok, []}, fn leaf, {:ok, resources} ->
+      case new(leaf, window) do
+        {:ok, resource} -> {:cont, {:ok, [resource | resources]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, resources} -> native(NIF.trace_metrics_batch_new(Enum.reverse(resources)))
+      error -> error
     end
   end
 
@@ -88,6 +116,13 @@ defmodule Pulso.Traces.Metrics do
       )
     )
   end
+
+  defp finish(%{expression: _} = parsed, metrics, window) do
+    with {:ok, leaves} <- native(NIF.trace_metrics_batch_finish(metrics)),
+         do: MetricExpression.finish(parsed, leaves, window)
+  end
+
+  defp finish(_parsed, metrics, _window), do: native(NIF.trace_metrics_finish(metrics))
 
   defp native(:fallback), do: {:error, :unsupported_trace_selector}
   defp native(result), do: result
@@ -139,8 +174,15 @@ defmodule Pulso.Traces.Metrics do
   @doc "Parse a TraceQL metrics query."
   @spec parse(String.t()) :: {:ok, query()} | {:error, term()}
   def parse(text) when is_binary(text) and byte_size(text) <= 16_384 do
-    with true <- String.valid?(text),
-         {:ok, selector, rest} <- split_selector(String.trim(text)),
+    if String.valid?(text),
+      do: MetricExpression.parse(text, &parse_pipeline/1),
+      else: {:error, :unsupported_trace_selector}
+  end
+
+  def parse(_text), do: {:error, :query_expression_limit}
+
+  defp parse_pipeline(text) do
+    with {:ok, selector, rest} <- split_selector(String.trim(text)),
          {:ok, program, root_only} <- selector(selector),
          {:ok, op, args, by, second} <- pipeline(rest),
          {:ok, value, quantiles} <- arguments(op, args),
@@ -152,8 +194,6 @@ defmodule Pulso.Traces.Metrics do
       _ -> {:error, :unsupported_trace_selector}
     end
   end
-
-  def parse(_text), do: {:error, :query_expression_limit}
 
   defp split_selector("{" <> _ = text) do
     case closing(text, 0, 0, false) do

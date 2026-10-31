@@ -2,9 +2,11 @@ defmodule Pulso.PromQL.Operations do
   @moduledoc false
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Histogram
+  alias Pulso.PromQL.LabelHash
   alias Pulso.PromQL.LabelReplace
   alias Pulso.PromQL.NativeHistogram
   alias Pulso.PromQL.Number
+  alias Pulso.PromQL.RangeMath
   alias Pulso.PromQL.Time
   alias Pulso.Record.NativeHistogram, as: HistogramSample
 
@@ -18,6 +20,8 @@ defmodule Pulso.PromQL.Operations do
   }
   @histogram_properties Map.keys(@histogram_property_functions)
   @sets ["and", "or", "unless"]
+  @trims ["</", ">/"]
+  @calendar_functions ~w(year month day_of_month day_of_week day_of_year days_in_month hour minute)
 
   def binary(op, modifiers, left, right, left_type, right_type, steps) do
     left = by_time(left)
@@ -44,25 +48,32 @@ defmodule Pulso.PromQL.Operations do
     {a, b} = if scalar_left?, do: {scalar, value}, else: {value, scalar}
 
     cond do
-      histogram?(a) or histogram?(b) -> histogram_pair(op, labels, a, b, boolean)
+      histogram?(a) or histogram?(b) or op in @trims -> histogram_pair(op, labels, a, b, boolean)
       filter?(op, boolean) -> filtered_sample(labels, value, Number.compare(op, a, b))
       true -> [{Map.delete(labels, "__name__"), result(op, a, b)}]
     end
   end
 
-  # Prometheus' `vectorElemBinop` for histogram operands: scaling by a float,
-  # adding or subtracting histograms, and comparing two for equality. Any
-  # other combination has no result.
+  # Mimir trimming keeps the histogram's name and reset hint; only a histogram
+  # on the left and a float on the right can produce a result.
+  defp histogram_pair(op, labels, %HistogramSample{} = h, cutoff, _boolean)
+       when op in @trims and not is_struct(cutoff) do
+    Evaluator.charge(:work, length(h.positive_buckets) + length(h.negative_buckets) + length(h.custom_values))
+    [{labels, NativeHistogram.trim(h, cutoff, op == "</")}]
+  end
+
+  # Prometheus' `vectorElemBinop` for other histogram operands: scaling by a
+  # float, adding or subtracting histograms, and comparing two for equality.
   defp histogram_pair(op, labels, a, b, boolean) do
     case {op, a, b} do
       {"*", %HistogramSample{}, b} when not is_struct(b) ->
-        [{Map.delete(labels, "__name__"), compact(NativeHistogram.scale(a, b))}]
+        scaled(op, labels, a, b)
 
       {"*", a, %HistogramSample{}} when not is_struct(a) ->
-        [{Map.delete(labels, "__name__"), compact(NativeHistogram.scale(b, a))}]
+        scaled(op, labels, b, a)
 
       {"/", %HistogramSample{}, b} when not is_struct(b) ->
-        [{Map.delete(labels, "__name__"), compact(NativeHistogram.divide(a, b))}]
+        scaled(op, labels, a, b)
 
       {op, %HistogramSample{}, %HistogramSample{}} when op in ["+", "-"] ->
         combined(op, labels, a, b)
@@ -71,20 +82,64 @@ defmodule Pulso.PromQL.Operations do
         equality(op, labels, a, b, boolean)
 
       _ ->
+        left = if histogram?(a), do: "histogram", else: "float"
+        right = if histogram?(b), do: "histogram", else: "float"
+
+        Evaluator.info(
+          "PromQL info: incompatible sample types encountered for binary operator \"#{op}\": #{left} #{op} #{right}"
+        )
+
         []
     end
   end
 
+  defp scaled(op, labels, h, factor) do
+    # Division by zero drops buckets without traversing them. Multiplication
+    # by zero still visits every bucket before compaction removes empty ones.
+    if !(op == "/" and Number.compare("==", factor, 0.0)) do
+      Evaluator.charge(:work, length(h.positive_buckets) + length(h.negative_buckets))
+    end
+
+    h = if op == "*", do: NativeHistogram.scale(h, factor), else: NativeHistogram.divide(h, factor)
+    [{Map.delete(labels, "__name__"), compact(h)}]
+  end
+
   defp combined(op, labels, a, b) do
+    work =
+      Enum.reduce([a, b], 0, fn h, total ->
+        total + length(h.positive_buckets) + length(h.negative_buckets) + length(h.custom_values)
+      end)
+
+    Evaluator.charge(:work, work)
     result = if op == "+", do: NativeHistogram.add(a, b), else: NativeHistogram.sub(a, b)
+    operation = if op == "+", do: "addition", else: "subtraction"
 
     case result do
-      {:ok, h} -> [{Map.delete(labels, "__name__"), compact(h)}]
-      _ -> []
+      {:ok, h} ->
+        if {a.counter_reset_hint, b.counter_reset_hint} in [{:yes, :no}, {:no, :yes}] do
+          Evaluator.warning("PromQL warning: conflicting counter resets during histogram #{operation}")
+        end
+
+        if a.schema == HistogramSample.custom_buckets_schema() and a.custom_values != b.custom_values do
+          Evaluator.info("PromQL info: mismatched custom buckets were reconciled during #{operation}")
+        end
+
+        h = if op == "-", do: %{h | counter_reset_hint: :gauge}, else: h
+        [{Map.delete(labels, "__name__"), compact(h)}]
+
+      {:error, :incompatible_schema} ->
+        Evaluator.warning("PromQL warning: incompatible bucket layout encountered for binary operator #{op}")
+        []
     end
   end
 
   defp equality(op, labels, a, b, boolean) do
+    work =
+      Enum.reduce([a, b], 0, fn h, total ->
+        total + length(h.positive_buckets) + length(h.negative_buckets) + length(h.custom_values)
+      end)
+
+    Evaluator.charge(:work, work)
     keep = NativeHistogram.equal?(a, b) == (op == "==")
 
     cond do
@@ -159,7 +214,7 @@ defmodule Pulso.PromQL.Operations do
     output_labels = result_labels(labels, other, context)
 
     cond do
-      histogram?(a) or histogram?(b) ->
+      histogram?(a) or histogram?(b) or context.op in @trims ->
         histogram_pair(context.op, output_labels, a, b, context.boolean)
 
       filter?(context.op, context.boolean) ->
@@ -171,8 +226,11 @@ defmodule Pulso.PromQL.Operations do
   end
 
   defp result_labels(labels, other, context) do
+    # Arithmetic removes the many-side name before explicit one-side label
+    # inclusion. group_left/right(__name__) can therefore copy a name back.
+    labels = if context.op in @comparisons or context.op in @trims, do: labels, else: Map.delete(labels, "__name__")
     labels = matched_labels(labels, other, context.modifiers, context.grouping)
-    if context.op not in @comparisons or context.boolean, do: Map.delete(labels, "__name__"), else: labels
+    if context.boolean, do: Map.delete(labels, "__name__"), else: labels
   end
 
   defp matched_labels(labels, _other, modifiers, nil) do
@@ -239,7 +297,21 @@ defmodule Pulso.PromQL.Operations do
   end
 
   def call("time", [], steps), do: [{%{}, Enum.map(steps, &{&1, Time.seconds(&1)})}]
+  def call("pi", [], steps), do: [{%{}, Enum.map(steps, &{&1, :math.pi()})}]
   def call("vector", [scalar], _steps), do: scalar
+
+  def call(name, [], steps) when name in ~w(start end step range) do
+    value = Process.get(:promql_query_context) |> Map.fetch!(name)
+    at_steps(steps, fn _ -> [{%{}, value}] end)
+  end
+
+  def call(name, [left, right], steps) when name in ["min_of", "max_of"] do
+    left = by_time(left)
+    right = by_time(right)
+    at_steps(steps, fn ts -> [{%{}, Number.extremum(name, value(at(left, ts)), value(at(right, ts)))}] end)
+  end
+
+  def call(name, [], steps) when name in @calendar_functions, do: call(name, [call("time", [], steps)], steps)
 
   def call("scalar", [vector], steps) do
     vector = by_time(vector)
@@ -248,17 +320,51 @@ defmodule Pulso.PromQL.Operations do
 
   def call("label_replace", [vector | args], _steps), do: vector |> LabelReplace.run(args) |> coalesce()
 
-  # Native histograms answer for themselves; float samples are classic `le`
-  # buckets, as Prometheus combines them.
+  def call(name, [vector | names], _steps) when name in ["sort_by_label", "sort_by_label_desc"] do
+    names = Enum.map(names, fn {:string, name} -> name end)
+
+    Enum.sort(vector, fn {left, _}, {right, _} ->
+      {left, right} = if name == "sort_by_label_desc", do: {right, left}, else: {left, right}
+      labels_before?(left, right, names)
+    end)
+  end
+
+  def call("label_join", [vector, {:string, destination}, {:string, separator} | sources], _steps) do
+    sources = Enum.map(sources, fn {:string, name} -> name end)
+    count = length(sources)
+    separator_bytes = max(0, count - 1) * byte_size(separator)
+
+    vector
+    |> Enum.map(fn {labels, samples} ->
+      Evaluator.charge(:work, max(1, count))
+      values = Enum.map(sources, &Map.get(labels, &1, ""))
+      bytes = Enum.reduce(values, separator_bytes, &(byte_size(&1) + &2))
+      # Reserve repeated source values and separators before constructing the
+      # joined binary. All reads use the original labels, even when dst is src.
+      Evaluator.charge(:work, bytes)
+      joined = Enum.join(values, separator)
+      labels = if joined == "", do: Map.delete(labels, destination), else: Map.put(labels, destination, joined)
+      {labels, samples}
+    end)
+    |> coalesce()
+  end
+
   def call("histogram_quantile", [quantile, buckets], steps) do
     quantile = by_time(quantile)
     buckets = by_time(buckets)
 
     at_steps(steps, fn ts ->
       q = value(at(quantile, ts))
-      {natives, classic} = Enum.split_with(at(buckets, ts), fn {_, v} -> histogram?(v) end)
-      native = for {labels, h} <- natives, do: {Map.delete(labels, "__name__"), NativeHistogram.quantile(q, h)}
-      native ++ Histogram.quantile(q, classic)
+      Histogram.quantile(q, at(buckets, ts))
+    end)
+  end
+
+  def call("histogram_quantiles", [vector, {:string, destination} | qs], steps) do
+    vector = by_time(vector)
+    qs = Enum.map(qs, &by_time/1)
+
+    at_steps(steps, fn ts ->
+      Histogram.quantiles(at(vector, ts), destination, Enum.map(qs, &value(at(&1, ts))))
     end)
   end
 
@@ -267,10 +373,7 @@ defmodule Pulso.PromQL.Operations do
 
     at_steps(steps, fn ts ->
       {l, u} = {value(at(lower, ts)), value(at(upper, ts))}
-
-      for {labels, h} <- at(vector, ts),
-          histogram?(h),
-          do: {Map.delete(labels, "__name__"), NativeHistogram.fraction(l, u, h)}
+      Histogram.fraction(l, u, at(vector, ts))
     end)
   end
 
@@ -278,31 +381,66 @@ defmodule Pulso.PromQL.Operations do
     property = Map.fetch!(@histogram_property_functions, name)
 
     for {labels, samples} <- vector,
-        points = for({ts, h} <- samples, histogram?(h), do: {ts, apply(NativeHistogram, property, [h])}),
+        points = for({ts, h} <- samples, histogram?(h), do: {ts, histogram_property(property, h)}),
         points != [],
         do: {Map.delete(labels, "__name__"), points}
   end
 
+  def call("clamp", [vector, lower, upper], steps) do
+    {vector, lower, upper} = {by_time(vector), by_time(lower), by_time(upper)}
+
+    at_steps(steps, fn ts ->
+      {low, high} = {value(at(lower, ts)), value(at(upper, ts))}
+
+      if Number.compare(">", low, high),
+        do: [],
+        else: transform_vector("clamp", at(vector, ts), {low, high})
+    end)
+  end
+
   def call(name, [vector | params], steps)
-      when name in [
-             "clamp_min",
-             "clamp_max",
-             "round",
-             "abs",
-             "sort",
-             "sort_desc",
-             "sgn",
-             "floor",
-             "ceil",
-             "sqrt",
-             "exp",
-             "ln",
-             "log2",
-             "log10"
-           ] do
+      when name in @calendar_functions or
+             name in [
+               "clamp_min",
+               "clamp_max",
+               "round",
+               "abs",
+               "sort",
+               "sort_desc",
+               "sgn",
+               "floor",
+               "ceil",
+               "sqrt",
+               "exp",
+               "ln",
+               "log2",
+               "log10",
+               "deg",
+               "rad",
+               "asin",
+               "acos",
+               "atan",
+               "sin",
+               "cos",
+               "tan",
+               "sinh",
+               "cosh",
+               "tanh",
+               "asinh",
+               "acosh",
+               "atanh"
+             ] do
     vector = by_time(vector)
     params = Enum.map(params, &by_time/1)
     at_steps(steps, fn ts -> transform_vector(name, at(vector, ts), parameter(params, ts)) end)
+  end
+
+  defp histogram_property(property, h) do
+    if property in [:stddev, :stdvar] do
+      Evaluator.charge(:work, 1 + length(h.positive_buckets) + length(h.negative_buckets) + length(h.custom_values))
+    end
+
+    apply(NativeHistogram, property, [h])
   end
 
   defp parameter([], _ts), do: 1.0
@@ -322,9 +460,55 @@ defmodule Pulso.PromQL.Operations do
     Enum.map(vector, fn {labels, value} -> {Map.delete(labels, "__name__"), transform(name, value, parameter)} end)
   end
 
+  defp transform("clamp", v, {lower, upper}), do: v |> clamp(upper, :max) |> clamp(lower, :min)
   defp transform("clamp_min", v, p), do: clamp(v, p, :min)
   defp transform("clamp_max", v, p), do: clamp(v, p, :max)
+  defp transform(name, v, _) when name in @calendar_functions, do: Time.calendar(name, v)
   defp transform("round", v, p), do: round_value(v, p)
+  # Pre-rounded pi/180 and 180/pi, as in Prometheus's constant expressions.
+  # Scale once: multiplying before dividing can overflow a finite conversion.
+  defp transform("rad", v, _), do: Number.multiply(v, 0.017453292519943295)
+  defp transform("deg", v, _), do: Number.multiply(v, 57.29577951308232)
+  defp transform("asin", v, _) when is_number(v) and v >= -1 and v <= 1, do: :math.asin(v)
+  defp transform("asin", _, _), do: :nan
+  defp transform("acos", v, _) when is_number(v) and v >= -1 and v <= 1, do: :math.acos(v)
+  defp transform("acos", _, _), do: :nan
+  defp transform("atan", :nan, _), do: :nan
+  defp transform("atan", :infinity, _), do: :math.pi() / 2
+  defp transform("atan", :negative_infinity, _), do: -:math.pi() / 2
+  defp transform("atan", v, _), do: :math.atan(v)
+
+  defp transform(name, v, _) when name in ["sin", "cos", "tan"] and v in [:nan, :infinity, :negative_infinity], do: :nan
+
+  defp transform("sin", v, _), do: :math.sin(v)
+  defp transform("cos", v, _), do: :math.cos(v)
+  defp transform("tan", v, _), do: :math.tan(v)
+  defp transform("sinh", v, _) when v in [:nan, :infinity, :negative_infinity], do: v
+  defp transform("cosh", :nan, _), do: :nan
+  defp transform("cosh", v, _) when v in [:infinity, :negative_infinity], do: :infinity
+
+  # Go math.Sinh/Cosh use Exp(abs(x))/2 above 21, including Exp's earlier
+  # overflow. Platform sinh/cosh can still return finite values beyond it.
+  defp transform(name, v, _) when name in ["sinh", "cosh"] and abs(v) > 21 do
+    result = Number.multiply(exponential(abs(v)), 0.5)
+    if name == "sinh" and v < 0, do: Number.negate(result), else: result
+  end
+
+  defp transform("sinh", v, _), do: :math.sinh(v)
+  defp transform("cosh", v, _), do: :math.cosh(v)
+  defp transform("tanh", :nan, _), do: :nan
+  defp transform("tanh", :infinity, _), do: 1.0
+  defp transform("tanh", :negative_infinity, _), do: -1.0
+  defp transform("tanh", v, _), do: :math.tanh(v)
+  defp transform("asinh", v, _) when v in [:nan, :infinity, :negative_infinity], do: v
+  defp transform("asinh", v, _), do: :math.asinh(v)
+  defp transform("acosh", :infinity, _), do: :infinity
+  defp transform("acosh", v, _) when is_number(v) and v >= 1, do: :math.acosh(v)
+  defp transform("acosh", _, _), do: :nan
+  defp transform("atanh", v, _) when v == 1, do: :infinity
+  defp transform("atanh", v, _) when v == -1, do: :negative_infinity
+  defp transform("atanh", v, _) when is_number(v) and v > -1 and v < 1, do: :math.atanh(v)
+  defp transform("atanh", _, _), do: :nan
   defp transform("floor", v, _) when is_number(v), do: :math.floor(v)
   defp transform("floor", v, _), do: v
   defp transform("ceil", v, _) when is_number(v), do: :math.ceil(v)
@@ -438,11 +622,135 @@ defmodule Pulso.PromQL.Operations do
     end
   end
 
-  def topk(op, grouping, parameter, vector, steps) do
+  def parameter_aggregate("count_values", grouping, {:string, name}, vector, steps) do
+    vector = by_time(vector)
+
+    at_steps(steps, fn ts ->
+      vector
+      |> at(ts)
+      |> Enum.reduce(%{}, fn {labels, sample}, counts ->
+        text = value_text(sample)
+        # Charge generated-label bytes before constructing its label map.
+        Evaluator.charge(:work, byte_size(name) + IO.iodata_length(text))
+        labels = labels |> group_key(grouping) |> Map.put(name, IO.iodata_to_binary(text))
+        Map.update(counts, labels, 1.0, &(&1 + 1.0))
+      end)
+      |> Map.to_list()
+    end)
+  end
+
+  def parameter_aggregate("quantile", grouping, parameter, vector, steps) do
+    parameter = by_time(parameter)
+    vector = by_time(vector)
+
+    at_steps(steps, fn ts ->
+      q = value(at(parameter, ts))
+      Evaluator.quantile_warning(q)
+      {histograms, floats} = Enum.split_with(at(vector, ts), fn {_, v} -> histogram?(v) end)
+      if histograms != [], do: Evaluator.info("PromQL info: ignored histogram in quantile aggregation")
+
+      floats
+      |> Enum.group_by(fn {labels, _} -> group_key(labels, grouping) end, fn {_, v} -> %{value: v} end)
+      |> Enum.map(fn {labels, samples} ->
+        count = length(samples)
+        Evaluator.charge(:work, count * length(Integer.digits(count, 2)))
+        {labels, RangeMath.quantile(q, samples)}
+      end)
+    end)
+  end
+
+  def parameter_aggregate(op, grouping, parameter, vector, steps) when op in ["limitk", "limit_ratio"] do
+    parameter = by_time(parameter)
+
+    {parameters, _} =
+      Enum.map_reduce(steps, MapSet.new(), fn ts, seen ->
+        {parameter, seen} = sampling_parameter(op, value(at(parameter, ts)), seen)
+        {{ts, parameter}, seen}
+      end)
+
+    parameters = Map.new(parameters)
+
+    # Hash every complete label set once, independently of values, groups and
+    # steps. Never reuse the storage fingerprint, including after label rewrites.
+    hashes =
+      Map.new(vector, fn {labels, _} ->
+        bytes = Enum.reduce(labels, 0, fn {k, v}, n -> n + byte_size(k) + byte_size(v) + 8 end)
+        Evaluator.charge(:work, bytes + map_size(labels) * length(Integer.digits(map_size(labels) + 1, 2)))
+        {labels, LabelHash.hash(labels)}
+      end)
+
+    vector = if op == "limitk", do: sampling_order(vector, hashes), else: vector
+    vector = by_time(vector)
+
+    at_steps(steps, fn ts ->
+      samples = at(vector, ts)
+      Evaluator.charge(:work, Enum.reduce(samples, 1, fn {labels, _}, n -> n + map_size(labels) end))
+      sampling_step(op, grouping, Map.fetch!(parameters, ts), samples, hashes)
+    end)
+  end
+
+  def parameter_aggregate(op, grouping, parameter, vector, steps) do
     parameter = by_time(parameter)
     vector = by_time(vector)
     at_steps(steps, fn ts -> topk_step(op, grouping, value(at(parameter, ts)), at(vector, ts)) end)
   end
+
+  defp sampling_parameter("limitk", k, seen) do
+    if not is_number(k) or k <= -9_223_372_036_854_775_808 or k >= 9_223_372_036_854_775_808,
+      do: throw({:promql_error, :invalid_aggregation_parameter})
+
+    {max(0, trunc(k)), seen}
+  end
+
+  defp sampling_parameter("limit_ratio", :nan, _), do: throw({:promql_error, :invalid_aggregation_parameter})
+
+  defp sampling_parameter("limit_ratio", ratio, seen) do
+    capped =
+      cond do
+        Number.compare(">", ratio, 1) -> 1.0
+        Number.compare("<", ratio, -1) -> -1.0
+        true -> ratio
+      end
+
+    if capped != ratio and not MapSet.member?(seen, capped) do
+      Evaluator.ratio_warning(ratio, capped)
+      {capped, MapSet.put(seen, capped)}
+    else
+      {capped, seen}
+    end
+  end
+
+  defp sampling_order(vector, hashes) do
+    count = length(vector)
+
+    bytes =
+      Enum.reduce(vector, 0, fn {labels, _}, n ->
+        Enum.reduce(labels, n + 1, fn {k, v}, n -> n + byte_size(k) + byte_size(v) end)
+      end)
+
+    Evaluator.charge(:work, (count + bytes) * length(Integer.digits(count + 1, 2)))
+    Enum.sort_by(vector, fn {labels, _} -> {Map.fetch!(hashes, labels), labels} end)
+  end
+
+  defp sampling_step("limitk", grouping, k, samples, _) do
+    samples
+    |> Enum.group_by(fn {labels, _} -> group_key(labels, grouping) end)
+    |> Enum.flat_map(fn {_, values} -> Enum.take(values, k) end)
+  end
+
+  defp sampling_step("limit_ratio", _, ratio, samples, hashes) do
+    Enum.filter(samples, fn {labels, _} ->
+      offset = Map.fetch!(hashes, labels) / 18_446_744_073_709_551_616
+      if ratio >= 0, do: offset < ratio, else: offset >= 1.0 + ratio
+    end)
+  end
+
+  defp value_text(%HistogramSample{} = h) do
+    Evaluator.charge(:work, 1 + length(h.positive_buckets) + length(h.negative_buckets) + length(h.custom_values))
+    NativeHistogram.value_text(h)
+  end
+
+  defp value_text(value), do: Number.format(value, :fixed)
 
   defp topk_step(op, grouping, k, vector) do
     k = rank_count(k)
@@ -465,6 +773,58 @@ defmodule Pulso.PromQL.Operations do
   def group_key(_, nil), do: %{}
   def group_key(labels, {:grouping, :by, names}), do: Map.take(labels, names)
   def group_key(labels, {:grouping, :without, names}), do: Map.drop(labels, ["__name__" | names])
+
+  defp labels_before?(left, right, []) do
+    bytes = Enum.reduce(left, 0, fn {k, v}, sum -> sum + byte_size(k) + byte_size(v) + 1 end)
+    bytes = Enum.reduce(right, bytes, fn {k, v}, sum -> sum + byte_size(k) + byte_size(v) + 1 end)
+    Evaluator.charge(:work, max(1, bytes))
+    Enum.sort(left) <= Enum.sort(right)
+  end
+
+  defp labels_before?(left, right, [name | names]) do
+    a = Map.get(left, name, "")
+    b = Map.get(right, name, "")
+    Evaluator.charge(:work, 1 + byte_size(name) + byte_size(a) + byte_size(b))
+
+    if a == b do
+      labels_before?(left, right, names)
+    else
+      # Match the pinned dependency's ASCII digit chunks and int64 overflow
+      # fallback. Its empty/leading-zero comparisons are not a total order.
+      natural_before?(Regex.scan(~r/[0-9]+|[^0-9]+/, a), Regex.scan(~r/[0-9]+|[^0-9]+/, b))
+    end
+  end
+
+  defp natural_before?([], _), do: false
+  defp natural_before?(_, []), do: false
+
+  defp natural_before?([[a] | rest_a], [[b] | rest_b]) do
+    {a, b} =
+      case {natural_integer(a), natural_integer(b)} do
+        {{:ok, a}, {:ok, b}} -> {a, b}
+        _ -> {a, b}
+      end
+
+    cond do
+      a != b -> a < b
+      rest_a == [] -> true
+      rest_b == [] -> false
+      true -> natural_before?(rest_a, rest_b)
+    end
+  end
+
+  defp natural_integer(chunk) do
+    # Trim before parsing so arbitrarily long zero prefixes never allocate
+    # an exponent-sized integer. Overflowing digit runs compare lexically.
+    digits = String.trim_leading(chunk, "0")
+
+    with true <- byte_size(digits) <= 19,
+         {value, ""} when value <= 9_223_372_036_854_775_807 <- Integer.parse(if(digits == "", do: "0", else: digits)) do
+      {:ok, value}
+    else
+      _ -> :overflow
+    end
+  end
 
   def sort(values, descending?) do
     Enum.sort(values, fn {la, a}, {lb, b} ->

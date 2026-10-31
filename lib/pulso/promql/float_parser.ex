@@ -2,6 +2,8 @@ defmodule Pulso.PromQL.FloatParser do
   @moduledoc false
   import Bitwise
 
+  alias Pulso.GoUnicode
+
   @digits "[0-9](?:_?[0-9])*"
   @hex "[0-9a-fA-F](?:_?[0-9a-fA-F])*"
   @decimal Regex.compile!("\\A[+-]?(?:#{@digits}(?:\\.(?:#{@digits})?)?|\\.#{@digits})(?:[eE][+-]?#{@digits})?\\z")
@@ -17,6 +19,26 @@ defmodule Pulso.PromQL.FloatParser do
   end
 
   def parse(_, _), do: :error
+
+  # Keep the existing parse/literal API while exposing Go's complete error
+  # details to LogQL. Malformed overflowing input is syntax, not range failure.
+  def parse_with_error(text) when is_binary(text) do
+    case parse(text) do
+      {:ok, _value} = result ->
+        result
+
+      :error ->
+        reason =
+          if Regex.match?(@decimal, text) or Regex.match?(@hex_float, text),
+            do: "value out of range",
+            else: "invalid syntax"
+
+        quoted = GoUnicode.quote(text)
+        {:error, "strconv.ParseFloat: parsing #{quoted}: #{reason}"}
+    end
+  end
+
+  def parse_with_error(_), do: :error
 
   defp parse_valid(text, mode) do
     case String.downcase(text) do

@@ -31,7 +31,7 @@ defmodule Pulso.LogQL.StreamMatchers do
 
   @doc "Anchor a label-matcher regex so it must match the complete value."
   @spec anchor(String.t()) :: String.t()
-  def anchor(pattern), do: "(?s:\\A(?:" <> pattern <> ")\\z)"
+  defdelegate anchor(pattern), to: Pulso.QueryRegex
 
   defp to_tuple(%AST.Matcher{name: name, op: op, value: value}) when op in [:re, :nre], do: {name, op, anchor(value)}
   defp to_tuple(%AST.Matcher{name: name, op: op, value: value}), do: {name, op, value}

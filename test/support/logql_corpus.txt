@@ -4,7 +4,7 @@
 {env!~"stg|dev"}
 {service="api"} |= "timeout"
 {service="api"} != "healthcheck"
-{service="api"} |~ "5\d\d"
+{service="api"} |~ `5\d\d`
 {service="api"} !~ "^GET"
 {service="api"} |= "a" |= "b" != "c"
 {service="api"} |= `raw \n backtick`
@@ -14,7 +14,7 @@
 {service="api"} | logfmt
 {service="api"} | logfmt --strict --keep-empty
 {service="api"} | logfmt method, code="status_code"
-{service="api"} | regexp "(?P<code>\d+)"
+{service="api"} | regexp `(?P<code>\d+)`
 {service="api"} | pattern "<method> <path>"
 {service="api"} | unpack
 {service="api"} | line_format "{{.level}} {{.msg}}"
@@ -66,6 +66,6 @@ rate({service="api"}[5m]) and rate({service="db"}[5m])
 rate({service="api"}[5m]) or rate({service="db"}[5m])
 rate({service="api"}[5m]) unless rate({service="db"}[5m])
 2 ^ 3 ^ 4
--rate({service="api"}[5m])
+0 - rate({service="api"}[5m])
 1.5
 100

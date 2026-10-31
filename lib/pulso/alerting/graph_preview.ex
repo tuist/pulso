@@ -196,6 +196,8 @@ defmodule Pulso.Alerting.GraphPreview do
     {:ok, {:numbers, Enum.map(series, fn {labels, {_, value}} -> %{labels: labels, value: value} end)}}
   end
 
+  defp input({:logql, :scalar, [{_, {_, value}}]}), do: {:ok, {:scalar, value}}
+
   defp input({:logql, :matrix, series}) when is_list(series) do
     {:ok, {:series, Enum.map(series, fn {labels, points} -> %{labels: labels, points: points} end)}}
   end

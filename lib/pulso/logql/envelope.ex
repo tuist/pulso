@@ -14,6 +14,15 @@ defmodule Pulso.LogQL.Envelope do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Time
 
+  @spec scalar([{map(), {integer(), term()}}], [String.t()]) :: map()
+  def scalar([{_labels, {ts, value}}], encoding_flags \\ []) do
+    %{
+      "status" => "success",
+      "data" => %{"resultType" => "scalar", "result" => [seconds_str(ts), value_str(value)], "stats" => %{}}
+    }
+    |> with_encoding_flags(encoding_flags)
+  end
+
   @spec streams([Pulso.LogQL.Evaluator.stream()], [String.t()]) :: map()
   def streams(streams, encoding_flags \\ []) when is_list(streams) do
     result =

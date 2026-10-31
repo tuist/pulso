@@ -87,14 +87,7 @@ pub(crate) fn predicates(input: Vec<(String, String, String, String)>) -> Res<Ve
                     if regexes > 8 {
                         return Err(Error::Invalid);
                     }
-                    crate::metric_segment_parquet::compile_metric_regex(&value)
-                        .map_err(|_| Error::Invalid)?;
-                    Some(
-                        crate::metric_segment_parquet::compile_metric_regex(&format!(
-                            "(?s:\\A(?:{value})\\z)"
-                        ))
-                        .map_err(|_| Error::Invalid)?,
-                    )
+                    Some(crate::query_regex::anchored(&value).map_err(|_| Error::Invalid)?)
                 }
                 _ => return Err(Error::Invalid),
             };

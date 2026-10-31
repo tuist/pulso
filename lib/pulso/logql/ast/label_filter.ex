@@ -16,6 +16,7 @@ defmodule Pulso.LogQL.AST.LabelFilter do
 
       {:string, str}
       {:re, pattern}
+      {:ip, pattern}            # `=ip(...)` / `!=ip(...)`
       {:number, integer | float}
       {:duration_ns, integer}   # `1s`, `500ms`, `1h30m` etc, resolved to ns
       {:bytes, integer}         # `5MB`, `1KiB`, `2GB`, resolved to bytes
@@ -28,6 +29,7 @@ defmodule Pulso.LogQL.AST.LabelFilter do
   @type value ::
           {:string, String.t()}
           | {:re, String.t()}
+          | {:ip, String.t()}
           | {:number, integer() | float()}
           | {:duration_ns, integer()}
           | {:bytes, integer()}

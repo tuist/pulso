@@ -2,10 +2,10 @@ defmodule Pulso.LogQL.MetricEval do
   @moduledoc """
   Metric-query evaluator.
 
-  A metric expression is a tree over `RangeAgg`, `VectorAgg`,
-  `BinaryOp`, and `NumberLit`. `evaluate/3` walks the tree and produces
-  either a `matrix` (a set of time series over the requested steps) or a
-  `vector` (one sample per series, at the query's evaluation timestamp).
+  A metric expression is a tree over `RangeAgg`, `VectorAgg`, `LabelReplace`,
+  `BinaryOp`, and literals. `evaluate/3` walks the tree and produces
+  a `matrix` (a set of time series over the requested steps), a `vector`
+  (one sample per series), or a `scalar` for an instant literal-only tree.
 
   Steps and evaluation timestamps come from the caller's `opts`:
 
@@ -24,10 +24,12 @@ defmodule Pulso.LogQL.MetricEval do
   alias Pulso.LogQL.Entry
   alias Pulso.LogQL.Evaluator
   alias Pulso.LogQL.NativeRange
+  alias Pulso.LogQL.Pipeline
   alias Pulso.LogQL.Quantile
   alias Pulso.LogQL.Quantity
   alias Pulso.PromQL.Evaluator, as: Budget
   alias Pulso.PromQL.FloatParser
+  alias Pulso.PromQL.LabelReplace
   alias Pulso.PromQL.Number
   alias Pulso.PromQL.Operations
   alias Pulso.PromQL.RangeMath
@@ -39,7 +41,7 @@ defmodule Pulso.LogQL.MetricEval do
 
   @over_time_ops [:sum_over_time, :avg_over_time, :max_over_time, :min_over_time, :stddev_over_time, :stdvar_over_time]
 
-  @type result :: {:matrix | :vector, [{map(), term()}]}
+  @type result :: {:matrix | :vector | :scalar, [{map(), term()}]}
 
   @spec evaluate(term(), Pulso.Storage.tenant(), Evaluator.opts()) :: {:ok, result()} | {:error, term()}
   def evaluate(expr, tenant, opts) when is_binary(tenant) and is_map(opts) do
@@ -53,6 +55,7 @@ defmodule Pulso.LogQL.MetricEval do
     with :ok <- validate_steps(opts),
          :ok <- validate_query_mode(expr, result_kind(opts)),
          {:ok, kind, series} <- eval(expr, tenant, opts) do
+      kind = if kind == :vector, do: expression_type(expr), else: kind
       {:ok, {kind, series}}
     end
   catch
@@ -107,7 +110,7 @@ defmodule Pulso.LogQL.MetricEval do
     spec = %{op: :absent_over_time, unwrap: extract_unwrap(agg.inner), grouping: :all}
 
     with {:ok, collected} <-
-           collect(remove_unwrap(agg.inner), spec, tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
+           collect(agg.inner, spec, tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
       samples = collected |> Map.values() |> List.flatten() |> ordered()
 
       points =
@@ -131,7 +134,7 @@ defmodule Pulso.LogQL.MetricEval do
       {first, last} = Enum.min_max(times)
 
       with {:ok, collected} <-
-             collect(remove_unwrap(agg.inner), spec, tenant, opts, first - offset - range + 1, last - offset) do
+             collect(agg.inner, spec, tenant, opts, first - offset - range + 1, last - offset) do
         {:ok, kind, Enum.flat_map(collected, &series_points(&1, times, spec, range, offset, kind))}
       end
     end
@@ -157,6 +160,18 @@ defmodule Pulso.LogQL.MetricEval do
     end
   end
 
+  defp do_eval(%AST.LabelReplace{} = expr, tenant, opts) do
+    with {:ok, kind, series} <- eval(expr.inner, tenant, opts) do
+      # Loki's dot does not match newlines by default. Reuse capture expansion
+      # directly, without PromQL's output coalescing or dot-all default.
+      args =
+        for value <- [expr.dst, expr.replacement, expr.src, Pulso.QueryRegex.non_dotall(expr.regex)],
+            do: {:string, value}
+
+      {:ok, kind, LabelReplace.run(series, args)}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Binary operator
   # ---------------------------------------------------------------------------
@@ -171,7 +186,7 @@ defmodule Pulso.LogQL.MetricEval do
           operator(op),
           modifiers(bool, matching),
           normalized(lser, kind),
-          normalized(rser, kind),
+          binary_denominator(normalized(rser, kind), op),
           expression_type(l),
           expression_type(r),
           times
@@ -182,6 +197,17 @@ defmodule Pulso.LogQL.MetricEval do
     end
   end
 
+  # Loki defines division by either signed zero as NaN, unlike PromQL's
+  # signed infinities. Adapt only the LogQL denominator before shared math.
+  defp binary_denominator(series, :div) do
+    Enum.map(series, fn {labels, points} ->
+      Budget.charge(:work, length(points))
+      {labels, Enum.map(points, fn {ts, value} -> {ts, if(value == 0, do: :nan, else: value)} end)}
+    end)
+  end
+
+  defp binary_denominator(series, _op), do: series
+
   # ---------------------------------------------------------------------------
   # Range helpers
   # ---------------------------------------------------------------------------
@@ -189,19 +215,33 @@ defmodule Pulso.LogQL.MetricEval do
   defp entry_label_key(%Entry{labels: labels}, unwrap, grouping) do
     labels = if unwrap, do: Map.delete(labels, unwrap.label), else: labels
 
-    case grouping do
-      nil -> labels
-      %AST.Grouping{mode: :by, labels: names} -> Map.take(labels, names)
-      %AST.Grouping{mode: :without, labels: names} -> Map.drop(labels, names)
-    end
+    grouped =
+      case grouping do
+        nil -> labels
+        %AST.Grouping{mode: :by, labels: names} -> Map.take(labels, names)
+        %AST.Grouping{mode: :without, labels: names} -> Map.drop(labels, names)
+      end
+
+    if Map.get(labels, "__error__", "") == "",
+      do: grouped,
+      else: Map.merge(grouped, Map.take(labels, ["__error__", "__error_details__"]))
   end
 
   defp extract_unwrap(%AST.LogQuery{stages: stages}) do
     Enum.find(stages, &match?(%AST.Unwrap{}, &1))
   end
 
-  defp remove_unwrap(%AST.LogQuery{stages: stages} = q) do
-    %{q | stages: Enum.reject(stages, &match?(%AST.Unwrap{}, &1))}
+  defp extraction(%AST.LogQuery{stages: stages} = query, spec) do
+    {before, rest} = Enum.split_while(stages, &(not match?(%AST.Unwrap{}, &1)))
+    after_unwrap = if rest == [], do: [], else: tl(rest)
+
+    spec =
+      Map.merge(spec, %{
+        post_filter: Pipeline.compile(after_unwrap),
+        preserve_errors: Pipeline.preserves_errors?(stages)
+      })
+
+    {%{query | stages: before}, spec}
   end
 
   # ---------------------------------------------------------------------------
@@ -214,6 +254,8 @@ defmodule Pulso.LogQL.MetricEval do
   defp collect(_inner, _spec, _tenant, _opts, _start, finish) when finish < @minimum_timestamp, do: {:ok, %{}}
 
   defp collect(inner, spec, tenant, opts, start, finish) do
+    {inner, spec} = extraction(inner, spec)
+
     query_opts =
       opts
       |> Map.put(:start_ts_ns, max(start, @minimum_timestamp))
@@ -231,7 +273,7 @@ defmodule Pulso.LogQL.MetricEval do
   end
 
   defp add_entry(entry, _record, acc, %{op: :approx_count_distinct, param: name} = spec) do
-    check_pipeline_error(entry)
+    check_pipeline_error(entry, spec)
 
     case {entry.timestamp_ns, Map.get(entry.labels, name)} do
       {ts, value} when is_integer(ts) and is_binary(value) and value != "" ->
@@ -244,17 +286,61 @@ defmodule Pulso.LogQL.MetricEval do
     end
   end
 
-  defp add_entry(entry, record, acc, spec) do
-    check_pipeline_error(entry)
+  # A missing/empty unwrap field supplies no observation, unlike a present
+  # nonnumeric field. The fold still charges all scanned/pipeline rows as work.
+  defp add_entry(%Entry{labels: labels} = entry, _record, acc, %{unwrap: %AST.Unwrap{label: label}} = spec)
+       when not is_map_key(labels, label) or :erlang.map_get(label, labels) == "" do
+    check_pipeline_error(entry, spec)
+    acc
+  end
 
-    case entry.timestamp_ns do
-      ts when is_integer(ts) ->
+  defp add_entry(entry, record, acc, spec) do
+    case extract_sample(entry, spec) do
+      {:keep, %Entry{timestamp_ns: ts} = entry, value} when is_integer(ts) ->
         Budget.charge(:log_samples, 1)
-        add_sample(acc, series_key(entry, spec), {ts, tie(spec.op, record), entry_value(spec, entry)})
+        add_sample(acc, series_key(entry, spec), {ts, tie(spec.op, record), value})
 
       _ ->
         acc
     end
+  end
+
+  defp extract_sample(entry, %{unwrap: nil} = spec) do
+    check_pipeline_error(entry, spec)
+    {:keep, entry, entry_value(spec, entry)}
+  end
+
+  defp extract_sample(entry, spec) do
+    {value, filtered_entry} = unwrapped(entry, spec.unwrap)
+
+    case Pipeline.apply(spec.post_filter, filtered_entry) do
+      {:keep, filtered_entry} ->
+        if value != :error, do: check_pipeline_error(filtered_entry, spec)
+        value = if value == :error and spec.preserve_errors, do: 0.0, else: value
+        if value == :error and spec.op == :absent_over_time, do: throw({:logql_error, :sample_extraction_error})
+        {:keep, filtered_entry, value}
+
+      :drop ->
+        :drop
+    end
+  end
+
+  defp extraction_error(entry, %{label: name, conversion: conversion}) do
+    value = Map.fetch!(entry.labels, name)
+
+    details =
+      case conversion do
+        :none -> "strconv.ParseFloat: parsing #{Pulso.JSON.encode!(value)}: invalid syntax"
+        _ -> "cannot convert #{Pulso.JSON.encode!(value)} with #{conversion}"
+      end
+
+    extraction_error(entry, details)
+  end
+
+  defp extraction_error(entry, details) when is_binary(details) do
+    entry
+    |> Entry.put_label("__error__", "SampleExtractionErr", :parsed)
+    |> Entry.put_label("__error_details__", details, :parsed)
   end
 
   defp add_sample(acc, key, sample) do
@@ -273,9 +359,9 @@ defmodule Pulso.LogQL.MetricEval do
 
   defp series_key(entry, %{unwrap: unwrap, grouping: grouping}), do: entry_label_key(entry, unwrap, grouping)
 
-  # Equal timestamps keep the canonical log order only where it decides the
-  # result (first/last); the key is copied so it never pins segment memory.
-  defp tie(op, record) when op in [:first_over_time, :last_over_time],
+  # Equal timestamps keep the complete record key where ordering decides the
+  # result (first/last or counter resets); detach it from segment memory.
+  defp tie(op, record) when op in [:first_over_time, :last_over_time, :rate_counter],
     do: record |> SortOrder.log_key() |> :erlang.term_to_binary() |> :erlang.binary_to_term()
 
   defp tie(_op, _record), do: nil
@@ -284,19 +370,15 @@ defmodule Pulso.LogQL.MetricEval do
   defp entry_value(%{op: :count_over_time}, _entry), do: 1.0
   defp entry_value(%{unwrap: nil}, _entry), do: 1.0
 
-  # absent_over_time checks every unwrapped entry of its whole range.
-  defp entry_value(%{op: :absent_over_time, unwrap: unwrap}, entry) do
-    if unwrapped(entry, unwrap) == :error, do: throw({:logql_error, :sample_extraction_error}), else: 1.0
-  end
-
-  defp entry_value(%{unwrap: unwrap}, entry), do: unwrapped(entry, unwrap)
-
-  defp unwrapped(%Entry{labels: labels}, %AST.Unwrap{label: name, conversion: conv}) do
+  defp unwrapped(%Entry{labels: labels} = entry, %AST.Unwrap{label: name, conversion: conv} = unwrap) do
     with value when is_binary(value) <- Map.get(labels, name),
          number when not is_nil(number) <- parse_unwrap(conv, value) do
-      number
+      case number do
+        {:error, details} -> {:error, extraction_error(entry, details)}
+        value -> {value, entry}
+      end
     else
-      _ -> :error
+      _ -> {:error, extraction_error(entry, unwrap)}
     end
   end
 
@@ -387,6 +469,41 @@ defmodule Pulso.LogQL.MetricEval do
     Number.binary("/", total, seconds)
   end
 
+  defp aggregate(%{op: :rate_counter}, samples, first, last, start, finish) do
+    initial = checked(samples, last)
+    difference = Number.binary("-", checked(samples, first), initial)
+
+    # Walk forward in source time, including every reset rather than only the
+    # endpoints. Equal-time observations follow ascending canonical record keys.
+    {increase, _previous} =
+      Enum.reduce(last..first//-1, {difference, 0.0}, fn index, {increase, previous} ->
+        value = checked(samples, index)
+        increase = if Number.compare("<", value, previous), do: Number.add(increase, previous), else: increase
+        {increase, value}
+      end)
+
+    if first == last do
+      0.0
+    else
+      elapsed = (ts_at(samples, first) - ts_at(samples, last)) / 1_000_000_000
+      spacing = elapsed / (last - first)
+      left = (ts_at(samples, last) - start + 1) / 1_000_000_000
+      right = (finish - ts_at(samples, first)) / 1_000_000_000
+      left = if left >= spacing * 1.1, do: spacing / 2, else: left
+      right = if right >= spacing * 1.1, do: spacing / 2, else: right
+
+      # Cap by sample spacing before the counter's zero point. Reversing these
+      # caps can incorrectly extend a sparse counter's extrapolation.
+      left =
+        if Number.compare(">", increase, 0) and Number.compare(">=", initial, 0),
+          do: Number.min(left, Number.multiply(elapsed, Number.divide(initial, increase))),
+          else: left
+
+      factor = Number.divide(elapsed + left + right, elapsed)
+      Number.divide(Number.multiply(increase, factor), (finish - start + 1) / 1_000_000_000)
+    end
+  end
+
   defp aggregate(%{op: :bytes_over_time}, samples, first, last, _start, _finish),
     do: samples |> slice(first, last) |> Enum.sum() |> Kernel.*(1.0)
 
@@ -462,13 +579,15 @@ defmodule Pulso.LogQL.MetricEval do
   defp parse_unwrap(:none, v) do
     case parse_number_str(v) do
       {:ok, n} -> n
+      {:error, _details} = error -> error
       :error -> nil
     end
   end
 
   defp parse_unwrap(conv, v) when conv in [:duration, :duration_seconds] do
     case parse_duration(v) do
-      {:ok, ns} -> if conv == :duration_seconds, do: ns / 1_000_000_000, else: ns / 1_000_000_000
+      {:ok, ns} -> div(ns, 1_000_000_000) + rem(ns, 1_000_000_000) / 1_000_000_000
+      {:error, _details} = error -> error
       :error -> nil
     end
   end
@@ -476,6 +595,7 @@ defmodule Pulso.LogQL.MetricEval do
   defp parse_unwrap(:bytes, v) do
     case parse_bytes(v) do
       {:ok, b} -> b * 1.0
+      {:error, _details} = error -> error
       :error -> nil
     end
   end
@@ -641,10 +761,12 @@ defmodule Pulso.LogQL.MetricEval do
   # Bucketing / opts helpers
   # ---------------------------------------------------------------------------
 
-  defp check_pipeline_error(%{labels: %{"__error__" => error}}) when error != "",
+  defp check_pipeline_error(_entry, %{preserve_errors: true}), do: :ok
+
+  defp check_pipeline_error(%{labels: %{"__error__" => error}}, _spec) when error != "",
     do: throw({:logql_error, :pipeline_error})
 
-  defp check_pipeline_error(_), do: :ok
+  defp check_pipeline_error(_, _), do: :ok
 
   defp result_kind(opts) do
     if Map.get(opts, :step_ns), do: :matrix, else: :vector
@@ -654,6 +776,7 @@ defmodule Pulso.LogQL.MetricEval do
   defp validate_query_mode(_expr, :vector), do: :ok
   defp validate_query_mode(%AST.VectorAgg{op: :approx_topk}, :matrix), do: {:error, :instant_query_required}
   defp validate_query_mode(%AST.VectorAgg{inner: inner}, kind), do: validate_query_mode(inner, kind)
+  defp validate_query_mode(%AST.LabelReplace{inner: inner}, kind), do: validate_query_mode(inner, kind)
 
   defp validate_query_mode(%AST.BinaryOp{left: left, right: right}, kind) do
     with :ok <- validate_query_mode(left, kind), do: validate_query_mode(right, kind)
@@ -698,10 +821,10 @@ defmodule Pulso.LogQL.MetricEval do
   # Numeric helpers
   # ---------------------------------------------------------------------------
 
-  defp parse_number_str(str), do: FloatParser.parse(str)
+  defp parse_number_str(str), do: FloatParser.parse_with_error(str)
 
-  defp parse_duration(str), do: Quantity.duration(str)
-  defp parse_bytes(str), do: Quantity.bytes(str)
+  defp parse_duration(str), do: Quantity.duration_value(str)
+  defp parse_bytes(str), do: Quantity.bytes_value(str)
 
   defp stddev(values), do: RangeMath.deviation(Enum.map(values, &%{value: &1}))
   defp variance(values), do: RangeMath.variance(Enum.map(values, &%{value: &1}))

@@ -80,6 +80,6 @@ defmodule Pulso.Traces.Selector do
 
   defp valid_predicate?({_, key, "=~", value}) do
     byte_size(key) <= 256 and byte_size(value) <= 1024 and NIF.validate_metric_regex(value) == :ok and
-      NIF.validate_metric_regex("(?s:\\A(?:#{value})\\z)") == :ok
+      NIF.validate_metric_regex(Pulso.QueryRegex.anchor(value)) == :ok
   end
 end

@@ -2,22 +2,25 @@ defmodule Pulso.LogQL.QueryValidation do
   @moduledoc """
   Static validation for a LogQL AST before evaluation.
 
-  Two categories of failure surface here as `{:error, reason}` instead
+  These failures surface here as `{:error, reason}` instead
   of a crash or a silent wrong answer downstream:
 
     * **Invalid regex patterns** in selectors, line filters, label
       filters, `regexp`/`pattern` parser stages, and `drop`/`keep`
       entries. Patterns pushed into the native decoder are checked with
       its own regular-expression engine before reading storage.
-    * **`ip(...)` line filters**, which no adapter evaluates yet.
-      Returning them as an explicit `:unsupported` beats the pre-fix
-      behaviour where the Elixir stub silently kept every line (for
-      `|=`) or dropped every line (for `!=`, `|~`, `!~`).
+    * **Invalid IP patterns and operators** in line and label filters.
+      IP filters run in the bounded Elixir pipeline, never native pushdown.
+    * **Invalid JSON/logfmt field expressions**, before any storage reads.
   """
 
   alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
+  alias Pulso.LogQL.Pipeline.IP
+  alias Pulso.LogQL.Pipeline.Json
+  alias Pulso.LogQL.Pipeline.Logfmt
   alias Pulso.LogQL.Pipeline.Pattern
+  alias Pulso.LogQL.Pipeline.Template
 
   @spec validate(struct()) :: :ok | {:error, term()}
   def validate(%AST.LogQuery{selector: sel, stages: stages}) do
@@ -46,6 +49,14 @@ defmodule Pulso.LogQL.QueryValidation do
     with :ok <- validate_binary(binary), :ok <- validate(l), do: validate(r)
   end
 
+  def validate(%AST.LabelReplace{inner: inner, regex: pattern}) do
+    case NIF.validate_metric_regex(pattern) == :ok and
+           NIF.compile_metric_capture_regex(Pulso.QueryRegex.non_dotall(pattern)) do
+      {:ok, _} -> validate(inner)
+      _ -> {:error, {:invalid_regex, :label_replace, pattern}}
+    end
+  end
+
   def validate(%AST.NumberLit{}), do: :ok
   def validate(%AST.VectorLit{}), do: :ok
 
@@ -71,9 +82,6 @@ defmodule Pulso.LogQL.QueryValidation do
   defp validate_set(_, _), do: :ok
 
   defp validate_boolean(%AST.BinaryOp{bool: true, op: op}, _) when op not in @comparisons,
-    do: {:error, :invalid_binary_operation}
-
-  defp validate_boolean(%AST.BinaryOp{bool: false, op: op}, {true, true}) when op in @comparisons,
     do: {:error, :invalid_binary_operation}
 
   defp validate_boolean(_, _), do: :ok
@@ -124,13 +132,16 @@ defmodule Pulso.LogQL.QueryValidation do
             ], do: :ok
 
   defp validate_range_grouping(_, _, _), do: {:error, :unsupported_range_grouping}
-  defp validate_range_unwrap(_, :rate_counter), do: {:error, :unsupported_rate_counter}
 
   defp validate_range_unwrap(%AST.LogQuery{stages: stages}, op) do
     case Enum.split_while(stages, &(not match?(%AST.Unwrap{}, &1))) do
-      {_, []} -> log_op(op)
-      {_, [_]} -> unwrap_op(op)
-      _ -> {:error, :unsupported_post_unwrap_stage}
+      {_, []} ->
+        log_op(op)
+
+      {_, [_unwrap | filters]} ->
+        if Enum.all?(filters, &match?(%AST.LabelFilter{}, &1)),
+          do: unwrap_op(op),
+          else: {:error, :unsupported_post_unwrap_stage}
     end
   end
 
@@ -144,6 +155,7 @@ defmodule Pulso.LogQL.QueryValidation do
               :stdvar_over_time,
               :quantile_over_time,
               :rate,
+              :rate_counter,
               :absent_over_time,
               :first_over_time,
               :last_over_time
@@ -185,9 +197,19 @@ defmodule Pulso.LogQL.QueryValidation do
     end
   end
 
-  defp validate_stage(%AST.LineFilter{value: {:ip, cidr}}, _native?) do
-    {:error, {:unsupported, :ip_line_filter, cidr}}
+  defp validate_stage(%AST.LineFilter{value: {:or, values}} = filter, _native?) do
+    Enum.reduce_while(values, :ok, fn value, :ok ->
+      case validate_stage(%{filter | value: value}, false) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
+
+  defp validate_stage(%AST.LineFilter{op: op, value: {:ip, pattern}}, _native?) when op in [:contains, :not_contains],
+    do: validate_ip(pattern)
+
+  defp validate_stage(%AST.LineFilter{value: {:ip, _}}, _), do: {:error, :invalid_ip_operation}
 
   defp validate_stage(%AST.LineFilter{value: {:pattern, pattern}}, _native?) do
     case Pattern.compile_filter(pattern) do
@@ -206,12 +228,82 @@ defmodule Pulso.LogQL.QueryValidation do
 
   defp validate_stage(%AST.LabelFilter{expr: expr}, _native?), do: validate_label_expr(expr)
 
-  defp validate_stage(%AST.RegexpParser{pattern: pat}, _native?), do: validate_pattern(:regexp_stage, pat)
+  defp validate_stage(%AST.JsonParser{fields: fields}, _native?) do
+    Enum.reduce_while(fields, :ok, fn {_name, source}, :ok ->
+      case Json.expression(source) do
+        {:ok, _path} -> {:cont, :ok}
+        _ -> {:halt, {:error, {:invalid_json_expression, source}}}
+      end
+    end)
+  end
+
+  defp validate_stage(%AST.LogfmtParser{fields: fields}, _native?) do
+    Enum.reduce_while(fields, :ok, fn {_name, source}, :ok ->
+      case Logfmt.expression(source) do
+        {:ok, _key} -> {:cont, :ok}
+        :error -> {:halt, {:error, {:invalid_logfmt_expression, source}}}
+      end
+    end)
+  end
+
+  defp validate_stage(%AST.RegexpParser{pattern: pat}, _native?) do
+    case NIF.compile_log_regex(pat) do
+      {:ok, regex} ->
+        if NIF.log_regex_named_capture?(regex), do: :ok, else: {:error, :missing_named_capture}
+
+      :error ->
+        validate_pattern(:regexp_stage, pat)
+    end
+  end
+
+  defp validate_stage(%AST.PatternParser{pattern: pat}, _native?) do
+    case Pattern.compile_parser(pat) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, {:invalid_pattern, :parser, reason}}
+    end
+  end
+
+  defp validate_stage(%AST.LabelFormat{entries: entries}, _native?) do
+    names = Enum.map(entries, &elem(&1, 0))
+
+    cond do
+      "__error__" in names ->
+        {:error, :error_label_cannot_be_formatted}
+
+      Enum.uniq(names) != names ->
+        {:error, :duplicate_label_format_destination}
+
+      true ->
+        validate_label_templates(entries)
+    end
+  end
+
+  defp validate_stage(%AST.LineFormat{template: template}, _native?), do: validate_template(template)
 
   defp validate_stage(%AST.Drop{entries: entries}, _native?), do: validate_drop_entries(entries)
   defp validate_stage(%AST.Keep{entries: entries}, _native?), do: validate_drop_entries(entries)
 
   defp validate_stage(_, _native?), do: :ok
+
+  defp validate_template(template) do
+    case Template.compile(template) do
+      {:ok, _} -> :ok
+      {:error, details} -> {:error, {:invalid_template, details}}
+    end
+  end
+
+  defp validate_label_templates(entries) do
+    Enum.reduce_while(entries, :ok, fn
+      {_name, {:rename, _}}, :ok ->
+        {:cont, :ok}
+
+      {_name, {:template, template}}, :ok ->
+        case validate_template(template) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+    end)
+  end
 
   defp validate_label_expr({:and, l, r}) do
     with :ok <- validate_label_expr(l), do: validate_label_expr(r)
@@ -225,7 +317,20 @@ defmodule Pulso.LogQL.QueryValidation do
     validate_pattern({:label_filter, name}, pat)
   end
 
+  defp validate_label_expr({:cmp, name, _, {type, _}})
+       when name in ["__error__", "__error_details__"] and type != :string, do: {:error, :invalid_error_filter}
+
+  defp validate_label_expr({:cmp, _, op, {:ip, pattern}}) when op in [:eq, :neq], do: validate_ip(pattern)
+  defp validate_label_expr({:cmp, _, _, {:ip, _}}), do: {:error, :invalid_ip_operation}
+
   defp validate_label_expr(_), do: :ok
+
+  defp validate_ip(pattern) do
+    case IP.compile(pattern) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
 
   defp validate_drop_entries(entries) do
     Enum.reduce_while(entries, :ok, fn
@@ -241,15 +346,18 @@ defmodule Pulso.LogQL.QueryValidation do
   end
 
   defp validate_pattern(source, pattern) do
-    case Pulso.QueryRegex.compile(pattern) do
-      {:ok, _} ->
-        case NIF.validate_log_regex(pattern) do
-          :ok -> :ok
-          :error -> {:error, {:invalid_regex, source, pattern, "unsupported native regular expression"}}
-        end
+    case NIF.validate_log_regex(pattern) do
+      :ok ->
+        :ok
 
-      {:error, {reason, _}} ->
-        {:error, {:invalid_regex, source, pattern, to_string(reason)}}
+      :error ->
+        reason =
+          case Pulso.QueryRegex.compile(pattern) do
+            {:error, {reason, _}} -> to_string(reason)
+            {:ok, _} -> "unsupported native regular expression"
+          end
+
+        {:error, {:invalid_regex, source, pattern, reason}}
     end
   end
 

@@ -12,31 +12,40 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
 
   @spec compile(String.t()) :: template()
   def compile(pattern) when is_binary(pattern) do
-    do_compile(pattern, [])
+    ~r/(<[a-zA-Z_][a-zA-Z0-9_]*>)/
+    |> Regex.split(pattern, include_captures: true, trim: true)
+    |> Enum.map(fn
+      "<_>" ->
+        :skip
+
+      <<"<", rest::binary>> = part ->
+        if Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*>\z/, rest),
+          do: {:capture, binary_part(rest, 0, byte_size(rest) - 1)},
+          else: {:literal, part}
+
+      part ->
+        {:literal, part}
+    end)
+    |> merge_literals([])
   end
 
-  defp do_compile("", acc), do: Enum.reverse(acc)
+  @doc "Compile a parser pattern, rejecting absent, repeated or adjacent named captures."
+  @spec compile_parser(String.t()) :: {:ok, template()} | {:error, term()}
+  def compile_parser(pattern) do
+    parts = compile(pattern)
+    names = for {:capture, name} <- parts, do: name
 
-  defp do_compile(rest, acc) do
-    case :binary.match(rest, "<") do
-      :nomatch -> Enum.reverse([{:literal, rest} | acc])
-      {lit_end, 1} -> compile_placeholder(rest, lit_end, acc)
+    adjacent? =
+      parts
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.any?(fn [left, right] -> not match?({:literal, _}, left) and not match?({:literal, _}, right) end)
+
+    cond do
+      names == [] -> {:error, :missing_capture}
+      adjacent? -> {:error, :consecutive_captures}
+      length(Enum.uniq(names)) != length(names) -> {:error, :duplicate_capture}
+      true -> {:ok, parts}
     end
-  end
-
-  defp compile_placeholder(rest, lit_end, acc) do
-    {literal, after_lt} = String.split_at(rest, lit_end)
-
-    case String.split(after_lt, ">", parts: 2) do
-      [_only] -> do_compile("", [{:literal, rest} | acc])
-      [<<"<", inner::binary>>, tail] -> continue_placeholder(literal, inner, tail, acc)
-    end
-  end
-
-  defp continue_placeholder(literal, inner, tail, acc) do
-    acc = if literal == "", do: acc, else: [{:literal, literal} | acc]
-    token = if inner == "_", do: :skip, else: {:capture, inner}
-    do_compile(tail, [token | acc])
   end
 
   @doc """
@@ -46,19 +55,7 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
   """
   @spec compile_filter(String.t()) :: {:ok, [{:literal, binary()} | :skip]} | {:error, term()}
   def compile_filter(pattern) when is_binary(pattern) do
-    parts =
-      pattern
-      |> compile()
-      |> Enum.map(fn
-        {:capture, name} ->
-          if Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]*\z/, name),
-            do: {:capture, name},
-            else: {:literal, "<" <> name <> ">"}
-
-        part ->
-          part
-      end)
-      |> merge_literals([])
+    parts = compile(pattern)
 
     cond do
       Enum.any?(parts, &match?({:capture, _}, &1)) -> {:error, :named_capture}
@@ -107,6 +104,8 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
   end
 
   @spec match(template(), String.t()) :: {:ok, %{optional(String.t()) => String.t()}} | :nomatch
+  def match(_template, ""), do: {:ok, %{}}
+
   def match(template, line) when is_binary(line) do
     match_template(template, line, %{})
   end
@@ -123,7 +122,7 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
   defp match_template([{:capture, name}, {:literal, next} | rest], line, captures) do
     case :binary.match(line, next) do
       :nomatch ->
-        :nomatch
+        {:ok, Map.put(captures, name, line)}
 
       {pos, len} ->
         value = binary_part(line, 0, pos)
@@ -139,7 +138,7 @@ defmodule Pulso.LogQL.Pipeline.Pattern do
   defp match_template([:skip, {:literal, next} | rest], line, captures) do
     case :binary.match(line, next) do
       :nomatch ->
-        :nomatch
+        {:ok, captures}
 
       {pos, len} ->
         remaining = binary_part(line, pos + len, byte_size(line) - pos - len)

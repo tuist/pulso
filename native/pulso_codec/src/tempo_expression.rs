@@ -57,18 +57,10 @@ impl Expression {
                     "=" | "!=" => None,
                     "=~" | "!~" => {
                         regexes += 1;
-                        if regexes > 8
-                            || wanted.len() > 1024
-                            || crate::metric_segment_parquet::compile_metric_regex(&wanted).is_err()
-                        {
+                        if regexes > 8 || wanted.len() > 1024 {
                             return None;
                         }
-                        Some(
-                            crate::metric_segment_parquet::compile_metric_regex(&format!(
-                                "(?s:\\A(?:{wanted})\\z)"
-                            ))
-                            .ok()?,
-                        )
+                        Some(crate::query_regex::anchored(&wanted).ok()?)
                     }
                     _ => return None,
                 },

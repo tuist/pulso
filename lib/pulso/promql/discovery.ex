@@ -151,8 +151,8 @@ defmodule Pulso.PromQL.Discovery do
 
   defp match_value?(value, :eq, expected), do: value == expected
   defp match_value?(value, :neq, expected), do: value != expected
-  defp match_value?(value, :re, expected), do: NIF.match_metric_regex("(?s:\\A(?:#{expected})\\z)", value)
-  defp match_value?(value, :nre, expected), do: not NIF.match_metric_regex("(?s:\\A(?:#{expected})\\z)", value)
+  defp match_value?(value, :re, expected), do: NIF.match_metric_regex(Pulso.QueryRegex.anchor(expected), value)
+  defp match_value?(value, :nre, expected), do: not NIF.match_metric_regex(Pulso.QueryRegex.anchor(expected), value)
 
   defp collect(state, labels, mode, key) do
     labels = Map.reject(labels, fn {_, value} -> value == "" end)

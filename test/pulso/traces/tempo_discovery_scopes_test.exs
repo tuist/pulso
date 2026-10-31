@@ -124,7 +124,7 @@ defmodule Pulso.Traces.TempoDiscoveryScopesTest do
     q = ~s'{resource.service.name="absent"}'
     {:ok, predicates} = TempoDiscovery.filter("event", "phase", q)
 
-    for {attrs, projection, rounds} <- [{[], %{}, 1000}, {[pair], %{"phase" => "constant"}, 500}],
+    for {attrs, projection, parents} <- [{[], %{}, 1000}, {[pair], %{"phase" => "constant"}, 500}],
         key <- ["phase", ""] do
       event = Map.put(hd(base.events), "attributes", projection)
 
@@ -135,13 +135,17 @@ defmodule Pulso.Traces.TempoDiscoveryScopesTest do
       }
 
       {:ok, state} = NIF.tempo_filtered_discovery_new(0, "event", key, predicates)
-      {:ok, blob, _, _} = S3.encode_segment(:traces, [dense])
-      for _ <- 1..rounds, do: assert({:ok, 1} = NIF.tempo_discovery_add(state, blob))
-      assert {:error, :trace_discovery_work_limit} = NIF.tempo_discovery_add(state, blob)
+      # Keep every parent and all two million work units, but amortize Parquet
+      # setup across ten rows. The extra parent still crosses the exact limit
+      # in a separate source, so resetting work per segment cannot pass.
+      {:ok, blob, _, _} = S3.encode_segment(:traces, List.duplicate(dense, 10))
+      {:ok, extra, _, _} = S3.encode_segment(:traces, [dense])
+      for _ <- 1..div(parents, 10), do: assert({:ok, 10} = NIF.tempo_discovery_add(state, blob))
+      assert {:error, :trace_discovery_work_limit} = NIF.tempo_discovery_add(state, extra)
       assert :fallback = NIF.tempo_discovery_finish(state)
 
       assert {:error, :trace_discovery_work_limit} =
-               TempoDiscovery.json(List.duplicate(dense, rounds + 1), "event", key, discovery_query: q)
+               TempoDiscovery.json(List.duplicate(dense, parents + 1), "event", key, discovery_query: q)
     end
   end
 end

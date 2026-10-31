@@ -160,10 +160,7 @@ fn metric_discovery_new<'a>(
                     if regex_count > 8 || value.len() > 1024 {
                         return Err(Error::Invalid);
                     }
-                    Some(
-                        metrics::compile_metric_regex(&format!("(?s:\\A(?:{value})\\z)"))
-                            .map_err(|_| Error::Invalid)?,
-                    )
+                    Some(crate::query_regex::anchored(&value).map_err(|_| Error::Invalid)?)
                 } else {
                     None
                 };

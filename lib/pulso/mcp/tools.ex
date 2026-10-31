@@ -811,6 +811,7 @@ defmodule Pulso.MCP.Tools do
     case Evaluator.evaluate_metric(metric_expr, tenant, opts) do
       {:ok, {:matrix, series}} -> {:ok, Envelope.matrix(series)}
       {:ok, {:vector, series}} -> {:ok, Envelope.vector(series)}
+      {:ok, {:scalar, series}} -> {:ok, Envelope.scalar(series)}
       {:error, _} = err -> err
     end
   end

@@ -192,6 +192,11 @@ subset or a silent transient skip. Dense/long windows
 can exceed bounds; do not remove limits merely to fit the cadence. There is no
 log-to-metric materialization or local counter authority.
 
+Threshold queries must return vectors. Bare numbers and scalar-only LogQL
+arithmetic now retain their scalar type and reject as threshold results, like
+scalar PromQL queries; use a vector expression when authoring a threshold.
+Explicitly bound expression previews accept scalar sources as scalars.
+
 ### Required signal freshness
 
 Native threshold and recording evaluations require a freshly validated S3
