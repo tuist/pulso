@@ -10,7 +10,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustler = "0.38"
+rustler = { version = "0.38", features = ["nif_version_2_16"] }
 snap = "1.1"
 simdutf8 = "0.1"
 memchr = "2"

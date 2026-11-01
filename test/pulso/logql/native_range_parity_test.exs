@@ -93,6 +93,9 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
   defp approx(v) when is_float(v), do: Float.round(v, 9)
   defp approx(v), do: v
 
+  # Keep all 120 native/reference comparisons, including multi-step windows,
+  # without applying the ordinary one-minute test budget under CI contention.
+  @tag timeout: 180_000
   test "random native range scans match the materializing evaluator", %{tenant: tenant} do
     for _ <- 1..120 do
       text = query()

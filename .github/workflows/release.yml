@@ -73,7 +73,10 @@ jobs:
           project-version: ${{ steps.extract.outputs.version }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
-          use-cross: ${{ matrix.job.use-cross }}
+          # Composite inputs are strings: "false" is truthy in this pinned
+          # action's install condition. Empty skips cross on native builds;
+          # build.sh also treats it as false when choosing cargo vs cross.
+          use-cross: ${{ matrix.job.use-cross && 'true' || '' }}
           project-dir: "native/${{ matrix.crate }}"
 
       - name: Upload artifact to the release

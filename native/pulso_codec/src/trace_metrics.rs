@@ -406,7 +406,13 @@ fn trace_metrics_batch_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -
                     return Err(Error::Budget);
                 }
                 let mut packed = NewBinary::new(env, values.len() * 8);
-                for (slot, value) in packed.as_mut_slice().chunks_exact_mut(8).zip(values) {
+                for (slot, value) in packed
+                    .as_mut_slice()
+                    .as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(values)
+                {
                     slot.copy_from_slice(&value.to_be_bytes());
                 }
                 let labels: Vec<_> = labels

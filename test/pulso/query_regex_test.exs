@@ -33,6 +33,9 @@ defmodule Pulso.QueryRegexTest do
   @scalar_complements Path.expand("../fixtures/regex/scalar-complement-controls.json", __DIR__)
   @external_resource @scalar_complements
 
+  # This bounded corpus checks over 54,000 inputs through several native APIs;
+  # allow for dirty-scheduler contention during the full concurrent CI suite.
+  @tag timeout: 180_000
   test "Unicode properties and scalar class complements match the pinned upstream engine" do
     for path <- [@scalar_complements, @properties],
         row <- path |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases") do
