@@ -15,8 +15,9 @@ defmodule Pulso.LogQL.Entry do
     * `base_labels` — resource/promoted stream names still protected from
       parser writes. Drop/rename releases a name. Manual entries without
       provenance treat all initial labels as stream labels.
-    * `metadata_labels` — current structured-metadata owners, including the
-      one-suffix names of metadata that collided with stream labels.
+    * `metadata_labels` — protected structured-metadata names, including the
+      one-suffix names of metadata that collided with stream labels. Incoming
+      error labels stay protected but use the parsed category on the wire.
     * `extracted_labels` — names written by earlier parsed stages, including
       names subsequently dropped. Ordinary parsers keep the first extraction;
       explicit expression parsers have their own overwrite rules.
@@ -61,9 +62,14 @@ defmodule Pulso.LogQL.Entry do
       |> maybe_put("level", record.severity_text)
       |> maybe_put("detected_level", record.severity_text)
 
+    attributes =
+      Enum.reduce([{"trace_id", record.trace_id}, {"span_id", record.span_id}], record.attributes || %{}, fn
+        {_name, value}, attributes when value in [nil, ""] -> attributes
+        {name, value}, attributes -> Map.put_new(attributes, name, value)
+      end)
+
     {labels, metadata} =
-      Enum.reduce(Enum.sort(record.attributes || %{}), {stringify_values(base_labels), %{}}, fn {name, value},
-                                                                                                {labels, metadata} ->
+      Enum.reduce(Enum.sort(attributes), {stringify_values(base_labels), %{}}, fn {name, value}, {labels, metadata} ->
         target = if Map.has_key?(base_labels, name), do: name <> "_extracted", else: name
 
         if target != name and Map.has_key?(labels, target) do
@@ -78,7 +84,12 @@ defmodule Pulso.LogQL.Entry do
       if categorize_labels? do
         base_labels
         |> Map.new(fn {name, _} -> {name, :stream} end)
-        |> Map.merge(Map.new(metadata, fn {name, _} -> {name, :structured_metadata} end))
+        |> Map.merge(
+          Map.new(metadata, fn
+            {name, _} when name in ["__error__", "__error_details__"] -> {name, :parsed}
+            {name, _} -> {name, :structured_metadata}
+          end)
+        )
       end
 
     %__MODULE__{

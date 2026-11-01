@@ -643,20 +643,46 @@ defmodule Pulso.LogQL.Pipeline do
     |> Entry.put_label("__error_details__", details, :parsed)
   end
 
-  # Strip ANSI CSI sequences: ESC[ ... final-byte (a byte in 0x40-0x7E).
-  defp strip_ansi(line) do
-    strip_ansi(line, [])
+  # Recognize Loki's decolorizer language without discarding unmatched input.
+  # Each candidate is scanned at most twice; neither body accepts a new marker.
+  defp strip_ansi(line), do: strip_ansi(line, <<>>)
+
+  defp strip_ansi(line, acc) do
+    case :binary.match(line, [<<0x1B>>, <<0x9B::utf8>>]) do
+      :nomatch ->
+        if acc == <<>>, do: line, else: <<acc::binary, line::binary>>
+
+      {offset, size} ->
+        <<prefix::binary-size(^offset), marker::binary-size(^size), rest::binary>> = line
+
+        case ansi_sequence(rest) do
+          nil -> strip_ansi(rest, <<acc::binary, prefix::binary, marker::binary>>)
+          tail -> strip_ansi(tail, <<acc::binary, prefix::binary>>)
+        end
+    end
   end
 
-  defp strip_ansi(<<0x1B, "[", rest::binary>>, acc) do
-    rest = skip_ansi_params(rest)
-    strip_ansi(rest, acc)
-  end
+  defp ansi_sequence(<<char, rest::binary>>) when char in ~c"[]()#;?", do: ansi_sequence(rest)
+  defp ansi_sequence(rest), do: ansi_bell(rest) || ansi_control(rest, 0, nil)
 
-  defp strip_ansi(<<c::utf8, rest::binary>>, acc), do: strip_ansi(rest, [acc, <<c::utf8>>])
-  defp strip_ansi(<<>>, acc), do: IO.iodata_to_binary(acc)
+  # The BEL-terminated alternative takes priority, even across an apparent
+  # control terminator. Its body is ASCII alphanumerics and semicolons only.
+  defp ansi_bell(<<7, rest::binary>>), do: rest
 
-  defp skip_ansi_params(<<c, rest::binary>>) when c >= 0x40 and c <= 0x7E, do: rest
-  defp skip_ansi_params(<<_c, rest::binary>>), do: skip_ansi_params(rest)
-  defp skip_ansi_params(<<>>), do: <<>>
+  defp ansi_bell(<<char, rest::binary>>) when char in ?a..?z or char in ?A..?Z or char in ?0..?9 or char == ?;,
+    do: ansi_bell(rest)
+
+  defp ansi_bell(_), do: nil
+
+  # Parameter components have at most four digits. A digit can itself be the
+  # final byte, so retain the last valid endpoint when a longer candidate fails.
+  defp ansi_control(<<char, rest::binary>>, digits, _last) when char in ?0..?9 and digits < 4,
+    do: ansi_control(rest, digits + 1, rest)
+
+  defp ansi_control(<<?;, rest::binary>>, _digits, last) when not is_nil(last), do: ansi_control(rest, 0, last)
+
+  defp ansi_control(<<char, rest::binary>>, _digits, _last)
+       when char in ?0..?9 or char in ?A..?P or char in ?f..?n or char in ~c"RZctqry=><~", do: rest
+
+  defp ansi_control(_, _digits, last), do: last
 end

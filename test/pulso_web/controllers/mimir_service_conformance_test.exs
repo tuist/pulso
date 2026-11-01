@@ -404,8 +404,16 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
   end
 
   @tag :result_types_batch
+  @tag :range_result_diagnostics
   test "Pulso rejects range and string results in range requests before storage", %{store: store} do
-    for query <- [~s("text"), "series_1[5m]", "series_1[5m:]"],
+    for query <- [
+          ~s("text"),
+          "series_1[5m]",
+          "(series_1[5m])",
+          "series_1[5m:]",
+          "series_1[5m] @ 1700000000",
+          "(sum(rate(series_1[1m])))[5m:10s]"
+        ],
         finish <- [@start, @start + 60],
         method <- [:get, :post] do
       params = [query: query, start: @start, end: finish, step: "1m"]
@@ -418,7 +426,13 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
             |> put_req_header("content-type", "application/x-www-form-urlencoded")
             |> post("/api/v1/query_range", URI.encode_query(params))
 
-      assert %{"status" => "error", "errorType" => "bad_data", "error" => "Invalid or unsupported query parameters."} ==
+      expected =
+        if query == ~s("text"),
+          do: "Invalid or unsupported query parameters.",
+          else:
+            "invalid parameter \"query\": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar"
+
+      assert %{"status" => "error", "errorType" => "bad_data", "error" => expected} ==
                json_response(response, 400)
     end
 
@@ -991,9 +1005,108 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
     end
   end
 
-  # TestQueryFrontendErrorMessageParity: only its eight portable invalid range
-  # requests. Preserve HTTP/status/errorType, but assert Pulso's complete generic
-  # diagnostic envelope, not upstream error-message parity. QueryRangeRaw sends
+  test "TestQueryFrontendErrorMessageParity / execution error", %{store: store} do
+    seed_frontend_error_series()
+
+    query =
+      ~s'sum by (group_1) (metric{unique=~"0|1|2|3"})' <>
+        ~s' * on(group_1) group_right(unique) (sum by (group_1,unique) (metric{unique=~"0|1|2|3"}))'
+
+    response =
+      conn()
+      |> get(
+        "/api/v1/query_range?" <>
+          URI.encode_query(query: query, start: @start - 60, end: @start, step: "60")
+      )
+
+    assert json_response(response, 422) == %{
+             "status" => "error",
+             "errorType" => "execution",
+             "error" => "multiple matches for labels: grouping labels must ensure unique matches"
+           }
+
+    assert_parquet(store)
+  end
+
+  test "Pulso grouping controls: step-local uniqueness, directions and error ownership", %{store: store} do
+    seed_frontend_error_series()
+    one = ~s'sum by (group_1) (metric{unique=~"0|1|2|3"})'
+    many = ~s'sum by (group_1,unique) (metric{unique=~"0|1|2|3"})'
+    single = ~s'sum by (group_1,unique) (metric{unique=~"0|1"})'
+
+    for query <- [
+          one <> " * on(group_1) group_right " <> many,
+          many <> " * on(group_1) group_left " <> one,
+          one <> " * on(group_1) group_right(unique) " <> single,
+          single <> " * on(group_1) group_left(unique) " <> one
+        ] do
+      labels =
+        if String.contains?(query, "(unique)"),
+          do: [%{"group_1" => "0"}, %{"group_1" => "1"}],
+          else: for(i <- [0, 2, 1, 3], do: %{"group_1" => to_string(rem(i, 2)), "unique" => to_string(i)})
+
+      expected = Enum.map(labels, &%{"metric" => &1, "values" => [[@start, "0.5"], [@start + 60, "0.5"]]})
+
+      params = [query: query, start: @start - 60, end: @start + 60, step: "60"]
+      assert data("/api/v1/query_range", params) == %{"resultType" => "matrix", "result" => expected}
+    end
+
+    for query <- [
+          one <> " * on(group_1) group_right(unique) " <> many,
+          many <> " * on(group_1) group_left(unique) " <> one,
+          one <> " < bool on(group_1) group_right(unique) " <> many,
+          many <> " > bool on(group_1) group_left(unique) " <> one
+        ],
+        {path, params} <- [
+          {"/api/v1/query", [query: query, time: @start]},
+          {"/api/v1/query_range", [query: query, start: @start - 60, end: @start + 60, step: "60"]}
+        ] do
+      for response <- [
+            get(conn(), path, params),
+            conn()
+            |> put_req_header("content-type", "application/x-www-form-urlencoded")
+            |> post(path, URI.encode_query(params))
+          ] do
+        assert json_response(response, 422) == %{
+                 "status" => "error",
+                 "errorType" => "execution",
+                 "error" => "multiple matches for labels: grouping labels must ensure unique matches"
+               }
+      end
+
+      assert data("/api/v1/query", query: query, time: @start - 1) == %{"resultType" => "vector", "result" => []}
+      assert data("/api/v1/query", query: query, time: @start + 300) == %{"resultType" => "vector", "result" => []}
+    end
+
+    # Filtered-out pairs never enter the uniqueness set, whereas bool false
+    # pairs above retain zero-valued output and must still reject collisions.
+    for query <- [
+          one <> " < on(group_1) group_right(unique) " <> many,
+          many <> " > on(group_1) group_left(unique) " <> one,
+          one <> ~s' * on(group_1) group_right(unique) metric{group_1="missing"}'
+        ] do
+      assert data("/api/v1/query", query: query, time: @start) == %{"resultType" => "vector", "result" => []}
+    end
+
+    # Ordinary duplicate outputs and an ambiguous one-side index are different
+    # execution errors, not grouped output collisions.
+    for query <- [
+          many <> " * on(group_1) group_right " <> one,
+          ~s'label_replace(metric{unique=~"0|2"}, "unique", "", "unique", ".*")'
+        ] do
+      assert conn() |> get("/api/v1/query", query: query, time: @start) |> json_response(422) == %{
+               "status" => "error",
+               "errorType" => "execution",
+               "error" => "Vector matching produced ambiguous or duplicate series."
+             }
+    end
+
+    assert_parquet(store)
+  end
+
+  # TestQueryFrontendErrorMessageParity: its eight portable invalid range
+  # requests. Six diagnostics retain the complete upstream envelope;
+  # unknown-function/aggregation diagnostics remain adapted. QueryRangeRaw sends
   # numeric seconds (including -60), not duration strings. The last row's omitted
   # resolution is valid inside range functions, but a top-level range result rejects.
   for {name, query, first, last, step} <- [
@@ -1008,6 +1121,26 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
         {"wrong timestamp in start", "unknown", "depths-of-time", @start, "30"},
         {"range query with range vector", "(sum(rate(up[1m])))[5m:]", @start - 3600, @start, "60"}
       ] do
+    expected_error =
+      Map.get(
+        %{
+          "maximum resolution error" =>
+            "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)",
+          "negative step" =>
+            "invalid parameter \"step\": zero or negative query resolution step widths are not accepted. Try a positive integer",
+          "start after end" => "invalid parameter \"end\": end timestamp must not be before start time",
+          "wrong duration specified in step" =>
+            ~s(invalid parameter "step": cannot parse "123notafloat" to a valid duration),
+          "wrong timestamp in start" =>
+            ~s(invalid parameter "start": cannot parse "depths-of-time" to a valid timestamp),
+          "range query with range vector" =>
+            "invalid parameter \"query\": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar"
+        },
+        name,
+        "Invalid or unsupported query parameters."
+      )
+
+    @tag range_result_diagnostics: name == "range query with range vector"
     test "TestQueryFrontendErrorMessageParity / #{name} / Pulso diagnostics", %{store: store} do
       params = [query: unquote(query), start: unquote(first), end: unquote(last), step: unquote(step)]
       assert Agent.get(store, & &1.requests) == []
@@ -1017,7 +1150,7 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
       assert json_response(response, 400) == %{
                "status" => "error",
                "errorType" => "bad_data",
-               "error" => "Invalid or unsupported query parameters."
+               "error" => unquote(expected_error)
              }
 
       assert Agent.get(store, & &1.requests) == []
@@ -1172,6 +1305,15 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
     response = conn(tenant) |> get(path <> "?" <> URI.encode_query(params)) |> json_response(200)
     assert response["status"] == "success"
     Map.fetch!(response, "data")
+  end
+
+  # integration/query_frontend_test.go:672-689. Freeze GenerateSeries' random
+  # float to 0.5 and clock to @start; keep all 50 distinct RW1 pushes.
+  defp seed_frontend_error_series do
+    for i <- 0..49 do
+      labels = [{"__name__", "metric"}, {"unique", to_string(i)}, {"group_1", to_string(rem(i, 2))}]
+      assert post_write(field(1, series(labels, [{@start, 0.5}]))).status == 204
+    end
   end
 
   defp post_write(bytes, version \\ :v1, headers \\ []) do

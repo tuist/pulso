@@ -17,6 +17,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
   alias Pulso.Auth.SharedSecret
   alias Pulso.LogQL.AST.RangeAgg
   alias Pulso.LogQL.Parser
+  alias Pulso.Loki.PushProto
   alias Pulso.Loki.Tail
   alias Pulso.PromQL.Evaluator
   alias Pulso.Runtime
@@ -25,12 +26,36 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Test.BlockingMetricStorage
   alias Pulso.Test.CompactionStore
+  alias Pulso.Test.LokiLabelBuilderFixture
+  alias Pulso.Test.LokiPipelineFixture
+  alias Pulso.Test.LokiSampleExtractorFixture
   alias Pulso.Test.RuntimePlug
   alias Pulso.Test.WebSocketClient
 
   @second 1_000_000_000
   @minute 60 * @second
   @week 7 * 24 * 60 * @minute
+
+  @http_parameters_path "test/fixtures/logs/loki-upstream/http-parameters.json"
+  @external_resource @http_parameters_path
+  @http_parameter_rows @http_parameters_path |> File.read!() |> JSON.decode!() |> Map.fetch!("rows")
+
+  @http_errors_path "test/fixtures/logs/loki-upstream/http-errors.json"
+  @external_resource @http_errors_path
+  @http_error_rows @http_errors_path
+                   |> File.read!()
+                   |> JSON.decode!()
+                   |> Map.fetch!("rows")
+                   |> Map.new(&{&1["name"], &1["expected"]})
+
+  @error_classification_path "test/fixtures/logs/loki-upstream/error-classification.json"
+  @external_resource @error_classification_path
+  @wrapped_limit_rows @error_classification_path
+                      |> File.read!()
+                      |> JSON.decode!()
+                      |> Map.fetch!("rows")
+                      |> Enum.filter(&(&1["table"] == "TestWrappedLimitErrorStatusPreserved"))
+                      |> Map.new(&{&1["name"], &1["expected"]})
 
   setup do
     Runtime.share()
@@ -90,6 +115,1217 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       now: System.system_time(:nanosecond) - 10 * @second,
       store: store
     }
+  end
+
+  @tag :http_errors_batch
+  test "Loki parse and interval errors retain upstream client-error status", ctx do
+    for method <- [&request/4, &request_form/4], path <- ["/query", "/query_range"] do
+      response = method.(ctx, path, [{"query", "{"} | range(ctx)], @http_error_rows["parse error"]["status"])
+      assert response["error"] == "parse_error"
+      refute Map.has_key?(response, "data")
+
+      limited = query_limits(ctx, ~s({"maxQueryInterval":"1s"}))
+
+      response =
+        method.(
+          limited,
+          path,
+          [{"query", ~s'count_over_time({job="fake"}[2s])'} | range(ctx)],
+          @http_error_rows["interval limit"]["status"]
+        )
+
+      assert response["error"] == "query_limit"
+      assert response["message"] =~ @http_error_rows["interval limit"]["body"]
+      refute Map.has_key?(response, "data")
+    end
+
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == {[], 0, []}
+  end
+
+  @tag :http_errors_batch
+  test "finite Loki reads retain upstream deadline status with a sanitized JSON body", ctx do
+    Runtime.put_env(:pulso, Storage, adapter: BlockingMetricStorage)
+    Runtime.put_env(:pulso, BlockingMetricStorage, {:error, :query_timeout})
+
+    for {path, extra} <- finite_reads(), method <- [&request/4, &request_form/4] do
+      params =
+        extra ++
+          [{"time", to_string(ctx.now)}, {"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now)}]
+
+      assert method.(ctx, path, params, @http_error_rows["deadline"]["status"]) == %{
+               "status" => "error",
+               "error" => "query_timeout",
+               "message" => "Query timed out."
+             }
+    end
+  end
+
+  @tag :http_errors_batch
+  test "finite Loki reads retain upstream internal status after worker failure", ctx do
+    Runtime.put_env(:pulso, Storage, adapter: BlockingMetricStorage)
+    Runtime.put_env(:pulso, BlockingMetricStorage, self())
+
+    for {path, extra} <- finite_reads(), method <- [&request/4, &request_form/4] do
+      params =
+        extra ++
+          [{"time", to_string(ctx.now)}, {"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now)}]
+
+      caller = Pulso.Runtime.Task.async(fn -> method.(ctx, path, params, @http_error_rows["internal"]["status"]) end)
+      assert_receive {:blocked_metric_query, worker, tenant}, 1000
+      assert tenant == ctx.tenant
+      ref = Process.monitor(worker)
+      Process.exit(worker, :simulated_query_failure)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :simulated_query_failure}, 1000
+
+      assert Task.await(caller) == %{
+               "status" => "error",
+               "error" => "query_failed",
+               "message" => "Query execution failed."
+             }
+    end
+  end
+
+  @tag :http_errors_batch
+  test "finite Loki reads sanitize storage failures consistently", ctx do
+    Runtime.put_env(:pulso, Storage, adapter: BlockingMetricStorage)
+    Runtime.put_env(:pulso, BlockingMetricStorage, {:error, {:provider_failure, "private-provider-detail"}})
+
+    for {path, extra} <- finite_reads(), method <- [&request/4, &request_form/4] do
+      params =
+        extra ++
+          [{"time", to_string(ctx.now)}, {"start", to_string(ctx.now - @minute)}, {"end", to_string(ctx.now)}]
+
+      assert method.(ctx, path, params, 503) == %{
+               "status" => "error",
+               "error" => "storage_unavailable",
+               "message" => "Storage is unavailable."
+             }
+    end
+
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == {[], 0, []}
+
+    Runtime.put_env(:pulso, Storage, adapter: S3)
+    push(ctx, "recovered", ctx.now, %{"job" => "fake"})
+    assert lines(request(ctx, "/query_range", [{"query", ~s({job="fake"})} | range(ctx)])) == ["recovered"]
+    assert_parquet_read(ctx)
+  end
+
+  @tag :http_parameter_controls
+  test "Loki HTTP parameters reject malformed supplied values before provider access", ctx do
+    push(ctx, "control", ctx.now, %{"job" => "http-parameters"})
+
+    for {path, additions} <- [
+          {"/query", [{"limit", "h"}]},
+          {"/query", [{"direction", "fw"}]},
+          {"/query_range", [{"limit", "4294967296"}]},
+          {"/query_range", [{"direction", "fw"}]},
+          {"/query_range", [{"step", "h"}]},
+          {"/query_range", [{"step", "-1"}]},
+          {"/query_range", [{"interval", "-1"}]},
+          {"/query_range", [{"interval", "nonsense"}]}
+        ],
+        method <- [&request/4, &request_form/4] do
+      params = Map.new([{"query", ~s({job="http-parameters"})} | range(ctx)] ++ additions)
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = method.(ctx, path, params, 400)
+      assert response["error"] == "invalid_parameter"
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+    end
+  end
+
+  @tag :http_parameter_controls
+  test "Loki HTTP interval samples globally before the limit in either direction", ctx do
+    base = div(ctx.now, @second) * @second
+
+    # Separate immutable objects have overlapping time envelopes.
+    for stream <- [
+          %{
+            "stream" => %{"job" => "interval", "owner" => "a"},
+            "values" => for(n <- [0, 2, 4, 6], do: [to_string(base + n * @second), "a#{n}"])
+          },
+          %{
+            "stream" => %{"job" => "interval", "owner" => "b"},
+            "values" => for(n <- [1, 3, 5], do: [to_string(base + n * @second), "b#{n}"])
+          }
+        ],
+        do: push_streams(ctx, [stream])
+
+    for method <- [&request/4, &request_form/4],
+        {direction, expected} <- [{"FORWARD", ["a0", "b3", "a6"]}, {"BACKWARD", ["a6", "b3", "a0"]}] do
+      params = [
+        {"query", ~s({job="interval"})},
+        {"start", to_string(base)},
+        {"end", to_string(base + 7 * @second)},
+        {"direction", direction},
+        {"step", "0.5"},
+        {"interval", "3"},
+        {"limit", "3"}
+      ]
+
+      response = method.(ctx, "/query_range", params, 200)
+      values = Enum.flat_map(response["data"]["result"], & &1["values"])
+      order = if direction == "FORWARD", do: :asc, else: :desc
+
+      assert values |> Enum.sort_by(fn [ts | _] -> String.to_integer(ts) end, order) |> Enum.map(&Enum.at(&1, 1)) ==
+               expected
+
+      # Pipelines still run before interval selection and retain source times.
+      formatted =
+        List.keyreplace(params, "query", 0, {"query", ~s({job="interval"} !~ "[25]$" | line_format "{{__line__}}!")})
+
+      response = method.(ctx, "/query_range", formatted, 200)
+      values = Enum.flat_map(response["data"]["result"], & &1["values"])
+
+      assert values |> Enum.sort_by(fn [ts | _] -> String.to_integer(ts) end, order) |> Enum.map(&Enum.at(&1, 1)) ==
+               Enum.map(expected, &(&1 <> "!"))
+    end
+  end
+
+  # Component-only rows replay in HTTPParamsTest. These complete request tables
+  # additionally exercise real authentication, form decoding and native S3 reads.
+  @tag :http_parameter_controls
+  test "interval collection fails whole on sample and work ceilings, while zero keeps ordinary top-k", ctx do
+    for n <- 0..2, do: push(ctx, "keep #{n}", ctx.now + n * @second, %{"job" => "interval-budget"})
+    push(ctx, "drop", ctx.now + 3 * @second, %{"job" => "interval-budget"})
+
+    params = [
+      {"query", ~s({job="interval-budget"} |= "keep" | line_format "{{__line__}}!")},
+      {"start", to_string(ctx.now)},
+      {"end", to_string(ctx.now + 4 * @second)},
+      {"limit", "1"},
+      {"interval", "1"}
+    ]
+
+    for limits <- [[max_log_samples: 2], [max_work: 1]], method <- [&request/4, &request_form/4] do
+      Runtime.put_env(:pulso, Evaluator, limits)
+      response = method.(ctx, "/query_range", params, 422)
+      assert response["error"] == "query_limit"
+      refute Map.has_key?(response, "data")
+    end
+
+    Runtime.put_env(:pulso, Evaluator, max_log_samples: 2)
+
+    for method <- [&request/4, &request_form/4] do
+      response = method.(ctx, "/query_range", List.keyreplace(params, "interval", 0, {"interval", "0"}), 200)
+
+      assert Enum.flat_map(response["data"]["result"], & &1["values"]) == [
+               [to_string(ctx.now + 2 * @second), "keep 2!"]
+             ]
+    end
+  end
+
+  @tag :http_parameter_controls
+  test "decimal timestamps, since windows and fractional volume steps affect retained HTTP results", ctx do
+    base = 1_571_332_130 * @second
+    for n <- [0, 1, 2, 3], do: push(ctx, "abc", base + n * 1_000_000, %{"job" => "decimal"})
+
+    for method <- [&request/4, &request_form/4] do
+      params = [query: ~s({job="decimal"}), start: "1571332130.0004", end: "1571332130.0016", direction: "forward"]
+      response = method.(ctx, "/query_range", params, 200)
+
+      assert Enum.flat_map(response["data"]["result"], & &1["values"]) ==
+               for(n <- [0, 1, 2], do: [to_string(base + n * 1_000_000), "abc"])
+
+      assert method.(ctx, "/labels", [end: to_string(base + @second), since: "1s"], 200)["data"] == ["job"]
+      assert method.(ctx, "/labels", [end: to_string(base + 2 * @second), since: "1s"], 200)["data"] == []
+    end
+
+    response =
+      request(ctx, "/index/volume_range",
+        query: ~s({job="decimal"}),
+        start: to_string(base),
+        end: to_string(base + @second),
+        step: "0.5"
+      )
+
+    assert [%{"metric" => %{"job" => "decimal"}, "values" => samples}] = response["data"]["result"]
+    # The first evaluation includes the start event; the next includes the
+    # other three events. Four three-byte lines must contribute exactly once.
+    assert Enum.sum_by(samples, fn [_, value] -> String.to_integer(value) end) == 12
+  end
+
+  for row <- @http_parameter_rows,
+      row["table"] in ["TestParseRangeQuery", "TestParseInstantQuery", "TestHttp_ParseRangeQuery_Step"] do
+    @tag :http_parameters_batch
+    test "HTTP parameter query table #{row["table"]}/#{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      params = http_parameter_params(row)
+      path = if row["table"] == "TestParseInstantQuery", do: "/query", else: "/query_range"
+
+      if !row["error"]["reject"] do
+        fields = row["expected"]["fields"]
+        finish = String.to_integer(fields["End_ns"] || fields["Ts_ns"])
+        # Full-window/time rejection must differ from successful empty results.
+        push(ctx, "included", finish, %{"foo" => "bar"})
+        push(ctx, "future", finish + 1, %{"foo" => "bar"})
+      end
+
+      for method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, params, if(row["error"]["reject"], do: 400, else: 200))
+
+        if row["error"]["reject"] do
+          assert Agent.get(ctx.store, & &1.requests) == before
+        else
+          assert Enum.flat_map(response["data"]["result"], & &1["values"]) ==
+                   [[row["expected"]["fields"]["End_ns"] || row["expected"]["fields"]["Ts_ns"], "included"]]
+
+          assert_parquet_read(ctx)
+        end
+      end
+    end
+  end
+
+  for row <- @http_parameter_rows, row["table"] == "TestParseLabelQuery" do
+    @tag :http_parameters_batch
+    test "HTTP parameter label table #{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      fields = row["expected"]["fields"]
+      path = if fields && fields["Values"], do: "/label/#{fields["Name"]}/values", else: "/labels"
+
+      if fields do
+        push(ctx, "inside", String.to_integer(fields["Start_ns"]), %{"test" => "inside"})
+        push(ctx, "outside", String.to_integer(fields["End_ns"]) + 1, %{"test" => "outside"})
+      end
+
+      for method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, http_parameter_params(row), if(row["error"]["reject"], do: 400, else: 200))
+
+        if row["error"]["reject"] do
+          assert Agent.get(ctx.store, & &1.requests) == before
+        else
+          assert response["data"] == if(fields["Values"], do: ["inside"], else: ["test"])
+          assert_parquet_read(ctx)
+        end
+      end
+    end
+  end
+
+  for row <- @http_parameter_rows, row["table"] == "TestParseAndValidateSeriesQuery" do
+    @tag :http_parameters_batch
+    test "HTTP parameter series table #{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      fields = row["expected"]["fields"]
+      start = String.to_integer(fields["Start_ns"])
+      finish = String.to_integer(fields["End_ns"])
+      a = %{"a" => "1"}
+      b = %{"b" => "2", "c" => "3", "d" => "5"}
+      noise = %{"other" => "noise"}
+      for labels <- [a, b, noise], do: push(ctx, "inside", start, labels)
+      push(ctx, "outside", finish + 1, %{"a" => "1", "outside" => "true"})
+
+      expected =
+        case fields["Groups"] do
+          [] -> [a, b, noise]
+          [~s({foo=""})] -> [a, b, noise]
+          _ -> [a, b]
+        end
+
+      for method <- [&request/4, &request_form/4] do
+        response = method.(ctx, "/series", http_parameter_params(row), 200)
+        assert Enum.sort(response["data"]) == Enum.sort(expected)
+      end
+
+      assert_parquet_read(ctx)
+    end
+  end
+
+  for row <- @http_parameter_rows, row["table"] == "TestParseTailQuery" do
+    @tag :http_parameters_batch
+    test "HTTP parameter tail table #{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      params = http_parameter_params(row)
+
+      if !row["error"]["reject"] do
+        start = String.to_integer(row["expected"]["fields"]["Start_ns"])
+        push(ctx, "excluded", start - 1, %{"foo" => "bar"})
+        push(ctx, "history", start, %{"foo" => "bar"})
+      end
+
+      before = Agent.get(ctx.store, & &1.requests)
+      path = "/loki/api/v1/tail?" <> URI.encode_query(params)
+      result = WebSocketClient.connect(URI.parse(ctx.url).port, path, headers(ctx))
+
+      if row["error"]["reject"] do
+        assert {:error, {400, _}} = result
+        assert Agent.get(ctx.store, & &1.requests) == before
+      else
+        assert {:ok, socket} = result
+
+        try do
+          assert tail_values(socket, 1) == [[row["expected"]["fields"]["Start_ns"], "history"]]
+        after
+          WebSocketClient.close(socket)
+        end
+
+        assert_parquet_read(ctx)
+      end
+    end
+  end
+
+  for row <- @http_parameter_rows, row["table"] == "TestParsePatternsQuery" do
+    @tag :http_parameters_batch
+    test "HTTP parameter patterns table #{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      params = http_parameter_params(row)
+      fields = row["expected"]["fields"]
+
+      if fields do
+        start = String.to_integer(fields["Start_ns"])
+        push(ctx, "parameter pattern", start + 1_000_000, %{"foo" => "bar"})
+        push(ctx, "parameter pattern", String.to_integer(fields["End_ns"]) - 1_000_000, %{"foo" => "bar"})
+        push(ctx, "excluded", String.to_integer(fields["End_ns"]) + 1, %{"foo" => "bar"})
+      end
+
+      before = Agent.get(ctx.store, & &1.requests)
+      response = request(ctx, "/patterns", params, if(row["error"]["reject"], do: 400, else: 200))
+
+      if row["error"]["reject"] do
+        assert Agent.get(ctx.store, & &1.requests) == before
+      else
+        start = String.to_integer(fields["Start_ns"])
+        step = String.to_integer(fields["Step_ns"])
+
+        samples =
+          [start + 1_000_000, String.to_integer(fields["End_ns"]) - 1_000_000]
+          |> Enum.frequencies_by(&div(start + div(&1 - start, step) * step, @second))
+          |> Enum.sort()
+          |> Enum.map(fn {ts, count} -> [ts, count] end)
+
+        assert response["data"] == [%{"pattern" => "parameter pattern", "samples" => samples}]
+        assert_parquet_read(ctx)
+      end
+    end
+  end
+
+  for row <- @http_parameter_rows, row["table"] in ["Test_ParseVolumeInstantQuery", "Test_ParseVolumeRangeQuery"] do
+    @tag :http_parameters_batch
+    test "HTTP parameter volume table #{row["table"]}/#{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      params = http_parameter_params(row)
+      path = if row["table"] == "Test_ParseVolumeInstantQuery", do: "/index/volume", else: "/index/volume_range"
+
+      if !row["error"]["reject"] do
+        # Partial aggregateBy oracles remain partial. The shared original bounds
+        # come from the complete row, not from the parser under test.
+        complete = Enum.find(@http_parameter_rows, &(&1["table"] == row["table"] and &1["name"] == ""))
+        finish = String.to_integer(complete["expected"]["fields"]["End_ns"])
+        push(ctx, "abc", finish - @second, %{"foo" => "bar", "bar" => "baz", "noise" => "unused"})
+        push(ctx, "excluded", finish + @second, %{"foo" => "bar", "bar" => "baz"})
+      end
+
+      before = Agent.get(ctx.store, & &1.requests)
+      response = request(ctx, path, params, if(row["error"]["reject"], do: 400, else: 200))
+
+      if row["error"]["reject"] do
+        assert response["message"] == row["error"]["equals"]
+        assert Agent.get(ctx.store, & &1.requests) == before
+      else
+        labels? = row["expected"]["AggregateBy"] == "labels"
+        expected_labels = if labels?, do: [%{"bar" => ""}, %{"foo" => ""}], else: [%{"foo" => "bar", "bar" => "baz"}]
+        result = response["data"]["result"]
+        assert Enum.sort(Enum.map(result, & &1["metric"])) == Enum.sort(expected_labels)
+
+        for series <- result do
+          samples = if path == "/index/volume", do: [series["value"]], else: series["values"]
+          assert Enum.sum_by(samples, fn [_, value] -> String.to_integer(value) end) == 3
+        end
+
+        assert_parquet_read(ctx)
+      end
+    end
+  end
+
+  @tag :correlation_labels_batch
+  test "correlation IDs survive Loki push as metadata, not stream labels", ctx do
+    ids = [
+      %{"trace_id" => "t1", "span_id" => "s1"},
+      %{"trace_id" => "t1", "span_id" => "s2"},
+      %{"trace_id" => "t2", "span_id" => "s1"},
+      %{},
+      %{"trace_id" => "", "span_id" => ""}
+    ]
+
+    line = "trace_id=parsed span_id=parsed"
+    base = %{"app" => "correlation"}
+
+    rows =
+      for {metadata, index} <- Enum.with_index(ids) do
+        {to_string(ctx.now + index * @second), metadata}
+      end
+
+    push_streams(ctx, [%{"stream" => base, "values" => for({ts, metadata} <- rows, do: [ts, line, metadata])}])
+
+    for categorized? <- [false, true], path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      params = [query: ~s'{app="correlation"}', start: to_string(ctx.now), end: to_string(ctx.now + 4 * @second)]
+      response = method.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
+
+      actual =
+        for %{"stream" => stream, "values" => values} <- response["data"]["result"],
+            [ts, ^line | extra] <- values,
+            into: %{},
+            do: {ts, {stream, extra}}
+
+      expected =
+        Map.new(rows, fn {ts, metadata} ->
+          metadata = if metadata == %{"trace_id" => "", "span_id" => ""}, do: %{}, else: metadata
+          extra = if metadata == %{}, do: %{}, else: %{"structuredMetadata" => metadata}
+          value = if categorized?, do: {base, [extra]}, else: {Map.merge(base, metadata), []}
+          {ts, value}
+        end)
+
+      assert actual == expected
+    end
+
+    expected = %{
+      %{"trace_id" => "t1", "span_id" => "s1"} => [{4, "1"}],
+      %{"trace_id" => "t1", "span_id" => "s2"} => [{4, "1"}],
+      %{"trace_id" => "t2", "span_id" => "s1"} => [{4, "1"}],
+      %{} => [{4, "2"}]
+    }
+
+    query = ~s'sum by (trace_id,span_id) (count_over_time({app="correlation"}[1m]))'
+    assert_metric(ctx, query, 4, expected)
+    assert_metric(ctx, query, {4, 4, "1"}, expected)
+
+    for {stages, count} <- [
+          {~s'| trace_id="t1" | span_id="s2"', "1"},
+          {~s'| logfmt | trace_id="t1" | trace_id_extracted="parsed" | span_id_extracted="parsed"', "2"},
+          {~s'| logfmt | trace_id="parsed" | span_id="parsed"', "2"}
+        ] do
+      assert_metric(ctx, "sum(count_over_time({app=\"correlation\"} #{stages} [1m]))", 4, %{%{} => [{4, count}]})
+    end
+
+    assert_metric(ctx, ~s'count_over_time({app="correlation",trace_id="t1"}[1m])', 4, %{})
+    assert_parquet(ctx, 1)
+  end
+
+  @tag :sample_extractors_batch
+  test "Loki label sample-extractor observations survive HTTP and native Parquet", ctx do
+    rows = LokiSampleExtractorFixture.cases(LokiSampleExtractorFixture.load())
+
+    rows =
+      Enum.filter(
+        rows,
+        &(&1.function in [
+            "Test_labelSampleExtractor_Extract",
+            "Test_Extract_ExpectedLabels",
+            "TestLabelExtractorWithStages"
+          ])
+      )
+
+    assert length(rows) == 41
+    replay_sample_extractors(ctx, rows)
+  end
+
+  @tag :sample_extractors_batch
+  test "Loki line and distinct sample-extractor observations survive HTTP and native Parquet", ctx do
+    rows = LokiSampleExtractorFixture.cases(LokiSampleExtractorFixture.load())
+
+    rows =
+      Enum.reject(
+        rows,
+        &(&1.function in [
+            "Test_labelSampleExtractor_Extract",
+            "Test_Extract_ExpectedLabels",
+            "TestLabelExtractorWithStages"
+          ])
+      )
+
+    assert length(rows) == 47
+    replay_sample_extractors(ctx, rows)
+  end
+
+  @tag :sample_extractors_batch
+  test "Loki sample extraction isolates interleaved stream and metadata owners", ctx do
+    # Original A -> B -> A regression input. B's nonmatching metadata must
+    # not replace A's own namespace. This checks public isolation, not Go types.
+    a = %{"app" => "a", "namespace" => "dev"}
+    b = %{"app" => "b"}
+
+    push_streams(ctx, [
+      %{"stream" => a, "values" => [[to_string(ctx.now), "line"], [to_string(ctx.now + 2 * @second), "line"]]},
+      %{"stream" => b, "values" => [[to_string(ctx.now + @second), "line", %{"namespace" => "prod"}]]}
+    ])
+
+    query = ~s'sum by (app) (count_over_time({} | namespace="dev" [1s]))'
+    assert_metric(ctx, query, {0, 2, "1"}, %{%{"app" => "a"} => [{0, "1"}, {2, "1"}]})
+    assert_metric(ctx, query, 2, %{%{"app" => "a"} => [{2, "1"}]})
+
+    # An authored whole-window control observes both original accepted calls.
+    assert_metric(ctx, ~s'sum by (app) (count_over_time({} | namespace="dev" [3s]))', 2, %{
+      %{"app" => "a"} => [{2, "2"}]
+    })
+
+    assert_parquet(ctx, 1)
+  end
+
+  @tag :label_builder_batch
+  test "Loki builder literal lookups, maps and Add error categories survive public ingestion", ctx do
+    fixture = LokiLabelBuilderFixture.load()
+    errors = LokiLabelBuilderFixture.error_case(fixture)
+    lookalikes = %{"__error___extracted" => "ordinary", "__error_details___extracted" => "other"}
+
+    control = %{
+      errors
+      | metadata: Map.merge(errors.metadata, lookalikes),
+        checks:
+          Enum.map(errors.checks, fn
+            {:labels, name, labels} -> {:labels, name, Map.merge(labels, lookalikes)}
+            {:structured_metadata, name, _} -> {:structured_metadata, name, lookalikes}
+            check -> check
+          end)
+    }
+
+    rows = push_builder_rows(ctx, LokiLabelBuilderFixture.log_cases(fixture) ++ [errors, control])
+    assert length(rows) == 12
+
+    for {row, at} <- rows,
+        categorized? <- [false, true],
+        path <- ["/query", "/query_range"],
+        method <- [&request/4, &request_form/4] do
+      timestamp = to_string(at.now)
+      params = [query: row.query, start: timestamp, end: timestamp, time: timestamp]
+      response = method.(if(categorized?, do: categorize(at), else: at), path, params, 200)
+      assert [%{"stream" => stream, "values" => [value]}] = response["data"]["result"]
+      assert Enum.take(value, 2) == [timestamp, "label-builder"]
+      actual = {stream, if(categorized?, do: Enum.at(value, 2), else: %{})}
+
+      for {kind, name, expected} <- row.checks, categorized? or kind in [:labels, :present, :value] do
+        assert LokiLabelBuilderFixture.observation(kind, name, actual) == expected, inspect({row.query, kind, name})
+      end
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :label_builder_batch
+  test "Loki builder grouping snapshots reach native Parquet metric queries", ctx do
+    rows = push_builder_rows(ctx, LokiLabelBuilderFixture.group_cases(LokiLabelBuilderFixture.load()), 120 * @second)
+    assert length(rows) == 13
+
+    for {row, at} <- rows do
+      expected = %{row.expected => [{0, "1"}]}
+      assert_metric(at, row.query, 0, expected)
+      assert_metric(at, row.query, {0, 0, "1"}, expected)
+    end
+  end
+
+  @tag :label_builder_batch
+  test "all Loki preserve-error category and grouping identities remain ordinary labels", ctx do
+    rows = push_builder_rows(ctx, LokiLabelBuilderFixture.preserve_cases(LokiLabelBuilderFixture.load()), 120 * @second)
+    assert length(rows) == 9
+
+    for {row, at} <- rows, path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      timestamp = to_string(at.now)
+      params = [query: row.query, time: timestamp, start: timestamp, end: timestamp, step: "1"]
+      response = method.(at, path, params, 200)
+      assert [%{"metric" => labels} = series] = response["data"]["result"]
+      samples = if path == "/query", do: [series["value"]], else: series["values"]
+      assert samples == [[at.now / @second, "0"]]
+      assert labels["__error__"] == "SampleExtractionErr"
+
+      if row.expected == false,
+        do: refute(Map.has_key?(labels, "__preserve_error__")),
+        else: assert(labels["__preserve_error__"] == row.expected)
+
+      # A caller-supplied label cannot grant error-preservation permission.
+      failed = method.(at, path, Keyword.put(params, :query, row.unpreserved_query), 400)
+      assert failed["error"] == "evaluation_failed"
+      assert failed["message"] =~ "sample_extraction_error"
+      refute Map.has_key?(failed, "data")
+    end
+  end
+
+  @tag :label_builder_batch
+  test "the original Loki colliding label pair keeps distinct public log and metric identities", ctx do
+    labels = LokiLabelBuilderFixture.collision_labels(LokiLabelBuilderFixture.load())
+    assert length(labels) == 2
+    timestamp = to_string(ctx.now)
+    push_streams(ctx, Enum.map(labels, &%{"stream" => &1, "values" => [[timestamp, "label-builder"]]}))
+
+    for categorized? <- [false, true], path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      params = [query: "{}", start: timestamp, end: timestamp, time: timestamp]
+      response = method.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
+      value = if categorized?, do: [timestamp, "label-builder", %{}], else: [timestamp, "label-builder"]
+
+      assert Enum.sort(response["data"]["result"]) ==
+               Enum.sort(Enum.map(labels, &%{"stream" => &1, "values" => [value]}))
+    end
+
+    expected = Map.new(labels, &{&1, [{0, "1"}]})
+    assert_metric(ctx, "count_over_time({}[1m])", 0, expected)
+    assert_metric(ctx, "count_over_time({}[1m])", {0, 0, "1"}, expected)
+    assert_parquet(ctx, 1)
+  end
+
+  @tag :pipeline_ownership_batch
+  test "complete Loki ordinary pipeline ownership survives authenticated Parquet HTTP", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/pipeline-ownership.json") |> Pulso.JSON.decode!()
+    assert fixture["execution_count"] == 30
+
+    rows =
+      fixture["executions"]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {row, index} ->
+        {row, Integer.to_string(ctx.now - index * @second)}
+      end)
+
+    streams =
+      Enum.map(rows, fn {row, timestamp} ->
+        %{
+          "stream" => Map.new(row["stream_labels"], &{&1["name"], &1["value"]}),
+          "values" => [
+            [
+              timestamp,
+              Base.decode64!(row["input_line_bytes_base64"]),
+              Map.new(row["structured_metadata"], &{&1["name"], &1["value"]})
+            ]
+          ]
+        }
+      end)
+
+    push_streams(ctx, streams)
+    assert_parquet(ctx, 1)
+
+    for {row, timestamp} <- rows,
+        categorized? <- [false, true],
+        path <- ["/query", "/query_range"],
+        send_request <- [&request/4, &request_form/4] do
+      query = LokiPipelineFixture.query(row["table"], row["source_index"])
+      params = %{query: query, start: timestamp, end: timestamp, time: timestamp}
+      response = send_request.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
+
+      expected =
+        if row["expected_match"] == false do
+          []
+        else
+          # Drop's original executor does not assert its output line. Keeping
+          # that input unchanged is a separate public transport control.
+          line = Base.decode64!(row["expected_line_bytes_base64"] || row["input_line_bytes_base64"])
+
+          if categorized? do
+            categories =
+              Map.new(row["expected_categories"], fn {name, pairs} ->
+                {name, Map.new(pairs, &{&1["name"], &1["value"]})}
+              end)
+
+            extra =
+              %{"structuredMetadata" => categories["structured_metadata"], "parsed" => categories["parsed"]}
+              |> Map.reject(fn {_key, labels} -> labels == %{} end)
+
+            [%{"stream" => categories["stream"], "values" => [[timestamp, line, extra]]}]
+          else
+            [
+              %{
+                "stream" => Map.new(row["expected_labels"], &{&1["name"], &1["value"]}),
+                "values" => [[timestamp, line]]
+              }
+            ]
+          end
+        end
+
+      assert response["data"]["resultType"] == "streams"
+      assert response["data"]["result"] == expected, row["execution_id"]
+    end
+
+    assert_parquet_read(ctx)
+    assert_parquet(ctx, 1)
+  end
+
+  @tag :formatter_roundtrip_batch
+  test "complete Loki formatter query spellings reach public admission with explicit boundaries", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/formatter-roundtrip.json") |> Pulso.JSON.decode!()
+    assert fixture["literal_query_count"] == 185
+
+    for table <- fixture["tables"], row <- table["rows"], row["query_is_direct_input"] do
+      status =
+        case {table["name"], row["source_index"]} do
+          {"Test_SampleExpr_String", 49} -> 400
+          {"TestStringer", index} when index in [15, 36] -> 400
+          {"TestJSONSerializationRoundTrip", 12} -> 400
+          {"Test_formatQueryHandlerResponse", 1} -> 400
+          _ -> 200
+        end
+
+      spellings =
+        if row["expected_is_same_expression"] and row["expected_bytes_base64"],
+          do: [row["query_bytes_base64"], row["expected_bytes_base64"]],
+          else: [row["query_bytes_base64"]]
+
+      for bytes <- spellings, path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+        params = [
+          {"query", Base.decode64!(bytes)},
+          {"time", to_string(ctx.now)},
+          {"start", to_string(ctx.now - @second)},
+          {"end", to_string(ctx.now)},
+          {"step", "1"}
+        ]
+
+        before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+        response = method.(ctx, path, params, status)
+
+        if status == 400 do
+          refute Map.has_key?(response, "data")
+          assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+        else
+          assert response["status"] == "success"
+        end
+      end
+    end
+  end
+
+  @tag :formatter_roundtrip_batch
+  test "Loki stringer literal pairs preserve nonempty native query results", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/formatter-roundtrip.json") |> Pulso.JSON.decode!()
+    tables = Map.new(fixture["tables"], &{&1["name"], &1["rows"]})
+    assert length(tables["TestStringer"]) == 38
+
+    lines = [
+      "foo",
+      "bar",
+      "baz",
+      "car",
+      "qux",
+      "test",
+      "fizz",
+      "buzz",
+      "127.0.0.1",
+      "10.1.2.3",
+      "192.168.1.2",
+      "foo payload baz",
+      "foo tail",
+      "foo car"
+    ]
+
+    push_streams(ctx, [
+      %{
+        "stream" => %{"app" => "foo"},
+        "values" => Enum.with_index(lines, fn line, index -> [to_string(ctx.now - index * @second), line] end)
+      },
+      %{
+        "stream" => %{"foo" => "bar"},
+        "values" => [[to_string(ctx.now), "one"], [to_string(ctx.now - @second), "two"]]
+      },
+      %{"stream" => %{"region" => "us-east1", "name" => "live"}, "values" => [[to_string(ctx.now), "ranked"]]}
+    ])
+
+    for row <- tables["TestStringer"] do
+      original = Base.decode64!(row["query_bytes_base64"])
+      expected = Base.decode64!(row["expected_bytes_base64"])
+
+      params = [
+        {"time", to_string(ctx.now)},
+        {"start", to_string(ctx.now - @minute)},
+        {"end", to_string(ctx.now)},
+        {"step", "60"}
+      ]
+
+      # Loki supplies a literal equivalent expression, not a Pulso formatter
+      # result. These reads check semantics; the formatting surface stays open.
+      for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+        status = if row["source_index"] in [15, 36], do: 400, else: 200
+        before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+        assert method.(ctx, path, [{"query", original} | params], status) ==
+                 method.(ctx, path, [{"query", expected} | params], status),
+               inspect({row["source_index"], original, expected})
+
+        if status == 400, do: assert(Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before)
+      end
+    end
+
+    # These are original rejection oracles, explicitly not passing ports.
+    # A nonempty ranked source distinguishes accepting zero from data absence.
+    for row <- tables["Test_SampleExpr_String_Fail"] do
+      assert row["reject"]
+      query = Base.decode64!(row["query_bytes_base64"])
+      assert_metric(ctx, query, 0, %{})
+      assert_metric(ctx, query, {0, 0, "1"}, %{})
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :formatter_roundtrip_batch
+  test "original no-op and escaped regex spellings retain actual lines and rates", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/formatter-roundtrip.json") |> Pulso.JSON.decode!()
+    tables = Map.new(fixture["tables"], &{&1["name"], &1["rows"]})
+    labels = %{"cluster" => "beep", "namespace" => "boop"}
+    quoted = "`a\"`"
+    line = "msg=" <> Pulso.JSON.encode!(quoted)
+    push(ctx, "metadata request", ctx.now - 2 * @second, labels, %{"msg" => "GET /loki/api/123a/query_range"})
+    push(ctx, "escaped matcher", ctx.now, labels, %{"msg" => "word"})
+    push(ctx, line, ctx.now, %{"foo" => "bar"})
+    push(ctx, "missing foo still matches", ctx.now, %{"container_name" => "app"})
+
+    for row <- tables["TestParseSampleExpr_String"] do
+      spellings =
+        if row["expected_bytes_base64"],
+          do: [row["query_bytes_base64"], row["expected_bytes_base64"]],
+          else: [row["query_bytes_base64"]]
+
+      if !row["expected_bytes_base64"], do: assert(row["expected_reference"] == "query")
+
+      for bytes <- spellings, path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+        params = [
+          {"query", Base.decode64!(bytes)},
+          {"time", to_string(ctx.now)},
+          {"start", to_string(ctx.now)},
+          {"end", to_string(ctx.now)},
+          {"step", "1"}
+        ]
+
+        response = method.(ctx, path, params, 200)
+
+        case row["source_index"] do
+          0 ->
+            [%{"metric" => %{}} = result] = response["data"]["result"]
+            [_timestamp, value] = if path == "/query", do: result["value"], else: hd(result["values"])
+            # One matching entry in the original one-day rate window.
+            assert String.to_float(value) == 1 / 86_400
+
+          1 ->
+            assert_streams(response, [{Map.put(labels, "msg", "word"), ["escaped matcher"]}])
+
+          2 ->
+            assert_streams(response, [{%{"foo" => "bar", "msg" => quoted}, [line]}])
+        end
+      end
+    end
+
+    [noop] = tables["TestNoOpLabelToString"]
+
+    for method <- [&request/4, &request_form/4] do
+      params = [{"query", Base.decode64!(noop["query_bytes_base64"])} | range(ctx)]
+
+      assert_streams(
+        method.(ctx, "/query_range", params, 200),
+        [{%{"container_name" => "app"}, ["missing foo still matches"]}]
+      )
+    end
+
+    assert_parquet(ctx, 4)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :label_parsing_batch
+  test "complete Loki label sets retain original discovery results through protobuf and Parquet", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/label-parsing.json") |> Pulso.JSON.decode!()
+    table = Enum.find(fixture["tables"], &(&1["name"] == "TestParseLabels"))
+    assert length(table["rows"]) == 4
+
+    for row <- table["rows"] do
+      time = ctx.now - row["source_index"] * @second
+      labels = Base.decode64!(row["query_bytes_base64"])
+      push_protobuf(ctx, labels, time, "label-case-#{row["source_index"]}")
+      expected = Map.new(row["expected_labels"], &{&1["name"], &1["value"]})
+      params = [{"match[]", ~s/{job="foo"}/}, {"start", to_string(time)}, {"end", to_string(time)}]
+
+      for method <- [&request/4, &request_form/4] do
+        assert method.(ctx, "/series", params, 200)["data"] == [expected]
+      end
+    end
+
+    # Source preservation differs from Loki's write-time empty-label removal;
+    # prove the distinction survives actual Parquet storage, not just decoding.
+    assert {:ok, records} = Storage.query(:logs, ctx.tenant, start_ts: ctx.now - 4 * @second, end_ts: ctx.now)
+    assert length(records) == 4
+    assert Enum.find(records, &(&1.body == "label-case-3")).resource == %{"job" => "foo", "bar" => ""}
+    assert_parquet(ctx, 4)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :label_parsing_batch
+  test "complete Loki unreserved-label table admits original queries with native result controls", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/label-parsing.json") |> Pulso.JSON.decode!()
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+    table = Enum.find(fixture["tables"], &(&1["name"] == "TestParseUnreservedWordsAsLabelNames"))
+    assert length(table["rows"]) == 4
+    first = %{"variants" => "a", "of" => "a", "foo" => "other"}
+    second = %{"variants" => "b", "of" => "a", "foo" => "bar"}
+    push(ctx, "first", ctx.now, first)
+    push(ctx, "second", ctx.now, second)
+
+    for row <- table["rows"] do
+      refute row["reject"]
+      query = Base.decode64!(row["query_bytes_base64"])
+
+      if row["source_index"] == 2 do
+        # Upstream asserts admission only; these values are authored controls.
+        expected = %{%{"variants" => "b", "of" => "a"} => [{0, "1"}]}
+        assert_metric(ctx, query, 0, expected)
+        assert_metric(ctx, query, {0, 0, "1"}, expected)
+      else
+        expected =
+          case row["source_index"] do
+            0 -> [{first, ["first"]}]
+            1 -> [{first, ["first"]}, {second, ["second"]}]
+            3 -> [{second, ["second"]}]
+          end
+
+        params = [
+          {"query", query},
+          {"time", to_string(ctx.now)},
+          {"start", to_string(ctx.now)},
+          {"end", to_string(ctx.now)}
+        ]
+
+        for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+          assert_streams(method.(ctx, path, params, 200), expected)
+        end
+      end
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :label_parsing_batch
+  test "original oversized label input rejects before publication at the public body cap", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/label-parsing.json") |> Pulso.JSON.decode!()
+    [control] = fixture["controls"]
+    assert control["reject"]
+    labels = :binary.copy(Base.decode64!(control["repeat_bytes_base64"]), control["repeat_count"])
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests, &1.objects})
+    response = push_protobuf(ctx, labels, ctx.now, "oversized", 413)
+    assert Pulso.JSON.decode!(response.body) == %{"error" => "payload_too_large"}
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests, &1.objects}) == before
+
+    # A smaller malformed label set takes the existing per-entry drop path,
+    # rather than making the size rejection look like exact parser-error parity.
+    response = push_protobuf(ctx, "a", ctx.now, "malformed")
+    assert Req.Response.get_header(response, "x-pulso-rejected-records") == ["1"]
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests, &1.objects}) == before
+    push_protobuf(ctx, ~s/{job="foo"}/, ctx.now, "recovered")
+    assert_streams(query(ctx, ~s/{job="foo"}/), [{%{"job" => "foo"}, ["recovered"]}])
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :matcher_admission_batch
+  test "complete Loki matcher-admission tables replay through selector and query endpoints", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/matcher-admission.json") |> Pulso.JSON.decode!()
+    assert fixture["row_count"] == 30
+
+    # Empty storage isolates admission from data-dependent pipeline results.
+    for table <- fixture["tables"], row <- table["rows"] do
+      {paths, parameter, policy_difference?} =
+        case table["name"] do
+          "TestParseMatchers" ->
+            {["/series"], "match[]", false}
+
+          "TestParseSampleExpr_equalityMatcher" ->
+            {["/query", "/query_range"], "query", row["source_index"] in [1, 4, 6, 7, 8, 10, 15, 16, 17]}
+
+          "TestParseLogSelectorExpr_equalityMatcher" ->
+            {["/query", "/query_range"], "query", row["source_index"] in [1, 4, 6]}
+        end
+
+      # The component replay independently pins each original rejection and
+      # explicitly accepted policy exception. No source expectation is rewritten.
+      reject? = row["reject"] and not policy_difference?
+      query = Base.decode64!(row["query_bytes_base64"])
+
+      params = [
+        {parameter, query},
+        {"time", to_string(ctx.now)},
+        {"start", to_string(ctx.now - @second)},
+        {"end", to_string(ctx.now)},
+        {"step", "1"}
+      ]
+
+      for path <- paths, method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+        response = method.(ctx, path, params, if(reject?, do: 400, else: 200))
+
+        if reject? do
+          refute Map.has_key?(response, "data"), inspect({table["name"], row["source_index"], response})
+          assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before, inspect(query)
+        else
+          assert response["status"] == "success", inspect({table["name"], row["source_index"], response})
+        end
+      end
+    end
+  end
+
+  @tag :matcher_admission_batch
+  test "matcher controls preserve full-value regexes and negative-selector execution on native storage", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/matcher-admission.json") |> Pulso.JSON.decode!()
+    tables = Map.new(fixture["tables"], &{&1["name"], &1["rows"]})
+
+    # Authored values, not source result oracles. Prefix/suffix near-misses,
+    # negative regexes and missing labels distinguish plausible wrong matchers.
+    labels = [
+      %{"app" => "foo", "cluster" => "prodbar", "bar" => "nope", "foo" => "bar"},
+      %{"app" => "other", "cluster" => "prodbar", "bar" => "nope", "foo" => "baz"},
+      %{"app" => "other", "cluster" => "prodbar", "bar" => "xboo", "foo" => "bar"},
+      %{"app" => "foo", "cluster" => "prodbar-tail", "bar" => "nope", "foo" => "bar"},
+      %{"app" => "foo", "cluster" => "bar", "bar" => "nope", "foo" => "bar"},
+      %{"app" => "other", "cluster" => "prodbar", "bar" => "yboo-tail", "foo" => "qux"},
+      %{"app" => "other", "cluster" => "other", "bar" => "nope"}
+    ]
+
+    for {stream, index} <- Enum.with_index(labels), do: push(ctx, "line-#{index}", ctx.now, stream)
+
+    for {row, selected} <- Enum.zip(Enum.take(tables["TestParseMatchers"], 2), [[0], [1, 5]]) do
+      params = [{"match[]", Base.decode64!(row["query_bytes_base64"])} | range(ctx)]
+      expected = Enum.map(selected, &Enum.at(labels, &1)) |> Enum.sort()
+
+      for method <- [&request/4, &request_form/4] do
+        assert Enum.sort(method.(ctx, "/series", params, 200)["data"]) == expected
+      end
+    end
+
+    negative_metric = Enum.at(tables["TestParseSampleExpr_equalityMatcher"], 1)
+    assert negative_metric["reject"]
+    expected = Map.new([1, 5, 6], &{Enum.at(labels, &1), [{0, "1"}]})
+    assert_metric(ctx, Base.decode64!(negative_metric["query_bytes_base64"]), 0, expected)
+
+    negative_log = Enum.at(tables["TestParseLogSelectorExpr_equalityMatcher"], 1)
+    assert negative_log["reject"]
+    params = [{"query", Base.decode64!(negative_log["query_bytes_base64"])}, {"time", to_string(ctx.now)} | range(ctx)]
+    expected = Enum.map([1, 5, 6], &{Enum.at(labels, &1), ["line-#{&1}"]})
+
+    for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      assert_streams(method.(ctx, path, params, 200), expected)
+    end
+
+    assert_parquet(ctx, 7)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :syntax_admission_batch
+  test "complete Loki syntax table reaches HTTP admission with explicit policy differences", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/syntax-admission.json") |> Pulso.JSON.decode!()
+    assert length(fixture["rows"]) == 206
+
+    # Empty owned storage isolates admission from runtime data-dependent errors.
+    # Neither these success statuses nor the symbolic source ASTs are value oracles.
+    for row <- fixture["rows"], path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      query = Base.decode64!(row["query_bytes_base64"])
+      # The component replay pins these two policy differences independently;
+      # see syntax-admission.md. Original fixture expectations remain unchanged.
+      reject? = if row["source_index"] in [0, 42], do: not row["reject"], else: row["reject"]
+
+      params = [
+        {"query", query},
+        {"time", to_string(ctx.now)},
+        {"start", to_string(ctx.now - @second)},
+        {"end", to_string(ctx.now)},
+        {"step", "1"}
+      ]
+
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = method.(ctx, path, params, if(reject?, do: 400, else: 200))
+
+      if reject? do
+        refute Map.has_key?(response, "data"), inspect({row["source_index"], query, response})
+        assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before, inspect(query)
+      else
+        assert response["status"] == "success", inspect({row["source_index"], query, response})
+      end
+    end
+
+    # Authored nonempty control: the same admitted count query reads Parquet,
+    # counts two matching lines, and excludes a differently labelled source.
+    push(ctx, "one", ctx.now - @second, %{"foo" => "bar"})
+    push(ctx, "two", ctx.now, %{"foo" => "bar"})
+    push(ctx, "noise", ctx.now, %{"foo" => "other"})
+    assert_metric(ctx, ~s/count_over_time({foo="bar"}[1m])/, 0, %{%{"foo" => "bar"} => [{0, "2"}]})
+  end
+
+  @tag :reserved_label_comparisons_batch
+  test "Loki reserved-label comparison matrix preserves every original admission oracle over HTTP", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/reserved-label-comparisons.json") |> Pulso.JSON.decode!()
+    rows = fixture["rows"]
+    assert length(rows) == 68
+    assert Enum.count(rows, & &1["reject"]) == 56
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+
+    # Upstream supplies parser admission oracles, not log-value oracles. Nonempty
+    # storage separately proves accepted requests reach native Parquet/S3 reads.
+    push(ctx, "latency=2s size=1000000 bytes=2", ctx.now, %{"app" => "foo"})
+
+    for row <- rows, path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      params = [
+        {"query", row["query"]},
+        {"time", to_string(ctx.now + @second)},
+        {"start", to_string(ctx.now - @minute)},
+        {"end", to_string(ctx.now + @second)},
+        {"step", "1"}
+      ]
+
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      status = if row["reject"], do: 400, else: 200
+      response = method.(ctx, path, params, status)
+
+      if row["reject"] do
+        assert response["error"] == "parse_error", inspect({row["query"], response})
+
+        for fragment <- Map.get(row, "error_contains", []) do
+          assert response["message"] =~ fragment, row["query"]
+        end
+
+        assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before, row["query"]
+      else
+        assert response["status"] == "success", row["query"]
+      end
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :decolorize_batch
+  test "Loki TestDecolorizer: both original table rows replay through HTTP and Parquet", ctx do
+    rows = File.read!("test/fixtures/logs/loki-upstream/decolorize.json") |> Pulso.JSON.decode!()
+
+    push_streams(
+      ctx,
+      for row <- rows["upstream"] do
+        %{"stream" => %{"job" => "decolorize", "case" => row["name"]}, "values" => [[to_string(ctx.now), row["line"]]]}
+      end
+    )
+
+    expected = for row <- rows["upstream"], do: {%{"job" => "decolorize", "case" => row["name"]}, [row["expected"]]}
+    params = [{"query", ~s({job="decolorize"} | decolorize)} | range(ctx)]
+    assert_streams(request(ctx, "/query_range", params), expected)
+    assert_streams(request_form(ctx, "/query_range", params), expected)
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :decolorize_batch
+  test "Pulso controls: decolorize preserves unmatched text and matches the pinned escape profile", ctx do
+    rows = File.read!("test/fixtures/logs/loki-upstream/decolorize.json") |> Pulso.JSON.decode!()
+    controls = rows["controls"]
+
+    push_streams(
+      ctx,
+      for row <- controls do
+        %{"stream" => %{"job" => "decolorize", "case" => row["name"]}, "values" => [[to_string(ctx.now), row["line"]]]}
+      end
+    )
+
+    expected = for row <- controls, do: {%{"job" => "decolorize", "case" => row["name"]}, [row["expected"]]}
+    params = [{"query", ~s({job="decolorize"} | decolorize)}, {"limit", "1000"} | range(ctx)]
+    assert_streams(request(ctx, "/query_range", params), expected)
+    assert_streams(request_form(ctx, "/query_range", params), expected)
+
+    # Formatting sees the rewritten line; filters do not silently discard
+    # an unmatched marker, even when a later valid sequence can be removed.
+    row = Enum.find(controls, &(&1["name"] == "boundary-27"))
+    expression = ~s({job="decolorize",case="boundary-27"} | decolorize | line_format "[{{__line__}}]")
+    assert lines(query(ctx, expression)) == ["[" <> row["expected"] <> "]"]
+
+    expression = ~s'sum(count_over_time({job="decolorize"} | decolorize |= "☃" [1m]))'
+    count = Enum.count(controls, &String.contains?(&1["expected"], "☃"))
+    assert values(instant(ctx, expression)) == %{%{} => to_string(count)}
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
   end
 
   @tag :regex_hex_batch
@@ -6474,6 +7710,61 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     assert Agent.get(ctx.store, & &1.requests) == []
   end
 
+  describe "TestMicroServicesIngestQueryWithSchemaChange public stored results" do
+    setup ctx do
+      push(ctx, "lineA", ctx.now - 72 * 60 * @minute, %{"job" => "fake"})
+      push(ctx, "lineB", ctx.now - 48 * 60 * @minute, %{"job" => "fake"})
+      :ok
+    end
+
+    test "query again to verify logs being served from storage", ctx do
+      assert_parquet(ctx, 2)
+      params = [{"query", ~s({job="fake"})} | range(ctx)]
+      response = request(ctx, "/query_range", params)
+      assert_streams(response, [{%{"job" => "fake"}, ["lineB", "lineA"]}])
+      assert request_form(ctx, "/query_range", params) == response
+      assert_parquet_read(ctx)
+    end
+
+    test "query both periods to verify logs being served from storage", ctx do
+      push(ctx, "lineC", ctx.now, %{"job" => "fake"})
+      push(ctx, "lineD", ctx.now, %{"job" => "fake"})
+      assert_parquet(ctx, 4)
+
+      params = [{"query", ~s({job="fake"})} | range(ctx)]
+      response = request(ctx, "/query_range", params)
+      assert response["data"]["resultType"] == "streams"
+      assert lines(response) == ["lineA", "lineB", "lineC", "lineD"]
+      assert request_form(ctx, "/query_range", params) == response
+      assert_parquet_read(ctx)
+    end
+  end
+
+  test "Pulso control: historical partitions retain inclusive source-time boundaries", ctx do
+    for {line, timestamp} <- [
+          {"lineA", ctx.now - 72 * 60 * @minute},
+          {"lineB", ctx.now - 48 * 60 * @minute},
+          {"lineC", ctx.now},
+          {"lineD", ctx.now}
+        ] do
+      push(ctx, line, timestamp, %{"job" => "fake"})
+    end
+
+    for {start, finish, expected} <- [
+          {ctx.now - 72 * 60 * @minute, ctx.now - 48 * 60 * @minute, ["lineA", "lineB"]},
+          {ctx.now - 72 * 60 * @minute + 1, ctx.now - 48 * 60 * @minute - 1, []},
+          {ctx.now - 48 * 60 * @minute + 1, ctx.now, ["lineC", "lineD"]}
+        ],
+        direction <- ["forward", "backward"] do
+      params = [query: ~s({job="fake"}), start: to_string(start), end: to_string(finish), direction: direction]
+      response = request(ctx, "/query_range", params)
+      assert lines(response) == expected
+      assert request_form(ctx, "/query_range", params) == response
+    end
+
+    assert_parquet_read(ctx)
+  end
+
   describe "TestMicroServicesIngestQuery" do
     setup ctx do
       for {line, timestamp} <- [
@@ -7506,10 +8797,44 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
   end
 
+  @tag :error_classification_batch
+  test "query-length errors preserve the original 800h versus 721h quantities", ctx do
+    hour = 60 * @minute
+    limited = query_limits(ctx, ~s({"maxQueryLength":"721h"}))
+    push(ctx, "retained", ctx.now - @second, %{"job" => "fake"})
+
+    for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      params = [
+        {"query", ~s({job="fake"})},
+        {"start", to_string(ctx.now - 800 * hour)},
+        {"end", to_string(ctx.now)}
+      ]
+
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = method.(limited, path, params, @wrapped_limit_rows["max_query_length"]["status"])
+      assert response["error"] == "query_limit"
+      assert response["message"] =~ "query length: #{800 * hour}ns, limit: #{721 * hour}ns"
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+
+      boundary = List.keystore(params, "start", 0, {"start", to_string(ctx.now - 721 * hour)})
+      assert lines(method.(limited, path, boundary, 200)) == ["retained"]
+
+      over = List.keystore(params, "start", 0, {"start", to_string(ctx.now - 721 * hour - 1)})
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      assert method.(limited, path, over, 400)["error"] == "query_limit"
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+    end
+
+    assert_parquet_read(ctx)
+  end
+
   # TestTripperware_EntriesLimit's exact query, limit and six-hour window.
   @tag :query_policy_batch
+  @tag :error_classification_batch
   test "Loki entries-limit middleware rejects before storage", ctx do
     limited = query_limits(ctx, ~s({"maxEntriesLimitPerQuery":5000}))
+    push(ctx, "retained", ctx.now - @second, %{"app" => "foo"})
 
     params = [
       {"query", ~s({app="foo"})},
@@ -7519,14 +8844,43 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       {"limit", "10000"}
     ]
 
-    for response <- [request(limited, "/query_range", params, 400), request_form(limited, "/query_range", params, 400)] do
+    for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      response = method.(limited, path, params, @wrapped_limit_rows["max_entries"]["status"])
       assert response["error"] == "query_limit"
+      assert response["message"] == @wrapped_limit_rows["max_entries"]["body"]
 
-      assert response["message"] ==
-               "max entries limit per query exceeded, limit > max_entries_limit_per_query (10000 > 5000)"
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+
+      boundary = List.keystore(params, "limit", 0, {"limit", "5000"})
+      assert lines(method.(limited, path, boundary, 200)) == ["retained"]
+
+      over = List.keystore(params, "limit", 0, {"limit", "5001"})
+      before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+      assert method.(limited, path, over, 400)["error"] == "query_limit"
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
     end
 
-    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == {[], 0, []}
+    assert_parquet_read(ctx)
+  end
+
+  @tag :error_classification_batch
+  test "provider messages matching Loki limit templates are not treated as client rejections", ctx do
+    Runtime.put_env(:pulso, Storage, adapter: BlockingMetricStorage)
+
+    for {_name, original} <- @wrapped_limit_rows do
+      Runtime.put_env(:pulso, BlockingMetricStorage, {:error, original["body"]})
+
+      for path <- ["/query_range", "/labels"], method <- [&request/4, &request_form/4] do
+        params = [{"query", ~s({job="fake"})} | range(ctx)]
+
+        assert method.(ctx, path, params, 503) == %{
+                 "status" => "error",
+                 "error" => "storage_unavailable",
+                 "message" => "Storage is unavailable."
+               }
+      end
+    end
   end
 
   # Complete TestTripperware_RequiredLabels admission table. Upstream supplies
@@ -8319,9 +9673,99 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     push_streams(ctx, [%{"stream" => labels, "values" => [[to_string(timestamp), line, metadata]]}])
   end
 
+  defp replay_sample_extractors(ctx, rows) do
+    rows =
+      Enum.map(Enum.with_index(rows, 1), fn {row, index} ->
+        {row, %{ctx | now: ctx.now - index * 120 * @second}}
+      end)
+
+    push_streams(
+      ctx,
+      for {row, at} <- rows do
+        %{"stream" => row.base, "values" => [[to_string(at.now), row.line, row.metadata]]}
+      end
+    )
+
+    assert_parquet(ctx, 1)
+
+    for {row, at} <- rows,
+        path <- ["/query", "/query_range"],
+        method <- [&request/4, &request_form/4] do
+      timestamp = to_string(at.now)
+      params = [query: row.query, time: timestamp, start: timestamp, end: timestamp, step: "1"]
+      response = method.(at, path, params, 200)
+      series = response["data"]["result"]
+
+      if row.expected_ok do
+        assert [%{"metric" => labels} = sample] = series, row.id
+        assert is_nil(row.expected_labels) or labels == row.expected_labels, row.id
+        points = Map.get(sample, "values", [sample["value"]])
+        assert [[time, text]] = points, row.id
+        assert time == at.now / @second, row.id
+        assert {value, ""} = Float.parse(text), row.id
+        assert is_nil(row.expected_value) or value == row.expected_value, row.id
+        assert not row.distinct? or value == 1.0, row.id
+      else
+        assert series == [], row.id
+      end
+
+      if row.unpreserved_query do
+        failed = method.(at, path, Keyword.put(params, :query, row.unpreserved_query), 400)
+        assert failed["error"] == "evaluation_failed"
+        refute Map.has_key?(failed, "data")
+      end
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  defp push_builder_rows(ctx, rows, spacing \\ @second) do
+    rows = Enum.map(Enum.with_index(rows, 1), fn {row, index} -> {row, %{ctx | now: ctx.now - index * spacing}} end)
+
+    push_streams(
+      ctx,
+      for {row, at} <- rows do
+        %{"stream" => row.base, "values" => [[to_string(at.now), "label-builder", row.metadata]]}
+      end
+    )
+
+    assert_parquet(ctx, 1)
+    rows
+  end
+
   defp push_streams(ctx, streams) do
     response = Req.post!(ctx.url <> "/loki/api/v1/push", headers: headers(ctx), json: %{"streams" => streams})
     assert response.status == 204, inspect(response.body)
+  end
+
+  defp push_protobuf(ctx, labels, timestamp, line, status \\ 204) do
+    request = %PushProto.PushRequest{
+      streams: [
+        %PushProto.Stream{
+          labels: labels,
+          entries: [
+            %PushProto.Entry{
+              timestamp: %PushProto.Timestamp{seconds: div(timestamp, @second), nanos: rem(timestamp, @second)},
+              line: line
+            }
+          ]
+        }
+      ]
+    }
+
+    {bytes, _} = PushProto.PushRequest.encode!(request)
+    {:ok, compressed} = :snappyer.compress(IO.iodata_to_binary(bytes))
+
+    response =
+      Req.post!(ctx.url <> "/loki/api/v1/push",
+        headers: [{"content-type", "application/x-protobuf"} | headers(ctx)],
+        body: compressed,
+        decode_body: false,
+        retry: false
+      )
+
+    assert response.status == status, response.body
+    response
   end
 
   defp quantity_errors(kind) do
@@ -8351,6 +9795,15 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     "test/fixtures/logs/loki-upstream/line-or.jsonl"
     |> File.stream!()
     |> Enum.map(&Pulso.JSON.decode!/1)
+  end
+
+  defp http_parameter_params(%{"input" => %{"input" => values}}) do
+    Enum.flat_map(values, fn {key, entries} -> Enum.map(entries, &{key, &1}) end)
+  end
+
+  defp http_parameter_params(%{"input" => input}) do
+    target = input["path"] || input["reqPath"] || input["r"]["fields"]["URL"]
+    target |> URI.parse() |> Map.fetch!(:query) |> URI.query_decoder() |> Enum.to_list()
   end
 
   defp request(ctx, path, params \\ [], status \\ 200) do

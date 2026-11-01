@@ -11,11 +11,89 @@ to Grafana Labs contributors. The unmodified upstream license is in
 [`LICENSE`](LICENSE). No upstream runtime implementation is vendored or imported.
 The test harness and production fixes use Pulso's own HTTP/storage interfaces.
 
+The complete pinned syntax-admission table now retains all **206 source rows**
+(159 admissions/47 rejections), including duplicate and invalid UTF-8 inputs.
+Component and authenticated GET/form-POST replay on both query endpoints cover
+every row: 204 original outcomes agree; eager invalid-regex rejection and
+empty-selector admission remain two explicit policy differences, not passing
+upstream cases. All 188 rejected HTTP attempts avoid provider access. The 824
+table attempts isolate admission on empty owned storage; a separate two-request
+nonempty native Parquet/S3 count control verifies execution. Go AST equivalence
+and exact diagnostics remain open. See the [full provenance and policy ledger](syntax-admission.md).
+
+The three complete matcher-admission tables retain **30 original rows**,
+including all 15 source rejections and five literal matcher expectations.
+Eighteen admission outcomes agree; 12 selectivity-policy rejections remain
+explicit differences, since Pulso allows empty/negative/empty-compatible
+selectors within server budgets. Component and 112 authenticated HTTP attempts
+cover every row, including matcher-only pipeline rejection with no provider
+access for all eight rejected attempts. Ten further nonempty native Parquet/S3
+read controls check exact stream selection, full-value/negative regexes and
+negative-only log/metric execution with missing labels. See the
+[complete matcher provenance and policy ledger](matcher-admission.md).
+
+Complete label-parsing coverage retains four original label-map rows, four
+unreserved-name admissions and the original trailing 16 MiB rejection. Native
+protobuf/component and 34 authenticated HTTP requests replay every source case,
+with nonempty Parquet/S3 controls. Public discovery matches all four label maps;
+raw empty labels deliberately remain preserved in storage. Oversized input
+rejects at the whole-request decompression cap, not Go's isolated parser limit;
+the smaller malformed-label/drop and valid recovery controls stay separate.
+Exact diagnostics, serialized Go-label ordering and broader grammar/capacity
+parity are not claimed. See the [label-parsing provenance and qualifications](label-parsing.md).
+
+The complete [formatter/round-trip selection](formatter-roundtrip.md) preserves
+196 rows / 20 functions, all eight prettier functions, 94 literal outputs and
+four original rejection oracles. Internal AST serialization and constructed
+fragments remain explicitly symbolic. Pulso has no LogQL formatter or Loki AST
+JSON codec: admission and equivalent query results are not formatting parity.
+All 185 literal inputs and 73 applicable output spellings receive component and
+authenticated HTTP admission checks. Nonempty native Parquet/S3 reads exercise
+literal stringer equivalences, escaping, no-op filtering and the existing
+zero-rank policy difference. The 1,375 HTTP requests include five authored seed
+writes; all 44 rejected attempts avoid provider access. Layout, round-trip AST
+equivalence, exact diagnostics and optimized internal stage counts remain open.
+Original assertions and compatibility boundaries are retained, not rewritten.
+
+The complete [pipeline ownership selection](pipeline-ownership.md) preserves six
+functions, 31 source rows and 48 original method executions. All 30 ordinary
+executions replay component ownership and 240 authenticated reads, plus one push,
+through native Parquet/owned S3 with ordinary/categorized output. Original label,
+line and error-detail oracles agree without a runtime change. The other 18
+deletion-wrapper executions remain symbolic, not passing ports. Go hash/String/
+cache contracts and the internal empty-keep constructor remain explicit gaps;
+public replay omits the empty identity stage rather than inventing syntax.
+
+The complete [label-builder source selection](label-builder.md) preserves all
+15 tests, 107 assertion sites, 118 expanded assertion events and the original
+colliding pair. Component and 232 authenticated HTTP reads replay literal
+lookup/category maps, deletion/grouping, nine ordinary preserve-error identities
+and distinct colliding-input results over native Parquet/owned S3. Four seed
+pushes and separate fail-whole/suffixed-name controls are identified in the
+ledger. Received exact error metadata now uses parsed categorized output,
+matching the original Add oracle. Raw Set/error injection, hash/String/cache,
+sorting and metadata-reference contracts remain explicit symbolic gaps; source
+completeness is not full Go-builder compatibility.
+
+The complete [sample-extractor source selection](sample-extractors.md) retains
+all 16 tests, 185 assertion sites and 106 expanded method calls: 88 ordinary
+and 18 symbolic deletion-wrapper executions. Component replay covers all 88
+ordinary observations; all 88 also replay through authenticated HTTP and native
+Parquet/owned S3, including the three original `trace_id` metadata observations.
+Query projection restores dedicated trace/span IDs as metadata without changing
+ingestion or stored bytes. Error-selection companions and an interleaved-stream
+control bring source replay coverage to 398 reads
+and three seed pushes. Hash bits, Go types/cache/reference identities and all
+hint contracts remain symbolic. Separate correlation-ID controls cover raw and
+categorized output, filters, grouping, attribute precedence, stream/parser
+collisions and native cache isolation. Upgrade query-serving app/native pairs
+to log tuple `{1,1,17}`; resource ceilings and storage/keyed bytes are unchanged.
+
 ## Source-to-test mapping
 
-There are **28 integration-derived ExUnit checks**: 27 preserve the selected public
+There are **30 integration-derived ExUnit checks**: 29 preserve the selected public
 request/response semantics, and one metric-range check has an explicit resolution
-adaptation described below. They are not 28 complete upstream integration suites.
+adaptation described below. They are not 30 complete upstream integration suites.
 Seven further checks port **23 executable upstream LogQL counter-rate scenarios**
 (21 successful/empty results and two invalid queries), not seven additional
 microservice suites. Four more checks port **89 unwrap scenarios** from the same
@@ -50,9 +128,18 @@ native/reference regression. The source-expression continuation adds one wrapper
 for 15 frozen unit-table rows and one local lookup/admission/budget control.
 These are not additional service suites.
 
+The [reserved error-label comparison continuation](reserved-label-comparisons.md)
+adds the complete original `TestParseExpr_ShouldValidateLabelComparison`
+matrix: 68 queries, 56 rejections and 12 admissions. One HTTP/S3 wrapper replays
+every query through instant/range GET/form POST (272 requests), requiring
+`parse_error` and the original diagnostic fragments for failures, with no
+provider requests. This is a complete selected syntax table, not another
+service-integration suite or full parser-error text/position parity.
+
 | Upstream source | Selected cases | Checks |
 | --- | --- | ---: |
 | [`integration/loki_micro_services_test.go`, `TestMicroServicesIngestQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L110-L209) | `query`, `label-names`, `label-values`, `series`, `series error`, `stats error`, `per-request-limits`, `tail` | 8 |
+| [Same source, `TestMicroServicesIngestQueryWithSchemaChange`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L283-L402) | Both stored-result assertions: `lineA/lineB` at -72h/-48h, then all four lines after adding `lineC/lineD` at now. No TSDB schema change or ingester-only lookback behavior is claimed. | 2 |
 | [`integration/loki_micro_services_test.go`, `TestProbabilisticQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L779-L886) | Exact four `lineA`–`lineD` writes under `job=one/two`; instant `approx_topk(1, count_over_time({job=~".+"}[1h]))` returns only `job=one`, value `3`. Pulso ranks exactly under existing bounds, not with upstream sketches. | 1 |
 | [`integration/loki_micro_services_test.go`, `TestApproxCountDistinctQuery`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L888-L992) | Four exact `mac` logfmt writes with overlapping `shared` values under `job=devices,version=1,device=a/b`; `query` groups by version and `query-ungrouped` uses `by ()`, both returning `3`. Multi-shard statistics assertions are excluded. | 2 |
 | [`integration/per_request_limits_test.go`, `TestPerRequestLimits`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/per_request_limits_test.go#L21-L64) | One `lineA` write; limited range and default-time label requests reject, then a header-free range request returns `lineA`, in one sequential check | 1 |
@@ -175,6 +262,33 @@ all six segments, and GET/form-POST agreement. It also passed on the unchanged
 runtime. No approximation, resource-ceiling change, storage/keyed-byte/native
 ABI change, asynchronous acknowledgement or upgrade requirement is introduced
 by this coverage-only extension.
+
+### Historical stored-result continuation
+
+Two additional integration-derived checks preserve the stored-result assertions
+from `TestMicroServicesIngestQueryWithSchemaChange` in
+[`integration/loki_micro_services_test.go:283–402`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/integration/loki_micro_services_test.go#L283-L402).
+The first retains `lineA` at `now-72h` and `lineB` at `now-48h`, `job="fake"`,
+the seven-day query window and both expected lines. The second adds `lineC`
+and `lineD` at `now` and retains the complete four-line result. Each runs GET
+and form POST against authenticated HTTP, verifies native Parquet publication
+and actual segment reads. They pass without runtime changes.
+
+These are **two public stored-result assertions**, not the complete schema-change
+test or a new TSDB migration implementation. Pulso's acknowledgement already
+publishes durable data; the ingester-only empty result, lookback flag changes,
+TSDB index-prefix change, flush/restart sequence and repeated equivalent result
+assertions are not reproduced or counted as passing. The original full-source
+hash below covers this selection too. One separately marked Pulso control
+checks inclusive nanosecond boundaries across the historical date partitions,
+an empty interior window, and forward/backward GET/form agreement.
+
+The separate `TestDedupMicroServicesKafka` suite remains unported: it expects
+query-time suppression of identical stored entries and duplicate statistics.
+Pulso deliberately retains identical entries, as exercised by its existing
+categorized-label controls. That behavior has not been silently changed to
+make the upstream deduplication assertion pass. Kafka, ingester/store merging
+and engine-specific statistics also remain outside this harness.
 
 ### Per-request query-length failure replay and local controls
 
@@ -3520,6 +3634,126 @@ upgrade query applications. Arbitrary date layouts, named zones, time methods,
 | Combined `fmt_test.go:539–546,775–780` | `a2ff17deb9cd096ccf30c2b35054e5bc27354b61733bb240e14a00ccb7862c79` |
 | Complete Sprig v3.3.0 `date.go` | `db6ac4b6f9a6445769b9ccaa36bb53f74b14f07bd04512a18dcd5d21b81d0540` |
 | Sprig v3.3.0 `date.go:150–152` | `b08976360798c4a0bc7a2160ac308a468a1f71ec1682d2253a9f62fa7af7cfbd` |
+
+## Decolorizer continuation
+
+One additional HTTP/Parquet/S3 wrapper preserves both complete rows from
+[`pkg/logql/log/fmt_test.go:962–979`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/fmt_test.go#L962-L979),
+`TestDecolorizer`: unchanged plain text and the original green/red escape input.
+Names, input bytes and expected bytes are unchanged. The job/case labels and
+source clock only adapt these unit-table rows to the existing HTTP harness;
+this is not another upstream microservice suite.
+
+[`decolorize.json`](decolorize.json) separates those two `upstream` rows from
+129 Pulso-authored `controls`. The controls cover ESC/U+009B, unmatched/trailing
+markers, all printable ASCII terminal candidates, the four-digit parameter
+boundary, semicolons, BEL alternative priority, Unicode/newlines and neighboring
+valid/malformed sequences. Their answers come from executing the pinned
+`fmt.go` pattern with Go 1.27.3 `regexp.ReplaceAllString`, not Pulso. This is a
+source-pattern oracle, not a linked Loki/forked-regexp execution or a general
+ANSI sanitizer claim. The two original upstream answers are also retained
+literally from their table. Both wrappers exercise GET and form POST with native
+Parquet reads; local controls additionally cover line formatting and metric
+filtering after decolorization.
+
+Before the fix, the original wrapper passed but the control wrapper failed
+because malformed escapes lost ordinary text and C1/BEL forms were not handled
+(`decolorize-before.log`, seed 41). Both pass after the independently written
+linear recognizer. A disposable comparison checked another 20,000 deterministic
+Go-pattern inputs against the actual compiled pipeline, with identical results
+and unchanged labels/times. Four separate 1–1.2 MiB dense-marker/long-body probes
+also preserve the expected output. These are validation, not additional frozen
+source rows or provider-capacity evidence; output is in `decolorize-oracle.log`.
+No upstream runtime implementation is copied into production, and no native,
+storage/keyed-byte, dependency or resource-ceiling change is required.
+
+The reusable [`decolorize-producer.go.txt`](decolorize-producer.go.txt) reads the
+source pattern from the pinned `pkg/logql/log/fmt.go`. To regenerate, copy the
+producer to a `.go` path, build it with Go 1.27.3 and pass the verified source
+file as its sole argument; stdout is the frozen JSON. Normal replay requires
+only Elixir/Rust, without Go, downloads or external services. Test-derived
+artifacts retain this directory's AGPL-3.0-only attribution.
+
+| Selection/artifact, including final newline | SHA-256 |
+| --- | --- |
+| Complete pinned `fmt.go` | `0a1830ef146924bdeff22d371fcb2489b8ffb44e8eb08503ee17c6c0f0418132` |
+| Complete pinned `fmt_test.go` | `58955c60c2ff68f91a5f0777208e49180d194c290c3bbb36f3145911f1f22ff6` |
+| `fmt_test.go:962–979` | `015f5d487adb8001286560bfff5d67b7b966662a91b07e1244c0da0cfbabb26e` |
+| `fmt.go:517–530` | `bfb1e11af8ba526cb7fed08fea3d71f1b018c7a9c1070407dbb1b2e7dcfed44f` |
+| `decolorize.json` | `109ee97aaa4bb4bb54674fafe99db68bdf2259c3a12719d0251b106023d236bf` |
+| `decolorize-producer.go.txt` | `742eac30266290628ebfd866652670c220d9efb513e06796746ec847bb8c9450` |
+
+## Complete HTTP parameter-table continuation
+
+[`http-parameters.md`](http-parameters.md) records **87 original rows across
+15 complete tests** from the pinned `pkg/loghttp` query, numeric/time, bounds,
+label, series, tail, volume and patterns tables. All 35 error expectations remain
+in the fixture; no row is dropped to make the replay pass. The standard-library
+Go AST producer preserves original source text, hashes, request literals,
+partial assertions and nanosecond strings without executing either parser.
+
+The component replay owns 56 rows from nine tables. Authenticated HTTP/native
+Parquet/owned-loopback-S3 replay owns 51 request rows from nine tables (20 overlap,
+31 additional), with 82 read attempts including five WebSocket handshakes.
+Query/label/series rows run GET and form POST; tail uses WebSocket and
+patterns/volume use GET. Every rejected HTTP attempt asserts no provider request;
+successful rows exercise nonempty data and original bounds/selectors/grouping.
+Public effects replace Go request-struct comparisons; the adjacent provenance
+page details this adaptation and the narrower partial volume assertions.
+
+The runtime accepts decimal-second timestamps with Loki's float64/millisecond
+fraction rounding, case-insensitive directions, float/duration steps, `since`
+and complete mixed/repeated series selectors. Omitted/lone-empty series selectors
+scan all bounded streams. Malformed supplied values reject before storage.
+Positive log intervals select globally before limits; unordered storage requires
+bounded collection/sorting, unlike unchanged zero-interval streaming top-k.
+Separate authored controls cover both directions, pipeline ordering, fractional
+volume steps and fail-whole sample/work ceilings. Endpoint, scan, heap and metric
+point ceilings remain unchanged; uint32 parser success is not a quota bypass.
+
+This closes the selected tables, not full HTTP error/duplicate-scalar/RFC3339
+grammar, live-tail delay scheduling, full Loki engine/client admission or deployed
+provider/capacity acceptance. Query applications must upgrade together; no
+native/storage/keyed-byte format changes.
+
+## Complete HTTP error-writer table
+
+[`http-errors.md`](http-errors.md) retains all 25 original `Test_writeError`
+rows, including exact bodies and both direct/gRPC-roundtrip assertion paths
+(50 upstream executions, not 50 Pulso tests). Every row has an explicit ledger
+entry: four adapted status categories, three incompatible tenant/query-sentinel
+contracts and 18 cancellation/gRPC/aggregate gaps. No exact-body or internal
+roundtrip compatibility is claimed, and no unresolved row is counted as passing.
+
+The `http_errors_batch` HTTP tests exercise 98 error attempts: parse/interval
+client rejection, deadline and worker failure mapping, and sanitized storage
+failures across both methods/all 15 finite-read shapes where applicable. A
+regression exposed raw provider terms in discovery responses; fixed 503 JSON
+now matches existing log-query sanitization. A native Parquet/owned-S3 recovery
+read succeeds after restoring storage. Existing deadline tests separately own
+actual worker expiry and blocked native GET recovery. The fixture's Go producer
+is optional provenance tooling; normal replay needs only Elixir/Rust.
+Separate classifier/wrapped-limit contracts are inventoried below, not claimed
+as exact internal error compatibility.
+
+## Complete classifier and wrapped-limit continuation
+
+[`error-classification.md`](error-classification.md) freezes all 22 classifier
+rows, all three wrapped-limit rows and all 11 logical prefix constraints from
+three complete original tests. Source category/reason/status/body/identity
+assertions remain unchanged. No category/reason classifier or template-matching
+fallback is added: Pulso's operational counters use success/error/exception,
+not Loki's reason labels. All classifier/prefix and Go wrapping contracts stay
+explicitly unimplemented; none are counted as passing.
+
+Two wrapped-limit rows have adapted HTTP checks with the original quantities:
+entry limit 10000 versus 5000 retains exact message text inside JSON;
+800h versus 721h retains HTTP 400 and quantities but diagnoses nanoseconds.
+The byte-limit policy remains unsupported. Three HTTP tests (36 attempts)
+add exact/one-unit-over boundary controls, nonempty native Parquet/owned-S3
+successes and provider-string controls that preserve sanitized 503 rather than
+infer client rejection from message text. The existing runtime passes without
+changes; source freezing is not a claim of classifier execution.
 
 ## Replay
 

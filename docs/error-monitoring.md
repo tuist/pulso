@@ -41,8 +41,8 @@ not. Both tools require `tenant` and numeric `project`, accept `limit` (1–100,
 default 50), and return `next_cursor`:
 
 - `list_error_changes`: ordered `baseline_ready`, `new_in_retained_history`,
-  `issue_observation` and `reset` changes. Even an empty response returns a cursor
-  to reuse for the next poll.
+  `issue_observation`, `error_rate_increase` and `reset` changes. Even an empty
+  response returns a cursor to reuse for the next poll.
 - `list_indexed_error_issues`: small issue summaries with exact deduplicated
   `retained_count`, occurrence `first_seen_ns`/`last_seen_ns`, title, service and
   `latest_example` containing an event ID and timestamp. An incomplete
@@ -57,6 +57,57 @@ Persist change cursors in the agent runtime, durably and independently of Pulso
 nodes. Process changes idempotently using `change_id`; after acting, save the
 returned cursor. A crash between acting and saving can replay the same change.
 Subscriptions are not implemented; polling is the durable contract.
+
+## Error-rate findings for agent workflows
+
+The enabled monitoring worker also runs `error-count-ratio-v1`; no separate
+detector service or model is required. Poll `list_error_changes` through MCP
+with `tenant`, numeric-string `project` and the last durably accepted `cursor`.
+An `error_rate_increase` change is a concrete investigation trigger, not an
+instruction or permission to change infrastructure.
+
+The detector compares the latest two **completed, epoch-aligned five-minute
+windows**, independently for each issue/service. Intervals include their start
+and exclude their end. It emits when the preceding window has at least five
+deduplicated events and the latest has at least three times that count (therefore
+at least fifteen). This measures error occurrences per equal time window, **not
+the fraction of requests that failed**, seasonality or statistical significance.
+Zero/sparse baseline groups do not qualify; use existing novelty changes for
+new issues. Thresholds/windows are fixed in this detector version.
+
+Each finding includes `detector`, `issue_id`, `service`, `baseline` and `current`
+with `start_ns`, `end_ns`, `count`, the `ratio`, `coverage: retained_snapshot`,
+the inspected snapshot's `source_etag` and `history_floor_ns`, and up to three
+recent compact `evidence` examples with event ID, occurrence
+timestamp, title and service. These examples are stored in the committed replay
+page, not fetched through raw pointers; they remain readable after source expiry
+until the replay floor passes them. They are **not full stack traces/payloads**;
+fetch those through `query_errors` while raw history remains available.
+
+The first complete detector pass after bootstrap, source reset or upgrade from
+a worker without this detector establishes a baseline without emitting historical
+findings. Later passes can discover late events in the latest window. Each
+issue/service emits at most once per evaluated window, even if counts fluctuate
+and later cross the threshold again. Counts are observations of one committed
+retained snapshot, not proof that exporters finished delivering the window.
+Older windows are not backfilled after downtime; an unavailable worker is not
+evidence of health. Existing unknown-lag and reset semantics still apply.
+
+Responses expose `rate_detector` with `detector`, `status` and, when available,
+`window_end_ns`. Status is `baseline_pending`, `catching_up`,
+`insufficient_history` or `ready`. `ready` means a complete inspected snapshot
+was evaluable, **not that the application is healthy or ingestion is current**.
+Incomplete source reconciliation emits no rate findings; insufficient retained
+history cannot form a baseline. A later lower count does not emit a resolution.
+
+Measurements, detector deduplication and changes publish in the same projection
+root CAS. Failed/losing publications cannot independently emit findings.
+Upgrade every projection worker before relying on detector progress: older
+workers do not evaluate rate windows. Consumers must accept the additional
+change kind and `rate_detector` response field. Raw ingestion, storage/native
+formats and retention defaults are unchanged; processing-only ingestion is
+still not implemented. Retained findings/examples remain sensitive tenant data
+subject to the derived-prefix erasure procedures below.
 
 ## What newness and counts mean
 

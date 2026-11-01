@@ -81,10 +81,72 @@ error_projection_interval =
     _ -> raise "PULSO_ERROR_PROJECTION_INTERVAL_MS must be an integer in 1000..60000"
   end
 
+reliability_enabled = env_var.("PULSO_RELIABILITY_ENABLED", "false") in ["1", "true", "yes"]
+
+reliability_tenants =
+  case JSON.decode(env_var.("PULSO_RELIABILITY_TENANTS_JSON", "[]")) do
+    {:ok, tenants} when is_list(tenants) and length(tenants) <= 64 ->
+      if Enum.all?(
+           tenants,
+           &(is_binary(&1) and &1 not in [".", ".."] and Regex.match?(~r/\A[A-Za-z0-9_.\-]{1,128}\z/, &1))
+         ) and
+           length(Enum.uniq(tenants)) == length(tenants),
+         do: tenants,
+         else: raise("PULSO_RELIABILITY_TENANTS_JSON contains invalid/duplicate tenants")
+
+    _ ->
+      raise "PULSO_RELIABILITY_TENANTS_JSON must be an array of at most 64 tenant identifiers"
+  end
+
+reliability_integer = fn name, default, maximum ->
+  case Integer.parse(env_var.(name, Integer.to_string(default))) do
+    {value, ""} when value >= 0 and value <= maximum -> value
+    _ -> raise "#{name} must be an integer in 0..#{maximum}"
+  end
+end
+
+reliability_price_until = env_var.("PULSO_RELIABILITY_PRICE_VALID_UNTIL", "")
+reliability_key = env_var.("PULSO_RELIABILITY_OPENAI_API_KEY", "")
+investigation_url = env_var.("PULSO_RELIABILITY_INVESTIGATION_URL", "")
+investigation_token = env_var.("PULSO_RELIABILITY_INVESTIGATION_TOKEN", "")
+reliability_input_price = reliability_integer.("PULSO_RELIABILITY_INPUT_NANO_USD_PER_TOKEN", 110, 1_000_000)
+
+if reliability_input_price == 0,
+  do: raise("PULSO_RELIABILITY_INPUT_NANO_USD_PER_TOKEN must be positive")
+
 config :pulso, Projection,
   enabled: env_var.("PULSO_ERROR_PROJECTION_ENABLED", "false") in ["1", "true", "yes"],
   history_days: error_history_days,
   interval_ms: error_projection_interval
+
+if reliability_enabled and
+     (reliability_tenants == [] or reliability_key == "" or
+        not match?({:ok, _}, Date.from_iso8601(reliability_price_until))),
+   do: raise("Reliability requires tenants, an OpenAI API key and an ISO price-valid-until date")
+
+if investigation_url != "" do
+  uri = URI.parse(investigation_url)
+
+  if uri.scheme != "https" or uri.host in [nil, ""] or uri.userinfo != nil or uri.fragment != nil or
+       investigation_token == "" or String.contains?(investigation_token, ["\r", "\n"]),
+     do: raise("Reliability investigation handoff requires a fixed HTTPS URL and bearer token")
+end
+
+config :pulso, Pulso.Reliability,
+  enabled: reliability_enabled,
+  tenants: reliability_tenants,
+  interval_ms: 1000,
+  api_key: reliability_key,
+  price_valid_until: reliability_price_until,
+  max_input_tokens: 5000,
+  input_nano_usd_per_token: reliability_input_price,
+  assessment_budget_nano_usd:
+    reliability_integer.("PULSO_RELIABILITY_ASSESSMENT_BUDGET_USD", 500, 100_000) * 1_000_000_000,
+  object_budget_nano_usd: reliability_integer.("PULSO_RELIABILITY_OBJECT_BUDGET_USD", 100, 100_000) * 1_000_000_000,
+  investigation_budget_nano_usd:
+    reliability_integer.("PULSO_RELIABILITY_INVESTIGATION_BUDGET_USD", 1000, 100_000) * 1_000_000_000,
+  investigation_url: if(investigation_url != "", do: investigation_url),
+  investigation_token: investigation_token
 
 config :pulso, Pulso.Sentry, projects: sentry_projects
 

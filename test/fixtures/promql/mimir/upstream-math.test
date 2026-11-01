@@ -17,7 +17,40 @@ load 5m
 	data{type="nan"} NaN
 	data{type="histogram"} {{schema:0 sum:1 count:1}}
 
+eval instant at 0m abs(data)
+	{type="positive"} 2.5
+	{type="whole"} 2
+	{type="negative"} 2.5
+	{type="nwhole"} 2
+	{type="zero"} 0
+	{type="nzero"} 0
+	{type="inf"} +Inf
+	{type="ninf"} +Inf
+	{type="nan"} NaN
+
 eval instant at 0m ceil(data)
+	{type="positive"} 3
+	{type="whole"} 2
+	{type="negative"} -2
+	{type="nwhole"} -2
+	{type="zero"} 0
+	{type="nzero"} 0
+	{type="inf"} +Inf
+	{type="ninf"} -Inf
+	{type="nan"} NaN
+
+eval instant at 0m floor(data)
+	{type="positive"} 2
+	{type="whole"} 2
+	{type="negative"} -3
+	{type="nwhole"} -2
+	{type="zero"} 0
+	{type="nzero"} 0
+	{type="inf"} +Inf
+	{type="ninf"} -Inf
+	{type="nan"} NaN
+
+eval instant at 0m round(data)
 	{type="positive"} 3
 	{type="whole"} 2
 	{type="negative"} -2
@@ -117,3 +150,10 @@ eval instant at 1m log10(exp_root_log - 20)
 	{l="y"} -Inf
 
 clear
+
+# Check round with mixed data types
+load 1m
+	mixed_metric {{schema:0 sum:5 count:4 buckets:[1 2 1]}} 1 2 3 {{schema:0 sum:5 count:4 buckets:[1 2 1]}} {{schema:0 sum:8 count:6 buckets:[1 4 1]}}
+
+eval range from 0 to 5m step 1m round(mixed_metric)
+	{} _ 1 2 3

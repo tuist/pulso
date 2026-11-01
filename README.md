@@ -1,13 +1,32 @@
 # Pulso 🫀
 
-An open-source, headless observability backend built for AI agents as much as for humans.
+An open-source, headless reliability backend built for agent-driven investigation.
 
-Pulso accepts logs, metrics, and traces over the protocols your collectors already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores them as Parquet in an S3-compatible bucket, and lets agents investigate them through a native [Model Context Protocol](https://modelcontextprotocol.io/) interface. Prometheus- and Loki-compatible query APIs keep existing dashboards working.
+Pulso's direction is to turn telemetry into actionable reliability signals with
+supporting evidence for external agent workflows, with raw queryable retention
+as an opt-in capability. The target combines bounded cross-signal service
+summaries with opt-in, budgeted model assessments; your workflow owns deeper
+investigation and policy-gated actions. Assessment, object-storage overhead and
+investigation have separate allowances. See the
+[architecture](docs/architecture.md#reliability-signals-and-optional-raw-retention)
+for the target design and its boundary with current behavior.
+
+Today, Pulso accepts logs, metrics, and traces over the protocols your collectors
+already speak (Loki push, Prometheus remote write, and OpenTelemetry), stores
+them as Parquet in an S3-compatible bucket, and lets agents investigate them
+through a native [Model Context Protocol](https://modelcontextprotocol.io/)
+interface. Prometheus- and Loki-compatible query APIs keep existing dashboards
+working. Experimental [periodic reliability assessments](docs/reliability.md)
+combine bounded cross-signal windows with opt-in OpenAI Decisions, durable MCP
+signals and capped external investigation handoffs. Processing-only ingestion
+is not implemented; raw records are retained indefinitely unless expiry is configured.
 
 Experimental [error tracking](docs/error-tracking.md) accepts Sentry SDK JSON errors
 into the same object storage and exposes error events and issue groups through MCP.
 An optional [error monitoring index](docs/error-monitoring.md) adds compact
 retained-history summaries and replayable changes without gating ingestion.
+Its first bounded detector emits measured error-rate increases with compact
+evidence for an external workflow to consume; it does not execute that workflow.
 
 ## Why Pulso
 

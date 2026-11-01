@@ -468,7 +468,7 @@ pub(crate) fn normalize(pattern: &str) -> Result<Cow<'_, str>, regex::Error> {
             class_range_end = false;
         }
         if ch == '\\' {
-            if depth == 0 && !chars.peek().is_some_and(|(_, c)| *c == 'Q') {
+            if depth == 0 && chars.peek().is_none_or(|(_, c)| *c != 'Q') {
                 atom = Some((output_offset, ungreedy));
                 quantified_atom = false;
                 repeat_flags = (0, 0);

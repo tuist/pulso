@@ -471,6 +471,13 @@ duplicate and separate-owner partitions replay normally using Elixir/Rust only.
 Combined bounds are one 2M work / 5000 scope-name-pair budget, including 20 static
 entries even before v1 flattening; they are not five independent query budgets.
 
+The 20-name count above records the original v2.9 fixture, not the current
+vocabulary. The [pinned service continuation](tempo_integration/README.md#v2-name-content-tables-and-versioned-static-vocabulary)
+independently freezes 25 names from the newer public helper. Current replays
+replace only the vocabulary portion of the old complete expectations; original
+stored-name and seven static-value oracles remain unchanged. All 25 suggestions
+reserve capacity before stored names, including before v1 flattening.
+
 `produce_tempo_default_name_handlers.go.txt` separately executes **actual frontend
 HTTP handlers** for 90 cases: all 15 results × v1/v2 × omitted/empty/none scope.
 Its backend metadata responses are **owned stubs**, not actual network requests

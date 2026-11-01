@@ -28,7 +28,7 @@ defmodule Pulso.Loki.Discovery do
   Discover `mode` over the tenant's streams in `[start_ns, end_ns]`.
 
   `selectors` is a list of parsed stream selectors; their union is
-  discovered. Series mode requires at least one selector.
+  discovered. An empty list discovers all streams within the same budgets.
   """
   @spec query(String.t(), mode(), String.t(), [AST.Selector.t()], map()) :: {:ok, binary()} | {:error, term()}
   def query(tenant, mode, key, selectors, times) when mode in [:names, :values, :series] do
@@ -68,7 +68,6 @@ defmodule Pulso.Loki.Discovery do
   defp validate(:values, key, _selectors) when not is_binary(key) or key == "" or byte_size(key) > 256,
     do: {:error, {:invalid_query_parameter, "name"}}
 
-  defp validate(:series, _key, []), do: {:error, {:missing_param, "match[]"}}
   defp validate(_mode, _key, selectors) when length(selectors) > 16, do: {:error, {:invalid_query_parameter, "match[]"}}
   defp validate(_mode, _key, _selectors), do: :ok
 

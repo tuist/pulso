@@ -4,16 +4,157 @@ This document is the source of truth for Pulso's design decisions. Every non-tri
 
 ## What Pulso is
 
-A headless, open-source observability backend: unified logs, metrics, and traces access, with built-in alerting and a native Model Context Protocol (MCP) interface, built on Elixir/OTP with a Rust hot path for columnar data.
+A headless, open-source reliability backend: turn errors, logs, metrics and
+traces into actionable observations for external agent workflows, with unified
+query access, built-in alerting and a native Model Context Protocol (MCP)
+interface, built on Elixir/OTP with a Rust hot path for columnar data.
 
-Pulso ships no UI. It exists to be talked to by humans through their own dashboards and, first-class, by AI agents through MCP.
+Pulso ships no UI. Its target primary experience is an agent reacting to a
+meaningful change, fetching bounded evidence and investigating it, not a human
+searching an archive. Raw queryable retention is a separate, opt-in product
+capability in that target design, not a prerequisite for useful reliability
+signals. Humans can still use their own dashboards and agents can still query
+retained data through MCP.
+
+**This is product direction, not current ingest behavior.** Today successful
+ingestion still publishes raw Parquet records and their manifest; raw records
+remain indefinitely unless experimental event-time expiry is configured.
+There is no processing-only ingest mode or general anomaly detector yet.
+Experimental periodic cross-signal assessments now add bounded Decisions
+judgments and capped external handoffs. These, error projection and native alert
+evaluation are not proof that raw retention can already be disabled safely.
+
+## Reliability signals and optional raw retention
+
+The target separates three data lifetimes:
+
+| Data | Purpose | Target contract |
+| --- | --- | --- |
+| Processing inputs | Allow bounded asynchronous analysis and crash recovery | Short-lived durable inputs; not an indefinite user-queryable archive |
+| Findings, baselines and selected evidence | Explain changes and support agent catch-up | Independently bounded durable state, with coverage, provenance and replay floors |
+| Raw archive | Ad hoc investigation, dashboards and audit queries | Explicit opt-in retention, independent of finding/evidence lifetimes |
+
+Processing all admitted inputs does not mean retaining them all, sending each
+event to an LLM, detecting every possible failure or proving exporter
+completeness. The target is periodic model assessment of bounded cross-signal
+service summaries, including apparently ordinary windows, not only events that
+cross deterministic thresholds. Deterministic reducers own measurements and
+resource bounds; an opt-in decision model judges whether those observations
+deserve investigation. Existing authored alerts and deterministic detectors
+remain useful inputs, not the only gate to assessment. Versions, grouping keys,
+baseline windows and minimum-observation requirements must be explicit. Cold
+start, stale inputs, overload and missing coverage are unknown/degraded states,
+never evidence of health or resolution.
+
+A finding must contain its stable identity/revision, tenant and service scope,
+detector/version, occurrence window and publication time, measured observation
+and comparison baseline, coverage/freshness, and bounded supporting evidence.
+Exact measurements, estimates and inferred explanations remain distinguishable.
+Selected payload evidence is retained independently, not merely a pointer to a
+raw record that may expire first; unavailable evidence is explicit. Findings,
+baselines and evidence remain sensitive data with their own authorization,
+redaction, expiry and tenant-erasure requirements.
+
+Pulso may call a configured decision provider for fixed, versioned assessment
+questions; this does not permit arbitrary agent execution. A ReliabilitySignal
+separates measured evidence from that model's assessment. An external workflow
+consumes committed changes, durably deduplicates them, checks whether a finding
+is still current, then uses read-only MCP tools to investigate. The external
+runtime owns investigative GPT execution, workflow checkpoints, tool/model spend,
+action policy, human approval and remediation. Live notifications are wakeups;
+bounded durable replay and explicit gaps are the recovery contract. Existing
+alert and error feeds keep their distinct schemas and semantics; a common
+finding model must not silently relabel them as anomalies.
+
+### Budgeted service assessments
+
+The proposed starting profile assesses up to 100 tenant/environment/service
+groups every five minutes, combining logs, metrics and traces in one envelope
+bounded to 5000 total charged input tokens, including instructions/questions.
+Compare the latest completed five-minute window with thirty preceding minutes;
+retain coverage and late-arrival uncertainty. Route-level drilldown and retries
+consume the same assessment allowance, never an unbounded multiplier. Selection
+exclusions and missed assessment slots remain visible. The experimental first
+implementation uses these evidence intervals and a 100-known-group admission
+ceiling, not fair inventory rotation or a calibrated detection guarantee.
+One group runs per worker pass; five minutes is not a cadence SLA.
+
+At the verified October 31, 2026 Decisions rate of $0.10/million uncached input
+tokens, this profile costs $432 per 30-day month before premiums and retries.
+The initial reference envelope is $500/month for model assessment, $100/month
+estimated incremental reliability object work, and a separate $1000/month for
+external investigation. Base ingest/archive and compute are additional costs,
+not silently included in these allowances. External investigations additionally
+cap starts at 20/day, concurrency at two, and each run at $5; the monthly cap
+therefore funds at most 200 fully reserved runs. These are illustrative
+budget examples, not charges imposed by Pulso or a claim that $5 is sufficient
+for a useful investigation. Assessment and investigation are independently opt-in.
+
+Before dispatch, reserve the conservative maximum charge under a versioned
+price schedule. Per-tenant object-store CAS reservations bound assessment spend
+across independent instances; rendezvous and local counters alone do not.
+Unknown provider outcomes retain their reservation, and every retry needs a new
+one. The external runtime separately enforces investigation tokens, tool costs,
+starts and concurrency across its workers. Never reclaim in-flight allowance
+merely because a caller times out or a billing month changes. This is bounded
+authorized dispatch under declared prices, not control over provider invoices
+or unrelated use of shared credentials.
+
+Budget exhaustion, failed assessments and rate limiting publish explicit
+deferred/unknown coverage, not a healthy verdict. Repeated findings update a
+stable episode rather than launch another workflow per window. Periodic
+assessment continues independently of investigation cooldowns; severity never
+silently bypasses a hard spending cap. See the
+[budget and scheduling contract](../plans/reliability-first.md#assessment-and-investigation-budgets)
+for the broader target. The experimental implementation now reserves full
+5000-token attempts through per-tenant CAS before calling Decisions, with no
+refunds/retries and one catalog-only captured-evidence follow-up. It exposes
+durable read-only MCP signals and a single-attempt external webhook with
+authenticated completion; uncertain delivery retains concurrency indefinitely.
+Object charges are planning estimates, not physical request metering or invoice
+caps. Fair inventory rotation, reliable workflow delivery, orphan sweeping and
+processing-only ingestion remain open. See [operator contracts and limits](reliability.md).
+Raw retention remains required today.
+
+Object-storage cost constrains this design as strongly as token cost. Reduce all
+admitted services together per bounded source scan and persist versioned minute
+summaries; do not reread every service's full overlapping raw baseline before
+every model call. Batch bounded summary/evidence pages, and charge discovery,
+ledger/result CAS, retries, compaction and cleanup as well as data GETs. Tigris
+Standard Global/Single-region currently prices PUT/LIST at $5/million versus
+$0.50/million GET/HEAD; small objects and versioned-head churn can dominate
+short-lived payload storage. Free egress does not make repeated decoding free.
+Maintain physical-request, byte, work and derived-state limits in addition to
+estimated dollars. These additional caps must not change raw-ingest durability
+or trigger unauthorized retention changes. See the
+[storage cost model](../plans/reliability-first.md#object-storage-and-total-operating-cost)
+for placement-specific rates, examples and the limits of invoice estimates.
+
+Object storage remains the only shared authority. In processing-only mode,
+acknowledgement must wait for recoverable processing inputs and their committed
+work references, or the completed required outputs; an in-memory detector or
+subscriber delivery is insufficient. Reuse immutable Parquet batches and
+manifest/CAS coordination, not a new broker, local WAL or database. Required
+detector versions and policy are pinned to admitted work. Releasing a processing
+input requires committed outputs or an explicit durable coverage gap after the
+declared processing deadline. Publication ordering, retry/deduplication bounds
+and bounded pending-work metadata must be proven before that mode can ship.
+Any instance can ingest or read; overlapping workers and restarts cannot lose
+accepted work or double-count it merely because ownership changes.
+
+This deliberately changes the target from storing every raw record as the
+product to preserving the promised processing outcome and its evidence. It does
+not weaken the existing raw-ingest acknowledgement contract or authorize changing
+defaults, expiring existing data, or deploying a processing-only mode. See the
+[reliability-first implementation plan](../plans/reliability-first.md) for stages,
+acceptance gates and the initial external-workflow integration.
 
 ## Core bets
 
 Four bets shape everything below. Deviating from any of them is a redesign, not a refactor.
 
 1. **Headless nodes, shared-nothing at the write path.** No shared database, no leader election, no consensus service, no cluster-visible mutable state. Nodes coordinate only through object storage. Kill a node, launch another; nothing is lost.
-2. **Object storage is the source of truth.** S3 (or any S3-compatible: R2, GCS, Azure Blob, MinIO) holds every acknowledged record until an explicitly configured retention policy expires it (indefinitely by default). Local disk is a warm cache and nothing more.
+2. **Object storage is the source of truth.** S3 (or an S3-compatible provider with the required conditional-write semantics) holds all promised durable state. Today that means every acknowledged raw record until configured expiry (indefinitely by default). The target processing-only contract instead requires recoverable processing work, committed findings and selected evidence under their declared lifetimes; optional archival ingestion still promises raw-record durability. Local disk and process memory are disposable, never the authority for accepted work.
 3. **BEAM for orchestration, Rust for bytes.** Elixir/OTP owns concurrency, supervision, per-tenant isolation, backpressure, and the MCP surface. Rust owns Parquet encode/decode, DataFusion query execution, and the S3 object store client, called via Rustler NIFs. Object-store calls never block a BEAM scheduler: the NIF starts the request on its tokio runtime and replies to the caller's mailbox, so in-flight provider requests are not capped by the VM's dirty I/O schedulers. Nothing crosses the boundary that doesn't need to.
 4. **MCP is first-class, not bolted on.** The primary read surface is MCP tools. HTTP APIs exist for compatibility with agents (Alloy, OTel collectors, Prometheus remote_write clients) that expect them, not as the recommended read path.
 
@@ -1087,6 +1228,22 @@ discovery sequence/time remain separate. A higher raw floor beyond previous
 coverage, or known unprocessed input disappearing, forces a conservative reset;
 current manifests cannot prove that unseen input did not arrive and expire.
 Raw retention never waits for projection progress.
+
+The same projection now evaluates `error-count-ratio-v1` over the latest two
+completed five-minute windows per issue/service. At least five deduplicated
+baseline events and a threefold increase produce an `error_rate_increase`
+change containing counts, windows and up to three compact examples. This is a
+fixed count/rate threshold, not request-normalized failures or statistical anomaly
+detection. Bootstrap/reset/old-worker upgrade baselines suppress historical
+findings; incomplete reconciliation and insufficient history cannot emit them.
+An emitted-group set for the current window commits with progress and replay in
+the same root CAS, preventing repeats during rescans or competing publications.
+Compact examples live inside replay pages independently of raw payloads, but
+full stack traces still need raw retention. Pages split by both bytes and count;
+existing root/page/input budgets remain unchanged. This is the first executable
+reliability-signal slice, not completion-aware ingest, historical window backfill,
+an external GPT workflow or an application-recovery/health guarantee. Detector
+status and unknown source lag remain visible through MCP.
 
 The initial implementation bounds each project to 4096 source segments, 20,000
 stored occurrence copies and an 8 MiB root, processing at most 32 new segments per

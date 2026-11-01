@@ -20,6 +20,11 @@ also have their origin listed in `PULSO_MCP_ALLOWED_ORIGINS`.
 
 The query tools below are read-only and take the tenant as an argument:
 
+Experimental `list_reliability_signals`, `get_reliability_signal` and
+`list_reliability_changes` expose periodic cross-signal model assessments and
+their budgets/coverage. They use existing tenant authorization and do not start
+investigations. See [durable replay and freshness rules](reliability.md#consume-signals).
+
 | Tool | Purpose |
 | --- | --- |
 | `query_logs` | Return log records for a time range, optionally filtered by service, including their typed `otlp` envelope when present. |
@@ -27,14 +32,14 @@ The query tools below are read-only and take the tenant as an argument:
 | `discover_metrics` | Complete retained-sample label names, values or series with OR selectors and exact time bounds. Empty-valued labels project as absent. Same contracts as the [Prometheus metadata APIs](metric-discovery.md); safety limits fail rather than truncate. |
 | `query_metrics` | Return raw metric samples for a time range, filtered by label matchers. Optional exact-equality footer postings skip native row-group decoding, not whole-object GETs or source scan budgets. See [bounds and fallback](metrics.md#bounded-native-query-acceleration). |
 | `get_trace` | Assemble all stored spans for one exact trace ID, with roots, missing parents and duplicate/conflict IDs. No truncation or time window; budget exhaustion is an error. See [traces](traces.md#assemble-a-stored-trace). |
-| `discover_trace_tags`, `discover_trace_tag_values` | Default-off retained resource/span/instrumentation/event/link names and original string/int64/bool/float values (nonfinite classes included). Names/values accept optional original-string equality/anchored-regex AND `query`, on one parent span; nested predicates and value same-target equality reject. Filtered names include complete matching keys plus fixed all-visible-context promotion hints, not key-presence proofs; they can exceed raw upstream names. Omit name scope/use none to combine five namespaces plus 20 static intrinsic suggestions in v2; this shares one global work/pair/byte budget, not five query budgets, and any storage/metadata error fails whole. Combined names hint service.name for any visible parent even unfiltered/absent original. Scope-none values combine resource/span/instrumentation only, not events/links. Optional bounded resource/span strings select one parent then union its three original typed owners, a complete extension rather than Tempo's ignored-query fast path. Returned other-owner values need not themselves match the literal/regex. Same-key equality across resource/span and reserved root aliases reject. Requires discovery12 matching artifacts; query-aware unscoped execution or bounded reference, and separate explicit windowed-filtered-none support, never old callbacks. Floats retain type/signed zero using TraceQL text. Seven stored intrinsic strings (span name/status message, scope name/version, event names) accept parent filters under normal stored-data bounds; complete values may exceed upstream distinct-iterator omissions. event:timeSinceStart returns exact signed int nanoseconds, not duration strings: event time minus its own parent's start. Default event time0 can yield negative values; no events invent no values. Parent-string filtering is a complete extension versus upstream's empty filtered path. Every requested event time validates even on nonmatches; parent+all events/attrs spend work first. Separate event-time /4 or bounded reference plus dedicated windowed /6 fence old string/window callbacks. Requested-owner-plus-attribute work caps at 2,000,000 per scan attempt before filtering, so dense flat scopes can fail earlier. Values require scope (including explicit none); paired positive start_ts_ns/end_ts_ns select whole retention-visible source envelopes, not point-time rows; all raw source headers/provider costs still charge, no indexed-planning improvement. Compaction can broaden dictionaries; unselected payload metadata is not integrity-scrubbed. Explicit window-aware adapters or rejection, no silent flat approximation. No zero/one-sided windows or intrinsic predicates; whole legacy/type/scan/dictionary errors never truncate. Separate `intrinsic` scope returns static protocol names and seven keyword/empty v2 shortcuts without storage, not stored presence or full TraceQL support; static filters and stored span-duration intrinsic values reject. rootName/rootServiceName and trace:rootName/trace:rootService are stored root strings: matching parents select trace IDs then recover all retained context, even outside windows/predicates. Missing/ambiguous roots or missing original string root service fail409 whole, no defaults or skip-incomplete. In-flight/retention-straddling/multi-root traces can make broad/recent queries unusable. All retained root S3 input must fit1024 objects/32MiB compressed/1M rows regardless of window, with local all-source replay and no service/ID planner. 65,536 candidates/16MiB bookkeeping and2M resource/span/link owner+attr work plus standard dictionary/result bounds. Dedicated root/window support, not old span-local callbacks; proof is not full exporter/span-ID conflict or deployed-client parity. Canonical trace:duration now measures complete retained max-end/min-start without requiring roots; in-flight ingestion/retention change that envelope, not exporter completeness. Unfiltered returns int nanoseconds, supported filters return Go duration strings (µs), both lexical; keep caches separate across query/type changes. Same whole-tenant input/replay/group/dictionary bounds, with2M resource/span owner+attr work and80B-per-summary bookkeeping charges under16MiB, not a total native-memory guarantee. Broad nanosecond dictionaries commonly fail422; no samples/truncation. Dedicated duration/window support fences old callbacks. Static empty duration/span:duration/traceDuration remain unchanged. See [discovery subset](traces.md#experimental-scoped-tag-discovery). |
+| `discover_trace_tags`, `discover_trace_tag_values` | Default-off retained resource/span/instrumentation/event/link names and original string/int64/bool/float values (nonfinite classes included). Names/values accept optional original-string equality/anchored-regex AND `query`, on one parent span; nested predicates and value same-target equality reject. Filtered names include complete matching keys plus fixed all-visible-context promotion hints, not key-presence proofs; they can exceed raw upstream names. Omit name scope/use none to combine five namespaces plus 25 static intrinsic suggestions in v2; this shares one global work/pair/byte budget, not five query budgets, and any storage/metadata error fails whole. Combined names hint service.name for any visible parent even unfiltered/absent original. Scope-none values combine resource/span/instrumentation only, not events/links. Optional bounded resource/span strings select one parent then union its three original typed owners, a complete extension rather than Tempo's ignored-query fast path. Returned other-owner values need not themselves match the literal/regex. Same-key equality across resource/span and reserved root aliases reject. Requires discovery12 matching artifacts; query-aware unscoped execution or bounded reference, and separate explicit windowed-filtered-none support, never old callbacks. Floats retain type/signed zero using TraceQL text. Seven stored intrinsic strings (span name/status message, scope name/version, event names) accept parent filters under normal stored-data bounds; complete values may exceed upstream distinct-iterator omissions. event:timeSinceStart returns exact signed int nanoseconds, not duration strings: event time minus its own parent's start. Default event time0 can yield negative values; no events invent no values. Parent-string filtering is a complete extension versus upstream's empty filtered path. Every requested event time validates even on nonmatches; parent+all events/attrs spend work first. Separate event-time /4 or bounded reference plus dedicated windowed /6 fence old string/window callbacks. Requested-owner-plus-attribute work caps at 2,000,000 per scan attempt before filtering, so dense flat scopes can fail earlier. Values require scope (including explicit none); paired positive start_ts_ns/end_ts_ns select whole retention-visible source envelopes, not point-time rows; all raw source headers/provider costs still charge, no indexed-planning improvement. Compaction can broaden dictionaries; unselected payload metadata is not integrity-scrubbed. Explicit window-aware adapters or rejection, no silent flat approximation. No zero/one-sided windows or intrinsic predicates; whole legacy/type/scan/dictionary errors never truncate. Separate `intrinsic` scope returns static protocol names and seven keyword/empty v2 shortcuts without storage, not stored presence or full TraceQL support; static filters and stored span-duration intrinsic values reject. rootName/rootServiceName and trace:rootName/trace:rootService are stored root strings: matching parents select trace IDs then recover all retained context, even outside windows/predicates. Missing/ambiguous roots or missing original string root service fail409 whole, no defaults or skip-incomplete. In-flight/retention-straddling/multi-root traces can make broad/recent queries unusable. All retained root S3 input must fit1024 objects/32MiB compressed/1M rows regardless of window, with local all-source replay and no service/ID planner. 65,536 candidates/16MiB bookkeeping and2M resource/span/link owner+attr work plus standard dictionary/result bounds. Dedicated root/window support, not old span-local callbacks; proof is not full exporter/span-ID conflict or deployed-client parity. Canonical trace:duration now measures complete retained max-end/min-start without requiring roots; in-flight ingestion/retention change that envelope, not exporter completeness. Unfiltered returns int nanoseconds, supported filters return Go duration strings (µs), both lexical; keep caches separate across query/type changes. Same whole-tenant input/replay/group/dictionary bounds, with2M resource/span owner+attr work and80B-per-summary bookkeeping charges under16MiB, not a total native-memory guarantee. Broad nanosecond dictionaries commonly fail422; no samples/truncation. Dedicated duration/window support fences old callbacks. Static empty duration/span:duration/traceDuration remain unchanged. See [discovery subset](traces.md#experimental-scoped-tag-discovery). |
 | `search_trace_metadata` | Disabled-by-default experimental Tempo-shaped search over complete retained context before inclusive trace overlap, ordering, limit and sampled spansets. Requires explicit `most_recent=true`; ALL retained tenant IDs/rows consume bounds even outside the window. See [opt-in and planning costs](traces.md#experimental-tempo-search). |
 | `search_traces` | Search distinct traces using bounded original-string resource/span AND selectors in an explicit span-start window. Groups before trace limits; unknown legacy types and all-window group/scan exhaustion fail. Native window-local aggregates, not a Tempo envelope. See [search limits and legacy history](traces.md#search-distinct-traces). |
 | `query_traces` | Lookup spans by trace/span/parent ID or search by start time, service, name, kind, status, duration, roots and query-projection attributes, with optional output projection. See [traces](traces.md#query-spans). |
 | `query_promql` | Evaluate a Prometheus Query Language expression, instant or range. |
 | `query_errors` | Read Sentry error events and scrubbed payloads in a required time window. |
 | `list_error_issues` | Group Sentry errors with exact window-scoped counts and first/last seen; see [error tracking](error-tracking.md). |
-| `list_error_changes` | Poll the separately enabled experimental index for retained-history issue changes and explicit resets; save the cursor durably. |
+| `list_error_changes` | Poll the separately enabled experimental index for retained-history issue changes, measured error-rate increases with compact evidence, and explicit resets; save the cursor durably. See [detector semantics](error-monitoring.md#error-rate-findings-for-agent-workflows). |
 | `list_indexed_error_issues` | Read compact deduplicated retained-history summaries and example references from that index; see [error monitoring](error-monitoring.md). |
 
 `tools/list` returns each tool's full input schema. Invalid arguments, such as a
@@ -159,6 +164,16 @@ values are capped at ten seconds. Results use Prometheus scalar, vector, and mat
 formats, plus string results for instant queries, so Grafana can use Pulso as a
 Prometheus data source within the supported subset below.
 
+Range requests return HTTP 400/`bad_data` with field-specific diagnostics for
+invalid `start`, `end` or `step`, reversed bounds and zero/negative numeric steps.
+The existing limit is 11,000 inclusive evaluation points, not 11,000 intervals;
+an otherwise valid request exceeding it returns the maximum-resolution error.
+Reflected parameter values are quoted and truncated after 128 input bytes.
+Authorization runs before these diagnostics. Upgrade query-serving applications
+for consistent error responses; timestamp/duration admission and resource limits
+are unchanged. Other expression/instant-query diagnostics are not full Mimir
+error-text parity.
+
 Instant queries also accept top-level range selectors and subqueries, returning
 a matrix with original sample or inner-grid timestamps, complete float/native
 histogram values and metric names. Range windows exclude their lower boundary
@@ -167,8 +182,20 @@ and include their upper boundary; stale markers are omitted. Strings return
 strings. Both result types share existing sample, work, intermediate and output
 budgets. `/api/v1/query_range` accepts only scalar or instant-vector expressions,
 even when `start=end`; strings, range selectors and subqueries return `400`
-before reading storage. Upgrade every query-serving application before relying
+before reading storage. A top-level range selector or subquery reports
+`invalid parameter "query": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar`.
+This does not change string-result or general parser diagnostics.
+Upgrade every query-serving application before relying
 on these instant results; storage, keyed bytes and native ABIs are unchanged.
+
+`absent_over_time` tests whether any nonstale sample exists in each window,
+including zero, NaN and native histograms. Distinct metrics sharing the same
+other labels retain their source identities during this check; they must not
+cause a duplicate-series error merely because their names differ. Only absent
+windows emit `1`, with labels inferred from unambiguous equality matchers.
+Sample/work limits still reject the whole query, including when its result
+would be empty. Upgrade query-serving applications for the multi-metric fix;
+storage, keyed bytes, native ABIs and limits are unchanged.
 
 Selectors accept quoted UTF-8 metric and label names, for example
 `{"utf_metric😀C", "utf8_label😀"="test"}`. A quoted metric name inside braces
@@ -464,6 +491,16 @@ combinations now emit the same type diagnostic instead of silently disappearing.
 These infos omit expression positions. Existing instant/range and batch budgets
 apply; upgrade all query-serving applications, without changing native artifacts,
 storage or keyed-ingest bytes.
+
+Grouped vector matching that produces the same final labels twice within one
+matching group returns HTTP 422 with `errorType="execution"` and
+`multiple matches for labels: grouping labels must ensure unique matches`.
+Uniqueness checks run after filtering, independently at each evaluation step;
+false `bool` samples still count as retained outputs. A collision fails the
+whole query, not just that step. Ambiguous one-side matches and unrelated
+duplicate output identities retain their existing diagnostics. Upgrade all
+query-serving applications for consistent error responses; successful samples,
+resource ceilings, native artifacts, storage and keyed bytes are unchanged.
 
 `label_join(vector, "destination", "separator", "source", ...)` joins source
 label values in argument order. Missing source labels contribute empty strings;
@@ -1067,6 +1104,18 @@ Metric results use Loki's sample format: `[<Unix seconds as a JSON number>,
 "<value>"]`, with values formatted as Prometheus and Loki do (`"8"`, not
 `"8.0"`). Log results keep nanosecond timestamp strings.
 
+Finite Loki read failures return JSON, not Loki's plaintext error-writer bodies.
+Invalid queries and request-local interval limits return HTTP 400; query-worker
+deadlines return 504, admission overload returns 429, and worker failures return
+500. Storage failures return 503 with `storage_unavailable` and the fixed message
+`Storage is unavailable.`; provider error terms are not included. Scan, sample,
+work and result-budget rejections remain 422; worker heap kills return 500.
+Failed requests return no partial query result.
+These are Pulso's error contracts, not exact Loki error compatibility: client
+cancellation/499 responses, internal gRPC status roundtrips and aggregate-error
+precedence are not implemented. An omitted tenant still uses the default tenant
+when authorized, rather than Loki's missing-org-ID error.
+
 Literal-only instant expressions return `resultType="scalar"` with one
 `[evaluation_time, value]` pair; `vector(2)` remains a vector. Range requests
 return matrices for both forms. Scalar comparisons return 0/1 with or without
@@ -1150,6 +1199,16 @@ pipeline without native pushdown; existing expression, scan, work, sample,
 result, deadline and heap ceilings apply. Upgrade query-serving applications;
 no native/storage migration or keyed-retry drain is required.
 
+`| decolorize` removes escape sequences matching Loki's ANSI-removal profile,
+including ESC and Unicode U+009B markers and supported BEL-terminated forms.
+Unmatched markers and following ordinary text are preserved. This is a specific
+compatibility profile, not a general terminal-control sanitizer: some incomplete
+numeric sequences match, while unsupported control forms remain in the line.
+Later filters, parsers, templates and metric reductions see the rewritten line;
+labels and source timestamps are unchanged. Existing query budgets still apply.
+Upgrade query-serving applications for corrected escape handling; native
+artifacts, storage/keyed bytes and resource ceilings are unchanged.
+
 IP filters accept a single IPv4/IPv6 address, CIDR or inclusive same-family
 range. Use `|= ip("192.0.2.1")` / `!= ip("192.0.2.0/24")` on the current line,
 or `| remote_addr=ip("2001:db8::1-2001:db8::8")` / `!=ip(...)` on a label.
@@ -1195,6 +1254,17 @@ prefix. This applies to stream selectors, pipeline label filters
 
 ### Response encoding
 
+Nonempty dedicated log `trace_id` and `span_id` fields are exposed as structured
+metadata in LogQL. Explicit attributes with those names take precedence,
+including empty attribute values; absent or empty dedicated IDs add no label.
+Stream-label collisions use one `_extracted` suffix and preserve an already
+occupied suffixed name. Parsers use the same metadata-name protection as other
+attributes. Use pipeline filters such as `{app="api"} | trace_id="..."` or metric
+grouping to query the IDs; they are not added to stream selectors or discovery.
+This applies to already-stored logs too, without rewriting records. Upgrade all
+query-serving app/native pairs to log codec tuple `{1,1,17}` before relying on
+these labels; storage formats, keyed bytes and resource ceilings are unchanged.
+
 Without an encoding header, log results keep merged stream, structured-metadata
 and parser labels in `stream`, with `["<nanoseconds>", "<line>"]` values.
 Send `X-Loki-Response-Encoding-Flags: categorize-labels` on either query endpoint
@@ -1211,6 +1281,13 @@ retain the previous value. `drop`, `keep` and renames remove the affected labels
 from their original category too. Resource/promoted labels that survive without
 such a rewrite remain stream labels. This changes grouping/encoding only, not
 selectors, filtering, line formatting, global `limit` selection or stored data.
+
+Exact `__error__` and `__error_details__` names received as structured metadata
+use the `parsed` output category when they do not collide with stream labels.
+Ordinary suffixed names such as `__error___extracted` remain metadata. Their
+values and existing name protection are unchanged, as are unflagged responses
+and metric-error admission; a `__preserve_error__` label never grants permission
+to retain failed metric conversions.
 
 The response echoes comma-separated, deduplicated flags in `data.encodingFlags`.
 Tokens are exact and case-sensitive; unknown tokens are echoed without behavior.
@@ -1505,7 +1582,7 @@ at least their byte length, including unknown names that emit nothing.
 Each additional duplicate capture examined also spends one work unit, even
 when every candidate is unmatched and the reference emits no bytes.
 Output/work exhaustion fails the whole query, never as a preservable formatting error. Matching
-query-serving apps/native artifacts require log codec tuple `{1,1,16}` for
+query-serving apps/native artifacts require log codec tuple `{1,1,17}` for
 regex replacement; storage and keyed encoder bytes are unchanged.
 
 `trunc count text` selects the first count bytes, or the final -count bytes for
@@ -1750,7 +1827,7 @@ selection; it is not a preservable formatting
 error. Existing query length, scan, work, deadline and heap limits still apply.
 Channel/function iteration, date-layout/timezone functions beyond the timestamp
 helpers above and other Go-template built-ins remain unsupported. Upgrade every
-query-serving app/native pair to log tuple `{1,1,16}` for regex counting/replacement;
+query-serving app/native pair to log tuple `{1,1,17}` for regex counting/replacement;
 storage-format and keyed-ingest bytes are unchanged.
 
 `| json` flattens nested object scalar fields with `_` separators, sanitizes
@@ -1952,9 +2029,18 @@ Normal decimal filters can run natively; values requiring conversion/error
 handling fall back to the bounded Elixir pipeline. Filtered-out observations
 still spend scan/work budgets, but not retained-sample quota.
 
+The reserved `__error__` and `__error_details__` labels are strings. Comparing
+either with a numeric, duration, byte or `ip(...)` operand returns HTTP 400
+`parse_error` before storage access, including compound, nested metric and
+post-unwrap expressions. Use string/regex comparisons instead; ordinary typed
+labels and existing error-preservation rules are unchanged. Upgrade
+query-serving applications for this error-classification fix. It changes no
+native ABI, storage/keyed bytes or resource ceiling; exact general parser
+wording and positions remain incomplete.
+
 Upgrade every serving app/native pair together before relying on these parser
 collision, logfmt, quantity and filter-error semantics. The required log codec
-tuple is `{1,1,16}`; older artifacts fail startup. They do not change stored
+tuple is `{1,1,17}`; older artifacts fail startup. They do not change stored
 records or keyed encoder bytes.
 
 ### Limits and metric evaluation
@@ -2020,9 +2106,21 @@ keyed-byte change is required.
 `tsdbShardingStrategy` remain unsupported and reject explicitly.
 
 `limit` keeps the newest lines (`direction=backward`, the default) or the oldest
-lines (`direction=forward`) across all matching streams, as Loki does. Only
-those lines are held while the query reads storage, and a backward query stops
-reading as soon as no older segment can contain a newer line.
+lines (`direction=forward`) across all matching streams, as Loki does. Direction
+is case-insensitive; malformed supplied limits or directions return HTTP 400.
+Without a positive `interval`, only those lines are held while the query reads
+storage, and a backward query stops reading as soon as no older segment can
+contain a newer line.
+
+Range log queries accept `interval` as nonnegative float seconds or an ordered
+integer Prometheus duration. A positive interval keeps the first line and then
+lines at least that far from the last emitted line, globally across streams in
+the requested direction, **before** applying `limit`. This is not metric `step`
+or per-stream sampling. Because stored batches are not globally ordered, this
+path collects and sorts selected entries under the existing log-sample, work,
+scan, deadline and worker-heap ceilings. It can therefore fail a broad request
+that ordinary top-k can answer; exhaustion fails the whole query. Zero/omission
+keeps the ordinary streaming top-k path.
 
 Metric queries such as `rate`, `count_over_time`, `bytes_over_time`,
 `quantile_over_time` or `sum_over_time(... | unwrap ...)` reduce each selected
@@ -2039,12 +2137,14 @@ PromQL's `PULSO_QUERY_MAX_SAMPLES`.
 ### Stream discovery
 
 `/loki/api/v1/labels`, `/loki/api/v1/label/<name>/values` (both with an
-optional `query` selector) and `/loki/api/v1/series` (one or more `match[]`
+optional `query` selector) and `/loki/api/v1/series` (optional `match`/`match[]`
 selectors) accept GET or form-encoded POST. Stream labels are the labels a
 stream selector can match: the stream labels of pushed logs, the resource
 attributes of OTLP logs, and `service_name` for records with a service.
-Empty values count as absent. Without `start`/`end`, discovery covers the last
-six hours, as in Loki.
+Empty values count as absent. Repeated `match` and `match[]` values are unioned
+and deduplicated. Omission or a lone `{}` selector (including ASCII spaces)
+discovers all streams under the same budgets. Without explicit bounds,
+discovery covers the last hour; `since` can change that window.
 
 Discovery selectors and the `query` parameter of `/loki/api/v1/index/stats`
 accept only label matchers. A pipeline such as `{job="api"} |= "error"` or
@@ -2310,8 +2410,8 @@ shared schema admission; counting allocates no name metadata. Existing program,
 scan, work and heap limits also apply.
 
 Upgrade every query-serving app/native pair before relying on these forms.
-The required log capability tuple is `{1,1,16}` for scalar class complements,
-Unicode property admission and numeric/repeated capture names;
+The required log capability tuple is `{1,1,17}` for correlation-ID metadata,
+scalar class complements, Unicode property admission and numeric/repeated capture names;
 trace/metric capability tuples, storage formats and keyed bytes are unchanged.
 Unsupported syntax rejects rather than switching dialects. Remaining pipeline
 line/label predicates, drop/keep and named `regexp` capture extraction use the
@@ -2323,15 +2423,31 @@ serving app/native pair before relying on this parity.
 
 Instant queries honor `time` (default: now); an explicitly supplied `end` is a
 compatibility fallback when `time` is absent. Range queries default to an end of
-now and a start one hour before that end. Supply explicit bounds for older data.
-`time`, `start` and `end` accept integer Unix timestamps or RFC3339 strings,
-including nanosecond fractions. As in Loki, integer strings of at most ten
+now and a start one hour before the earlier of `end` and now. `since` changes
+the default start using ordered integer Prometheus durations such as `1d2h`;
+an explicit start wins, but malformed `since` still rejects. Supply explicit
+bounds for older data.
+`time`, `start` and `end` accept integer Unix timestamps, decimal Unix seconds
+or RFC3339 strings. RFC3339 retains nanosecond fractions; decimal seconds follow
+Loki's float64 conversion and millisecond fractional rounding, not exact decimal
+nanoseconds. As in Loki, integer strings of at most ten
 characters mean Unix seconds; longer integer strings mean Unix nanoseconds.
 The converted value must fit signed int64 nanoseconds. Use RFC3339 to identify
 very early epoch nanoseconds unambiguously. Timestamp text caps at 128 bytes.
 Malformed, overflowing or reversed supplied bounds return HTTP 400 instead of
-being dropped into an unbounded scan. Decimal Unix seconds are not supported by
-this adapter.
+being dropped into an unbounded scan. Nonfinite and nonportable out-of-range
+float conversions reject rather than inventing a timestamp.
+
+Range `step` accepts positive float seconds or ordered integer Prometheus
+durations. Its default is the whole-second floor of the window divided by 250,
+at least one second. HTTP admission rejects more than 11,000 intervals;
+evaluation still applies the existing stricter inclusive-point and resource
+ceilings. Numeric/duration parameter text is bounded to 128 bytes. Primitive
+uint32 acceptance does not bypass endpoint caps: detected fields and volume
+retain their 5,000 limit, and tail retains its configured entry cap and
+five-second maximum `delay_for` (accepted but not used to delay delivery).
+Upgrade all query-serving applications for these HTTP semantics; native,
+storage and keyed-byte formats are unchanged.
 
 Raw MCP logs expose complete typed OTLP metadata; Loki responses remain
 line-oriented projections. See [stored log content](logs.md#stored-content-and-raw-queries).

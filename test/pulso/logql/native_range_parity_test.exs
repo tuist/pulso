@@ -32,7 +32,9 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
           service: Enum.random(["api", "web", nil]),
           severity_text: Enum.random(["info", "error", nil]),
           body: body,
-          attributes: Enum.random([%{}, %{"trace" => "t#{rem(i, 5)}"}]),
+          trace_id: Enum.random([nil, "", "t#{rem(i, 3)}"]),
+          span_id: Enum.random([nil, "", "s#{rem(i, 7)}"]),
+          attributes: Enum.random([%{}, %{"trace" => "t#{rem(i, 5)}"}, %{"trace_id" => "attribute", "span_id" => ""}]),
           resource: %{"app" => Enum.random(["a", "b"]), "pod" => Enum.random(["p1", "p2", "p3"])}
         }
       end
@@ -58,7 +60,9 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
         ~s/|= "level" | logfmt | code=~"5.." or dur > 300/,
         ~s/| regexp "dur=(?P<d>[0-9.]+)(?P<rest> .*)?" | d != ""/,
         ~s/!~ "n=1[0-9]" | logfmt | code != "404" and pod != "p3"/,
-        ~s/| logfmt | msg =~ "hello.*" or level="info"/
+        ~s/| logfmt | msg =~ "hello.*" or level="info"/,
+        ~s/| trace_id!="" | logfmt/,
+        ~s/| span_id=~"s.*" | logfmt | trace_id=~".+"/
       ])
 
     unwrap = if unwrap?, do: Enum.random([" | unwrap dur", " | logfmt | unwrap dur"]), else: ""
@@ -115,6 +119,65 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
     native_scans = native |> Enum.take_while(& &1) |> length()
     # Most queries must take the native path rather than fall back.
     assert native_scans >= 80
+  end
+
+  @tag :correlation_labels_batch
+  test "native correlation metadata preserves both IDs, attribute ownership and stream collisions" do
+    tenant = "native-correlation-#{System.unique_integer([:positive])}"
+    resource = %{"app" => "correlation"}
+
+    # The first three records share every old cache-key field, but differ
+    # independently in span and trace ID inside the same native input batch.
+    records = [
+      %Log{trace_id: "t1", span_id: "s1"},
+      %Log{trace_id: "t1", span_id: "s2"},
+      %Log{trace_id: "t2", span_id: "s1"},
+      %Log{trace_id: "", span_id: ""},
+      %Log{},
+      %Log{trace_id: "dedicated", span_id: "dedicated-span", attributes: %{"trace_id" => "attribute", "span_id" => ""}},
+      %Log{
+        trace_id: "dedicated",
+        span_id: "dedicated-span",
+        resource: %{
+          "app" => "correlation",
+          "trace_id" => "stream",
+          "trace_id_extracted" => "reserved",
+          "span_id" => "stream-span"
+        }
+      }
+    ]
+
+    records =
+      Enum.map(records, fn record ->
+        %{record | timestamp_ns: 5 * @second, body: "line", resource: Map.merge(resource, record.resource)}
+      end)
+
+    assert :ok = Storage.append(:logs, tenant, records)
+    end_ts = 30 * @second
+
+    expected = %{
+      %{"app" => "correlation", "trace_id" => "t1", "span_id" => "s1"} => 1.0,
+      %{"app" => "correlation", "trace_id" => "t1", "span_id" => "s2"} => 1.0,
+      %{"app" => "correlation", "trace_id" => "t2", "span_id" => "s1"} => 1.0,
+      %{"app" => "correlation"} => 2.0,
+      %{"app" => "correlation", "trace_id" => "attribute", "span_id" => ""} => 1.0,
+      %{
+        "app" => "correlation",
+        "trace_id" => "stream",
+        "trace_id_extracted" => "reserved",
+        "span_id" => "stream-span",
+        "span_id_extracted" => "dedicated-span"
+      } => 1.0
+    }
+
+    assert {:ok, ast} = Parser.parse(~s'count_over_time({app="correlation"}[1m])')
+
+    for module <- [MetricEvalReference, MetricEval] do
+      assert {:ok, {:vector, series}} = evaluate(module, ast, tenant, %{end_ts_ns: end_ts})
+      assert Map.new(series, fn {labels, {^end_ts, value}} -> {labels, value} end) == expected
+    end
+
+    assert_received :native_log_metric_scan
   end
 
   test "failed unwrap replaces an earlier typed-filter error before metric validation" do

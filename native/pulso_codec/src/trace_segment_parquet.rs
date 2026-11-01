@@ -540,12 +540,12 @@ pub(crate) fn select_prepared<'a>(
         .filter(
             |i| match metadata.row_group(*i).column(ts_index).statistics() {
                 Some(Statistics::Int64(s)) => {
-                    !start
+                    start
                         .zip(s.max_opt())
-                        .is_some_and(|(v, m)| v > i128::from(*m))
-                        && !end
+                        .is_none_or(|(v, m)| v <= i128::from(*m))
+                        && end
                             .zip(s.min_opt())
-                            .is_some_and(|(v, m)| v < i128::from(*m))
+                            .is_none_or(|(v, m)| v >= i128::from(*m))
                 }
                 _ => true,
             },

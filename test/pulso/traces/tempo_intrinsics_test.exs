@@ -12,10 +12,20 @@ defmodule Pulso.Traces.TempoIntrinsicsTest do
     assert Base.encode16(:crypto.hash(:sha256, raw), case: :lower) ==
              "6965837a433969eacc439f6c651a61dcd1ab350f112bd428244d50aab0a4f043"
 
-    Pulso.JSON.decode!(raw)
+    # Retain the actual v2.9 oracle, but use the independently frozen v3 names
+    # for its vocabulary-only row. The seven value expectations are unchanged.
+    names =
+      File.read!(Path.expand("../../fixtures/traces/tempo_integration/intrinsic-names.json", __DIR__))
+      |> Pulso.JSON.decode!()
+
+    for c <- Pulso.JSON.decode!(raw) do
+      if c["key"] == "",
+        do: %{c | "response" => %{"scopes" => [%{"name" => "intrinsic", "tags" => names}]}},
+        else: c
+    end
   end
 
-  test "actual public querier without backend establishes static names and seven value shortcuts" do
+  test "versioned public vocabulary and seven v2.9 value shortcuts work without a backend" do
     Runtime.put_env(:pulso, TempoSearch, enabled: true)
     Runtime.put_env(:pulso, Storage, adapter: FailingStorage)
     assert length(cases()) == 8
@@ -49,7 +59,7 @@ defmodule Pulso.Traces.TempoIntrinsicsTest do
   test "virtual shortcuts do not infer arbitrary empty values, accept filters, or apply v2 status semantics to v1" do
     Runtime.put_env(:pulso, TempoSearch, enabled: true)
 
-    for key <- ["error", "status.code"] do
+    for key <- ~w(error status.code link:spanID link:traceID span:id span:parentID trace:id) do
       assert {:error, :unsupported_trace_discovery} = TempoDiscovery.query("static", "intrinsic", key)
     end
 

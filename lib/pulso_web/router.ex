@@ -51,6 +51,8 @@ defmodule PulsoWeb.Router do
   scope "/", PulsoWeb do
     pipe_through :api
 
+    post "/api/v1/reliability/investigations/:id/complete", ReliabilityController, :complete
+
     post "/api/v1/alerting/import/preview", AlertingController, :import_preview
     get "/api/v1/alerting/rules", AlertingController, :index
     get "/api/v1/alerting/rules/:id", AlertingController, :show

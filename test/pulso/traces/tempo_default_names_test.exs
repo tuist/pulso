@@ -20,7 +20,16 @@ defmodule Pulso.Traces.TempoDefaultNamesTest do
         {name, rows}
       end
 
-    {datasets, Pulso.JSON.decode!(raw)}
+    # Preserve the v2.9 producer bytes and all stored-name expectations. Only
+    # its static vocabulary is superseded by the independently pinned v3 list.
+    names = File.read!(Path.join(dir, "tempo_integration/intrinsic-names.json")) |> Pulso.JSON.decode!()
+
+    cases =
+      for c <- Pulso.JSON.decode!(raw) do
+        put_in(c, ["complete", "scopes", Access.filter(&(&1["name"] == "intrinsic")), "tags"], names)
+      end
+
+    {datasets, cases}
   end
 
   defp state(q, floor \\ 0) do
@@ -175,6 +184,65 @@ defmodule Pulso.Traces.TempoDefaultNamesTest do
     assert {:error, :query_resource_limit} = NIF.tempo_discovery_add(s, blob)
     assert :fallback = NIF.tempo_discovery_finish(s)
     assert {:error, :query_resource_limit} = TempoDiscovery.json(rows, "none", "", [])
+  end
+
+  @tag :name_vocabulary
+  test "all 25 pinned intrinsic suggestions reserve capacity before filtered or unfiltered stored names" do
+    {:ok, [base], 0} =
+      Traces.decode(%{
+        "resourceSpans" => [
+          %{
+            "resource" => %{"attributes" => [%{"key" => "service.name", "value" => %{"stringValue" => "bound"}}]},
+            "scopeSpans" => [
+              %{
+                "spans" => [
+                  %{
+                    "traceId" => String.duplicate("1", 32),
+                    "spanId" => String.duplicate("2", 16),
+                    "startTimeUnixNano" => "1",
+                    "endTimeUnixNano" => "2"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      })
+
+    Runtime.put_env(:pulso, TempoSearch, enabled: true)
+
+    # 25 static names + one resource service.name hint leave 4,974 span keys.
+    # Each source row stays below normal OTLP per-owner attribute admission.
+    for count <- [4974, 4975] do
+      rows =
+        for chunk <- Enum.chunk_every(1..count, 100) do
+          attrs = for i <- chunk, do: %{"key" => "key#{i}", "value" => %{"stringValue" => "x"}}
+          %{base | attributes: Map.new(attrs, &{&1["key"], "x"}), otlp: Map.put(base.otlp, "attributes", attrs)}
+        end
+
+      tenant = "boundary-#{count}"
+      assert :ok = Storage.append(:traces, tenant, rows)
+
+      for q <- ["", ~s'{resource.service.name="bound"}'] do
+        for result <- [native(rows, q), TempoDiscovery.json(rows, "none", "", discovery_query: q)] do
+          if count == 4974 do
+            assert {:ok, json} = result
+            scopes = Pulso.JSON.decode!(json)["scopes"]
+            assert Enum.sum(Enum.map(scopes, &length(&1["tags"]))) == 5000
+            assert Enum.find(scopes, &(&1["name"] == "span"))["tags"] == Enum.sort(for i <- 1..4974, do: "key#{i}")
+          else
+            assert result == {:error, :query_resource_limit}
+          end
+        end
+
+        if count == 4974 do
+          assert {:ok, json} = TempoDiscovery.query(tenant, "none", "", 1, "json", q)
+          assert length(Pulso.JSON.decode!(json)["tagNames"]) == 4975
+        else
+          assert {:error, :query_resource_limit} = TempoDiscovery.query(tenant, "none", "", 1, "json", q)
+        end
+      end
+    end
   end
 
   test "default names charge all five scope owners and attrs before false filters under one work ceiling" do

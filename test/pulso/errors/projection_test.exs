@@ -289,10 +289,12 @@ defmodule Pulso.Errors.ProjectionTest do
   end
 
   test "competing projectors publish one coverage and change sequence", ctx do
-    assert :ok = S3.append(:logs, ctx.tenant, [record(1, ctx.now - 10)])
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    assert :ok = S3.append(:logs, ctx.tenant, for(id <- 1..5, do: record(id, finish - window - id)))
     assert {:ok, _} = step(ctx)
     assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
-    assert :ok = S3.append(:logs, ctx.tenant, [record(2, ctx.now - 5)])
+    assert :ok = S3.append(:logs, ctx.tenant, for(id <- 6..20, do: record(id, finish - id)))
     limits = Runtime.get_env(:pulso, Pulso.QueryRunner, [])
     Runtime.put_env(:pulso, Pulso.QueryRunner, Keyword.put(limits, :class_limits, %{alerting: 2}))
     key = Projection.key(ctx.tenant, "1")
@@ -308,8 +310,19 @@ defmodule Pulso.Errors.ProjectionTest do
     results = Enum.map(tasks, &Task.await(&1, 10_000))
     assert Enum.count(results, &match?({:ok, _}, &1)) == 1
     assert Enum.count(results, &(&1 == {:error, :projection_conflict_or_unconfirmed})) == 1
-    assert {:ok, %{"changes" => [%{"kind" => "issue_observation", "sequence" => 2}]}} = changes(ctx, cursor)
-    assert {:ok, %{"results" => [%{"retained_count" => 2}]}} = Projection.read(:issues, ctx.tenant, "1")
+
+    assert {:ok,
+            %{
+              "changes" => [
+                %{"kind" => "issue_observation", "sequence" => 2},
+                %{"kind" => "error_rate_increase", "sequence" => 3}
+              ],
+              "next_cursor" => next
+            }} = changes(ctx, cursor)
+
+    assert {:ok, %{"results" => [%{"retained_count" => 20}]}} = Projection.read(:issues, ctx.tenant, "1")
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, next)
   end
 
   test "an unseen source that appears and expires during downtime forces reset and a fresh baseline", ctx do
@@ -366,5 +379,163 @@ defmodule Pulso.Errors.ProjectionTest do
     root = Pulso.JSON.decode!(bytes)
     assert :ok = ObjectStore.delete(ctx.config, hd(root["pages"])["key"])
     assert {:error, :reset_required} = changes(ctx)
+  end
+
+  test "MCP replays one measured error-rate finding with retained evidence despite retries and source deletion", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    baseline = for id <- 1..5, do: record(id, finish - window - id)
+    current = for id <- 6..19, do: record(id, finish - id)
+    assert :ok = S3.append(:logs, ctx.tenant, baseline ++ current)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+
+    # Fourteen is below the threshold; copies of one SDK event cannot make 15.
+    assert :ok = S3.append(:logs, ctx.tenant, current ++ current)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, cursor)
+
+    assert :ok = S3.append(:logs, ctx.tenant, [record(20, finish - 20)])
+    assert {:ok, _} = step(ctx)
+    args = %{"tenant" => ctx.tenant, "project" => "1", "cursor" => cursor}
+    assert {:ok, [%{"text" => json}]} = Tools.call("list_error_changes", args)
+    result = Pulso.JSON.decode!(json)
+    assert [finding] = Enum.filter(result["changes"], &(&1["kind"] == "error_rate_increase"))
+
+    assert finding["detector"] == "error-count-ratio-v1"
+    assert finding["service"] == "api"
+    assert finding["baseline"] == %{"start_ns" => finish - 2 * window, "end_ns" => finish - window, "count" => 5}
+    assert finding["current"] == %{"start_ns" => finish - window, "end_ns" => finish, "count" => 15}
+    assert finding["ratio"] == 3.0
+    assert finding["coverage"] == "retained_snapshot"
+    assert finding["source_etag"] == result["source_etag"]
+    assert finding["history_floor_ns"] == result["history_floor_ns"]
+    assert length(finding["evidence"]) == 3
+    assert Enum.map(finding["evidence"], & &1["timestamp_ns"]) == [finish - 6, finish - 7, finish - 8]
+    assert Enum.all?(finding["evidence"], &(&1["title"] == "one" and &1["service"] == "api"))
+
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, result["next_cursor"])
+    assert {:ok, snapshot} = S3.log_snapshot(ctx.tenant, [])
+    for segment <- snapshot.segments, do: assert(:ok = ObjectStore.delete(ctx.config, segment.key))
+    assert {:ok, [%{"text" => replay}]} = Tools.call("list_error_changes", args)
+    assert finding in Pulso.JSON.decode!(replay)["changes"]
+  end
+
+  test "rate windows are half-open and service-local, with no bootstrap or sparse-baseline findings", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    baseline = for id <- 1..5, do: record(id, finish - 2 * window)
+    spike = for id <- 6..19, do: record(id, finish - window)
+    sparse = for id <- 21..24, do: record(id, finish - window - 1, "sparse")
+    sparse_spike = for id <- 25..44, do: record(id, finish - 1, "sparse")
+    historical = for id <- 86..105, do: record(id, if(id < 91, do: finish - window - 1, else: finish - 1), "historical")
+    assert :ok = S3.append(:logs, ctx.tenant, baseline ++ spike ++ sparse ++ sparse_spike ++ historical)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => [%{"kind" => "baseline_ready"}], "next_cursor" => cursor}} = changes(ctx)
+
+    # A first observation is not a regression, nor is a different service's count.
+    other_service = for id <- 45..64, do: %{record(id, finish - 1) | service: "worker"}
+    outside = for id <- 65..84, do: record(id, finish)
+    assert :ok = S3.append(:logs, ctx.tenant, other_service ++ outside)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => observed, "next_cursor" => next}} = changes(ctx, cursor)
+    refute Enum.any?(observed, &(&1["kind"] == "error_rate_increase"))
+
+    assert :ok = S3.append(:logs, ctx.tenant, [record(85, finish - window)])
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => observed, "next_cursor" => next}} = changes(ctx, next)
+
+    assert [%{"service" => "api", "baseline" => %{"count" => 5}, "current" => %{"count" => 15}}] =
+             Enum.filter(observed, &(&1["kind"] == "error_rate_increase"))
+
+    # The next completed window has 20 vs 15, below the 3x threshold.
+    assert {:ok, _} = step(ctx, finish + window)
+    assert {:ok, %{"changes" => observed}} = changes(ctx, next)
+    refute Enum.any?(observed, &(&1["kind"] == "error_rate_increase"))
+  end
+
+  test "rate findings commit with projection progress and cannot escape failed publication", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    baseline = for id <- 1..5, do: record(id, finish - window - id)
+    assert :ok = S3.append(:logs, ctx.tenant, baseline)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+    spike = for id <- 6..20, do: record(id, finish - id)
+    assert :ok = S3.append(:logs, ctx.tenant, spike)
+    key = Projection.key(ctx.tenant, "1")
+    Agent.update(ctx.agent, &%{&1 | faults: %{{"PUT", key} => {403, :before, 1}}})
+    assert {:error, :projection_conflict_or_unconfirmed} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, cursor)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => observed, "next_cursor" => next}} = changes(ctx, cursor)
+    assert [_] = Enum.filter(observed, &(&1["kind"] == "error_rate_increase"))
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, next)
+  end
+
+  test "a retained floor inside the comparison interval exposes insufficient history rather than a finding", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    assert :ok = S3.append(:logs, ctx.tenant, for(id <- 1..5, do: record(id, finish - window - id)))
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+    assert :ok = S3.append(:logs, ctx.tenant, for(id <- 6..20, do: record(id, finish - id)))
+    config = Map.merge(ctx.config, %{logs_retention_days: 1, retention_mode: "enforce"})
+    clock = ctx.now + @day - 1
+    assert {:ok, _} = Retention.advance(ctx.tenant, "logs", config, now_ns: clock, now_ms: div(clock, 1_000_000))
+    Runtime.put_env(:pulso, S3, config)
+    assert {:ok, %{"rate_detector" => %{"status" => "insufficient_history"}}} = step(ctx)
+    assert {:ok, %{"changes" => [%{"kind" => "reset"}, %{"kind" => "baseline_ready"}]}} = changes(ctx, cursor)
+  end
+
+  test "catchup withholds rate findings until every candidate is reconciled", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    assert :ok = S3.append(:logs, ctx.tenant, for(id <- 1..5, do: record(id, finish - window - id)))
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+    for id <- 6..38, do: assert(:ok = S3.append(:logs, ctx.tenant, [record(id, finish - id)]))
+    assert {:ok, %{"rate_detector" => %{"status" => "catching_up"}}} = step(ctx)
+    assert {:ok, %{"changes" => []}} = changes(ctx, cursor)
+    assert {:ok, %{"rate_detector" => %{"status" => "ready"}}} = step(ctx)
+    assert {:ok, %{"changes" => observed}} = changes(ctx, cursor)
+
+    assert [%{"current" => %{"count" => 33}, "baseline" => %{"count" => 5}}] =
+             Enum.filter(observed, &(&1["kind"] == "error_rate_increase"))
+  end
+
+  test "many findings with large compact examples remain replayable within page byte limits", ctx do
+    window = 300_000_000_000
+    finish = div(ctx.now, window) * window
+    title = String.duplicate("🫀", 500)
+
+    records =
+      for issue <- 1..64, id <- 1..19 do
+        timestamp = if id <= 5, do: finish - window - id, else: finish - id
+        row = record(issue * 100 + id, timestamp, "issue-#{issue}")
+        %{row | body: Map.put(row.body, "message", title)}
+      end
+
+    assert :ok = S3.append(:logs, ctx.tenant, records)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
+
+    incoming =
+      for issue <- 1..64 do
+        row = record(issue * 100 + 20, finish - 20, "issue-#{issue}")
+        %{row | body: Map.put(row.body, "message", title)}
+      end
+
+    assert :ok = S3.append(:logs, ctx.tenant, incoming)
+    assert {:ok, _} = step(ctx)
+    assert {:ok, %{"changes" => first, "next_cursor" => next}} = changes(ctx, cursor)
+    assert {:ok, %{"changes" => second}} = changes(ctx, next)
+    findings = Enum.filter(first ++ second, &(&1["kind"] == "error_rate_increase"))
+    assert length(first ++ second) == 128
+    assert length(findings) == 64
+    assert length(Enum.uniq_by(findings, & &1["issue_id"])) == 64
+    assert Enum.all?(findings, fn finding -> Enum.all?(finding["evidence"], &(&1["title"] == title)) end)
   end
 end

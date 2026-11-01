@@ -17,6 +17,13 @@ owners. Omitted or paired-zero HTTP search bounds scan bounded retained context,
 not an ingester-only tier; partial bounds reject. Discovery/window-local grammar,
 storage formats and resource ceilings are unchanged. See `docs/trace-query-expressions.md`.
 
+Tempo name discovery advertises 25 pinned intrinsic suggestions, superseding
+the 20-name v2.9 snapshots below. The five ID suggestions are vocabulary only,
+not ID-value discovery. All 25 reserve entries inside the existing global
+5,000-pair default-name ceiling, including before v1 flattening. Upgrade serving
+apps/native artifacts together; native tuples and storage/keyed bytes are
+unchanged. See `docs/traces.md#static-intrinsic-vocabulary`.
+
 Trace metrics capability **3** adds bounded scalar/vector arithmetic and
 value-preserving scalar filters. All unique leaves share one provider scan and
 native series/point/selector-work/group-byte budgets; native decode repeats per
@@ -25,7 +32,14 @@ group labels, broadcast only truly ungrouped series, omit NaNs and fail whole on
 storage/budget errors without resetting scan budgets. Upgrade all serving
 app/native pairs; trace/storage/keyed tuples are unchanged. See `docs/querying.md`.
 
-Current log codec tuple is `{1,1,16}`, superseding the log API snapshots below.
+Current log codec tuple is `{1,1,17}`, superseding the log API snapshots below.
+Dedicated nonempty log trace_id/span_id fields fill absent structured-metadata
+names for LogQL, never overwrite explicit attributes (including empty values)
+or become stream labels. Existing one-suffix stream/parser collision ownership
+applies. Native range scans project both IDs and key per-batch label reuse on
+both fields. All 88 ordinary sample-extractor calls now replay through HTTP/
+Parquet/S3, including the three original trace_id cases. Upgrade all query-serving
+app/native pairs; storage/keyed bytes and resource ceilings are unchanged.
 Regexp-parser admission inspects native named-capture metadata instead of
 compiling PCRE, preserving supported Go flag/quantifier grammar. Missing real
 named captures still reject before storage. Upgrade all serving app/native pairs;
@@ -578,8 +592,17 @@ quantile repair uses the upstream strict tolerance, minimum-normal absolute
 floor and maximum-float-capped relative scale; large finite counts no longer
 fail arithmetic and subnormals normalize correctly. Six public HTTP controls
 and 10,030 actual pinned Go quantile/repair comparisons cover the extremes.
-Selected Mimir engine corpus is now 1590 evaluations/85 files/5770 memory/S3 HTTP
-requests. Other native arithmetic and extended repair summaries/AST positions
+Selected Mimir engine corpus is now 1733 evaluations/94 files/6302 memory/S3 HTTP
+requests. Complete absence-over-time and staleness blocks plus label-replace,
+absence, timestamp and rounding selections retain original oracles. Complete
+upstream selectors/collision and Mimir staleness/subqueries/collision files add
+62 commands, including seven repeated offset evaluations. Multi-metric
+absence preserves source identities until testing presence, avoiding premature
+name-removal collisions; top-level range-query matrices report the exact default
+Mimir diagnostic before storage. Loki's complete 68-query reserved error-label
+comparison matrix rejects typed comparisons as parse errors before storage,
+with string/ordinary-label and error-ownership policies unchanged.
+Other native arithmetic and extended repair summaries/AST positions
 remain open. Upgrade query
 apps; no native/storage/keyed-byte change. See `docs/querying.md`.
 

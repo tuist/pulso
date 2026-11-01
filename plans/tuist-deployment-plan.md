@@ -2,6 +2,30 @@
 
 Status: implementation started. Deployment and replacement gates remain open. Based on the repositories inspected on October 2, 2026.
 
+## Product direction: proactive reliability workflow
+
+The first intended Tuist experience is now an external GPT workflow reacting to
+Pulso reliability signals, investigating through read-only MCP, and proposing or
+taking separately authorized actions. The target periodically assesses bounded
+log/metric/trace summaries per service, including ordinary unflagged windows,
+through an opt-in decision model. Keep model assessment, incremental object
+work and external investigation allowances separate; use durable reservations,
+episode coalescing and fleet-wide external concurrency limits, not a workflow
+per event/window. Existing error-change polling and native alert replay are
+integration controls, not the only gate to investigation. See the
+[reliability-first plan](reliability-first.md) for the implementation sequence.
+
+Full Grafana Cloud replacement is a separate optional-archive/client-compatibility
+track, not a prerequisite for this workflow. Preserve all replacement and paging
+gates below if that track is pursued. The older milestones describe that track,
+not the critical path for proving signal-driven value. Keep enough raw history
+for today's derived projections until durable processing/evidence is decoupled;
+this design does not authorize reducing existing retention or changing production.
+The external runtime owns workflow checkpoints, investigative GPT/tool spend,
+action policy and human approval; Pulso's proposed assessment calls have their
+own constrained provider boundary. No companion repository or deployment is
+changed by this plan.
+
 ## Current continuation checkpoint
 
 The broad protocol/storage increment landed in PR #34 (`f7a3ebe`). The milestone

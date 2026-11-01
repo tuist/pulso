@@ -56,9 +56,18 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
   for adapter <- [Memory, S3],
       {file, count} <- [
-        {"upstream-math.test", 21},
+        {"upstream-math.test", 25},
+        {"upstream-absence.test", 15},
+        {"upstream-timestamp.test", 7},
+        {"upstream-absence-over-time.test", 27},
+        {"upstream-label-replace.test", 11},
+        {"upstream-staleness.test", 17},
+        {"upstream-selectors.test", 31},
+        {"upstream-collision.test", 2},
+        {"mimir-staleness.test", 2},
+        {"mimir-subqueries.test", 25},
         {"mimir-math.test", 7},
-        {"collision.test", 2},
+        {"collision.test", 4},
         {"upstream-clamp.test", 27},
         {"mimir-clamp.test", 9},
         {"upstream-presence.test", 19},
@@ -148,6 +157,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
     @tag duration_expressions: file == "upstream-duration-expressions.test"
     @tag grammar_batch: String.starts_with?(file, "upstream-default-subquery")
     @tag result_types_batch: String.ends_with?(file, "-results.test")
+    @tag absence_timestamp_batch: file in ~w(upstream-math.test upstream-absence.test upstream-timestamp.test)
+    @tag absence_replace_staleness_batch:
+           file in ~w(upstream-absence-over-time.test upstream-label-replace.test upstream-staleness.test)
+    @tag complete_selector_subquery_batch:
+           file in ~w(upstream-selectors.test upstream-collision.test mimir-staleness.test mimir-subqueries.test collision.test)
     @tag histogram_annotations_batch: String.starts_with?(file, "upstream-histogram-")
     @tag histogram_quantiles_batch: String.ends_with?(file, "-histogram-quantiles.test")
     @tag histogram_fraction_batch: String.ends_with?(file, "-histogram-fractions.test")
@@ -2658,6 +2672,89 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
                    query
           end
         end
+      end
+    end
+
+    @tag adapter: adapter
+    @tag :absence_replace_staleness_batch
+    test "Pulso absence preserves multi-metric presence across types and expiry through #{inspect(adapter)}" do
+      samples =
+        records(~s(first{service="api"} 0 _ stale), 5_000_000_000)
+        |> Enum.map(&%{&1 | timestamp_ns: &1.timestamp_ns + 10_000_000_000})
+
+      histogram = value("{{count:0}}")
+
+      samples =
+        samples ++
+          [
+            %MetricSample{
+              labels: %{"__name__" => "second", "service" => "api"},
+              timestamp_ns: 15_000_000_000,
+              histogram: histogram
+            },
+            %MetricSample{
+              labels: %{"__name__" => "second", "service" => "api"},
+              timestamp_ns: 25_000_000_000,
+              histogram: %{histogram | sum: :stale}
+            },
+            %MetricSample{
+              labels: %{"__name__" => "third", "service" => "api"},
+              timestamp_ns: 30_000_000_000,
+              value: :nan
+            }
+          ]
+
+      assert :ok = Storage.append(:metrics, "absence-control", samples)
+      query = ~s|absent_over_time({service="api"}[10s])|
+
+      for method <- [:get, :post] do
+        for {time, expected} <- [
+              {"10", []},
+              {"20", []},
+              {"25", [~s({service="api"} 1)]},
+              {"30", []},
+              {"40", [~s({service="api"} 1)]}
+            ] do
+          params = %{query: query, time: time}
+          conn = build_conn() |> put_req_header("x-scope-orgid", "absence-control")
+
+          conn =
+            if method == :get,
+              do: get(conn, "/api/v1/query", params),
+              else:
+                conn
+                |> put_req_header("content-type", "application/x-www-form-urlencoded")
+                |> post("/api/v1/query", URI.encode_query(params))
+
+          assert %{"status" => "success", "data" => %{"result" => result}} = json_response(conn, 200)
+          assert_samples(result, expected, value(time), 1, query)
+        end
+      end
+
+      request(
+        "/api/v1/query_range",
+        %{query: query, start: "10", end: "40", step: "5"},
+        [~s({service="api"} _ _ _ 1 _ _ 1)],
+        "absence-control",
+        query,
+        10,
+        5
+      )
+
+      for limits <- [[max_samples: 1], [max_work: 1]] do
+        Runtime.put_env(:pulso, Evaluator, limits)
+
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "absence-control")
+          |> get("/api/v1/query", query: query, time: "20")
+
+        assert %{
+                 "status" => "error",
+                 "errorType" => "execution",
+                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+               } =
+                 json_response(conn, 422)
       end
     end
 
@@ -5805,14 +5902,17 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
   defp nanoseconds("0"), do: 0
 
   defp nanoseconds(duration) do
-    parts = Regex.scan(~r/(\d+)(ms|s|m)/, duration)
+    parts = Regex.scan(~r/(\d+)(ms|s|m|h)/, duration)
     assert Enum.map_join(parts, &hd/1) == duration
 
     Enum.sum(
       for [_, count, unit] <- parts,
           do:
             String.to_integer(count) *
-              Map.fetch!(%{"ms" => 1_000_000, "s" => 1_000_000_000, "m" => 60_000_000_000}, unit)
+              Map.fetch!(
+                %{"ms" => 1_000_000, "s" => 1_000_000_000, "m" => 60_000_000_000, "h" => 3_600_000_000_000},
+                unit
+              )
     )
   end
 
@@ -5848,11 +5948,24 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
     cond do
       path == "/api/v1/query_range" and
           Enum.any?(expected, &String.starts_with?(&1, ["expect string ", "expect range vector "])) ->
-        assert %{"status" => "error", "errorType" => "bad_data", "error" => "Invalid or unsupported query parameters."} ==
-                 json_response(conn, 400)
+        assert_range_type_rejection(conn, expected)
 
       Enum.any?(expected, &String.starts_with?(&1, ["expect fail regex:", "expect fail msg:invalid label name"])) ->
         assert_parse_rejection(conn, expected)
+
+      params.query in [
+        ~s|label_replace(testmetric, "dst", "value-$1", "src", "(.*")|,
+        ~S|label_replace(testmetric, "\xff", "", "src", "(.*)")|
+      ] ->
+        # These two original failures are admission errors, not duplicate-series
+        # execution errors. Upstream specifies failure without diagnostic text.
+        assert expected == ["expect fail"]
+
+        assert %{
+                 "status" => "error",
+                 "errorType" => "bad_data",
+                 "error" => "Invalid or unsupported query parameters."
+               } == json_response(conn, 400)
 
       Enum.any?(expected, &String.starts_with?(&1, "expected_fail_message invalid ")) ->
         assert ["expected_fail_message " <> message] = expected
@@ -5864,8 +5977,8 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{"status" => "error", "errorType" => "execution", "error" => message} == json_response(conn, 422)
 
-      String.starts_with?(command, "eval_fail") or expected == ["expect fail"] or
-          expected == ["expect fail msg:vector cannot contain metrics with the same labelset"] ->
+      String.starts_with?(command, "eval_fail") or
+          expected in [["expect fail"], ["expect fail msg:vector cannot contain metrics with the same labelset"]] ->
         assert expected in [
                  [],
                  ["expect fail"],
@@ -5886,7 +5999,18 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
     end
   end
 
+  defp assert_range_type_rejection(conn, expected) do
+    message =
+      if Enum.any?(expected, &String.starts_with?(&1, "expect range vector ")),
+        do:
+          "invalid parameter \"query\": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar",
+        else: "Invalid or unsupported query parameters."
+
+    assert %{"status" => "error", "errorType" => "bad_data", "error" => message} == json_response(conn, 400)
+  end
+
   defp assert_success(conn, expected, path, command, first, step) do
+    assert conn.status == 200, "#{command}: #{conn.status} #{conn.resp_body}"
     assert %{"status" => "success", "data" => data} = response = json_response(conn, 200)
     ordered? = "expect ordered" in expected or String.starts_with?(command, "eval_ordered ")
     expected = List.delete(expected, "expect ordered")

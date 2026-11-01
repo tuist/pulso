@@ -5,10 +5,11 @@ Revision: **`dd039cdd4ba466adb5d28280bf1b8a374a98432e`**.
 The executable fixtures are embedded in
 [`mimir_service_conformance_test.exs`](../../../../pulso_web/controllers/mimir_service_conformance_test.exs).
 They are ports of the public request/response portions of actual Mimir service
-integration tests, not invented cases labelled upstream. This is **51 selected
-scenario replays**, plus 22 separately named Pulso regression/control tests,
-not the complete Mimir integration suite. The existing math corpus in the parent
-directory is separate and remains unchanged.
+integration tests, not invented cases labelled upstream. This is **52 selected
+scenario replays** (51 ExUnit tests: the scalar/range frontend pair shares one),
+plus 23 separately named Pulso regression/control tests and five shared-regex
+control wrappers: **79 ExUnit tests**, not the complete Mimir integration suite.
+The existing math corpus in the parent directory is separate and remains unchanged.
 
 ## Sources and exact selection
 
@@ -25,7 +26,8 @@ All links below are pinned to the revision above.
 | [`TestIngesterQuerying`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/ingester_test.go#L23-L582) | All seven table entries: `float series`; `integer histogram series`; `float histogram series`; `series switching from float to integer histogram to float histogram`; `series including float and native histograms at same timestamp`; `float series where sample timestamps don't align with query step`; `query that returns no results` | 7 |
 | [`TestQueryFrontendWithExplicitLookbackDelta` → `queryLookbackDeltaTest`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L1067-L1203) | Default 5m lookback at sample+3m / sample+6m; explicit 10m / 1m at sample+6m. Each checks instant and range queries with the upstream ±100m / 100m step geometry. | 4 |
 | [`testQueryFrontend`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L359-L454) | User-0's `scalar(series_1)` and `series_1[5m]` instant requests, preserving complete type, timestamp and value assertions | 2 |
-| [`TestQueryFrontendErrorMessageParity` → `testQueryFrontendErrorMessageParityScenario`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L566-L905) | Eight portable invalid range requests: maximum resolution; negative step; unknown function; range vector instead of instant vector; start after end; malformed step; malformed start; range query with range vector. Exact HTTP/status/errorType and explicitly adapted diagnostic text (details below). | 8 |
+| [`TestQueryFrontendErrorMessageParity` → `testQueryFrontendErrorMessageParityScenario`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L566-L905) | Eight portable invalid range requests: maximum resolution; negative step; unknown function; range vector instead of instant vector; start after end; malformed step; malformed start; range query with range vector. Five parameter rows and the top-level range-result row assert complete original envelopes; two expression rows retain adapted diagnostics (details below). | 8 |
+| [Same frontend table, `execution error`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L865-L872) | All 50 source metric series, original grouped binary expression, -1m..now / 1m range, exact HTTP 422 and complete execution-error envelope including the original diagnostic | 1 |
 | [`TestQuerierWithBlocksStorageRunningInSingleBinaryMode`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L311-L517) → [`testMetadataQueriesWithBlocksStorage`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L573-L790) | All four helper time windows: inside head; inside ingester/outside head; partially inside ingester; entirely outside ingester. Every series lookup, metric-name values selector (including OR), and label-name expectation in that helper is retained: 29 discovery requests. | 4 |
 | [`TestHashCollisionHandling`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/querier_test.go#L983-L1068) | One RW1 push containing both `fingerprint_collision` series under `user-0`, then the complete instant vector at the shared sample timestamp | 1 |
 | [`TestFormatQueryAPIEndpoint`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/api_endpoints_test.go#L89-L112) | Exact GET expression `count(up)by(foo)`, HTTP 200 and expected `data="count by (foo) (up)"`; no storage request | 1 |
@@ -164,10 +166,13 @@ including the shortest-roundtrip spellings of `18.4 * float64(i+1)` sums.
     literals, relative bounds and numeric-second steps from the raw client.
     They use the harness's fixed clock and existing `user-1` tenant, rather
     than upstream's `fake` / `query-sharding` tenants and wall clock. The 50
-    seeded metric series and tenant policy/sharding/remote-execution/client
-    permutations are omitted: none is needed for these pre-storage rejections.
-    Diagnostic text is explicitly adapted to Pulso's existing generic message;
-    this is **not upstream error-message parity**. Omitted-resolution subqueries
+    seeded metric series are omitted for these eight pre-storage rejections,
+    but retained for the separate execution-error replay below. Tenant policy,
+    sharding, remote-execution and client permutations are omitted.
+    Five request-parameter rows and the top-level range-result row now retain
+    upstream diagnostic text exactly; the other two expression rows retain
+    Pulso's generic message. This is **not
+    complete upstream error-message parity**. Omitted-resolution subqueries
     and instant top-level range results are now supported. Range-query requests
     still reject range expressions, including the last selected row, even with
     equal bounds. A separate Pulso control checks GET/form POST and verifies
@@ -356,9 +361,11 @@ that method/header behavior via its existing connection helper, with the
 documented path and tenant adaptations.
 
 All eight retain upstream **HTTP 400**, `status=error`, `errorType=bad_data`.
-Mimir's row-specific diagnostic strings are deliberately **not** asserted.
-Every test asserts this complete, unchanged Pulso envelope, including no extra
-keys, rather than a status-only or partial-map match:
+The five parameter rows and top-level range-result row now assert Mimir's complete
+original envelopes, including their diagnostic strings, as detailed below. The two
+expression rows (`unknown function`, `range vector instead of instant vector`)
+still assert this complete adapted Pulso
+envelope, including no extra keys, rather than a partial-map match:
 
 ```json
 {"status":"error","errorType":"bad_data","error":"Invalid or unsupported query parameters."}
@@ -367,8 +374,8 @@ keys, rather than a status-only or partial-map match:
 Initially `(sum(rate(up[1m])))[5m:]` rejected because omitted resolutions were
 unsupported. The grammar and result-type batches now support them inside range
 functions and as top-level instant results. The selected range request still
-rejects, now with `{:error, :invalid_result_type}`.
-Exact diagnostic parity remains a gap.
+rejects, now with `{:error, :range_result_for_range_query}` and the default
+upstream diagnostic below. Other expression-diagnostic parity remains a gap.
 No selected row unexpectedly succeeded or returned a different HTTP status.
 
 Each test uses the existing async, owned loopback S3 provider/native
@@ -376,9 +383,10 @@ object-store/manifest/Parquet context without application or OS environment
 mutation. Its provider request list is empty before and after the invalid GET:
 no LIST, HEAD, GET, PUT or DELETE is issued. These cases intentionally do not
 seed data or create Parquet objects; existing valid scenarios continue to
-exercise native Parquet writes/reads. No synthetic control tests or runtime
-changes were needed or made, and the existing UTF-8 and fingerprint additions
-are preserved.
+exercise native Parquet writes/reads. The initial coverage-only increment needed
+no runtime changes. The parameter-diagnostic follow-up below adds runtime
+validation and separately named controller controls, preserving the existing
+UTF-8 and fingerprint additions.
 
 SHA-256 provenance from the clean Mimir checkout at the pinned revision:
 
@@ -415,6 +423,99 @@ mix test test/pulso_web/controllers/mimir_service_conformance_test.exs --warning
 mix test test/pulso_web/controllers/mimir_service_conformance_test.exs:645 --warnings-as-errors --seed 255007
 mix format --check-formatted test/pulso_web/controllers/mimir_service_conformance_test.exs
 git diff --check -- test/pulso_web/controllers/mimir_service_conformance_test.exs test/fixtures/promql/mimir/services/README.md
+```
+
+### Five exact request-parameter diagnostics
+
+The existing five rows now preserve the full original `expJSON` objects from
+`TestQueryFrontendErrorMessageParity`, not merely HTTP status or selected keys:
+
+| Row | Exact `error` value (the other fields remain `status=error`, `errorType=bad_data`) |
+| --- | --- |
+| maximum resolution error | `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)` |
+| negative step | `invalid parameter "step": zero or negative query resolution step widths are not accepted. Try a positive integer` |
+| start after end | `invalid parameter "end": end timestamp must not be before start time` |
+| wrong duration specified in step | `invalid parameter "step": cannot parse "123notafloat" to a valid duration` |
+| wrong timestamp in start | `invalid parameter "start": cannot parse "depths-of-time" to a valid timestamp` |
+
+No selected inputs, expressions, relative bounds, methods, tenants, fixed clocks
+or storage assertions changed. All eight rows still prove zero provider requests.
+The two remaining expression diagnostics are explicitly adapted, not exact;
+the top-level range-result follow-up below supersedes its earlier generic error.
+
+The independently written range-request validation attributes timestamp failures
+to their field, rejects reversed bounds before parsing step, distinguishes numeric
+nonpositive steps from malformed durations and reports the existing point limit.
+Authorization still runs first. Exact decimal/exponent seconds, RFC3339 timestamps,
+nanosecond rounding, admitted duration grammar and evaluator/query budgets remain
+unchanged. In particular, Pulso's existing ceiling is **11,000 inclusive evaluation
+points**: 10,999 intervals succeed; 11,000 intervals reject. The pinned upstream
+helper checks `> 11000` intervals and can admit an extra endpoint; this boundary
+is deliberately **not** adopted. Numeric overflow/nonfinite and signed-unit
+duration diagnostics are not claimed to match upstream. Instant-query, timeout,
+lookback and expression diagnostics retain their existing adaptation.
+
+Reflected values use the existing Go-compatible quoting, capped at 128 input bytes
+before quoting with an explicit `...(truncated)` marker for longer values.
+Non-string terms are described without inspecting nested contents. These are
+bounded diagnostic adaptations, not a new timestamp/duration grammar. No upstream
+runtime implementation was copied; storage, keyed bytes and native ABI are
+unchanged. Upgrade query-serving applications for consistent diagnostics.
+
+Three separately named tests in `prometheus_query_controller_test.exs` cover GET
+and real URL-encoded form POST, field/ordering precedence, zero/negative/sub-ns
+steps, equal bounds, exact point-limit boundaries, successful numeric/unit and
+RFC3339 inputs, missing/empty/nested/oversized/overflow/nonfinite values, escaped
+quotes/backslashes/control bytes/Unicode, unchanged generic errors and denial
+before diagnostics. These are local controls, not additional upstream scenarios.
+
+Source helper review used pinned
+[`invalidParamError`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/prometheus/prometheus/web/api/v1/api.go#L595-L599),
+[`queryRange` validation](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/prometheus/prometheus/web/api/v1/api.go#L1079-L1105),
+[`parseTime` / `parseDuration`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/prometheus/prometheus/web/api/v1/api.go#L2912-L2948)
+and the raw-client/time helpers linked above. SHA-256 hashes (each `sed`
+selection includes its final newline):
+
+```text
+e3efbd42ededf70a5b4ec1af7c1bc0ac2929b85401bbae0888ad39c225076b52  integration/query_frontend_test.go (whole file)
+c687b25759978e72d2fe13dab683f86734648808f18b52605b2102227637785d  integration/query_frontend_test.go (sed -n '770,785p;802,838p')
+ae172cc1cc506fa8ceb7f62b5bf0d79a871407ec616451bdaec646e982013f16  vendor/github.com/prometheus/prometheus/web/api/v1/api.go (whole file)
+21386994b95271af81f3f972d4436ce6cf8fffe29a9f88b43c2adfbf6883bcbf  vendor/github.com/prometheus/prometheus/web/api/v1/api.go (sed -n '595,599p;1079,1105p;2912,2948p')
+1a699a91a65da204ee8cff7f88da64fc91c6b8e13b29f28c7c2c1b28efa0d537  integration/e2emimir/client.go (whole file)
+189d2b5a7fada5ae508e55122af28a3fb09a06bbf18d361e2fe60a1b5651d308  integration/e2emimir/client.go (sed -n '343,358p;1454,1457p')
+```
+
+Before runtime changes, the strengthened selection plus controller suite failed
+**6/20** tests at seed **1201**: all five upstream parameter rows and the local
+diagnostic control returned the old generic text. Fourteen tests passed, 71 were
+excluded, and no failures were hidden. The identical selection then passed
+**20/20**, 71 excluded. The complete service/controller run passed **91/91** with
+no skips. Red/green logs are retained under `.amp/in/artifacts/` as
+`mimir-parameter-diagnostics-{red-selected,green-selected,green-full}.log`.
+The first attempted location selection landed before the generated upstream
+tests and only exercised the controller suite; its separate red log is retained
+as `mimir-parameter-diagnostics-red.log`, not counted as the five-row baseline.
+Commands used `ERL_FLAGS='+S 4:4' mise exec --`:
+
+```sh
+mix test test/pulso_web/controllers/mimir_service_conformance_test.exs:1127 test/pulso_web/controllers/prometheus_query_controller_test.exs --warnings-as-errors --seed 1201
+mix test test/pulso_web/controllers/mimir_service_conformance_test.exs test/pulso_web/controllers/prometheus_query_controller_test.exs --warnings-as-errors --seed 1201
+```
+
+After the additional malformed/missing/unchanged-error controls, the complete
+`test/pulso/promql` directory plus both controller files passed **229 tests**;
+the existing optional promtool conformance test was skipped because
+`PULSO_PROMTOOL` was unset. This run used seed 1201 and is retained in
+`mimir-parameter-diagnostics-green-regression.log`. Compile-with-warnings-as-errors,
+scoped formatting and scoped `git diff --check` passed; their output is retained
+in `mimir-parameter-diagnostics-checks.log`.
+
+```sh
+# Same ERL_FLAGS / mise exec prefix as above.
+mix test test/pulso/promql test/pulso_web/controllers/mimir_service_conformance_test.exs test/pulso_web/controllers/prometheus_query_controller_test.exs --warnings-as-errors --seed 1201
+mix compile --warnings-as-errors
+mix format --check-formatted lib/pulso_web/controllers/prometheus_query_controller.ex test/pulso_web/controllers/prometheus_query_controller_test.exs test/pulso_web/controllers/mimir_service_conformance_test.exs
+git diff --check -- lib/pulso_web/controllers/prometheus_query_controller.ex test/pulso_web/controllers/prometheus_query_controller_test.exs test/pulso_web/controllers/mimir_service_conformance_test.exs test/fixtures/promql/mimir/services/README.md
 ```
 
 ### Query-formatting increment
@@ -454,6 +555,103 @@ Pinned source SHA-256 hashes:
 ceff996c20433ee86378330cfa02d27b8ec58ab213158af7b6027137257cadde  selected lines 89–112, including final newline
 ```
 
+### Grouped vector execution-error increment
+
+The complete portable public scenario selects the `execution error` row at
+[`query_frontend_test.go:865–872`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L865-L872),
+with its full [50-series seed loop at lines 672–687](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/query_frontend_test.go#L672-L687).
+The exact expression is:
+
+```promql
+sum by (group_1) (metric{unique=~"0|1|2|3"}) * on(group_1) group_right(unique) (sum by (group_1,unique) (metric{unique=~"0|1|2|3"}))
+```
+
+All 50 distinct RW1 pushes retain `metric`, `unique=i` and `group_1=i%2`,
+including the 46 series excluded by the query. Each push traverses HTTP ingest,
+native encoding and actual Parquet/S3 publication. The query retains GET,
+`start=N-60`, `end=N`, `step=60`, HTTP **422** and this complete original envelope,
+without adapting the diagnostic:
+
+```json
+{"error":"multiple matches for labels: grouping labels must ensure unique matches","errorType":"execution","status":"error"}
+```
+
+The generator alias is
+[`integration/util.go:28–32`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/integration/util.go#L28-L32);
+[`e2e.GenerateSeries:132–179`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/grafana/e2e/util.go#L132-L179)
+adds the metric name before the supplied labels, generates one random float
+and an unasserted exemplar, and uses `TimeToMilliseconds` (lines 114–130).
+As in the earlier ports, the float is frozen to **0.5**, the clock to
+**1700000000**, and the unasserted `trace_id=1234` exemplar is omitted. The seed
+retains separate pushes instead of merging them into one synthetic write. The
+upstream `fake` and sharded tenants collapse to the harness's `user-1` tenant;
+the three frontend/sharded-frontend/querier clients and both remote-execution
+modes collapse to one public Pulso endpoint. Push success is 204 rather than
+200. No tenant policies, max-sample quota, blocked queries, remote read or
+deployment/sharding machinery are simulated. Adjacent unported table rows
+depend on those deliberately excluded features, not another portable scenario.
+
+Before the runtime fix, both added tests failed (seed **901**, **0/2 passed,
+77 excluded**). The selected upstream request already returned HTTP 422 and
+`execution`, but its diagnostic was the generic
+`Vector matching produced ambiguous or duplicate series.` The separately named
+Pulso control reached the same diagnostic mismatch after its successful-group
+assertions. Earlier test-authoring runs exposed a sigil delimiter typo and
+incorrect expected ordering in the new local control; both were corrected
+before this red baseline, without changing runtime or upstream expectations.
+
+The independently written runtime change distinguishes same-matching-group,
+same-final-label collisions from an ambiguous one-side index and from generic
+duplicate result identities. Checks occur after pair filtering and restart at
+every evaluation step. The controller exposes the original upstream message
+only for the new specific reason; unrelated duplicate/ambiguous errors retain
+their existing diagnostics. No upstream runtime code was copied. This changes
+error classification/text, not successful samples, storage/keyed bytes, native
+ABI or resource ceilings. Upgrade all query-serving applications for consistent
+errors behind non-sticky routing; no data migration or retry drain is needed.
+
+The local control covers both group directions, omitted versus explicit include
+labels, one retained sample per group, two valid evaluation steps, the empty
+step before ingestion, the exact left-open five-minute lookback boundary,
+filtered-out and unmatched pairs, false-valued `bool` collisions, and generic
+error ownership. Collision queries replay instant/range GET and form POST,
+including a range whose earlier step is empty: execution fails whole, never
+publishes partial results. These are local controls, not more upstream ports.
+
+Validation, with `ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mise exec --`:
+
+```sh
+# After fix: 2 passed, 77 excluded, seed 901.
+mix test test/pulso_web/controllers/mimir_service_conformance_test.exs:994 test/pulso_web/controllers/mimir_service_conformance_test.exs:1017 --warnings-as-errors --seed 901
+# Complete service file: 79 passed, no skips.
+mix test test/pulso_web/controllers/mimir_service_conformance_test.exs --warnings-as-errors --seed 901
+# Expanded regression run: 538 passed; one existing optional promtool test skipped.
+mix test test/pulso_web/controllers/mimir_service_conformance_test.exs test/pulso/promql test/pulso_web/controllers/prometheus_query_controller_test.exs test/pulso_web/controllers/prometheus_math_conformance_test.exs --warnings-as-errors --seed 902
+mix compile --warnings-as-errors
+mix credo --strict lib/pulso/promql/operations.ex lib/pulso_web/controllers/prometheus_query_controller.ex test/pulso_web/controllers/mimir_service_conformance_test.exs
+mix format --check-formatted lib/pulso/promql/operations.ex lib/pulso_web/controllers/prometheus_query_controller.ex test/pulso_web/controllers/mimir_service_conformance_test.exs
+```
+
+Scoped strict Credo checked all three files with no issues. The optional
+promtool check requires an externally configured executable; the default service
+replay remains offline with no Go, Docker or network dependency. SHA-256 hashes
+of the pinned inputs (range selections include their final newlines):
+
+```text
+e3efbd42ededf70a5b4ec1af7c1bc0ac2929b85401bbae0888ad39c225076b52  integration/query_frontend_test.go (whole file)
+a424e9c5315231d4cd6d338572a470f14161cc0004e88ae788817ccf9222e12b  integration/query_frontend_test.go (sed -n '672,687p;865,872p')
+04c2be3bbbd201741eae3097001129e67c9999acccd85b7e8232bc06bd38e41d  integration/util.go (whole file)
+6acb197a8f9bb97af58e632fa1543bcd30ea7a36634dae3f79e9d050b0503b53  integration/util.go (sed -n '28,32p')
+6f3d2dfd92e26d7eb8f620da253ea7b0fa7d9627729968b0ed160a6c66f77ecc  vendor/github.com/grafana/e2e/util.go (whole file)
+085a6cade8a5da80c74d361757d5132dc4312cac4f01cc8cb674b823d827ef72  vendor/github.com/grafana/e2e/util.go (sed -n '114,179p')
+e9f0db4655abd580e7efea236d4843774990c62d13fc5e035a0160cfef618e65  vendor/github.com/grafana/e2e/util.go (sed -n '132,179p')
+```
+
+The service source retains the existing AGPL-3.0-only/Cortex Apache-2.0
+attributions. The vendored Grafana e2e generator is Apache-2.0, as recorded in
+its pinned `vendor/github.com/grafana/e2e/LICENSE`; the existing
+`LICENSE-Prometheus` contains that license text.
+
 Remaining service-suite gaps include exemplar age/disabled policies and histogram
 downscaling under tenant overrides, broader label/name-validation and partial-write
 permutations, HA/relabel/tenant configuration, UTF-8 grammar outside selectors, OTLP translation,
@@ -461,6 +659,31 @@ remote-read, tenant federation, cardinality analysis, exact upstream printer lay
 streaming transport and Mimir-specific sharding/caching/limits/failure topology.
 Passing this selection is not full PromQL, full Mimir service or deployed-client
 compatibility evidence.
+
+## Top-level range-vector diagnostic continuation
+
+The original `range query with range vector` row at
+`integration/query_frontend_test.go:874–882` retains its query
+`(sum(rate(up[1m])))[5m:]`, one-hour range, one-minute step and complete HTTP400
+error envelope. It now asserts the default engine's exact message:
+
+```json
+{"error":"invalid parameter \"query\": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar","errorType":"bad_data","status":"error"}
+```
+
+The same source also specifies an MQE variant without the `invalid parameter`
+prefix. This port selects the default variant, not both contradictory messages.
+Whole-source SHA-256 remains
+`e3efbd42ededf70a5b4ec1af7c1bc0ac2929b85401bbae0888ad39c225076b52`.
+No input or original expectation is rewritten, and no new upstream scenario is
+counted. The existing local result-type control additionally covers named and
+label-only ranges, parentheses, anchors, explicit/default-resolution subqueries,
+GET/form POST and equal/multiple evaluation bounds, with zero provider requests.
+String results keep their existing generic rejection; scalar/vector queries
+and instant matrices remain accepted. Authorization still precedes diagnostics.
+This is a query-serving application fix with unchanged storage/keyed bytes,
+native ABI and resource ceilings. Unknown-function and aggregation-type parser
+diagnostics remain explicitly unported.
 
 ## Shared hexadecimal regex controls
 

@@ -252,6 +252,29 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert Agent.get(ctx.agent, & &1.lists) == lists
   end
 
+  test "missing authority preserves optional freshness and distinction semantics for every signal", ctx do
+    cases = [
+      {[], :signal_authority_missing},
+      {[fresh: false], :signal_authority_missing},
+      {[fresh: true], :not_found},
+      {[distinguish_missing_authority: false], :signal_authority_missing},
+      {[distinguish_missing_authority: true], :signal_authority_missing},
+      {[fresh: false, distinguish_missing_authority: false], :signal_authority_missing},
+      {[fresh: false, distinguish_missing_authority: true], :signal_authority_missing},
+      {[fresh: true, distinguish_missing_authority: false], :not_found},
+      {[fresh: true, distinguish_missing_authority: true], :signal_authority_missing}
+    ]
+
+    lists = Agent.get(ctx.agent, & &1.lists)
+
+    for signal <- [:logs, :metrics, :traces], {opts, reason} <- cases do
+      assert {:error, ^reason} = S3.query(signal, ctx.tenant, [require_fresh_manifest: true] ++ opts)
+      assert ManifestCache.get(ctx.tenant, Atom.to_string(signal)) == nil
+    end
+
+    assert Agent.get(ctx.agent, & &1.lists) == lists
+  end
+
   test "a failed legacy CAS response succeeds only when fresh read-back proves every key visible", ctx do
     key = Manifest.manifest_key(ctx.tenant, "logs")
     Agent.update(ctx.agent, &%{&1 | faults: %{{"PUT", key} => {400, :after, 1}}})

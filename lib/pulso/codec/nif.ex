@@ -33,8 +33,8 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {1, 1, 16} do
-      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership or preserve scalar class complements; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
+    if version != {1, 1, 17} do
+      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership, preserve scalar class complements or expose correlation IDs as LogQL metadata; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
     end
 
     :ok

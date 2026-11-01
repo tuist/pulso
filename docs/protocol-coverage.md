@@ -80,7 +80,7 @@ Negated scalar classes correctly exclude separately listed U+D7FF/U+E000
 members across the surrogate hole, including raw/hexadecimal/range forms,
 folding, captures and repetition. Independent Go/fork oracles and the same
 local HTTP harnesses cover matching and rejection before storage.
-Upgrade all query-serving app/native pairs to log tuple `{1,1,16}`; trace/metric
+Upgrade all query-serving app/native pairs to log tuple `{1,1,17}`; trace/metric
 tuples, storage and keyed bytes are unchanged. See
 [query regex semantics](querying.md#shared-query-regex-semantics).
 
@@ -103,6 +103,138 @@ controls cover all 15 finite request shapes, and an actual blocked S3 GET checks
 timeout recovery. Already-dispatched native/provider work may outlive callers.
 Lookback, byte and sharding policies remain
 unsupported; see [query limits](querying.md#limits-and-metric-evaluation).
+
+Loki HTTP parameters have 87 frozen rows across 15 complete pinned request and
+component tables, including all 35 rejection expectations. Component replay
+covers 56 rows; HTTP/native Parquet/owned-loopback-S3 replay covers 51 request
+rows (20 overlap), through 82 read attempts including five WebSocket handshakes.
+Public HTTP assertions check observable bounds/selectors/grouping/buckets rather
+than Go structs; rejected attempts perform no provider requests. Decimal-second
+timestamps use float64/millisecond fractional rounding, directions are
+case-insensitive, `step` accepts float seconds/durations, `since` governs default
+bounds, and repeated/mixed or omitted/lone-empty series selectors work. Positive
+log intervals sample globally before limits under bounded collection/sorting;
+zero retains streaming top-k. Existing endpoint/scan/work/heap/inclusive-point
+ceilings remain. Full error-body/duplicate-scalar/RFC3339 grammar, tail scheduling
+and engine/client/deployed-capacity parity remain open. See the
+[source-table qualifications](../test/fixtures/logs/loki-upstream/http-parameters.md).
+
+Loki's complete `Test_writeError` table is frozen separately: 25 original rows,
+each with direct and gRPC-status-roundtrip assertions (50 upstream executions,
+not 50 Pulso tests). Four direct categories have adapted public HTTP checks:
+parse/interval 400, deadline 504 and internal worker failure 500. The remaining
+21 direct rows and all internal roundtrips retain explicit gaps or incompatible
+contracts; none are skipped and counted as passing. JSON/sanitized bodies,
+default-tenant behavior and storage 503 remain deliberate differences. The
+98 error HTTP attempts cover both methods and all 15 finite-read shapes where
+applicable; storage failures no longer expose provider terms, and a native
+Parquet/owned-S3 read verifies recovery. Cancellation/499, gRPC/aggregate-error
+precedence remain open.
+See the [complete error ledger](../test/fixtures/logs/loki-upstream/http-errors.md).
+
+The separate classifier/limit continuation freezes all 22 `TestClassifyFailure`
+rows, three wrapped-limit rows and the complete prefix-template constraints.
+Pulso has no category/reason classifier: its bounded operational counters retain
+success/error/exception outcomes, not Loki's reason labels. Those 22 rows and
+prefix matching remain explicit unimplemented internal contracts, not passing
+replays. Public equivalents of two wrapped-limit rows verify entry-count and
+query-length HTTP 400 admission. The entry message matches exactly inside JSON;
+length diagnostics still render exact nanoseconds instead of `800h`/`721h`.
+Go sentinel identity/wrapping and the query-byte policy remain unimplemented.
+Boundary controls accept a requested log limit of 5000 and a 721-hour window,
+rejecting one entry/nanosecond over, with no provider access for rejections and
+nonempty native Parquet/S3 reads for acceptance. Provider strings matching the
+three source limit bodies remain
+sanitized 503, never inferred client errors. These are 36 authored public HTTP
+attempts, not 36 upstream rows. See the
+[classifier/limit ledger](../test/fixtures/logs/loki-upstream/error-classification.md).
+
+The complete pinned Loki `ParseTestCases` table preserves 206 original rows
+(159 admissions/47 rejections), duplicate rows, exact invalid UTF-8 bytes,
+symbolic Go ASTs and original diagnostics. Component admission and 824
+authenticated GET/form-POST attempts across instant/range endpoints replay
+every row. Admission agrees on 204; two existing policies deliberately differ:
+invalid line regexes reject eagerly before storage, while empty selectors stay
+allowed within server budgets. All 188 rejected attempts prove no provider
+access. Empty-store success statuses are admission evidence, not result-value
+oracles; a separate nonempty native Parquet/S3 count control checks execution.
+No runtime change, Go AST equivalence or exact diagnostic parity is claimed.
+See the [syntax-admission ledger](../test/fixtures/logs/loki-upstream/syntax-admission.md).
+
+The three complete matcher-admission tables retain 30 original rows (15 accepts/
+15 rejections), five literal matcher tuples and all 13 exact source error
+constructors. Component and authenticated HTTP replay cover every row. Eighteen
+admission outcomes agree; 12 selectivity-policy rejections deliberately differ
+because Pulso admits empty, negative-only and empty-compatible selectors under
+existing server budgets. Matcher-only discovery still rejects pipelines.
+All eight rejections among 112 table HTTP attempts avoid provider access.
+Ten separate nonempty native Parquet/S3 read controls verify full-value regex
+selection, negative regexes and negative-only log/metric execution, including
+missing labels. No production change or exact diagnostic parity is claimed.
+See the [matcher-admission ledger](../test/fixtures/logs/loki-upstream/matcher-admission.md).
+
+The complete label-parsing continuation preserves four original label maps,
+four unreserved-name admissions and the trailing 16 MiB rejection. Native
+protobuf and authenticated HTTP/Parquet/S3 replay cover all nine source cases.
+All four public discovery maps agree, but raw empty labels remain stored by
+design; this is not Loki's write-time normalization. All four original queries
+accept `variants`/`of` as selector, grouping and pipeline labels. Authored
+nonempty controls check actual lines/labels/counts. The oversized input rejects
+before provider access with HTTP 413 at the decompressed-request cap, not an
+isolated Go label-parser limit. A smaller malformed input uses 204 with one
+rejected entry and no publication; valid ingestion/read recovers. The 34 HTTP
+requests do not establish exact errors, Go-label ordering or broad grammar/
+capacity parity. No production behavior or limits change. See the
+[label-parsing qualifications](../test/fixtures/logs/loki-upstream/label-parsing.md).
+
+Complete formatter/round-trip source coverage preserves 196 rows across 20
+functions, including all eight prettier functions, 94 literal outputs, four
+rejection oracles and symbolic internal serialization. **LogQL formatting and
+Loki AST JSON round trips remain unimplemented**, not passing ports. Component
+and 1,032 authenticated HTTP attempts check admission of all 185 literal inputs
+and 73 applicable output spellings. Dotted logfmt sources, invalid IP operators
+and empty IP patterns reject during executable validation despite grammar-only
+source success. All four ordinary zero-rank rejection oracles remain explicit
+differences: Pulso accepts and returns empty results. Another 338 nonempty reads
+check 36 stringer equivalences, two rejected pairs, zero-rank behavior, escaping
+and no-op semantics against actual Parquet/S3. Five seed writes bring the total
+to 1,375 HTTP requests. Layout, exact formatting/errors, internal optimization,
+serialization and deployed/capacity parity are not claimed. No production change
+is made. See the [formatter/round-trip ledger](../test/fixtures/logs/loki-upstream/formatter-roundtrip.md).
+
+Complete pipeline ownership source coverage preserves six functions and 48
+method executions. Thirty ordinary executions agree on original label ownership,
+asserted lines and selected parser-error details through component replay and
+240 authenticated HTTP reads over native Parquet/owned S3, in ordinary and
+categorized modes. The remaining 18 deletion-wrapper executions are symbolic,
+not supported delete semantics. Go hashes, label rendering/cache identities and
+the internal empty-keep constructor are not claimed; public replay omits that
+identity stage. No production behavior changes. See the
+[pipeline ownership ledger](../test/fixtures/logs/loki-upstream/pipeline-ownership.md).
+
+The complete label-builder source inventory retains all 15 tests, 107 assertion
+sites and 118 expanded events. Component and 232 authenticated HTTP reads cover
+literal lookups/categories, deletion/grouping maps, all nine ordinary
+preserve-error identities and distinct original collision inputs through native
+Parquet/S3. Received exact error metadata now appears in the parsed category;
+ordinary suffixed names, unflagged values and metric-error admission are unchanged.
+Raw builder setters, arbitrary error injection, hash/String/cache and hint flags
+remain symbolic, not passing ports. Upgrade query-serving applications; native
+tuples, resource ceilings and storage/keyed bytes are unchanged. See the
+[label-builder ledger](../test/fixtures/logs/loki-upstream/label-builder.md).
+
+Complete sample-extractor source coverage retains 16 tests and 106 method calls,
+including 88 ordinary and 18 symbolic deletion-wrapper executions. All 88
+ordinary observations replay through both the component query interface and
+public HTTP/Parquet/S3, including the three original `trace_id` cases.
+Dedicated nonempty trace/span IDs now fill absent metadata names without
+overwriting attributes or becoming stream labels. Explicit empty attributes,
+stream/parser collisions and native label-cache isolation have separate controls.
+Error-preservation and stream-isolation controls bring the source replay to
+398 reads plus three pushes. Numeric hash bits, optimized Go types/cache/reference
+identity and hint contracts are not claimed. Upgrade query-serving app/native
+pairs to `{1,1,17}`; budgets, storage and keyed bytes are unchanged. See the
+[sample-extractor ledger](../test/fixtures/logs/loki-upstream/sample-extractors.md).
 
 LogQL range pipelines may precede or follow the bracket/offset, and complete
 ranges may be parenthesized recursively. Seventeen original first/last engine
@@ -490,6 +622,16 @@ native/storage formats and generic metric-error envelopes are unchanged.
 See the [conjunction fixtures](../test/fixtures/logs/loki-upstream/README.md#label-filter-conjunction-continuation).
 Complete parser-error and deployed-client/capacity acceptance remain open.
 
+The complete pinned Loki reserved-error-label comparison matrix adds 68 original
+queries: 56 typed-comparison rejections and 12 string/ordinary-label admissions.
+All replay over instant/range GET/form POST through native Parquet/S3; rejected
+requests issue no provider operations. Typed comparisons on `__error__` or
+`__error_details__` now return `parse_error` before evaluation, including nested
+and post-unwrap predicates, rather than an evaluation-error category. Exact
+full parser wording/positions remain open. Upgrade query-serving applications;
+native/storage/keyed bytes and ceilings do not change. See the
+[matrix provenance](../test/fixtures/logs/loki-upstream/reserved-label-comparisons.md).
+
 The PromQL subset also includes eight optional-vector UTC calendar functions
 (`year`, `month`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`,
 `hour`, `minute`), natural `sort_by_label`/`sort_by_label_desc` with histogram
@@ -656,8 +798,17 @@ strict tolerance and capped relative scale, avoiding arithmetic failures on
 large finite counts. Six public HTTP controls and 10,030 actual pinned Go
 quantile/repair comparisons cover these numerical extremes separately from
 the imported engine count.
-The complete selected corpus now contains 1590 evaluations in 85 files, replayed
-through 5770 HTTP requests across both adapters. Upgrade query applications;
+The complete selected corpus now contains 1733 evaluations in 94 files, replayed
+through 6302 HTTP requests across both adapters. The preceding 81 evaluations add
+absence, timestamp/rounding, complete absence-over-time/staleness blocks and
+label replacement, including original failure assertions. Multi-metric absence
+no longer rejects distinct source names as intermediate duplicate identities.
+Another 62 commands complete upstream selectors/collisions, Mimir stale-grid
+and subquery files, and the remaining Mimir range-function collision assertions.
+The selector file repeats seven earlier offset evaluations; these are replay
+counts, not unique behaviors or full-suite coverage percentages.
+Top-level range-vector range queries now return the exact default Mimir error
+before storage. Upgrade query applications;
 native/storage/keyed bytes are unchanged. Remaining native annotation/iterator
 and deployed-client/provider/capacity gaps are not closed by this batch.
 
@@ -753,6 +904,43 @@ durability/capacity or deployed-client acceptance. The
 separate exact cases from explicit harness/behavior adaptations. In particular,
 Loki's adapted long-range metric check supplies an explicit resolution; it is
 not evidence for the upstream no-step expectation near the window's end.
+
+The latest increment adds Mimir's original grouped-vector execution-error
+scenario, including its full 50-series input and exact HTTP 422 diagnostic,
+and both historical stored-result assertions from Loki's schema-change test.
+The latter preserve the -72h/-48h/current inputs and expected lines, not TSDB
+schema migration or ingester-only lookback phases. Tempo's ten original rich
+trace fixtures now replay complete v1/v2 exact-ID content checks before and
+after refreshing manifest supervision. Its original multi-root search
+expectations still conflict with Pulso's deliberate fail-whole root-summary
+policy; separate local checks document the 409, not passing upstream searches.
+Likewise, Loki duplicate-suppression/statistics assertions remain unported
+because Pulso deliberately preserves duplicate entries. These incompatibilities
+are not hidden by regenerating upstream expected values from Pulso's output.
+The follow-up preserves five complete original Mimir request-parameter error
+envelopes, with separate GET/form controls for precedence, authorization and
+bounded reflection. The inclusive 11,000-point ceiling remains stricter than
+upstream's interval check. Loki's two original decolorizer rows now replay
+alongside 129 separately labeled source-pattern controls; malformed sequences
+no longer discard unmatched text, and supported C1/BEL forms are removed.
+These are selected diagnostic/unit-table continuations, not complete service
+suites. Upgrade query-serving applications; native artifacts, storage/keyed
+bytes and resource ceilings are unchanged.
+
+The Tempo name-discovery continuation adds six original `TestTagEndpoints`
+HTTP content-table rows over all seven original two-span batches, with complete
+scope/name equality and both omitted and ±2-hour bounds. The actual pinned
+public helper supplies 25 static names, exposing five missing ID suggestions
+in Pulso's Elixir/native vocabularies. These are autocomplete names only;
+ID-value discovery remains unsupported. All 25 reserve capacity inside the
+existing global 5,000-pair limit, including before v1 flattening; exact-limit
+and overflow controls exercise filtered/unfiltered native/reference paths.
+Old v2.9 fixture bytes remain unchanged, with only their static vocabulary
+explicitly superseded by the independent newer list. Upstream inspected-byte
+metadata and gRPC assertions are not covered by these content selections.
+Upgrade query-serving applications and native artifacts together for consistent
+vocabulary and budget accounting. Native tuples and storage/keyed bytes are
+unchanged; no retry drain or data migration is needed.
 
 Mimir's `TestFormatQueryAPIEndpoint` now replays its exact expression and
 formatted result. Formatting covers Pulso's supported grammar over GET/form

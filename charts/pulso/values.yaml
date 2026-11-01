@@ -221,11 +221,31 @@ sentry:
   projects: {}
   # Optional bounded S3 monitoring projection, independent of ingest success.
   # Newness means new within historyDays, not first ever. See docs/error-monitoring.md
-  # for capacity, replay floors, and conservative resets after retention gaps.
+  # for capacity, replay floors, conservative resets and the fixed five-minute
+  # error-rate detector (at least 5 baseline events and a 3x increase).
   projectionEnabled: false
   historyDays: 1
   # Round-robin cadence: each pass handles one configured project, 1000..60000.
   projectionIntervalMs: 5000
+
+reliability:
+  # Experimental periodic service assessments, independently opt-in. S3/CAS
+  # required. Raw ingest/retention is unchanged. See docs/reliability.md.
+  enabled: false
+  tenants: []
+  # Explicit ISO date required when enabling; verify current provider pricing.
+  priceValidUntil: ""
+  # USD/month PER TENANT. Objects are estimated dispatch charges, not an invoice
+  # cap. Model attempts reserve all 5000 tokens; failed attempts are not refunded.
+  assessmentBudgetUsd: 500
+  objectBudgetUsd: 100
+  investigationBudgetUsd: 1000
+  inputNanoUsdPerToken: 110
+  # Fixed HTTPS external runtime. $5/run, 20 starts/day, 2 unresolved runs and
+  # 1h/service cooldown. Receiver must enforce cost/deadline and report completion.
+  investigationUrl: ""
+  # Supply PULSO_RELIABILITY_OPENAI_API_KEY and, if handoff is enabled,
+  # PULSO_RELIABILITY_INVESTIGATION_TOKEN using Secret-backed extraEnv.
 
 mcp:
   # Browser origins allowed to call POST /mcp. Requests without an Origin

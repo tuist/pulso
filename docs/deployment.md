@@ -17,6 +17,17 @@ Pick a version from the [releases page](https://github.com/tuist/pulso/releases)
 
 ## Before you start
 
+Periodic [reliability assessments](reliability.md) are optional and disabled by
+default. Set the chart's `reliability.enabled`, explicit `tenants` and
+`priceValidUntil`, and provide `PULSO_RELIABILITY_OPENAI_API_KEY` via Secret-backed
+`extraEnv`. Review per-tenant allowances before enabling paid dispatch. A separate
+`reliability.investigationUrl` plus Secret-backed
+`PULSO_RELIABILITY_INVESTIGATION_TOKEN` enables a fixed HTTPS external receiver;
+it must enforce the [grant and completion contract](reliability.md#external-investigations).
+Expose `POST /api/v1/reliability/investigations/:id/complete` only as needed for
+that receiver; each callback requires its run-specific bearer token. Provision
+read-only tenant MCP credentials separately. Raw storage/retention is unchanged.
+
 You need:
 
 - A Kubernetes cluster with Helm 3.8 or later, or any host that runs containers.
@@ -82,7 +93,7 @@ The ones you are most likely to change:
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
 | `sentry.projects` | Experimental Sentry ingest-only project credentials and tenant/service bindings. Empty by default; add exact SDK ingress paths explicitly. See [error tracking](error-tracking.md). |
-| `sentry.projectionEnabled` | Separately enable the experimental S3 issue index, default `false`; no effect on ingest acknowledgment. See [error monitoring](error-monitoring.md). |
+| `sentry.projectionEnabled` | Separately enable the experimental S3 issue index and bounded error-rate detector, default `false`; no effect on ingest acknowledgment. See [error monitoring](error-monitoring.md). |
 | `sentry.historyDays` | Derived error-history horizon (`1..365` days), default `1`; independent of raw log retention. |
 | `sentry.projectionIntervalMs` | One-project worker cadence (`1000..60000` ms), default `5000`; measure freshness and read cost before reducing it. |
 | `alerting.principals` | Dedicated alert principal identities, hashed credentials and capabilities; see [alerting](alerting.md). |

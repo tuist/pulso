@@ -1,6 +1,7 @@
 defmodule Pulso.Loki.PushTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.Loki.Discovery
   alias Pulso.Loki.Push
   alias Pulso.Loki.PushProto
   alias Pulso.Record.Log
@@ -254,6 +255,37 @@ defmodule Pulso.Loki.PushTest do
     end
 
     defp decode(request), do: Push.decode_protobuf(compress(request), @max)
+
+    @tag :label_parsing_batch
+    test "complete Loki label-set table preserves source labels and normalized discovery values" do
+      fixture = File.read!("test/fixtures/logs/loki-upstream/label-parsing.json") |> Pulso.JSON.decode!()
+      table = Enum.find(fixture["tables"], &(&1["name"] == "TestParseLabels"))
+      assert length(table["rows"]) == 4
+
+      for row <- table["rows"] do
+        labels = Base.decode64!(row["query_bytes_base64"])
+        expected = Map.new(row["expected_labels"], &{&1["name"], &1["value"]})
+        assert {:ok, [record], 0} = decode(request([{labels, [entry()]}]))
+        assert Discovery.labels(record) == expected
+
+        if row["source_index"] == 3 do
+          # Loki drops this label during ParseLabels. Pulso deliberately keeps
+          # the original source map, normalizing only the discovery projection.
+          assert record.resource == Map.put(expected, "bar", "")
+          refute Map.has_key?(expected, "bar")
+        else
+          assert record.resource == expected
+        end
+      end
+
+      [control] = fixture["controls"]
+      assert control["reject"]
+      assert control["repeat_count"] == 16_777_216
+      labels = :binary.copy(Base.decode64!(control["repeat_bytes_base64"]), control["repeat_count"])
+      # The public decoder rejects the same bytes at its decompressed request
+      # cap, not as an exact replay of Go's standalone label-parser error.
+      assert {:error, :payload_too_large} = decode(request([{labels, [entry()]}]))
+    end
 
     test "decodes a well-formed stream with structured metadata" do
       req =

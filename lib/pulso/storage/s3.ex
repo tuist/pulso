@@ -575,7 +575,7 @@ defmodule Pulso.Storage.S3 do
 
     case ManifestOwner.ensure_loaded(tenant, signal, config, opts) do
       {:error, :signal_authority_missing} = error ->
-        if opts[:fresh], do: {:error, :not_found}, else: error
+        if opts[:fresh] && !opts[:distinguish_missing_authority], do: {:error, :not_found}, else: error
 
       result ->
         result

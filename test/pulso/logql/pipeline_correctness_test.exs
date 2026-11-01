@@ -7,7 +7,182 @@ defmodule Pulso.LogQL.PipelineCorrectnessTest do
   alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.LokiLabelBuilderFixture
+  alias Pulso.Test.LokiPipelineFixture
+  alias Pulso.Test.LokiSampleExtractorFixture
   alias Pulso.Test.NativeQueryStorage
+
+  @tag :sample_extractors_batch
+  test "complete sample-extractor observations retain asserted metric values and labels" do
+    fixture = LokiSampleExtractorFixture.load()
+    assert fixture["test_count"] == 16
+    assert fixture["execution_count"] == 88
+    assert fixture["deletion_wrapper_execution_count"] == 18
+    rows = LokiSampleExtractorFixture.cases(fixture)
+    assert length(rows) == 88
+    Runtime.put_env(:pulso, Storage, adapter: Memory)
+
+    for row <- rows do
+      tenant = "extractor-#{System.unique_integer([:positive])}"
+      record = %Log{timestamp_ns: 10, body: row.line, resource: row.base, attributes: row.metadata}
+      assert :ok = Storage.append(:logs, tenant, [record])
+      assert {:ok, {:vector, series}} = evaluate(row.query, tenant), row.id
+
+      if row.expected_ok do
+        assert [{labels, {30, value}}] = series, row.id
+        if row.expected_labels, do: assert(labels == row.expected_labels, row.id)
+        if row.expected_value, do: assert(value == row.expected_value, row.id)
+        # Cardinality one is a public control, not the source's float-encoded hash.
+        if row.distinct?, do: assert(value == 1.0, row.id)
+      else
+        assert series == [], row.id
+      end
+
+      if row.unpreserved_query do
+        assert {:error, reason} = evaluate(row.unpreserved_query, tenant), row.id
+        assert reason in [:sample_extraction_error, :pipeline_error], row.id
+      end
+    end
+  end
+
+  @tag :label_builder_batch
+  test "complete Loki builder observations retain literal lookup and category oracles" do
+    fixture = LokiLabelBuilderFixture.load()
+    assert fixture["function_count"] == 15
+    assert fixture["assertion_call_site_count"] == 107
+    assert fixture["expanded_event_counts"]["assertion"] == 118
+    all_assertions = Enum.flat_map(fixture["tables"], &LokiLabelBuilderFixture.assertions/1)
+    assert length(all_assertions) == 118
+    assert MapSet.size(MapSet.new(all_assertions, &{&1["source_function"], &1["source_assertion_index"]})) == 107
+    cases = LokiLabelBuilderFixture.log_cases(fixture)
+    assert length(cases) == 10
+
+    for row <- cases ++ [LokiLabelBuilderFixture.error_case(fixture)], categorized? <- [false, true] do
+      record = %Log{timestamp_ns: 10, body: "label-builder", resource: row.base, attributes: row.metadata}
+      entry = Entry.from_record(record, categorized?)
+      assert {:ok, ast} = Parser.parse(row.query)
+      assert {:keep, result} = Pipeline.apply(Pipeline.compile(ast.stages), entry)
+      actual = if categorized?, do: Entry.categorized_labels(result), else: {result.labels, %{}}
+
+      for {kind, name, expected} <- row.checks,
+          categorized? or kind in [:labels, :present, :value] do
+        assert LokiLabelBuilderFixture.observation(kind, name, actual) == expected, inspect({row.query, kind, name})
+      end
+    end
+
+    row = LokiLabelBuilderFixture.error_case(fixture)
+    lookalikes = %{"__error___extracted" => "ordinary", "__error_details___extracted" => "other"}
+
+    record = %Log{
+      timestamp_ns: 10,
+      body: "label-builder",
+      resource: row.base,
+      attributes: Map.merge(row.metadata, lookalikes)
+    }
+
+    assert Entry.categorized_labels(Entry.from_record(record, true)) ==
+             {row.base, %{"parsed" => row.metadata, "structuredMetadata" => lookalikes}}
+  end
+
+  @tag :label_builder_batch
+  test "Loki builder grouping and ordinary preserve-error observations reach metric evaluation" do
+    fixture = LokiLabelBuilderFixture.load()
+    Runtime.put_env(:pulso, Storage, adapter: Memory)
+    groups = LokiLabelBuilderFixture.group_cases(fixture)
+    assert length(groups) == 13
+
+    for row <- groups do
+      tenant = "builder-group-#{System.unique_integer([:positive])}"
+
+      assert :ok =
+               Storage.append(:logs, tenant, [
+                 %Log{timestamp_ns: 10, body: "label-builder", resource: row.base, attributes: row.metadata}
+               ])
+
+      assert {:ok, {:vector, [{labels, {30, 1.0}}]}} = evaluate(row.query, tenant)
+      assert labels == row.expected, row.query
+    end
+
+    preserved = LokiLabelBuilderFixture.preserve_cases(fixture)
+    assert length(preserved) == 9
+
+    for row <- preserved do
+      tenant = "builder-error-#{System.unique_integer([:positive])}"
+
+      assert :ok =
+               Storage.append(:logs, tenant, [
+                 %Log{timestamp_ns: 10, body: "label-builder", resource: row.base, attributes: row.metadata}
+               ])
+
+      assert {:ok, {:vector, [{labels, {30, value}}]}} = evaluate(row.query, tenant)
+      assert value == 0.0
+      assert labels["__error__"] == "SampleExtractionErr"
+
+      if row.expected == false,
+        do: refute(Map.has_key?(labels, "__preserve_error__")),
+        else: assert(labels["__preserve_error__"] == row.expected)
+
+      assert {:error, :sample_extraction_error} = evaluate(row.unpreserved_query, tenant)
+    end
+  end
+
+  @tag :pipeline_ownership_batch
+  test "complete Loki ordinary pipeline executions preserve values and label ownership" do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/pipeline-ownership.json") |> Pulso.JSON.decode!()
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+    assert fixture["source_execution_count"] == 48
+    assert fixture["execution_count"] == 30
+    assert fixture["symbolic_filtering_execution_count"] == 18
+    assert fixture["execution_method_counts"] == %{"Process" => 22, "ProcessString" => 8}
+
+    # Reuse compiled pipelines across successive entries as upstream does.
+    # Pulso's single binary path replays both source method identities; it
+    # does not pretend to implement separate Go byte/string or cache APIs.
+    for {query, rows} <-
+          Enum.group_by(fixture["executions"], &LokiPipelineFixture.query(&1["table"], &1["source_index"])) do
+      assert {:ok, ast} = Parser.parse(query)
+      compiled = Pipeline.compile(ast.stages)
+
+      for row <- rows, categorized? <- [false, true] do
+        record = %Log{
+          timestamp_ns: row["timestamp"],
+          body: Base.decode64!(row["input_line_bytes_base64"]),
+          resource: Map.new(row["stream_labels"], &{&1["name"], &1["value"]}),
+          attributes: Map.new(row["structured_metadata"], &{&1["name"], &1["value"]})
+        }
+
+        result = Pipeline.apply(compiled, Entry.from_record(record, categorized?))
+
+        if row["expected_match"] == false do
+          assert result == :drop, row["execution_id"]
+        else
+          assert {:keep, entry} = result
+          assert entry.labels == Map.new(row["expected_labels"], &{&1["name"], &1["value"]}), row["execution_id"]
+
+          if "line" in row["asserted_channels"] do
+            assert entry.line == Base.decode64!(row["expected_line_bytes_base64"]), row["execution_id"]
+          end
+
+          if categorized? do
+            expected =
+              Map.new(row["expected_categories"], fn {category, pairs} ->
+                {category, Map.new(pairs, &{&1["name"], &1["value"]})}
+              end)
+
+            {stream, categories} = Entry.categorized_labels(entry)
+            assert stream == expected["stream"], row["execution_id"]
+
+            assert Map.get(categories, "structuredMetadata", %{}) == expected["structured_metadata"],
+                   row["execution_id"]
+
+            assert Map.get(categories, "parsed", %{}) == expected["parsed"], row["execution_id"]
+          else
+            assert entry.label_categories == nil
+          end
+        end
+      end
+    end
+  end
 
   defp evaluate(query, tenant, opts \\ %{end_ts_ns: 30}) do
     Process.delete(:promql_budget)

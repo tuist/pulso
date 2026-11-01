@@ -15,3 +15,11 @@ eval range from 0 to 24m step 6m ceil({__name__=~"metric_.*"})
 # Same as above, but with conflict at T=30m.
 eval_fail range from 0 to 30m step 6m ceil({__name__=~"metric_.*"})
   expected_fail_message vector cannot contain metrics with the same labelset
+
+# Same two cases as above, but with a function that takes a range vector.
+eval range from 0 to 24m step 6m max_over_time({__name__=~"metric_.*"}[5m])
+  {common="label"} 0 1 2 3 4
+  {common="other-label"} -1 10 20 30 40
+
+eval_fail range from 0 to 30m step 6m max_over_time({__name__=~"metric_.*"}[5m])
+  expected_fail_message vector cannot contain metrics with the same labelset

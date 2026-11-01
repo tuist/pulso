@@ -32,8 +32,27 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, {:unauthorized, _}} ->
         error(conn, :unauthorized, "unauthorized", "unauthorized")
 
+      {:error, {:invalid_parameter, message}} ->
+        error(conn, :bad_request, "bad_data", message)
+
+      {:error, :range_result_for_range_query} ->
+        error(
+          conn,
+          :bad_request,
+          "bad_data",
+          "invalid parameter \"query\": query expression produces a range vector, but expression for range queries must produce an instant vector or scalar"
+        )
+
       {:error, :query_execution_failed} ->
         error(conn, :internal_server_error, "execution", "Metric query execution failed.")
+
+      {:error, :multiple_matches_for_labels} ->
+        error(
+          conn,
+          :unprocessable_entity,
+          "execution",
+          "multiple matches for labels: grouping labels must ensure unique matches"
+        )
 
       {:error, reason} when reason in [:many_to_many_matching, :duplicate_result_label_sets] ->
         error(conn, :unprocessable_entity, "execution", "Vector matching produced ambiguous or duplicate series.")
@@ -143,12 +162,80 @@ defmodule PulsoWeb.PrometheusQueryController do
   end
 
   defp options(params, :range) do
-    with {:ok, start} <- Time.parse_timestamp(params["start"]),
-         {:ok, finish} <- Time.parse_timestamp(params["end"]),
-         {:ok, step} <- step(params["step"]) do
+    with {:ok, start} <- range_timestamp(params["start"], "start"),
+         {:ok, finish} <- range_timestamp(params["end"], "end"),
+         :ok <- range_order(start, finish),
+         {:ok, step} <- range_step(params["step"]),
+         :ok <- range_resolution(start, finish, step) do
       {:ok, %{start_ts_ns: start, end_ts_ns: finish, step_ns: step}}
     end
   end
+
+  defp range_timestamp(value, field) do
+    case Time.parse_timestamp(value) do
+      {:ok, _} = result -> result
+      _ -> invalid_parameter(field, "cannot parse #{diagnostic_value(value)} to a valid timestamp")
+    end
+  end
+
+  defp range_order(start, finish) when start <= finish, do: :ok
+  defp range_order(_, _), do: invalid_parameter("end", "end timestamp must not be before start time")
+
+  defp range_step(value) do
+    # Keep the exact existing parsers/precision. Numeric nonpositive values must
+    # not fall through to the positive-only duration parser and lose their cause.
+    parsed =
+      case Time.parse_seconds(value) do
+        {:ok, _} = result when is_binary(value) -> result
+        _ -> step(value)
+      end
+
+    case parsed do
+      {:ok, ns} when ns > 0 -> {:ok, ns}
+      {:ok, _} -> nonpositive_step()
+      _ -> invalid_duration_step(value)
+    end
+  end
+
+  defp invalid_duration_step(value) do
+    # The duration parser only returns positive values. Recognize its zero-unit
+    # spelling for diagnostics, without admitting a new successful duration form.
+    if is_binary(value) and byte_size(value) <= 128 and Regex.match?(~r/\A(?:0+(?:ms|s|m|h|d|w|y))+\z/, value) do
+      nonpositive_step()
+    else
+      invalid_parameter("step", "cannot parse #{diagnostic_value(value)} to a valid duration")
+    end
+  end
+
+  defp nonpositive_step do
+    invalid_parameter(
+      "step",
+      "zero or negative query resolution step widths are not accepted. Try a positive integer"
+    )
+  end
+
+  defp range_resolution(start, finish, step) do
+    # Preserve the evaluator's inclusive 11,000-point ceiling, not upstream's
+    # 11,000-interval check (which can admit an extra endpoint).
+    if div(finish - start, step) < Pulso.QueryLimits.max_evaluation_steps() do
+      :ok
+    else
+      {:error,
+       {:invalid_parameter,
+        "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)"}}
+    end
+  end
+
+  defp invalid_parameter(field, reason), do: {:error, {:invalid_parameter, "invalid parameter \"#{field}\": #{reason}"}}
+
+  # Bound reflected bytes before Go quoting (including invalid UTF-8 and byte
+  # cuts inside a scalar). Never inspect arbitrary nested request terms.
+  defp diagnostic_value(value) when is_binary(value) and byte_size(value) > 128,
+    do: Pulso.GoUnicode.quote(binary_part(value, 0, 128) <> "...(truncated)")
+
+  defp diagnostic_value(value) when is_binary(value), do: Pulso.GoUnicode.quote(value)
+  defp diagnostic_value(nil), do: Pulso.GoUnicode.quote("")
+  defp diagnostic_value(_), do: "non-string value"
 
   defp step(value) when is_binary(value) do
     case Time.parse_seconds(value) do

@@ -41,6 +41,7 @@ defmodule PulsoWeb.LokiQueryController do
   alias Pulso.LogQL.StreamMatchers
   alias Pulso.Loki.Detected
   alias Pulso.Loki.Discovery
+  alias Pulso.Loki.HTTPParams
   alias Pulso.Loki.LabelVolume
   alias Pulso.Loki.Patterns
   alias Pulso.Loki.Tail
@@ -48,8 +49,6 @@ defmodule PulsoWeb.LokiQueryController do
   alias Pulso.Storage
 
   @default_tenant "default"
-  @default_direction :backward
-  @default_limit 100
   # ---------------------------------------------------------------------------
   # query_range
   # ---------------------------------------------------------------------------
@@ -68,7 +67,7 @@ defmodule PulsoWeb.LokiQueryController do
     with :ok <- Auth.verify(conn, tenant),
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- parse_query(query_str),
-         {:ok, opts} <- build_opts(params, mode),
+         {:ok, opts} <- HTTPParams.query(params, mode),
          {:ok, limits} <- request_query_limits(conn),
          :ok <- validate_query_length(limits, query_window_start(ast, opts), opts.end_ts_ns),
          :ok <- query_expression_limits(ast, opts, limits),
@@ -116,7 +115,7 @@ defmodule PulsoWeb.LokiQueryController do
   # ---------------------------------------------------------------------------
   # labels / label values / series — complete stream-label dictionaries
   # from `Pulso.Loki.Discovery`. Like Loki, an omitted range is the last
-  # six hours, and `query` (labels/values) or `match[]` (series) selects
+  # hour, and `query` (labels/values) or `match[]` (series) selects
   # streams with log-query matcher semantics.
   # ---------------------------------------------------------------------------
 
@@ -124,7 +123,23 @@ defmodule PulsoWeb.LokiQueryController do
 
   def label_values(conn, %{"name" => name} = params), do: discover(conn, params, :values, name, "query")
 
-  def series(conn, params), do: discover(conn, params, :series, "", "match")
+  def series(conn, params) do
+    matches =
+      [conn.query_string, Map.get(conn.assigns, :prometheus_discovery_form, "")]
+      |> Enum.flat_map(&Enum.to_list(URI.query_decoder(&1)))
+      |> Enum.filter(fn {key, _} -> key in ["match", "match[]"] end)
+      |> Enum.map(&elem(&1, 1))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    matches =
+      case matches do
+        [one] -> if String.replace(one, " ", "") == "{}", do: [], else: matches
+        _ -> matches
+      end
+
+    discover(conn, Map.put(params, "match", matches), :series, "", "match")
+  end
 
   defp discover(conn, params, mode, key, selector_param) do
     tenant = tenant_from(conn)
@@ -173,16 +188,9 @@ defmodule PulsoWeb.LokiQueryController do
   end
 
   defp discovery_times(params) do
-    now = System.system_time(:nanosecond)
-
-    with {:ok, start} <- query_timestamp(params["start"], "start"),
-         {:ok, finish} <- query_timestamp(params["end"], "end") do
-      finish = finish || now
-      start = start || max(-9_223_372_036_854_775_808, finish - 6 * 3_600_000_000_000)
-
-      if start > finish,
-        do: {:error, {:invalid_query_parameter, "start/end"}},
-        else: {:ok, %{start_ns: start, end_ns: finish}}
+    with {:ok, times} <- HTTPParams.bounds(params),
+         :ok <- HTTPParams.ordered(times) do
+      {:ok, times}
     end
   end
 
@@ -239,14 +247,14 @@ defmodule PulsoWeb.LokiQueryController do
   def volume_range(conn, params), do: volume(conn, params, :range)
 
   defp volume(conn, params, mode) do
-    case Auth.verify(conn, tenant_from(conn)) do
-      :ok ->
-        if params["aggregateBy"] == "labels",
-          do: label_volume(conn, params, mode),
-          else: series_volume(conn, params, mode)
-
-      err ->
-        render_error(conn, err)
+    with :ok <- Auth.verify(conn, tenant_from(conn)),
+         {:ok, _opts} <- HTTPParams.query(params, mode),
+         :ok <- volume_aggregation(params["aggregateBy"]) do
+      if params["aggregateBy"] == "labels",
+        do: label_volume(conn, params, mode),
+        else: series_volume(conn, params, mode)
+    else
+      err -> render_error(conn, err)
     end
   end
 
@@ -275,9 +283,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp label_volume_step(:instant, _value, _times), do: {:ok, nil}
 
   defp label_volume_step(:range, value, times) do
-    default = "#{max(1, div(times.end_ns - times.start_ns, 250_000_000_000))}s"
-
-    with {:ok, step} <- seconds_or_duration(value || default),
+    with {:ok, step} <- HTTPParams.step(value, times.start_ns, times.end_ns),
          true <- step >= 1_000_000,
          last = max(times.start_ns, times.end_ns - 1),
          true <-
@@ -295,7 +301,8 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, times} <- query_window_limits(conn, times),
          {:ok, limit} <- volume_limit(params["limit"]),
          :ok <- volume_aggregation(params["aggregateBy"]),
-         {:ok, labels} <- volume_labels(params["targetLabels"], selector) do
+         {:ok, labels} <- volume_labels(params["targetLabels"], selector),
+         {:ok, step_ns} <- label_volume_step(mode, params["step"], times) do
       grouping = Enum.join(labels, ",")
       range_ms = max(1, div(times.end_ns - times.start_ns, 1_000_000))
 
@@ -306,7 +313,7 @@ defmodule PulsoWeb.LokiQueryController do
              %{"time" => Integer.to_string(times.end_ns)}}
 
           :range ->
-            step = params["step"] || "#{max(1, div(range_ms, 1000 * 100))}s"
+            step = "#{div(step_ns, 1_000_000)}ms"
 
             {"sum by (#{grouping}) (bytes_over_time(#{query}[#{step}]))",
              %{"start" => Integer.to_string(times.start_ns), "end" => Integer.to_string(times.end_ns), "step" => step}}
@@ -327,7 +334,7 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp volume_selector(_params), do: {:error, {:missing_param, "query"}}
 
-  defp volume_limit(nil), do: {:ok, 100}
+  defp volume_limit(value) when value in [nil, ""], do: {:ok, 100}
 
   defp volume_limit(value) when is_binary(value) do
     case Integer.parse(value) do
@@ -338,8 +345,8 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp volume_limit(_value), do: {:error, {:invalid_query_parameter, "limit"}}
 
-  defp volume_aggregation(value) when value in [nil, "", "series"], do: :ok
-  defp volume_aggregation(_value), do: {:error, {:invalid_query_parameter, "aggregateBy"}}
+  defp volume_aggregation(value) when value in [nil, "", "series", "labels"], do: :ok
+  defp volume_aggregation(_value), do: {:error, {:http_parameter_error, "aggregateBy", "invalid aggregation option"}}
 
   defp volume_labels(value, selector) when value in [nil, ""],
     do: selector.matchers |> Enum.map(& &1.name) |> Enum.uniq() |> valid_labels()
@@ -426,41 +433,14 @@ defmodule PulsoWeb.LokiQueryController do
     end
   end
 
-  defp detected_limit(nil, default, _name), do: {:ok, default}
-
-  defp detected_limit(value, _default, name) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} when n > 0 and n <= 5000 -> {:ok, n}
+  defp detected_limit(value, default, name) do
+    case HTTPParams.uint32(value, name, default) do
+      {:ok, n} when n <= 5000 -> {:ok, n}
       _ -> {:error, {:invalid_query_parameter, name}}
     end
   end
 
-  defp detected_limit(_value, _default, name), do: {:error, {:invalid_query_parameter, name}}
-
-  # Like Loki: `end` defaults to now and `start` to `since` (default 1h) before it.
-  defp detected_window(params) do
-    now = System.system_time(:nanosecond)
-
-    with {:ok, start} <- query_timestamp(params["start"], "start"),
-         {:ok, finish} <- query_timestamp(params["end"], "end"),
-         {:ok, since} <- detected_since(params["since"]) do
-      finish = finish || now
-      start = start || finish - since
-
-      if start > finish,
-        do: {:error, {:invalid_query_parameter, "start/end"}},
-        else: {:ok, %{start_ns: start, end_ns: finish}}
-    end
-  end
-
-  defp detected_since(nil), do: {:ok, 3_600_000_000_000}
-
-  defp detected_since(value) do
-    case seconds_or_duration(value) do
-      {:ok, n} -> {:ok, n}
-      _ -> {:error, {:invalid_query_parameter, "since"}}
-    end
-  end
+  defp detected_window(params), do: discovery_times(params)
 
   # ---------------------------------------------------------------------------
   # patterns (`Pulso.Loki.Patterns`)
@@ -481,7 +461,7 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, limits} <- request_query_limits(conn),
          :ok <- validate_query_length(limits, window.start_ns, window.end_ns),
          :ok <- query_matcher_limits(ast, limits),
-         {:ok, step} <- patterns_step(params["step"], window),
+         {:ok, step} <- HTTPParams.step(params["step"], window.start_ns, window.end_ns),
          {:ok, patterns} <- Patterns.query(tenant, ast, window |> Map.put(:step_ns, step) |> query_timeout(limits)) do
       data =
         Enum.map(patterns, fn {pattern, samples} ->
@@ -492,32 +472,6 @@ defmodule PulsoWeb.LokiQueryController do
     else
       err -> render_error(conn, err)
     end
-  end
-
-  defp patterns_step(nil, window),
-    do: patterns_steps(max(div(window.end_ns - window.start_ns, 250 * 1_000_000_000), 1) * 1_000_000_000, window)
-
-  defp patterns_step(value, window) do
-    case seconds_or_duration(value) do
-      {:ok, n} -> patterns_steps(n, window)
-      _ -> {:error, {:invalid_query_parameter, "step"}}
-    end
-  end
-
-  # Float seconds or a Prometheus duration (`5m`, `1h30m`), as Loki parses `step` and `since`.
-  defp seconds_or_duration(value) when is_binary(value) do
-    case Pulso.PromQL.Time.parse_seconds(value) do
-      {:ok, ns} when ns > 0 -> {:ok, ns}
-      _ -> Pulso.PromQL.Parser.parse_duration(value)
-    end
-  end
-
-  defp seconds_or_duration(_value), do: {:error, :invalid_duration}
-
-  defp patterns_steps(step, window) do
-    if div(window.end_ns - window.start_ns, step) > 11_000,
-      do: {:error, {:invalid_query_parameter, "step"}},
-      else: {:ok, step}
   end
 
   # ---------------------------------------------------------------------------
@@ -542,9 +496,9 @@ defmodule PulsoWeb.LokiQueryController do
          :ok <- tail_validate(ast),
          {:ok, limit} <- tail_limit(params["limit"], Keyword.get(config, :max_limit, 5000)),
          :ok <- tail_delay(params["delay_for"]),
-         {:ok, start} <- query_timestamp(params["start"], "start"),
+         {:ok, times} <- discovery_times(params),
          {:ok, follower} <- Tail.join(tenant, Keyword.get(config, :max_per_tenant, 10)),
-         {:ok, history} <- tail_history(ast, tenant, start, limit) do
+         {:ok, history} <- tail_history(ast, tenant, times.start_ns, limit) do
       state = %{
         tenant: tenant,
         follower: follower,
@@ -605,27 +559,19 @@ defmodule PulsoWeb.LokiQueryController do
     end
   end
 
-  defp tail_limit(nil, _max), do: {:ok, @default_limit}
-
-  defp tail_limit(value, max) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} when n > 0 and n <= max -> {:ok, n}
+  defp tail_limit(value, max) do
+    case HTTPParams.uint32(value, "limit", 100) do
+      {:ok, n} when n <= max -> {:ok, n}
       _ -> {:error, {:invalid_query_parameter, "limit"}}
     end
   end
 
-  defp tail_limit(_value, _max), do: {:error, {:invalid_query_parameter, "limit"}}
-
-  defp tail_delay(nil), do: :ok
-
-  defp tail_delay(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} when n >= 0 and n <= 5 -> :ok
+  defp tail_delay(value) do
+    case HTTPParams.uint32(value, "delay_for", 0, 0) do
+      {:ok, n} when n <= 5 -> :ok
       _ -> {:error, {:invalid_query_parameter, "delay_for"}}
     end
   end
-
-  defp tail_delay(_value), do: {:error, {:invalid_query_parameter, "delay_for"}}
 
   # The connection already receives live entries, so the history window
   # ends now and the two overlap rather than leave a gap.
@@ -674,119 +620,6 @@ defmodule PulsoWeb.LokiQueryController do
       {:error, reason} -> {:error, {:parse_error, reason}}
     end
   end
-
-  # Integer times follow Loki's length rule: at most ten characters means
-  # seconds, otherwise nanoseconds. RFC3339 retains nanosecond fractions.
-  # Invalid supplied bounds fail before storage; omitted instant time is now.
-  # `step` is a duration string (`15s`, `1m`) or an integer seconds value.
-  defp build_opts(params, mode) do
-    with {:ok, time_opts} <- query_time_opts(params, mode) do
-      opts =
-        time_opts
-        |> maybe_put(:step_ns, step_for(mode, params, time_opts))
-        |> maybe_put(:limit, parse_limit(params["limit"]))
-        |> maybe_put(:direction, parse_direction(params["direction"]))
-
-      {:ok, opts}
-    end
-  end
-
-  defp step_for(:range, params, times) do
-    default = max(1, div(times.end_ts_ns - times.start_ts_ns, 250_000_000_000)) * 1_000_000_000
-    parse_step(params["step"]) || default
-  end
-
-  defp step_for(:instant, _params, _times), do: nil
-
-  defp parse_limit(nil), do: @default_limit
-  defp parse_limit(v) when is_integer(v) and v > 0, do: v
-
-  defp parse_limit(v) when is_binary(v) do
-    case Integer.parse(v) do
-      {n, ""} when n > 0 -> n
-      _ -> @default_limit
-    end
-  end
-
-  defp parse_limit(_), do: @default_limit
-
-  defp parse_direction("forward"), do: :forward
-  defp parse_direction("backward"), do: :backward
-  defp parse_direction(_), do: @default_direction
-
-  defp query_time_opts(params, mode) do
-    now = System.system_time(:nanosecond)
-
-    with {:ok, start} <- query_timestamp(params["start"], "start"),
-         {:ok, finish} <- query_timestamp(params["end"], "end"),
-         {:ok, time} <- query_timestamp(params["time"], "time") do
-      finish = if mode == :instant, do: time || finish || now, else: finish || now
-      start = start || if(mode == :range, do: max(-9_223_372_036_854_775_808, finish - 3_600_000_000_000))
-
-      if start != nil and start > finish,
-        do: {:error, {:invalid_query_parameter, "start/end"}},
-        else: {:ok, %{end_ts_ns: finish} |> maybe_put(:start_ts_ns, start)}
-    end
-  end
-
-  defp query_timestamp(nil, _), do: {:ok, nil}
-
-  defp query_timestamp(value, name) when is_integer(value) or (is_binary(value) and byte_size(value) <= 128) do
-    case parse_ts(value) do
-      n when is_integer(n) and n >= -9_223_372_036_854_775_808 and n <= 9_223_372_036_854_775_807 -> {:ok, n}
-      _ -> {:error, {:invalid_query_parameter, name}}
-    end
-  end
-
-  defp query_timestamp(_, name), do: {:error, {:invalid_query_parameter, name}}
-
-  defp parse_ts(nil), do: nil
-  defp parse_ts(v) when is_integer(v), do: parse_ts(Integer.to_string(v))
-
-  # RFC3339 goes through DateTime for calendar/offset validation. Its stored
-  # fraction is microseconds, so restore the final three nanosecond digits.
-  defp parse_ts(v) when is_binary(v) do
-    case Integer.parse(v) do
-      {n, ""} ->
-        if byte_size(v) <= 10, do: n * 1_000_000_000, else: n
-
-      _ ->
-        parse_rfc3339(v)
-    end
-  end
-
-  defp parse_rfc3339(text) do
-    with true <- Regex.match?(~r/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})\z/, text),
-         {:ok, dt, _offset} <- DateTime.from_iso8601(text) do
-      DateTime.to_unix(dt, :nanosecond) + fractional_ns(text)
-    else
-      _ -> nil
-    end
-  end
-
-  defp fractional_ns(text) do
-    case Regex.run(~r/[Tt]\d{2}:\d{2}:\d{2}[.,](\d+)(?:[Zz]|[+-]\d{2}:\d{2})$/, text) do
-      [_, fraction] -> fraction |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer() |> rem(1000)
-      _ -> 0
-    end
-  end
-
-  defp parse_step(nil), do: nil
-  defp parse_step(v) when is_integer(v), do: v * 1_000_000_000
-
-  defp parse_step(v) when is_binary(v) do
-    case Integer.parse(v) do
-      {n, ""} -> n * 1_000_000_000
-      {n, "s"} -> n * 1_000_000_000
-      {n, "ms"} -> n * 1_000_000
-      {n, "m"} -> n * 60 * 1_000_000_000
-      {n, "h"} -> n * 3600 * 1_000_000_000
-      _ -> nil
-    end
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   # Instant metrics have a zero evaluation window. Their range selectors are
   # not maxQueryLength (Loki calls that separate policy maxQueryInterval).
@@ -983,6 +816,9 @@ defmodule PulsoWeb.LokiQueryController do
   defp render_error(conn, {:error, {:invalid_query_parameter, name}}),
     do: error_json(conn, :bad_request, "invalid_parameter", name)
 
+  defp render_error(conn, {:error, {:http_parameter_error, _name, message}}),
+    do: error_json(conn, :bad_request, "invalid_parameter", message)
+
   defp render_error(conn, {:error, {:invalid_query_limits, reason}}),
     do: error_json(conn, :bad_request, "invalid_parameter", "X-Loki-Query-Limits: " <> reason)
 
@@ -1022,8 +858,8 @@ defmodule PulsoWeb.LokiQueryController do
               :query_execution_failed
             ], do: render_query_error(conn, reason)
 
-  defp render_error(conn, {:error, reason}),
-    do: error_json(conn, :service_unavailable, "storage_unavailable", inspect(reason))
+  defp render_error(conn, {:error, _reason}),
+    do: error_json(conn, :service_unavailable, "storage_unavailable", "Storage is unavailable.")
 
   defp render_query_error(conn, :query_overloaded),
     do: error_json(conn, :too_many_requests, "query_overloaded", "Query capacity is busy.")

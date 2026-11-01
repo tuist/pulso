@@ -3,6 +3,151 @@ defmodule Pulso.LogQL.ParserTest do
 
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Parser
+  alias Pulso.LogQL.QueryValidation
+
+  @tag :formatter_roundtrip_batch
+  test "complete Loki formatter inputs and literal outputs retain query admission" do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/formatter-roundtrip.json") |> Pulso.JSON.decode!()
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+    assert fixture["row_count"] == 196
+    assert fixture["literal_query_count"] == 185
+    assert fixture["literal_expected_count"] == 94
+
+    for table <- fixture["tables"], row <- table["rows"], row["query_is_direct_input"] do
+      query = Base.decode64!(row["query_bytes_base64"])
+      result = with {:ok, ast} <- Parser.parse(query), do: QueryValidation.validate(ast)
+
+      case {table["name"], row["source_index"]} do
+        {"Test_SampleExpr_String", 49} ->
+          # Outer grammar admits the string, but executable field expressions
+          # reject unquoted dotted logfmt sources in the actual pinned parser.
+          assert {:ok, _} = Parser.parse(query)
+          assert result == {:error, {:invalid_logfmt_expression, "response.code"}}
+
+        {"TestStringer", index} when index in [15, 36] ->
+          assert {:ok, _} = Parser.parse(query)
+          assert result == {:error, :invalid_ip_operation}
+
+        {"TestJSONSerializationRoundTrip", 12} ->
+          assert {:ok, _} = Parser.parse(query)
+          assert result == {:error, {:invalid_ip_pattern, ""}}
+
+        {"Test_SampleExpr_String_Fail", _} ->
+          # Preserve Loki's rejection oracle while retaining Pulso's existing
+          # ordinary nonpositive-rank empty-result policy, not a passing port.
+          assert row["reject"]
+          assert result == :ok
+
+        {"Test_formatQueryHandlerResponse", 1} ->
+          # The source asserts an invalid-query response, not a reject boolean.
+          assert {:error, _} = result
+
+        _ ->
+          assert result == :ok, inspect({table["name"], row["source_index"], query, result})
+      end
+
+      if row["expected_is_same_expression"] and row["expected_bytes_base64"] do
+        # These bytes come from Loki's literal oracle, not a Pulso formatter.
+        # Admission of both spellings is not proof that Pulso formats queries.
+        expected = Base.decode64!(row["expected_bytes_base64"])
+        assert {:ok, ast} = Parser.parse(expected)
+        assert QueryValidation.validate(ast) == result
+      end
+    end
+  end
+
+  @tag :matcher_admission_batch
+  test "complete Loki matcher tables preserve tuples and explicit selector-policy differences" do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/matcher-admission.json") |> Pulso.JSON.decode!()
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+    assert Enum.map(fixture["tables"], & &1["row_count"]) == [4, 19, 7]
+    assert fixture["rejected_count"] == 15
+
+    for table <- fixture["tables"], row <- table["rows"] do
+      query = Base.decode64!(row["query_bytes_base64"])
+      parsed = Parser.parse(query)
+
+      case table["name"] do
+        "TestParseMatchers" ->
+          # This is a selector-only contract, not general LogQL admission.
+          case parsed do
+            {:ok, %AST.LogQuery{selector: selector, stages: []} = ast} ->
+              refute row["reject"]
+              assert QueryValidation.validate(ast) == :ok
+              operators = %{eq: "=", neq: "!=", re: "=~", nre: "!~"}
+
+              actual =
+                Enum.map(selector.matchers, fn matcher ->
+                  {matcher.name, Map.fetch!(operators, matcher.op), matcher.value}
+                end)
+
+              expected =
+                Enum.map(row["expected_matchers"], fn matcher ->
+                  {matcher["name"], matcher["op"], matcher["value"]}
+                end)
+
+              assert actual == expected
+
+            _ ->
+              assert row["reject"], inspect({query, parsed})
+          end
+
+        name ->
+          result = with {:ok, ast} <- parsed, do: QueryValidation.validate(ast)
+
+          policy_difference? =
+            case name do
+              "TestParseSampleExpr_equalityMatcher" -> row["source_index"] in [1, 4, 6, 7, 8, 10, 15, 16, 17]
+              "TestParseLogSelectorExpr_equalityMatcher" -> row["source_index"] in [1, 4, 6]
+            end
+
+          if policy_difference? do
+            # Keep the source rejection: Pulso deliberately permits these
+            # empty/negative/empty-compatible selectors under server budgets.
+            assert row["reject"]
+
+            assert row["expected_error_expression"] ==
+                     "logqlmodel.NewParseError(errAtleastOneEqualityMatcherRequired, 0, 0)"
+
+            assert result == :ok, inspect(query)
+          else
+            assert result != :ok == row["reject"], inspect({name, query, result})
+          end
+      end
+    end
+  end
+
+  @tag :syntax_admission_batch
+  test "complete pinned Loki syntax table retains admission and explicit policy differences" do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/syntax-admission.json") |> Pulso.JSON.decode!()
+    assert fixture["revision"] == "5aa4b9212d64d723f63b2770452054aa23df114d"
+    assert length(fixture["rows"]) == 206
+    assert Enum.count(fixture["rows"], & &1["reject"]) == 47
+
+    for row <- fixture["rows"] do
+      # Base64 preserves the original invalid UTF-8 input as well as raw strings.
+      query = Base.decode64!(row["query_bytes_base64"])
+      result = with {:ok, ast} <- Parser.parse(query), do: QueryValidation.validate(ast)
+
+      case row["source_index"] do
+        0 ->
+          # Loki constructs this line-filter AST without compiling its trailing
+          # backslash; Pulso deliberately validates patterns before storage.
+          assert row["reject"] == false
+          assert {:ok, _} = Parser.parse(query)
+          assert {:error, {:invalid_regex, :line_filter, "error\\", _reason}} = result
+
+        42 ->
+          # Empty selectors are an existing Pulso policy, not a newly skipped row.
+          assert row["reject"] == true
+          assert query == "approx_count_distinct(mac, {}[1d]) by (version)"
+          assert result == :ok
+
+        _ ->
+          assert result != :ok == row["reject"], inspect({row["source_index"], query, result})
+      end
+    end
+  end
 
   # The primary parser test: every non-blank, non-comment line in the corpus
   # file MUST parse to `{:ok, _}`. This catches grammar regressions without

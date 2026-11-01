@@ -328,7 +328,7 @@ defmodule PulsoWeb.LokiQueryControllerTest do
       assert body["error"] in ["parse_error", "evaluation_failed"]
     end
 
-    test "unparseable limit falls back to default, does not 500", %{conn: conn} do
+    test "unparseable supplied limit rejects instead of silently using the default", %{conn: conn} do
       :ok = Storage.append(:logs, "acme", [%Log{timestamp_ns: 10, service: "api", body: "a"}])
 
       conn =
@@ -336,8 +336,8 @@ defmodule PulsoWeb.LokiQueryControllerTest do
         |> put_req_header("x-scope-orgid", "acme")
         |> get(~p"/loki/api/v1/query_range?query=#{"{service=\"api\"}"}&limit=abc")
 
-      body = json_response(conn, 200)
-      assert body["status"] == "success"
+      body = json_response(conn, 400)
+      assert body["error"] == "invalid_parameter"
     end
 
     test "RFC3339 timestamps parse instead of scanning the whole tenant", %{conn: conn} do
@@ -392,11 +392,12 @@ defmodule PulsoWeb.LokiQueryControllerTest do
              ]
     end
 
-    test "series requires a selector", %{conn: conn} do
-      assert conn
-             |> put_req_header("x-scope-orgid", "streams")
-             |> get("/loki/api/v1/series")
-             |> json_response(400)
+    test "series without a selector discovers all bounded streams", %{conn: conn} do
+      assert discover(conn, "/loki/api/v1/series", %{}) == [
+               %{"namespace" => "prod", "pod" => "api-1", "service_name" => "api"},
+               %{"namespace" => "prod", "pod" => "api-gw", "service_name" => "gateway"},
+               %{"namespace" => "staging", "pod" => "web-1"}
+             ]
     end
 
     test "label values honor the query selector", %{conn: conn} do

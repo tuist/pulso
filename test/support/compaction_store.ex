@@ -12,6 +12,8 @@ defmodule Pulso.Test.CompactionStore do
     key = conn.request_path |> URI.decode() |> String.trim_leading("/pulso/")
     {body, conn} = read_full_body(conn, [])
 
+    if hook = Keyword.get(opts, :before_request), do: hook.(conn.method, key, body)
+
     {status, etag, response} =
       Agent.get_and_update(agent, fn state ->
         dispatch(conn.method, key, body, conn, apply_hook(state, conn.method, key))

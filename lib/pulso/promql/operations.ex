@@ -202,9 +202,15 @@ defmodule Pulso.PromQL.Operations do
   defp matched_output({labels, _} = sample, seen, context) do
     output = vector_pair(sample, context)
     key = signature(labels, context.modifiers)
+    # Group modifiers may remove/overwrite a many-side label. Uniqueness is
+    # then per matching group AND final output labels, after filtering; it is
+    # distinct from an ambiguous one-side index or unrelated duplicate outputs.
+    key = if is_nil(context.grouping), do: key, else: {key, Enum.map(output, &elem(&1, 0))}
 
-    if output != [] and is_nil(context.grouping) and MapSet.member?(seen, key),
-      do: throw({:promql_error, :many_to_many_matching})
+    if output != [] and MapSet.member?(seen, key) do
+      reason = if is_nil(context.grouping), do: :many_to_many_matching, else: :multiple_matches_for_labels
+      throw({:promql_error, reason})
+    end
 
     seen = if output == [], do: seen, else: MapSet.put(seen, key)
     {output, seen}

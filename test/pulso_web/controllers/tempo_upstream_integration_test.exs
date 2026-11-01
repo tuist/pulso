@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Adapted from Grafana Tempo integration/api/search/{search,search_tags}_test.go.
+# Exact-ID/search cases: integration/api/tracebyid/trace_by_id_test.go.
 # Filtering cases: integration/api/tracebyid/trace_by_id_filtering_test.go.
 # Metric cases: integration/api/metrics/query_range_test.go.
 # Default metric steps: pkg/traceql/engine_metrics_test.go.
@@ -27,6 +28,11 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
          |> Path.expand(__DIR__)
          |> File.read!()
          |> Pulso.JSON.decode!()
+
+  @intrinsic_names "../../fixtures/traces/tempo_integration/intrinsic-names.json"
+                   |> Path.expand(__DIR__)
+                   |> File.read!()
+                   |> Pulso.JSON.decode!()
 
   @math "../../fixtures/traces/tempo_integration/metrics-math.json"
         |> Path.expand(__DIR__)
@@ -295,6 +301,61 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     end
   end
 
+  for row <- @cases["names"] do
+    @tag :name_vocabulary
+    test "TestTagEndpoints: v2 name content / #{row["name"]}", ctx do
+      row = unquote(Macro.escape(row))
+      ingest(ctx, @cases["batches"])
+
+      # Upstream adds the virtual vocabulary after constructing each scope
+      # table, then sorts scopes/tags. Keep that original helper behavior.
+      scopes =
+        if row["scope"] == "none",
+          do: [%{"name" => "intrinsic", "tags" => @intrinsic_names} | row["expected"]],
+          else: row["expected"]
+
+      expected = %{"scopes" => Enum.sort_by(scopes, & &1["name"])}
+
+      for window <- windows(ctx) do
+        params = Map.merge(window, %{"scope" => row["scope"], "q" => row["query"]})
+        assert get(ctx, "/api/v2/search/tags", params) == expected
+
+        response =
+          Req.get!(ctx.url <> "/api/v2/search/tags",
+            headers: [{"accept", "application/protobuf"} | ctx.headers],
+            params: params
+          )
+
+        assert response.status == 200
+        assert response.body == Protobuf.encode(expected, :tags_v2)
+      end
+    end
+  end
+
+  @tag :name_vocabulary
+  test "Pulso controls: current intrinsic names are vocabulary, never ID-value support or unauthenticated access",
+       ctx do
+    before_requests = Agent.get(ctx.store, & &1.requests)
+    expected = %{"scopes" => [%{"name" => "intrinsic", "tags" => @intrinsic_names}]}
+
+    for window <- windows(ctx) do
+      params = Map.put(window, "scope", "intrinsic")
+      assert get(ctx, "/api/v2/search/tags", params) == expected
+      assert get(ctx, "/api/search/tags", params) == %{"tagNames" => @intrinsic_names}
+    end
+
+    assert call_tool(ctx, "discover_trace_tags", %{"tenant" => ctx.tenant, "scope" => "intrinsic"}) == expected
+
+    for key <- ~w(link:spanID link:traceID span:id span:parentID trace:id) do
+      response = Req.get!(ctx.url <> values_path(2, key), headers: ctx.headers)
+      assert response.status == 400
+    end
+
+    denied = Req.get!(ctx.url <> "/api/v2/search/tags", params: %{"scope" => "intrinsic"})
+    assert denied.status == 401
+    assert Agent.get(ctx.store, & &1.requests) == before_requests
+  end
+
   test "TestSearchTraceQL: original resource and span attributes find the persisted trace with default or explicit bounds",
        ctx do
     ingest(ctx, @cases["batches"])
@@ -350,6 +411,63 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     for c <- dir |> Path.join("search-oracle.json") |> File.read!() |> Pulso.JSON.decode!() do
       params = %{"q" => c["query"], "start" => c["Start"], "end" => c["End"]}
       assert get(ctx, "/api/search", params) === c["response"], c["query"]
+    end
+  end
+
+  @tag :trace_by_id_upstream
+  test "TestTraceByIDandTraceQL: all ten original rich traces survive v1/v2 exact-ID reads", ctx do
+    fixture = ingest_trace_infos(ctx)
+
+    for phase <- [:published, :fresh_manifest] do
+      if phase == :fresh_manifest do
+        assert :ok = stop_supervised(ManifestSupervision)
+        start_supervised!(ManifestSupervision)
+      end
+
+      for row <- fixture["traces"] do
+        expected = canonical_trace_info(row["expected"])
+        v1 = get(ctx, "/api/traces/" <> row["traceID"], %{})
+        v2 = get(ctx, "/api/v2/traces/" <> row["traceID"], %{})
+        assert canonical_trace_info(%{"resourceSpans" => v1["batches"]}) === expected
+        assert canonical_trace_info(v2["trace"]) === expected
+        assert Map.get(v2, "status", "COMPLETE") == "COMPLETE"
+
+        for {prefix, body, schema} <- [
+              {"/api/traces/", v1, :export},
+              {"/api/v2/traces/", %{"trace" => %{"batches" => v2["trace"]["resourceSpans"]}}, :response}
+            ] do
+          response =
+            Req.get!(ctx.url <> prefix <> row["traceID"],
+              headers: [{"accept", "application/protobuf"} | ctx.headers]
+            )
+
+          assert response.status == 200
+          assert response.body == Protobuf.encode(body, schema)
+        end
+      end
+    end
+  end
+
+  @tag :trace_by_id_upstream
+  test "Pulso deliberate incompatibility: original multi-root trace searches reject whole", ctx do
+    fixture = ingest_trace_infos(ctx)
+
+    # The unchanged upstream helper asserts row["traceID"] is found. Executing
+    # that assertion failed with 409 trace_root_conflict (seed 701). Do not
+    # relabel these as passing upstream search cases or rewrite the producer's
+    # parent graph to evade Pulso's documented fail-whole root-summary policy.
+    for phase <- [:published, :fresh_manifest] do
+      if phase == :fresh_manifest do
+        assert :ok = stop_supervised(ManifestSupervision)
+        start_supervised!(ManifestSupervision)
+      end
+
+      for row <- fixture["traces"], query <- row["queries"] do
+        params = %{"q" => query, "start" => fixture["anchor"] - 3600, "end" => fixture["anchor"] + 3600}
+        response = Req.get!(ctx.url <> "/api/search", headers: ctx.headers, params: params)
+        assert response.status == 409, inspect({phase, row["traceID"], query})
+        assert response.body == "trace_root_conflict"
+      end
     end
   end
 
@@ -1243,6 +1361,48 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
     end
     |> Enum.sort()
   end
+
+  defp ingest_trace_infos(ctx) do
+    bytes =
+      "../../fixtures/traces/tempo_integration/trace-by-id.json"
+      |> Path.expand(__DIR__)
+      |> File.read!()
+
+    assert Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) ==
+             "e4c37ec95b0bd97bbd00e01876b14422c55ee669799a1e3a791c05cad93cef43"
+
+    fixture = Pulso.JSON.decode!(bytes)
+    assert length(fixture["traces"]) == 10
+
+    for row <- fixture["traces"] do
+      response =
+        Req.post!(ctx.url <> "/v1/traces",
+          headers: [{"content-type", "application/x-protobuf"} | ctx.headers],
+          body: Base.decode64!(row["wire"])
+        )
+
+      assert response.status == 200
+    end
+
+    fixture
+  end
+
+  # Like upstream SortTraceAndAttributes, compare all owners/fields while
+  # ignoring collection order. Never sort AnyValue arrays or discard duplicates.
+  defp canonical_trace_info(map) when is_map(map) do
+    Map.new(map, fn {key, value} ->
+      value = canonical_trace_info(value)
+
+      if key in ["resourceSpans", "scopeSpans", "spans", "attributes", "events", "links"] do
+        {key, Enum.sort(value)}
+      else
+        {key, value}
+      end
+    end)
+  end
+
+  defp canonical_trace_info(list) when is_list(list), do: Enum.map(list, &canonical_trace_info/1)
+  defp canonical_trace_info(value), do: value
 
   defp ingest(ctx, batches) do
     for {batch, i} <- Enum.with_index(batches, 1) do

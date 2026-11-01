@@ -29,6 +29,7 @@ defmodule Pulso.LogQL.Evaluator do
           optional(:limit) => pos_integer(),
           optional(:direction) => :forward | :backward,
           optional(:step_ns) => pos_integer(),
+          optional(:interval_ns) => non_neg_integer(),
           optional(:categorize_labels) => boolean()
         }
 
@@ -56,9 +57,33 @@ defmodule Pulso.LogQL.Evaluator do
     end)
   end
 
-  # With a limit, keep only the `limit` newest (backward) or oldest (forward)
-  # entries across all streams while folding, as Loki does, instead of
-  # materializing every match.
+  defp do_evaluate_log(query, tenant, %{interval_ns: interval, limit: limit} = opts) when interval > 0 do
+    direction = Map.get(opts, :direction, :backward)
+    Process.put(:promql_budget, %{log_samples: 0, work: 0})
+    Process.put(:promql_deadline_ms, Process.get(:query_deadline_ms))
+
+    # Storage batches are not globally time ordered. Interval selection cannot
+    # discard the nearest `limit` rows first: the next eligible row may be in
+    # another batch/stream. Bound the ordered input with the existing log-sample
+    # budget and worker heap; scan/work/deadline failures still fail whole.
+    collect = fn entry, _record, entries ->
+      Evaluator.charge(:log_samples, 1)
+      [Pulso.JSON.detach(entry) | entries]
+    end
+
+    with {:ok, entries} <- fold_log(query, tenant, opts, [], collect) do
+      entries
+      |> sample_interval(interval, limit, direction)
+      |> group_streams(Map.get(opts, :categorize_labels, false))
+      |> apply_direction(direction)
+      |> ok()
+    end
+  catch
+    {:promql_error, reason} -> {:error, reason}
+  end
+
+  # With a limit and no interval, keep only the newest/oldest entries across
+  # all streams while folding, rather than materializing every match.
   defp do_evaluate_log(query, tenant, %{limit: limit} = opts) when is_integer(limit) and limit > 0 do
     with {:ok, entries} <- do_select_entries(query, tenant, opts, fn entry, _record -> entry end) do
       entries
@@ -76,6 +101,26 @@ defmodule Pulso.LogQL.Evaluator do
       |> apply_limit(Map.get(opts, :limit))
       |> ok()
     end
+  end
+
+  defp sample_interval(entries, interval, limit, direction) do
+    order = if direction == :forward, do: :asc, else: :desc
+    ordered = Enum.sort_by(entries, &{&1.timestamp_ns, &1.line}, order)
+    Evaluator.charge(:work, length(ordered))
+
+    {selected, _, _} =
+      Enum.reduce_while(ordered, {[], nil, 0}, fn entry, {selected, previous, size} = acc ->
+        ts = entry.timestamp_ns
+        eligible = is_nil(previous) or previous < 0 or abs(ts - previous) >= interval
+
+        cond do
+          eligible and size + 1 == limit -> {:halt, {[entry | selected], ts, size + 1}}
+          eligible -> {:cont, {[entry | selected], ts, size + 1}}
+          true -> {:cont, acc}
+        end
+      end)
+
+    selected
   end
 
   @doc """

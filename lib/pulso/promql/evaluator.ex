@@ -206,7 +206,11 @@ defmodule Pulso.PromQL.Evaluator do
   # Like upstream, a range request accepts only scalars and instant vectors,
   # even when start == end. Reject before resolving or reading any selector.
   defp query_result_type(expr, :matrix) do
-    if Parser.type(expr) in [:scalar, :vector], do: :ok, else: {:error, :invalid_result_type}
+    case Parser.type(expr) do
+      type when type in [:scalar, :vector] -> :ok
+      :range -> {:error, :range_result_for_range_query}
+      _ -> {:error, :invalid_result_type}
+    end
   end
 
   defp query_result_type(_expr, :vector), do: :ok
@@ -457,7 +461,9 @@ defmodule Pulso.PromQL.Evaluator do
     do: evaluate_range(expr, tenant, steps, :raw_range)
 
   defp evaluate({:function, :absent_over_time, inner}, tenant, steps) do
-    with {:ok, vector, warnings} <- evaluate_range(inner, tenant, steps, :count_over_time) do
+    # Presence must retain source identities: removing metric names can make
+    # distinct selected metrics collide before we test whether any exists.
+    with {:ok, vector, warnings} <- evaluate_range(inner, tenant, steps, :last_over_time) do
       {:ok, Operations.absent(vector, absent_labels(inner), steps), warnings}
     end
   end

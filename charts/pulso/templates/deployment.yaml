@@ -104,6 +104,22 @@ spec:
               value: {{ include "pulso.boundedInteger" (list "sentry.historyDays" .Values.sentry.historyDays 1 365) | quote }}
             - name: PULSO_ERROR_PROJECTION_INTERVAL_MS
               value: {{ include "pulso.boundedInteger" (list "sentry.projectionIntervalMs" .Values.sentry.projectionIntervalMs 1000 60000) | quote }}
+            - name: PULSO_RELIABILITY_ENABLED
+              value: {{ .Values.reliability.enabled | quote }}
+            - name: PULSO_RELIABILITY_TENANTS_JSON
+              value: {{ .Values.reliability.tenants | toJson | quote }}
+            - name: PULSO_RELIABILITY_PRICE_VALID_UNTIL
+              value: {{ .Values.reliability.priceValidUntil | quote }}
+            - name: PULSO_RELIABILITY_INPUT_NANO_USD_PER_TOKEN
+              value: {{ include "pulso.boundedInteger" (list "reliability.inputNanoUsdPerToken" .Values.reliability.inputNanoUsdPerToken 1 1000000) | quote }}
+            - name: PULSO_RELIABILITY_ASSESSMENT_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.assessmentBudgetUsd" .Values.reliability.assessmentBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_OBJECT_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.objectBudgetUsd" .Values.reliability.objectBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_INVESTIGATION_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.investigationBudgetUsd" .Values.reliability.investigationBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_INVESTIGATION_URL
+              value: {{ .Values.reliability.investigationUrl | quote }}
             - name: PULSO_ALERTING_EVALUATION_ENABLED
               value: {{ .Values.alerting.evaluationEnabled | quote }}
             - name: PULSO_ALERTING_NOTIFICATIONS_ENABLED

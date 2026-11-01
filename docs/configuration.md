@@ -40,7 +40,7 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_LOG_COMPACTION_ENABLED` | `false` | Merge small log segments natively in the background. Read [Log compaction](#log-compaction) first. |
 | `PULSO_TRACE_COMPACTION_ENABLED` | `false` | Experimental native trace merges and retirement cleanup. Requires all readers/writers/compactors upgraded and bucket versioning; see [trace compaction](traces.md#optional-native-compaction). |
 | `PULSO_SENTRY_PROJECTS_JSON` | `{}` | Ingest-only Sentry project map: numeric ID to `tenant`, `service`, `public_key_hashes` (1–8 lowercase SHA-256 digests). At most 256 projects. Empty disables ingestion. See [error tracking](error-tracking.md). |
-| `PULSO_ERROR_PROJECTION_ENABLED` | `false` | Enable the experimental S3-derived issue index and replayable change feed. Independent of ingestion and diagnosis; see [error monitoring](error-monitoring.md). |
+| `PULSO_ERROR_PROJECTION_ENABLED` | `false` | Enable the experimental S3-derived issue index, bounded error-rate detector and replayable change feed. Independent of ingestion and diagnosis; see [error monitoring](error-monitoring.md). |
 | `PULSO_ERROR_HISTORY_DAYS` | `1` | Derived error history in whole days, integer `1..365`. Newness and counts are limited to this horizon and raw log retention. Changing it rebaselines the index. |
 | `PULSO_ERROR_PROJECTION_INTERVAL_MS` | `5000` | Derived-index worker cadence, integer `1000..60000`. Each pass visits one configured project and at most 32 new segments; catchup and freshness depend on project count and storage latency. |
 | `PULSO_ALERTING_PRINCIPALS_JSON` | `[]` | Dedicated alerting principal array with `tenant`, `id`, `type`, `token_hash` and `capabilities`; at most 256 entries. See [alerting credentials](alerting.md#configure-credentials-and-evaluation). |
@@ -68,6 +68,17 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PHX_HOST` | `example.com` | Host name used when Pulso generates absolute URLs. Pulso does not currently emit any, so this can stay unset. |
 
 Boolean variables accept `true`, `1`, or `yes`; anything else is false.
+
+## Reliability assessments
+
+Experimental periodic model assessments are independently opt-in using
+`PULSO_RELIABILITY_ENABLED`, an explicit `PULSO_RELIABILITY_TENANTS_JSON` enrollment,
+a secret `PULSO_RELIABILITY_OPENAI_API_KEY` and an operator-approved
+`PULSO_RELIABILITY_PRICE_VALID_UNTIL` ISO date. Assessment, estimated object work
+and external investigation have separate per-tenant monthly allowances. See the
+[complete variable table, defaults, disclosure policy and limits](reliability.md#enable-assessments).
+The chart's `reliability` block sets non-secret fields; Secret-backed `extraEnv`
+supplies credentials. This does not change raw retention or ingest durability.
 
 ## Tenants and tokens
 

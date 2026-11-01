@@ -28,13 +28,15 @@ mod atoms {
     unwrap, by, without, pipeline_error, query_resource_limit }
 }
 
-const COLUMNS: [&str; 6] = [
+const COLUMNS: [&str; 8] = [
     "timestamp_ns",
     "service",
     "severity_text",
     "body",
     "attributes",
     "resource",
+    "trace_id",
+    "span_id",
 ];
 
 #[derive(Debug)]
@@ -280,7 +282,7 @@ fn names(term: Term<'_>) -> Res<Vec<String>> {
 
 #[rustler::nif]
 fn log_metric_api_version() -> u32 {
-    16
+    17
 }
 
 /// `stages` is the pipeline after pushdown; `value` is `:count`, `:bytes` or
@@ -538,8 +540,15 @@ struct EntryLabels {
     stream_keys: HashSet<String>,
     metadata_keys: HashSet<String>,
 }
-// A row's stream identity within one batch: resource, attributes, service, level.
-type StreamKey<'b> = (&'b str, &'b str, Option<&'b str>, Option<&'b str>);
+// All inputs to a row's labels, including its per-entry correlation metadata.
+type StreamKey<'b> = (
+    &'b str,
+    &'b str,
+    Option<&'b str>,
+    Option<&'b str>,
+    Option<&'b str>,
+    Option<&'b str>,
+);
 
 impl State {
     fn scan(&mut self, bytes: Bytes, selection: &Selection) -> Res<(usize, usize)> {
@@ -576,6 +585,7 @@ impl State {
                 strings("body")?,
             );
             let (attributes, resource) = (strings("attributes")?, strings("resource")?);
+            let (trace_id, span_id) = (strings("trace_id")?, strings("span_id")?);
             // Stream labels repeat for runs of rows: build each set once.
             let mut bases: HashMap<StreamKey, Rc<EntryLabels>> = HashMap::new();
             for row in 0..batch.num_rows() {
@@ -622,11 +632,13 @@ impl State {
                 } else {
                     attributes.value(row)
                 };
-                let key = (res, attrs, svc, lvl);
+                let trace = (!trace_id.is_null(row)).then(|| trace_id.value(row));
+                let span = (!span_id.is_null(row)).then(|| span_id.value(row));
+                let key = (res, attrs, svc, lvl, trace, span);
                 let base = match bases.get(&key) {
                     Some(base) => Rc::clone(base),
                     None => {
-                        let base = Rc::new(entry_labels(res, attrs, svc, lvl)?);
+                        let base = Rc::new(entry_labels(res, attrs, svc, lvl, trace, span)?);
                         bases.insert(key, Rc::clone(&base));
                         base
                     }
@@ -781,6 +793,8 @@ fn entry_labels(
     attributes: &str,
     service: Option<&str>,
     level: Option<&str>,
+    trace_id: Option<&str>,
+    span_id: Option<&str>,
 ) -> Res<EntryLabels> {
     let mut labels = Labels::new();
     let mut stream_keys = HashSet::new();
@@ -815,6 +829,13 @@ fn entry_labels(
             let k = String::from_utf8(k.into_owned()).map_err(|_| Error::Fallback)?;
             let v = String::from_utf8(v.into_owned()).map_err(|_| Error::Fallback)?;
             metadata.insert(k, v);
+        }
+    }
+    for (name, value) in [("trace_id", trace_id), ("span_id", span_id)] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            metadata
+                .entry(name.to_owned())
+                .or_insert_with(|| value.to_owned());
         }
     }
     let mut metadata_keys = HashSet::new();

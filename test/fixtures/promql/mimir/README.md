@@ -1,6 +1,6 @@
 # Grafana Mimir math and range-function integration cases
 
-These are **1590 selected query-engine integration cases in 85 fixture files**, copied without
+These are **1733 selected query-engine integration cases in 94 fixture files**, copied without
 changing their input samples, expressions or expected values from
 [grafana/mimir at dd039cdd4ba466adb5d28280bf1b8a374a98432e](https://github.com/grafana/mimir/tree/dd039cdd4ba466adb5d28280bf1b8a374a98432e).
 This is not Mimir's complete test suite or its Docker/service integration suite.
@@ -8,7 +8,7 @@ This is not Mimir's complete test suite or its Docker/service integration suite.
 The upstream entry points are `TestUpstreamTestCases` and `TestOurTestCases` in
 [`pkg/streamingpromql/comparisons/comparisons_test.go`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/comparisons/comparisons_test.go).
 They execute the DSL against real query engines; Mimir's own cases also run
-against Prometheus. The imported files cover the six basic math functions,
+against Prometheus. The imported files cover basic math functions,
 `clamp`/`clamp_min`/`clamp_max` with changing bounds and missing scalar inputs,
 histogram omission, arithmetic/nested calls, NaN/infinities, signed zero,
 metric-name collisions, and merging disjoint series lifetimes in range queries.
@@ -341,9 +341,14 @@ Pulso.
 
 | Local file | Source | Inclusive ranges | Evaluations |
 | --- | --- | --- | --- |
-| `upstream-math.test` | `upstream/functions.test` | 1–5, 2017–2030, 2042–2052, 2270–2358 | 21 |
+| `upstream-math.test` | `upstream/functions.test` | 1–5, 2017–2074, 2270–2358, 2369–2375 | 25 |
+| `upstream-absence.test` | `upstream/functions.test` | 1–5, 2077–2129 | 15 |
+| `upstream-timestamp.test` | `upstream/functions.test` | 1–5, 536–558, 2358–2367 | 7 |
+| `upstream-absence-over-time.test` | `upstream/functions.test` | 1–5, 2127–2210 | 27 |
+| `upstream-label-replace.test` | `upstream/functions.test` | 1–5, 476–536 | 11 |
+| `upstream-staleness.test` | `upstream/staleness.test` | 1–63 (complete) | 17 |
 | `mimir-math.test` | `ours/functions.test` | 1–2, 74–77, 90–92, 96–97, 406–412, 437–439, 452–454, 476–484, 503–504 | 7 |
-| `collision.test` | `ours/collision.test` | 1–17 | 2 |
+| `collision.test` | `ours/collision.test` | 1–25 (complete) | 4 |
 | `upstream-clamp.test` | `upstream/functions.test` | 1–5, 615–708, 2651–2702 | 27 |
 | `mimir-clamp.test` | `ours/functions.test` | 1–2, 515–558 | 9 |
 | `upstream-presence.test` | `upstream/functions.test` | 1–5, 2211–2219, 2222–2270 | 19 |
@@ -430,7 +435,7 @@ Pulso.
 For example, reproduce the first extraction from a checkout of that revision:
 
 ```sh
-sed -n '1,5p;2017,2030p;2042,2052p;2270,2358p' \
+sed -n '1,5p;2017,2074p;2270,2358p;2369,2375p' \
   pkg/streamingpromql/testdata/upstream/functions.test
 ```
 
@@ -1057,6 +1062,9 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | Complete upstream `upstream/literals.test` | `6b3f622601de40f019f006b16cdc997f2101ba09d62c540a8077fea5293eba92` |
 | Complete upstream `upstream/native_histograms.test` | `6f7d52eea5787cf1f96dba6eceb8adc124177179aa066811cc6eb2a574d399cd` |
 | Complete upstream `upstream/histograms.test` | `1eadbc6129d601f4135da5734c49ec223f5ed52aed861897126ba8fb8bdd375a` |
+| `upstream-math.test` | `27a7d4a3f9c9d6cb601f68718aed9aba0cd606ffd611ac904ccdc307521cb3c1` |
+| `upstream-absence.test` | `f847a623d4b70ef5f0c6235444d8c3d95be89eb6fa1424003ed2083865c52534` |
+| `upstream-timestamp.test` | `68c4d84b146b9f4a4b47e7644711de28aaf77b39956625a38dfcdcabddb4bc17` |
 | `upstream-clamp.test` | `6b33f7d8d285983621c269fd088b6744a8413cdeb148f734d809179a7a2330e5` |
 | `mimir-clamp.test` | `c91ea2449d23b7da863156481ffc9d6e838a88e9327a068cd62fc88a3baa0f7f` |
 | `upstream-presence.test` | `a8f5c9c63568ddd3cd978127babc3d12507d1fc58f2b50dcac94d806903dbd2e` |
@@ -1161,9 +1169,9 @@ range replays compare label identities and samples without imposing vector order
 on a matrix. Unsupported syntax fails rather than being silently skipped.
 Every evaluation runs through Pulso's HTTP instant/range query endpoints, using
 both memory storage and the real native S3/Parquet adapter against an owned
-loopback S3 stub. The corpus has 1295 instant evaluations, each also replayed as
-a one-step range, and 295 range evaluations, each requested once: 2885 HTTP
-requests per adapter, 5770 total across 170 fixture wrappers (85 files per
+loopback S3 stub. The corpus has 1418 instant evaluations, each also replayed as
+a one-step range, and 315 range evaluations, each requested once: 3151 HTTP
+requests per adapter, 6302 total across 188 fixture wrappers (94 files per
 adapter). The three-file scalar-context/extrema batch contributes 51 evaluations
 and 72 requests per adapter; the five-file aggregation batch contributes 88
 evaluations (59 instant, 29 range) and 147 requests per adapter. The four-file
@@ -1415,6 +1423,242 @@ for omitted terminal `\E`. The original five quote-parser patterns and octal
 pattern retain their provenance in the shared fixture README. These controls
 use the Mimir integration harness but are not additional upstream integration
 rows, full regex conformance or provider/client/capacity acceptance.
+
+## Absence, timestamp and rounding continuation
+
+The first continuation adds **26 original evaluations**: the complete `absent()`
+block (15), original mixed float/histogram timestamp cases and dense timestamp
+range (seven), plus four missing `abs`/`floor`/`round` cases in the existing math
+file. Exact ranges and SHA-256 values are in the tables above. The same pinned
+source reproduces the two new files with:
+
+```sh
+sed -n '1,5p;2077,2129p' pkg/streamingpromql/testdata/upstream/functions.test > upstream-absence.test
+sed -n '1,5p;536,558p;2358,2367p' pkg/streamingpromql/testdata/upstream/functions.test > upstream-timestamp.test
+```
+
+Every source expression, input and expected result is unchanged; only the source
+blocks are concatenated. The timestamp range retains all 1,001 sparse input
+observations and its 62 evaluation steps. This batch has 25 instant commands and
+one range command, adding 102 HTTP requests across both adapters. All pass without
+new numerical runtime behavior. In the adjacent service-error continuation, the
+original top-level range-vector request now returns the exact default Mimir
+diagnostic before storage; the fixture runner's extra one-step range controls
+also assert that diagnostic. String-result rejection is unchanged.
+
+The diagnostic baseline passed 181/183 checks, with the original frontend row
+and its local control failing; after the fix and the two old range-matrix
+control expectations were updated, the same selection passes 183/183 (seed61).
+Logs: `mimir-absence-timestamp-before.log`, `mimir-absence-timestamp-after.log`,
+`mimir-absence-timestamp-green.log`. The intermediate full suite passed 2511
+tests, one optional skipped and 37 excluded, before the next 55 evaluations were
+added (`mimir-absence-timestamp-full-suite.log`). These are selected fixture
+replays and error controls, not complete upstream-suite or customer acceptance.
+
+## Complete absence-over-time, label-replacement and staleness selections
+
+These three selections add **55 original evaluations**, all instant commands,
+from the same pinned revision `dd039cdd4ba466adb5d28280bf1b8a374a98432e`.
+They supplement, rather than replace, the separate 26-evaluation
+absence/timestamp/rounding increment. Existing inputs and expectations remain
+unchanged, including the three original unqualified `expect fail` assertions.
+
+Paths in this table are relative to `pkg/streamingpromql/testdata/`:
+
+| Local file | Source | Inclusive ranges | Evaluations |
+| --- | --- | --- | ---: |
+| `upstream-absence-over-time.test` | `upstream/functions.test` | 1–5, 2127–2210 | 27 |
+| `upstream-label-replace.test` | `upstream/functions.test` | 1–5, 476–536 | 11 |
+| `upstream-staleness.test` | `upstream/staleness.test` | 1–63 (complete) | 17 |
+
+Each fixture is the byte-identical concatenation of those ranges, verified
+against the pinned checkout with `cmp`. The label-replacement selection ends
+after its own final `clear`, before the timestamp section at source line 537.
+All original SPDX, Prometheus provenance and copyright headers are retained;
+the existing licenses below apply. Reproduce the extractions with:
+
+```sh
+sed -n '1,5p;2127,2210p' pkg/streamingpromql/testdata/upstream/functions.test > upstream-absence-over-time.test
+sed -n '1,5p;476,536p' pkg/streamingpromql/testdata/upstream/functions.test > upstream-label-replace.test
+cp pkg/streamingpromql/testdata/upstream/staleness.test upstream-staleness.test
+```
+
+SHA-256 hashes:
+
+| File | SHA-256 |
+| --- | --- |
+| Source `upstream/functions.test` (whole file) | `ece0b612aefb95b029fec6685d6655827c6985ee29ab64790e764fcb67f45b71` |
+| `upstream-absence-over-time.test` | `c57230ab703000a7dd51441ac1642021fa8abc78bf5954bc95dddd45843c5b8e` |
+| `upstream-label-replace.test` | `86d9d2d6d64779a1059acf1898de3a30f81fb3cd194a7ad68e12a1ca8e6595c9` |
+| `upstream-staleness.test` (also complete upstream source) | `353c23a539c9524fa8239d65a81a30ecb0c66bccf339119bb40c6918bcd460fd` |
+
+The absence block includes missing/negative/conflicting matchers, inferred
+labels, sparse windows, subqueries, NaNs and native histograms. It retains the
+omitted-resolution empty-subquery evaluation already independently selected
+in `upstream-default-subquery-empty.test`; these are evaluation counts, not
+unique-query counts. Label replacement retains full-string matching, captures,
+missing sources, parenthesized arguments, destination deletion, invalid regex,
+invalid UTF-8 destination and duplicate-output failures. Staleness retains
+explicit markers, reappearance, exact five-minute expiry, single-point series
+and left-open range windows with both unit-bearing and unitless durations.
+
+The existing async owned Memory/S3 HTTP harness registers six fixture wrappers.
+Every original instant evaluation also executes as an equal-bound range
+request: **220 HTTP requests** across both adapters when the selection completes.
+Counts come from enumerating `^eval` directive lines, not generated controls.
+No Docker, Go, Python, external service or additional dependency is needed.
+
+Two label-replacement failures are admission errors: invalid regex and invalid
+UTF-8 destination assert exact HTTP 400 / `bad_data` Pulso envelopes. The third
+retains the exact HTTP 422 duplicate-series envelope. Upstream's original
+`expect fail` directives specify neither status nor diagnostic text; these
+explicit HTTP mappings do not claim upstream diagnostic parity. Existing
+duplicate-series and explicit-message assertions are not broadened.
+
+The initial unchanged-runtime replay exposed two kinds of failure: the runner
+incorrectly assumed all unqualified failures were HTTP 422, while both storage
+adapters rejected the valid original query
+`absent_over_time({instance="127.0.0.1"}[20m])` at 21m with HTTP 422 instead of
+an empty vector. After adding the explicit admission-error mappings, the
+selected baseline passed **4/6 wrappers** (all label-replacement and staleness
+evaluations), retaining **two failing absence wrappers**. The absence path
+counted ranges after removing metric names and rejected colliding intermediate
+identities before testing whether any selected sample existed. It now selects
+the last nonstale observation while retaining the full source identity; only
+presence matters, never the selected value. The identical six-wrapper replay
+passes without changing any original oracle or resource ceiling.
+
+Two separately named local controls additionally check multiple metric names
+sharing labels, float zero, zero-count native histograms, NaN, scalar/histogram
+staleness and exact window expiry through GET/form POST and a changing range.
+Sample/work ceilings still fail whole even when absence would emit nothing.
+All eight wrappers pass seed1911 (`mimir-absence-replace-staleness-green.log`,
+`mimir-absence-adversarial-green.log`). These controls are not extra imported
+evaluations or exact upstream diagnostic claims.
+
+The exact selected baseline command, seed 1911:
+
+```sh
+ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only absence_replace_staleness_batch:true --warnings-as-errors --seed 1911
+```
+
+## Complete selector, collision, stale-grid and subquery files
+
+Four complete files from revision `dd039cdd4ba466adb5d28280bf1b8a374a98432e`
+add **60 original evaluation commands**: 44 instant and 16 range. These are
+whole-file copies, not selected passing sections. Each retains every original
+load, expression, expected label/sample/histogram, notice directive, failure,
+comment, whitespace and license header. `cmp` against the pinned checkout
+verifies all four files byte for byte.
+
+Source paths below are relative to `pkg/streamingpromql/testdata/`:
+
+| Local file | Complete source | Inclusive lines | Instant | Range | Total |
+| --- | --- | --- | ---: | ---: | ---: |
+| `upstream-selectors.test` | `upstream/selectors.test` | 1–212 | 31 | 0 | 31 |
+| `upstream-collision.test` | `upstream/collision.test` | 1–28 | 2 | 0 | 2 |
+| `mimir-staleness.test` | `ours/staleness.test` | 1–19 | 0 | 2 | 2 |
+| `mimir-subqueries.test` | `ours/subqueries.test` | 1–150 | 11 | 14 | 25 |
+
+Counts independently enumerate the original `^eval` directive lines and their
+`instant`/`range` modes. The existing harness replays each instant command as
+both an instant request and an equal-bound range request; each range command
+runs on its original grid. The eight async fixture wrappers therefore execute
+**104 HTTP requests per adapter, 208 across Memory and native Parquet/S3**.
+The owned S3 harness, tenant isolation and default resource ceilings remain
+unchanged. No external service, Go, Python or new dependency is required.
+
+SHA-256 hashes, identical for each local fixture and its complete source:
+
+| Local file | SHA-256 |
+| --- | --- |
+| `upstream-selectors.test` | `92b0771305a6d315d7b5a0f846301914df10d5b1c1e926522ea6784bda342c6e` |
+| `upstream-collision.test` | `e0596e7d3b93d6d17a94791c57952db3ad9653cbcbb7826258c4769db050995a` |
+| `mimir-staleness.test` | `5b876f47c14d9c17b9957cdce176d1664d46c70cc6cdab3daafa33ed49c0dfe2` |
+| `mimir-subqueries.test` | `1acf7b61c4de5bfb52aeb3c95007487eada749b3d93a5b0977ba0e02e9f9d15c` |
+
+The full selector file deliberately repeats the seven evaluations already
+selected from source lines 1–48 in `upstream-time-offset.test`; the count of
+60 includes those repeats, without silently deducting them. The old
+`collision.test` comes from **`ours/collision.test`**, not this upstream
+collision file. Likewise, `upstream-staleness.test` and
+`upstream-time-subquery.test` come from different upstream files, not the new
+`ours` files. All older fixture registrations and expectations remain intact.
+
+The selector file adds missing-label equality/negative/regex behavior,
+case-insensitive regex scope, offsets and complete label identities. The
+collision file preserves the original three full-label group-left outputs and
+its original duplicate-output `expect fail`; the latter uses the existing
+exact HTTP 422 execution-envelope adaptation, not a generic failure or success.
+The stale-grid file retains stale gaps and wholly empty range results. The
+subquery file retains float/native/mixed samples, left-open windows, epoch
+grids, numeric and start/end anchors, offsets, deep nesting, empty inputs and
+windows containing no inner steps. Its two original mixed-type evaluations
+retain `expect warn` and `expect no_info`; no diagnostic strings are invented
+where the source only specifies notice presence/absence.
+
+The sole new runner capability is exact integer-hour conversion for the source
+load/time literals (`1h`, `0h`, `1h8m`). This does not rewrite fixture text or
+change public query parsing. The initial focused replay passes **8/8 wrappers**,
+seed 1921, on the existing runtime: **no runtime changes were required**, and no
+assertions were omitted, skipped or weakened. The command was:
+
+```sh
+ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only complete_selector_subquery_batch:true --warnings-as-errors --seed 1921
+```
+
+This is complete-file HTTP fixture replay, not a claim of complete engine,
+distributed topology, physical capacity or deployed-client compatibility.
+
+### Completed Mimir range-function collision file
+
+`collision.test` now copies all 25 lines of `ours/collision.test` at the same
+pin, including its two previously omitted `max_over_time` evaluations. The
+successful query must merge disjoint source lifetimes after removing metric
+names; extending the grid to include the overlapping final observations must
+fail with the original duplicate-labelset diagnostic. Both original `ceil`
+evaluations remain unchanged. The complete file's SHA-256 is
+`8afc790a96badb75afbe5a998a0120ae9a80736fb37d78e413bfa9a443d0edf6`.
+Reproduce it with `git show
+dd039cdd4ba466adb5d28280bf1b8a374a98432e:pkg/streamingpromql/testdata/ours/collision.test`.
+The two added range commands contribute four HTTP requests across both adapters;
+the existing exact 422 execution-envelope mapping remains unchanged.
+
+The current totals are independently enumerated from every local `^eval`,
+`^eval_ordered` and `^eval_fail` directive. The preceding 1671-command snapshot
+had 1374 instant and 297 range commands, not the previously stated 1375/296;
+its correct request count was 6090, not 6092. This is an accounting correction,
+not a change to fixture inputs, expectations or replay behavior. Reproduce the
+current split with:
+
+```sh
+rg --no-filename '^eval(_ordered|_fail)? ' test/fixtures/promql/mimir/*.test |
+  awk '$2 == "instant" {i++} $2 == "range" {r++} END {print i, r, 2*(2*i+r)}'
+```
+
+The final math-conformance replay passes all **332 checks**, seed 1921 and four
+concurrent cases, including all 188 fixture wrappers and the separately named
+Pulso controls. Strict Credo reports no issues. Evidence is retained in
+`.amp/in/artifacts/compatibility-selector-subquery-final-{math,credo}.log`.
+The earlier full-suite attempt run alongside another suite timed out in a large
+Loki regex HTTP test; that same test passed alone in 5.4 seconds without changing
+its timeout or assertions. The subsequent non-competing full-suite run passed
+2528 checks, with one optional skip and 37 opt-in exclusions; its log is
+`.amp/in/artifacts/compatibility-selector-subquery-full-suite.log`.
+After completing the range-function collision file, a fresh full-suite replay
+again passed **2528 checks, one skipped, 37 excluded** in 171.7 seconds, seed 0
+and four concurrent cases. Its log is
+`.amp/in/artifacts/compatibility-selector-subquery-final-full-suite.log`.
+Compilation with warnings as errors, scoped formatting and `git diff --check`
+also passed. The five complete files match their pinned sources byte for byte;
+hashes and independent corpus counts are retained in
+`.amp/in/artifacts/compatibility-selector-subquery-source-audit.txt`.
+These local loopback-provider checks do not establish deployed-client,
+production-provider or representative-load acceptance.
 
 ## License and attribution
 

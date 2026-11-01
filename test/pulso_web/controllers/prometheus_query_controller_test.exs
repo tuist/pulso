@@ -90,6 +90,119 @@ defmodule PulsoWeb.PrometheusQueryControllerTest do
              conn |> get("/api/v1/query", %{query: "boundary", time: "9999-01-01T00:00:00Z"}) |> json_response(400)
   end
 
+  test "range parameter diagnostics are field-aware with GET and form POST", %{conn: conn} do
+    nonpositive =
+      "invalid parameter \"step\": zero or negative query resolution step widths are not accepted. Try a positive integer"
+
+    cases =
+      Enum.map(["0", "-0", "-60", "-1e-9", "0s", "0m0s", "1e-20"], &{%{step: &1}, nonpositive}) ++
+        [
+          {%{start: "21", end: "20", step: "bad"},
+           "invalid parameter \"end\": end timestamp must not be before start time"},
+          {%{start: "bad", end: "bad", step: "bad"},
+           ~s(invalid parameter "start": cannot parse "bad" to a valid timestamp)},
+          {%{end: "bad", step: "bad"}, ~s(invalid parameter "end": cannot parse "bad" to a valid timestamp)},
+          {%{step: "bad"}, ~s(invalid parameter "step": cannot parse "bad" to a valid duration)},
+          {%{step: "1e300"}, ~s(invalid parameter "step": cannot parse "1e300" to a valid duration)},
+          {%{step: "-1s"}, ~s(invalid parameter "step": cannot parse "-1s" to a valid duration)},
+          {%{step: ""}, ~s(invalid parameter "step": cannot parse "" to a valid duration)},
+          {%{step: "NaN"}, ~s(invalid parameter "step": cannot parse "NaN" to a valid duration)},
+          {%{step: "+Inf"}, ~s(invalid parameter "step": cannot parse "+Inf" to a valid duration)},
+          {%{start: "1e300"}, ~s(invalid parameter "start": cannot parse "1e300" to a valid timestamp)},
+          {%{end: ""}, ~s(invalid parameter "end": cannot parse "" to a valid timestamp)},
+          {%{start: "0", end: "11000", step: "1"},
+           "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)"},
+          {%{start: "0", end: "11001", step: "1"},
+           "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)"},
+          {%{start: "a\"\n\\雪\u0000"}, ~S(invalid parameter "start": cannot parse "a\"\n\\雪\x00" to a valid timestamp)}
+        ]
+
+    for method <- [:get, :post], {overrides, message} <- cases do
+      params = Map.merge(%{query: "unknown", start: "0", end: "20", step: "1"}, overrides)
+
+      assert range_request(conn, method, params) |> json_response(400) == %{
+               "status" => "error",
+               "errorType" => "bad_data",
+               "error" => message
+             }
+    end
+  end
+
+  test "range admission preserves exact timestamps, duration grammar and the inclusive point ceiling", %{conn: conn} do
+    for method <- [:get, :post],
+        {first, last, step, count} <- [
+          {"0", "10999", "1", 11_000},
+          {"0", "10999.999999999", "1", 11_000},
+          {"20", "20", "1e-9", 1},
+          {"0.000000001", "0.000000002", "1e-9", 2},
+          {"1970-01-01T00:00:00Z", "1970-01-01T00:01:00+00:00", "1m", 2},
+          {"0", "0.000000002", "0.000000001", 3},
+          {"0", "60", "0m1s", 61}
+        ] do
+      response = range_request(conn, method, %{query: "1", start: first, end: last, step: step})
+      assert %{"status" => "success", "data" => %{"result" => [%{"values" => values}]}} = json_response(response, 200)
+      assert length(values) == count
+    end
+  end
+
+  test "malformed range fields have bounded reflection and denial wins over diagnostics", %{conn: conn} do
+    for method <- [:get, :post], field <- [:start, :end, :step] do
+      params = %{query: "unknown", start: "0", end: "20", step: "1"}
+      oversized = Map.put(params, field, String.duplicate("\u0000", 4096))
+      response = range_request(conn, method, oversized)
+      assert %{"status" => "error", "errorType" => "bad_data"} = json_response(response, 400)
+      assert byte_size(response.resp_body) < 2048
+
+      missing = range_request(conn, method, Map.delete(params, field))
+
+      assert json_response(missing, 400) == %{
+               "status" => "error",
+               "errorType" => "bad_data",
+               "error" =>
+                 "invalid parameter \"#{field}\": cannot parse \"\" to a valid #{if field == :step, do: "duration", else: "timestamp"}"
+             }
+
+      for value <- [[], %{"nested" => "bad"}] do
+        assert %{"status" => "error", "errorType" => "bad_data"} =
+                 conn |> post("/api/v1/query_range", Map.put(params, field, value)) |> json_response(400)
+      end
+    end
+
+    for method <- [:get, :post],
+        overrides <- [%{query: "unknown(up)"}, %{timeout: "bad"}, %{lookback_delta: "0"}, %{unsupported: "1"}] do
+      assert range_request(conn, method, Map.merge(%{query: "unknown", start: "0", end: "20", step: "1"}, overrides))
+             |> json_response(400) == %{
+               "status" => "error",
+               "errorType" => "bad_data",
+               "error" => "Invalid or unsupported query parameters."
+             }
+    end
+
+    Pulso.Runtime.put_env(:pulso, Auth, module: SharedSecret, tokens: %{})
+
+    for method <- [:get, :post],
+        params <- [
+          %{query: "unknown", start: "bad", end: "20", step: "bad"},
+          %{query: "unknown", start: "0", end: "86400", step: "1"},
+          %{query: "unknown", start: "0", end: "20", step: "-60"},
+          %{query: "up[1m]", start: "0", end: "20", step: "1"}
+        ] do
+      assert range_request(conn, method, params) |> json_response(401) == %{
+               "status" => "error",
+               "errorType" => "unauthorized",
+               "error" => "unauthorized"
+             }
+    end
+  end
+
+  defp range_request(conn, :get, params), do: get(conn, "/api/v1/query_range?" <> URI.encode_query(params))
+
+  defp range_request(conn, :post, params) do
+    conn
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> post("/api/v1/query_range", URI.encode_query(params))
+  end
+
   test "client timeouts are accepted and invalid durations rejected", %{conn: conn} do
     for timeout <- ["30s", "1s", "0.1"] do
       assert %{"status" => "success"} =

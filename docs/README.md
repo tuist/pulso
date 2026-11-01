@@ -5,6 +5,12 @@ protocols your collectors already speak, stores them as Parquet in an
 S3-compatible bucket, and serves queries through the Model Context Protocol and
 Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
 
+The [target architecture](architecture.md#reliability-signals-and-optional-raw-retention)
+prioritizes actionable reliability signals and supporting evidence for external
+agent workflows, with raw archival retention as an opt-in capability. That is
+design direction, not a current processing-only mode: today's ingestion still
+stores raw records, indefinitely unless event-time expiry is configured.
+
 > [!WARNING]
 > Pulso is early software. Logs, metrics, and OTLP/HTTP traces work end to end. Native alert
 > evaluation, Slack delivery, live resource hints and rule history are experimental.
@@ -65,6 +71,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
 - [Alerting](alerting.md): experimental native threshold/recording evaluation,
   durable recording publication, dedicated credentials, rule management and
   modification history, with explicit compatibility limits.
+- [Reliability assessments](reliability.md): opt-in cross-signal windows,
+  budgeted Decisions judgments, durable MCP signals and capped external handoff.
 - [Keyed ingestion](keyed-ingestion.md): conditional uploads, exact-byte retry
   verification, permanent conflicts, provider costs and all-writer upgrades.
 - [Retention](retention.md): experimental event-time retention for logs, metrics
@@ -111,7 +119,8 @@ Prometheus- and Loki-compatible HTTP APIs. It ships no user interface.
 ## Understanding Pulso
 
 - [Architecture](architecture.md): the storage model, coordination through
-  object storage, the query path, and the Model Context Protocol interface.
+  object storage, reliability-first direction and optional raw archive, the
+  query path, and the Model Context Protocol interface.
   Read it before contributing a design change.
 
 ## Getting help

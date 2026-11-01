@@ -9,6 +9,28 @@
     {"spanCount": 2, "name": "boo", "resourceAttr": "someRes", "resourceAttVal": "qux", "spanAttr": "sameAttr", "spanAttVal": "bar"}
   ],
   "tagNames": ["firstRes", "firstSpan", "sameAttr", "secondRes", "secondSpan", "service.name", "someRes", "someSpan", "twoRes", "twoSpan"],
+  "names": [
+    {"name": "no filtering", "query": "", "scope": "none", "expected": [
+      {"name": "resource", "tags": ["firstRes", "sameAttr", "secondRes", "service.name", "someRes", "twoRes"]},
+      {"name": "span", "tags": ["firstSpan", "sameAttr", "secondSpan", "someSpan", "twoSpan"]}
+    ]},
+    {"name": "both batches - name and resource attribute", "query": "{ resource.service.name=\"my-service\"}", "scope": "none", "expected": [
+      {"name": "resource", "tags": ["firstRes", "sameAttr", "secondRes", "service.name", "someRes", "twoRes"]},
+      {"name": "span", "tags": ["firstSpan", "sameAttr", "secondSpan", "someSpan", "twoSpan"]}
+    ]},
+    {"name": "first batch - resource att - span", "query": "{ resource.firstRes=\"bar\" }", "scope": "span", "expected": [
+      {"name": "span", "tags": ["firstSpan"]}
+    ]},
+    {"name": "first batch - resource att - resource", "query": "{ resource.firstRes=\"bar\" }", "scope": "resource", "expected": [
+      {"name": "resource", "tags": ["firstRes", "service.name"]}
+    ]},
+    {"name": "second batch - resource attribute - span", "query": "{ resource.secondRes=\"qux\" }", "scope": "span", "expected": [
+      {"name": "span", "tags": ["secondSpan"]}
+    ]},
+    {"name": "too restrictive query", "query": "{ resource.firstRes=\"bar\" && resource.y=\"qux\" }", "scope": "none", "expected": [
+      {"name": "resource", "tags": ["service.name"]}
+    ]}
+  ],
   "values": [
     {"name": "no filtering", "query": "", "tag": "span.twoSpan", "expected": ["bar", "qux"]},
     {"name": "first batch only - resource attribute", "query": "{ resource.twoRes=\"bar\" }", "tag": "span.twoSpan", "expected": ["bar"]},

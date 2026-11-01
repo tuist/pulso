@@ -518,7 +518,7 @@ retained row's typed metadata is known.
 
 Omit HTTP `scope`, send an empty value, or use `scope=none` to discover names in
 **all five stored namespaces in one retained-snapshot scan**. MCP omits scope or
-uses `"none"`. V2 retains each namespace separately and always adds the 20 static
+uses `"none"`. V2 retains each namespace separately and always adds the 25 static
 intrinsic suggestions, even for empty retained context. V1 flattens/deduplicates
 stored names and **excludes** intrinsic suggestions; explicit `scope=intrinsic`
 remains available for v1 vocabulary. Scope and key order are deterministic
@@ -537,14 +537,14 @@ names cannot be used to test whether a tenant has data.
 
 This is **not five independent query budgets**. One million parent rows, **2M
 work units across ALL five scopes**, 5000 distinct **scope/name pairs including
-20 reserved intrinsic entries**, and independent 1 MiB dictionary/result limits
+25 reserved intrinsic entries**, and independent 1 MiB dictionary/result limits
 apply to the combined canonical result. Dictionary bytes include scope strings plus per-entry headroom; explicitly scoped
 name queries now charge their scope bytes too and can reject slightly earlier
-near that limit. The 20-entry reservation and scoped-pair accounting also apply before v1 flattens/deduplicates, so a small v1 result can
+near that limit. The 25-entry reservation and scoped-pair accounting also apply before v1 flattens/deduplicates, so a small v1 result can
 still fail. Empty resource/span/instrumentation owners alone cost three units
 per parent; nested owners and all their attributes add work before filtering.
 A key occurring in all five scopes costs five entries even when v1 emits it once;
-only 4,980 entries remain for stored scope/name pairs. With 20 resource, 15 span
+only 4,975 entries remain for stored scope/name pairs. With 20 resource, 15 span
 and two instrumentation attributes and no nested owners, each row costs 40 units,
 so the work cap permits at most 50,000 parents even if the dictionary is tiny.
 A combined query can fail where five separately admitted scoped queries succeed.
@@ -1036,11 +1036,24 @@ This is scoped evidence, not generalized physical-layout/deployed-client parity.
 
 The discovery gate also enables explicit `scope=intrinsic` name lookup on both
 `/api/search/tags` and `/api/v2/search/tags`, and the same MCP scope. This returns
-Tempo's 20 intrinsic names as **protocol vocabulary**, not evidence that a tenant
+Tempo's 25 intrinsic names as **protocol vocabulary**, not evidence that a tenant
 has those fields or that Pulso supports the advertised TraceQL syntax. Selecting
-these suggestions in a TraceQL search/filter editor still returns `400`: that
-grammar accepts original resource/span string predicates, not intrinsics, even
-when vocabulary lookup itself succeeds.
+suggestions does not broaden the supported search/filter grammar. In particular,
+`link:spanID`, `link:traceID`, `span:id`, `span:parentID` and `trace:id` are name
+suggestions only: v2 ID-value discovery and explicit MCP intrinsic-value requests
+still reject rather than inventing empty dictionaries. V1 bare-key attribute
+lookup keeps its existing semantics, not core-ID discovery.
+
+The vocabulary follows the pinned newer Tempo integration profile, superseding
+the 20-name v2.9 snapshot. Combined default discovery reserves all 25 entries
+inside the existing global 5,000-pair ceiling, even for v1 before intrinsic names
+are removed from the response; near-cap requests can therefore reject five keys
+earlier. With only the required resource `service.name` hint, 4,974 distinct span
+keys fit and 4,975 reject whole. Upgrade all query-serving applications and their
+native artifacts together for consistent names and admission. The native API
+tuple, storage/keyed bytes, overall dictionary/byte/work ceilings and seven
+static value vocabularies are unchanged; no migration or keyed-retry drain is
+required.
 
 V2 static value lookup accepts these canonical targets (without an attribute-scope
 prefix), for example `/api/v2/search/tag/span:kind/values`:

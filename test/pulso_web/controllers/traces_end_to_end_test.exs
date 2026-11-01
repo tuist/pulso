@@ -18,6 +18,11 @@ defmodule PulsoWeb.TracesEndToEndTest do
   alias Pulso.Traces.TempoIntrinsics
   alias Pulso.Traces.TempoSearch
 
+  @intrinsic_names "../../fixtures/traces/tempo_integration/intrinsic-names.json"
+                   |> Path.expand(__DIR__)
+                   |> File.read!()
+                   |> Pulso.JSON.decode!()
+
   setup do
     store =
       start_supervised!(
@@ -302,7 +307,7 @@ defmodule PulsoWeb.TracesEndToEndTest do
 
   test "omitted empty and none name scopes preserve namespaces, version rules and complete hints", ctx do
     headers = [{"authorization", "Bearer #{ctx.token}"}, {"x-scope-orgid", ctx.tenant}]
-    static = TempoIntrinsics.json("") |> Pulso.JSON.decode!()
+    static = %{"scopes" => [%{"name" => "intrinsic", "tags" => @intrinsic_names}]}
     empty = Req.get!(ctx.url <> "/api/v2/search/tags", headers: headers)
     assert empty.status == 200 and empty.body == static
     empty = Req.get!(ctx.url <> "/api/search/tags", headers: headers)
@@ -323,6 +328,14 @@ defmodule PulsoWeb.TracesEndToEndTest do
       File.read!(Path.expand("../../fixtures/traces/tempo-default-names-oracle.json", __DIR__))
       |> Pulso.JSON.decode!()
       |> Enum.filter(&(&1["dataset"] == "no-service"))
+      |> Enum.map(fn c ->
+        # Only the v2.9 vocabulary is superseded; stored-name oracles stay intact.
+        update_in(c, ["complete", "scopes"], fn scopes ->
+          for scope <- scopes do
+            if scope["name"] == "intrinsic", do: %{scope | "tags" => @intrinsic_names}, else: scope
+          end
+        end)
+      end)
 
     for c <- cases, scope <- [%{}, %{scope: ""}, %{scope: "none"}], version <- [1, 2] do
       path = if version == 1, do: "/api/search/tags", else: "/api/v2/search/tags"
@@ -432,6 +445,14 @@ defmodule PulsoWeb.TracesEndToEndTest do
 
     cases =
       File.read!(Path.expand("../../fixtures/traces/tempo-intrinsics-oracle.json", __DIR__)) |> Pulso.JSON.decode!()
+
+    # Keep all seven original value shortcuts; names use the pinned newer helper.
+    cases =
+      for c <- cases do
+        if c["key"] == "",
+          do: %{c | "response" => %{"scopes" => [%{"name" => "intrinsic", "tags" => @intrinsic_names}]}},
+          else: c
+      end
 
     for c <- cases do
       path =

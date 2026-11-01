@@ -24,7 +24,9 @@ defmodule Pulso.QueryRunner do
               error_logger: false
             })
 
-            with :ok <- acquire({tenant}, config(:max_per_tenant, 2)),
+            scope = if class == :reliability_callback, do: {:reliability_callback, tenant}, else: tenant
+
+            with :ok <- acquire({scope}, config(:max_per_tenant, 2)),
                  :ok <- acquire_interactive(class),
                  :ok <- acquire({:class, class}, class_limit(class)) do
               fun.(deadline)
@@ -96,11 +98,11 @@ defmodule Pulso.QueryRunner do
 
   defp config(key, default), do: Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), key, default)
 
-  defp acquire_interactive(:alerting), do: :ok
+  defp acquire_interactive(class) when class in [:alerting, :reliability_callback], do: :ok
   defp acquire_interactive(_class), do: acquire({:class, :interactive}, config(:max_interactive, 3))
 
   defp class_limit(class) do
-    default = if class in [:raw, :discovery, :alerting], do: 1, else: 3
+    default = if class in [:raw, :discovery, :alerting, :reliability_callback], do: 1, else: 3
     Map.get(config(:class_limits, %{}), class, default)
   end
 

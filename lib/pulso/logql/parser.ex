@@ -60,9 +60,17 @@ defmodule Pulso.LogQL.Parser do
   def parse(input) when is_binary(input) do
     with :ok <- Limits.input(input), do: parse_bounded(input)
   catch
-    :invalid_quantity -> {:error, :invalid_quantity}
-    :invalid_string_escape -> {:error, :invalid_string_escape}
-    :invalid_range_placement -> {:error, :invalid_range_placement}
+    :invalid_quantity ->
+      {:error, :invalid_quantity}
+
+    :invalid_string_escape ->
+      {:error, :invalid_string_escape}
+
+    :invalid_range_placement ->
+      {:error, :invalid_range_placement}
+
+    {:invalid_error_label_comparison, name} ->
+      {:error, "#{name} is a string label and cannot be compared with a typed value; use a string comparison instead"}
   end
 
   def parse(_), do: {:error, :query_expression_limit}
@@ -465,6 +473,13 @@ defmodule Pulso.LogQL.Parser do
     |> reduce({__MODULE__, :build_label_cmp, []})
 
   @doc false
+  def build_label_cmp([name, _op, {tag, _value}])
+      when name in ["__error__", "__error_details__"] and tag in [:number, :duration_ns, :bytes, :ip] do
+    # Reject at construction, including nested and post-unwrap predicates,
+    # rather than deferring a syntactic type error to query evaluation.
+    throw({:invalid_error_label_comparison, name})
+  end
+
   def build_label_cmp([name, op, {tag, value}]) do
     tagged =
       cond do

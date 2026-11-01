@@ -50,6 +50,31 @@ defmodule Pulso.MCP.Tools do
     "openWorldHint" => false
   }
 
+  @reliability_tools (for name <- ~w(list_reliability_signals list_reliability_changes get_reliability_signal) do
+                        properties =
+                          if name == "get_reliability_signal" do
+                            %{"id" => %{"type" => "string", "minLength" => 1, "maxLength" => 64}}
+                          else
+                            %{
+                              "cursor" => %{"type" => "string", "maxLength" => 4096},
+                              "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 100}
+                            }
+                          end
+
+                        %{
+                          "name" => name,
+                          "annotations" => @read_only_annotations,
+                          "description" =>
+                            "Experimental opt-in periodic cross-signal assessments. Measured evidence and model verdicts are separate; missing/deferred/unknown is not health. Inspect window_end_ns, assessments, budgets and investigation statuses. Changes retain 128 events; persist next_cursor and deduplicate change_id, resetting below replay_floor. Signal-list cursors reset on publication. No arbitrary model queries or remediation.",
+                          "inputSchema" => %{
+                            "type" => "object",
+                            "additionalProperties" => false,
+                            "properties" => Map.put(properties, "tenant", %{"type" => "string", "minLength" => 1}),
+                            "required" => if(name == "get_reliability_signal", do: ["tenant", "id"], else: ["tenant"])
+                          }
+                        }
+                      end)
+
   @error_schema %{
     "type" => "object",
     "properties" => %{
@@ -84,7 +109,7 @@ defmodule Pulso.MCP.Tools do
       "name" => "discover_trace_tags",
       "annotations" => @read_only_annotations,
       "description" =>
-        "Experimental default-off complete retained resource/span/instrumentation/event/link attribute names. Requires PULSO_TEMPO_SEARCH_ENABLED. Omit scope or use none for one complete combined five-scope scan plus static intrinsic suggestions; individual attribute namespaces remain distinct. Optional paired positive start_ts_ns/end_ts_ns select retention-visible immutable segment envelopes inclusively, not individual span starts; compaction can broaden dictionaries. Headers for every retained segment still consume row/provider budgets, no indexed-plan improvement. Adapters must implement explicit window-aware execution; flat reference adapters reject rather than silently ignoring windows. No intrinsic predicates. Default names include required service.name for any visible parent even without a filter/original attr, and v2 adds static intrinsic suggestions even when empty. Default names share one 2000000-work and 5000-pair dictionary budget across all five scopes, reserving 20 intrinsic entries; this is stricter than five independent scoped queries. Scope-none values use a distinct three-owner parent-filtered contract, not this five-scope name union. Static suggestions are not stored-data proof; unlike intrinsic-only vocabulary, default names fail whole on storage/legacy/budget errors. Optional query uses the same bounded resource/span original-string equality/anchored-regex AND grammar as value discovery, all on one parent. Filtered names are hints: generic keys come from matching parents, but promoted-column names come from all selected retention-visible context even under impossible filters; required service.name appears if any visible parent exists even without an original attribute. They are NOT proof of matching key presence; values never use this shortcut. Fixed standard promotions only; dynamic dedicated-column mapping is unsupported. Pulso retains matching shared keys that upstream iterators can omit, a conservative complete extension rather than exact omission parity. Instrumentation attributes are not scope name/version, and event/link attributes never become intrinsic fields. Every retained raw header row is charged, and selected payload rows validate under shared admission/provider budgets, 1000000 rows, 2000000 owner-plus-attribute work units per scan attempt before filtering (flat scope capacity shrinks with attribute count), 5000 distinct scope/name pairs (default includes its 20 static reservations) and independent 1MiB retained dictionary/result ceilings; scope strings now count toward name dictionary bytes. Any selected legacy unknown or budget failure rejects the whole result. No truncation or exporter-completeness claim. Explicit intrinsic scope instead returns static Tempo protocol vocabulary with no storage reads, not proof of stored fields or support for all advertised TraceQL syntax; filters remain unsupported.",
+        "Experimental default-off complete retained resource/span/instrumentation/event/link attribute names. Requires PULSO_TEMPO_SEARCH_ENABLED. Omit scope or use none for one complete combined five-scope scan plus static intrinsic suggestions; individual attribute namespaces remain distinct. Optional paired positive start_ts_ns/end_ts_ns select retention-visible immutable segment envelopes inclusively, not individual span starts; compaction can broaden dictionaries. Headers for every retained segment still consume row/provider budgets, no indexed-plan improvement. Adapters must implement explicit window-aware execution; flat reference adapters reject rather than silently ignoring windows. No intrinsic predicates. Default names include required service.name for any visible parent even without a filter/original attr, and v2 adds static intrinsic suggestions even when empty. Default names share one 2000000-work and 5000-pair dictionary budget across all five scopes, reserving 25 intrinsic entries; this is stricter than five independent scoped queries. Scope-none values use a distinct three-owner parent-filtered contract, not this five-scope name union. Static suggestions are not stored-data proof; unlike intrinsic-only vocabulary, default names fail whole on storage/legacy/budget errors. Optional query uses the same bounded resource/span original-string equality/anchored-regex AND grammar as value discovery, all on one parent. Filtered names are hints: generic keys come from matching parents, but promoted-column names come from all selected retention-visible context even under impossible filters; required service.name appears if any visible parent exists even without an original attribute. They are NOT proof of matching key presence; values never use this shortcut. Fixed standard promotions only; dynamic dedicated-column mapping is unsupported. Pulso retains matching shared keys that upstream iterators can omit, a conservative complete extension rather than exact omission parity. Instrumentation attributes are not scope name/version, and event/link attributes never become intrinsic fields. Every retained raw header row is charged, and selected payload rows validate under shared admission/provider budgets, 1000000 rows, 2000000 owner-plus-attribute work units per scan attempt before filtering (flat scope capacity shrinks with attribute count), 5000 distinct scope/name pairs (default includes its 25 static reservations) and independent 1MiB retained dictionary/result ceilings; scope strings now count toward name dictionary bytes. Any selected legacy unknown or budget failure rejects the whole result. No truncation or exporter-completeness claim. Explicit intrinsic scope instead returns static Tempo protocol vocabulary with no storage reads, not proof of stored fields or support for all advertised TraceQL syntax; filters remain unsupported.",
       "inputSchema" => %{
         "type" => "object",
         "additionalProperties" => false,
@@ -247,7 +272,7 @@ defmodule Pulso.MCP.Tools do
       "name" => "list_error_changes",
       "annotations" => @read_only_annotations,
       "description" =>
-        "Poll the experimental opt-in S3 error index: baseline_ready, new_in_retained_history, issue_observation and explicit reset changes. Save next_cursor durably and deduplicate change_id. Newness is scoped to the reported project/history floor, never first-ever. Inspect indexed_at_ns and backlog; current lag is unknown. Cursors below replay_floor require reset.",
+        "Poll the experimental opt-in S3 error index: baseline_ready, new_in_retained_history, issue_observation, error_rate_increase and explicit reset changes. Rate findings compare the latest two completed five-minute windows per issue/service: at least 5 baseline events and a 3x increase, with exact counts and up to 3 compact examples. Not request-normalized error ratios or statistical anomalies; bootstrap/reset suppresses historical findings. Save next_cursor durably and deduplicate change_id. Newness is scoped to the reported project/history floor, never first-ever. Inspect rate_detector status, indexed_at_ns and backlog; current lag is unknown. Cursors below replay_floor require reset.",
       "inputSchema" => @error_index_schema
     },
     %{
@@ -392,9 +417,9 @@ defmodule Pulso.MCP.Tools do
   ]
 
   @spec list() :: [map()]
-  def list, do: @tools ++ Tools.list()
+  def list, do: @tools ++ @reliability_tools ++ Tools.list()
 
-  @tool_names Enum.map(@tools, & &1["name"])
+  @tool_names Enum.map(@tools ++ @reliability_tools, & &1["name"])
 
   @doc "Whether `name` is a registered tool."
   @spec known?(term()) :: boolean()
@@ -425,7 +450,7 @@ defmodule Pulso.MCP.Tools do
   end
 
   defp do_query_call(name, args, context) do
-    case Enum.find(@tools, &(&1["name"] == name)) do
+    case Enum.find(@tools ++ @reliability_tools, &(&1["name"] == name)) do
       nil ->
         {:error, {:unknown_tool, name}}
 
@@ -546,6 +571,20 @@ defmodule Pulso.MCP.Tools do
 
     with {:ok, json} <- Pulso.Errors.query(kind, tenant, args) do
       {:ok, [%{"type" => "text", "text" => json}]}
+    end
+  end
+
+  defp execute(name, %{"tenant" => tenant} = args)
+       when name in ~w(list_reliability_signals list_reliability_changes get_reliability_signal) do
+    kind =
+      case name do
+        "list_reliability_signals" -> :signals
+        "list_reliability_changes" -> :changes
+        "get_reliability_signal" -> :signal
+      end
+
+    with {:ok, result} <- Pulso.Reliability.read(kind, tenant, args) do
+      {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
     end
   end
 

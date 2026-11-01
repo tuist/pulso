@@ -7,10 +7,11 @@ This is a selected public API port, **not the complete Tempo integration suite**
 
 | Upstream test | Imported cases |
 | --- | --- |
-| `TestTagEndpoints` | All seven two-span input batches; v1 tag-name list and bare `service.name` values; six v2 value-table rows: no filtering, first/second resource attribute, too restrictive, both batches/name values, only resource attributes |
+| `TestTagEndpoints` | All seven two-span input batches; v1 tag-name list and bare `service.name` values; six v2 name-content rows and six v2 value-table rows. Name rows cover unfiltered, resource-filtered span/resource scopes, no matches and service equality; exact selections are below. Value rows cover no filtering, first/second resource attribute, too restrictive, both batches/name values and only resource attributes. |
 | `TestTagValuesWithSpecialCharacters` | All 19 enabled attribute/value pairs, in resource and span scopes; explicit encoded and unescaped slash requests |
 | `TestSearchTagValuesV2_badRequest` | HTTP rejection of `app.user.id`; Pulso's diagnostic rather than Tempo's parser wording |
 | [`TestSearchTraceQL`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/search/search_test.go) and [`SearchTraceQLAndAssertTrace{WithRange}`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/util/harness_api_reads.go) | Find the ingested trace with `{ .<original-key> = "<value>" }`, both without bounds and with explicit bounds. Random trace/attribute selection becomes the first batch's fixed `firstRes` and `firstSpan`; this preserves the found-trace assertion/query shape, not the random producer's full input. |
+| [`TestTraceByIDandTraceQL`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/tracebyid/trace_by_id_test.go#L15-L64), exact-ID selection | All ten actual `NewTraceInfos` traces, including every delayed batch, resource, scope, span, parent, typed attribute, event and status; complete v1/v2 trace equality before/after manifest restart. The original search assertion **does not pass**: multi-root inputs hit Pulso's deliberate whole-response rejection, recorded separately below. |
 | [`TestTraceByIDV2Filtering`](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/tracebyid/trace_by_id_filtering_test.go) | All 31 depth-table combinations, the exact six-span parent graph, two integer predicates, span-ID sets and COMPLETE/PARTIAL expectations; malformed query and active/ignored depth assertions. The oversized-URI response is an explicit adaptation below. |
 | [`TestQueryRangeExemplars`, metric and HTTP-validation subtests](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L306-L536) | All three aligned/unaligned/default-step interval rows (3/4/122 samples), all five instant/range aggregate comparisons, the instant-average comparison, all six topk/bottomk rows, both empty-result counts, and HTTP rejection of `0`, `0s` and `35ms` steps. Small-step diagnostic wording is explicitly adapted below. Exemplar production/requests and transport permutations are excluded. |
 | [`TestQueryRangeTypeHandling` and `TestQueryRangeMaxSeriesDisabled`, metric-cardinality selections](https://github.com/grafana/tempo/blob/1a7373ee774b2ee5a40957c2310179b0ef7ff843/integration/api/metrics/query_range_test.go#L636-L725) | Two spans with `foo` string `123` versus integer `123`, and the timed one-span producer, queried with `{} \| rate() by (span:id)`, five-minute bounds and `5s` step. COMPLETE and exact producer-cardinality assertions are retained. Exemplar requests, streaming and the unlimited-series configuration are not selected. |
@@ -26,7 +27,7 @@ checks are Pulso regressions, not additional upstream integration cases.
 mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs
 ```
 
-Sixty-five async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
+The async ExUnit tests send real authenticated OTLP/HTTP JSON/protobuf requests to an
 owned Bandit listener, persist native Parquet through Pulso's S3 adapter against
 an owned loopback object store, restart manifest supervision, and query JSON and
 protobuf responses. Default tests need no Go, Docker, remote services or network
@@ -46,6 +47,73 @@ lists and protobuf default omission are compared through their protocol shapes.
 Protobuf expectations use Pulso's existing encoder; this tests content
 negotiation/transport consistency, not independent wire conformance (covered by
 the separate public protobuf fixtures).
+
+### V2 name content tables and versioned static vocabulary
+
+The six original `TestTagEndpoints` name rows come from the pinned
+`integration/api/search/search_tags_test.go`:
+
+- `130–146`: no filtering.
+- `191–203`: first batch, resource attribute, span scope.
+- `204–216`: first batch, resource attribute, resource scope.
+- `217–229`: second batch, resource attribute, span scope.
+- `230–243`: too restrictive query, retaining the original service-name hint.
+- `278–294`: both batches, name and resource attribute.
+
+All seven original two-span batches (`40–53`) are ingested for every row. The
+upstream helper (`362–374`) augments scope-none results with the intrinsic
+vocabulary and sorts scopes/names; the port retains that behavior, unbounded
+and ±2-hour windows, and complete scope/name equality. JSON/protobuf transport
+checks are Pulso coverage. Upstream additionally asserts
+`metrics.inspectedBytes > 300` (`591–601`, `678–687`) and gRPC results: those are **not ported**. These
+are original HTTP **content-table selections**, not passing complete helper,
+deployment, storage-provider or gRPC scenarios.
+
+`intrinsic-names-producer.go.txt` executes the actual pinned
+`pkg/search/util.go:GetVirtualIntrinsicValues` (`57–93`), resolving names through
+`pkg/traceql/enum_attributes.go` (`174–213`). It produced all 25 names in
+`intrinsic-names.json`, independently of Pulso. Run it with Go 1.27.3 from the
+verified Tempo module root using `go run -mod=vendor /path/to/copied-producer.go`.
+Normal Elixir replay needs neither Go nor the checkout.
+
+Source and fixture SHA-256:
+
+- `search_tags_test.go`: `1dd8f881778c08ede478d2d369aaeed323ae6658175b12d7539985f22ef45e8f`.
+- `pkg/search/util.go`: `b88386fb59665c1200e440a37b8613ed8249416b47e33845a9a1705cbcc16bf9`.
+- `pkg/traceql/enum_attributes.go`: `7150265d29922a9209821369a9df1d9450eadfcfc66476eae82cf13125c84062`.
+- `cases.json`: `144bada60b7d5688753730bac3f36a64dbcc0ef3197607a601992d017d3ffd60`.
+- `intrinsic-names.json`: `a614ea99ad33f66a0c1c61fa1591c5f14470b7745730d4c30f1476bcfe24f70e`.
+- `intrinsic-names-producer.go.txt`: `2e3786441f3e286584adabcc688cd88f78cfbb210ca0f60d78c3cc19a9f71a2c`.
+
+Before the fix, the initial three-row selection passed only its explicit-span
+case: unfiltered and service-filtered scope-none results lacked five names
+(`tempo-name-vocabulary-before.log`, seed51). Adding the capacity regression
+also failed: the old reservation yielded 4,995 rather than 5,000 pairs
+(`tempo-name-vocabulary-budget-before.log`, seed52). Elixir/native vocabularies
+now add `link:spanID`, `link:traceID`, `span:id`, `span:parentID` and `trace:id`.
+The final six upstream rows plus two local controls pass seed52
+(`tempo-name-vocabulary-final-focused.log`).
+
+The local controls cover authenticated HTTP/MCP static discovery without any
+provider request, denied requests, unchanged unsupported ID-value discovery,
+and exactly 5,000 versus 5,001 pairs through native/reference paths, filtered
+and unfiltered, including v1 before flattening. All 25 names reserve capacity
+before stored names; the limit is not raised to accommodate the vocabulary.
+Existing v2.9 oracle files and hashes remain unchanged: only their vocabulary
+portion is explicitly overlaid with this newer independent list, leaving stored
+name expectations and all seven value shortcuts intact. This is not evidence
+that ID-value discovery or intrinsic filters are implemented.
+
+Final validation: the full Elixir suite passes **2507 tests**, one optional
+skipped and 37 optional excluded (seed0, four concurrent cases); the combined
+three-service plus Tempo end-to-end/default-name/intrinsic suites pass **409
+tests** (seed41). The first full run exposed two additional old-vocabulary
+end-to-end assertions; their vocabulary alone now uses the same independent
+newer list. All **133 native codec tests**, compile with warnings as errors,
+strict Credo, scoped Elixir/Rust formatting and whitespace checks pass. Logs:
+`tempo-name-vocabulary-full-suite-final.log`,
+`tempo-name-vocabulary-combined-final.log`, `tempo-name-vocabulary-native.log`
+and `tempo-name-vocabulary-credo-final.log` under `.amp/in/artifacts/`.
 
 ### Special-character test deadlines
 
@@ -482,6 +550,89 @@ flags preserve whole-value matching and scope. The shared matcher also checks
 actual Go anchored capture maps and `U`/lazy greediness. All three wrappers
 failed the respective baselines (seeds 680/682). These are independent Go
 controls, not extra Tempo integration exports; see the [regex provenance](../../regex/README.md).
+
+## Ten-trace exact-ID continuation and explicit search incompatibility
+
+`trace-by-id-producer.go.txt` was executed against the **actual pinned Tempo
+checkout and its vendored Jaeger translator**, using Go 1.27.3. It invokes
+`NewTraceInfos(time.Unix(1793404800, 0), 10, "")`, `EmitAllBatches` and
+`ConstructTraceFromEpoch` without copying or simplifying their implementation.
+The collector uses the same `ThriftToTraces` conversion as the upstream harness
+exporter. It checks the separately executed write and reconstruction paths with
+protobuf equality before emitting the fixture. Two regeneration runs produced
+byte-identical output. No Pulso code runs in this producer.
+
+`trace-by-id.json` freezes the complete OTLP protobuf inputs (base64) and
+independent expected JSON traces: **10 traces, 89 resource/scope batches, 266
+spans, 802 events and 3045 integer AnyValues**, alongside the original random
+strings/blobs, status codes and parent chains. All **89 parentless spans** remain
+intact. The fixed clock controls random seeds only; the original producer's
+nanosecond seed increments, microsecond source precision, random batch counts
+and delayed writes remain. There are no synthetic parent links or one-span
+substitutions. Empty/default messages and every typed owner are retained.
+
+The exact-ID wrapper compares complete v1 and v2 JSON traces, sorting collection
+order as upstream `AssertEqualTrace` does without removing duplicates or sorting
+AnyValue arrays. The v1 `batches` wrapper is mapped to `resourceSpans`; field
+content is unchanged. All ten traces are stored together through authenticated
+OTLP/HTTP protobuf and native Parquet/S3. Each endpoint is checked before and
+after manifest-supervision restart (**40 exact-ID content comparisons**).
+Another **40 protobuf HTTP responses** are compared with the existing independent
+Elixir encoder over the already independently checked JSON. The upstream client
+uses protobuf for exact-ID reads; this cross-format check is not independent
+wire-decoder or byte-layout conformance.
+
+The original range-search helper picks one random non-integer original
+attribute. The producer freezes two eligible original strings per trace,
+`vulture-process-0` and `vulture-0`, covering both resource/span branches. Queries
+retain `{ .<key> = "<value>"}` and the original ±one-hour bounds. **The upstream
+found-trace assertion failed on unchanged Pulso**, seed 701: exact-ID passed,
+but the first search returned `409 trace_root_conflict` instead of 200. All ten
+inputs contain multiple independent roots with differing names. This is not
+corruption and is not a passing upstream search port.
+
+Pulso already deliberately rejects conflicting matched root summaries rather
+than choosing or hiding a root: see `docs/traces.md` (retained-context search),
+`TempoSearch.selected/2`, native `tempo_search.rs::selected` and the existing
+native/reference ambiguity regression in `tempo_search_test.exs`. Changing
+that policy simply to pass this source scenario would undo a documented design
+decision. No runtime change is made. A **separately named Pulso incompatibility
+regression**, not an upstream success case, checks all **40** searches returning
+the explicit whole-response rejection across both phases. Original data,
+queries and source expectations remain documented; search compatibility is
+blocked on an explicit root-summary policy decision, not silently claimed.
+
+The restart phases test fresh local manifest authority over already published
+objects, not upstream recent-data/backend routing. This is one loopback S3
+configuration, not the original S3/Azure/GCS permutations. Jaeger ingestion,
+gRPC streaming, collector/deployed clients, WAL/Kafka orchestration and provider
+capacity remain untested. No native capability, storage/keyed bytes, budget,
+upgrade procedure or runtime behavior changes in this continuation.
+
+Run the new selection with:
+
+```sh
+mix test test/pulso_web/controllers/tempo_upstream_integration_test.exs --only trace_by_id_upstream
+```
+
+Optional regeneration (from the pinned checkout, not required for replay):
+
+```sh
+cp /path/to/trace-by-id-producer.go.txt /tmp/trace-by-id-producer.go
+GOMAXPROCS=4 go run -mod=vendor /tmp/trace-by-id-producer.go > /tmp/trace-by-id.json
+```
+
+| Complete source or generated artifact | SHA-256 |
+| --- | --- |
+| `integration/api/tracebyid/trace_by_id_test.go` (selected lines 15–64) | `4c95c1216c538dfd56fcf9e8d1a8bbfe552d72f1e20e2e2cd07278101e4e043b` |
+| `integration/util/harness_api_reads.go` (selected helpers 76–87, 136–159) | `41ac12605ba3b3b5d8ab0150e02213979cca2b09a42378e87dd7a05ea6eecd6d` |
+| `integration/util/harness_api_writes.go` (85–96, 206–212) | `53ea99c9dad9c6e2645e4004aeb587fe6d8bf6235ae7aab3bbb191e5124d66d3` |
+| `pkg/util/trace_info.go` | `d6a575ff8e3af47d9de976902ab8841d57197f255e17415e01dabfa8fafd14af` |
+| `pkg/model/trace/sort.go` | `472e499fe2013e94b4be2fe1b28d8f3367653b1db18b81d095dc82ac4d8807cc` |
+| `pkg/httpclient/client.go` (transport 120–144, query methods 270–292, 346–354) | `88ae684df15357ac2ac3cf678a25f40c267c7a8483694dcf2a862f8b0106bdd4` |
+| `vendor/github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/jaeger/jaegerthrift_to_traces.go` | `0c6cf9b49e452848bee0f652c13083ab9ade950d032360b4698aa525dde4e5b5` |
+| `trace-by-id.json` | `e4c37ec95b0bd97bbd00e01876b14422c55ee669799a1e3a791c05cad93cef43` |
+| `trace-by-id-producer.go.txt` | `2413583749bdbd525a92976647d6a283151ed2d138fa7a5c365c5d3ad506c5ea` |
 
 ## Explicit remaining gaps
 

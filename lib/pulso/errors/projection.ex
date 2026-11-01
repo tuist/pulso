@@ -19,6 +19,8 @@ defmodule Pulso.Errors.Projection do
   @occurrences 20_000
   @step_sources 32
   @day_ns 86_400_000_000_000
+  @rate_window_ns 300_000_000_000
+  @rate_detector "error-count-ratio-v1"
 
   def key(tenant, project), do: "tenants/#{tenant}/errors/v1/project=#{project}/head.json"
 
@@ -250,6 +252,9 @@ defmodule Pulso.Errors.Projection do
     # checkpoints advance independently; incomplete batches expose pending state,
     # not partial counts disguised as retained-history totals.
     changes = if backlog == 0, do: observation_changes(base, issues, floor), else: []
+    {rate_state, findings} = rate_changes(base, events, floor, now, backlog)
+    findings = Enum.map(findings, &Map.merge(&1, %{"source_etag" => snapshot.etag, "history_floor_ns" => floor}))
+    changes = changes ++ findings
     changes = if reset, do: [%{"kind" => "reset", "reason" => reset} | changes], else: changes
 
     changes =
@@ -266,6 +271,7 @@ defmodule Pulso.Errors.Projection do
         "history_floor_ns" => floor,
         "source_etag" => snapshot.etag,
         "indexed_at_ns" => now,
+        "rate_detector" => rate_state,
         "sequence" => old["sequence"] + length(changes)
       })
 
@@ -293,6 +299,73 @@ defmodule Pulso.Errors.Projection do
     end)
   end
 
+  defp rate_changes(base, _events, _floor, _now, backlog) when backlog > 0, do: {base["rate_detector"], []}
+
+  defp rate_changes(base, events, floor, now, 0) do
+    finish = div(now, @rate_window_ns) * @rate_window_ns
+    middle = finish - @rate_window_ns
+    start = middle - @rate_window_ns
+    previous = base["rate_detector"]
+
+    if start < floor do
+      {%{"detector" => @rate_detector, "status" => "insufficient_history", "window_end_ns" => finish}, []}
+    else
+      emitted =
+        if previous && previous["window_end_ns"] == finish,
+          do: MapSet.new(previous["emitted"] || []),
+          else: MapSet.new()
+
+      findings =
+        events
+        |> rate_findings(start, middle, finish)
+        |> Enum.reject(&MapSet.member?(emitted, [&1["issue_id"], &1["service"]]))
+
+      emitted = Enum.reduce(findings, emitted, &MapSet.put(&2, [&1["issue_id"], &1["service"]]))
+
+      state = %{
+        "detector" => @rate_detector,
+        "status" => "ready",
+        "window_end_ns" => finish,
+        "emitted" => Enum.sort(emitted)
+      }
+
+      # Bootstrap, reset and old-worker upgrades establish a baseline, not an
+      # incident. Remember qualifying groups so the next pass cannot announce it.
+      suppress = base["baseline"] or previous == nil or previous["status"] != "ready"
+      {state, if(suppress, do: [], else: findings)}
+    end
+  end
+
+  defp rate_findings(events, start, middle, finish) do
+    events
+    |> Enum.filter(&(&1["timestamp_ns"] >= start and &1["timestamp_ns"] < finish))
+    |> Enum.group_by(&[&1["issue_id"], &1["service"]])
+    |> Enum.sort()
+    |> Enum.flat_map(fn {[issue, service], rows} ->
+      {current, baseline} = Enum.split_with(rows, &(&1["timestamp_ns"] >= middle))
+      before = length(baseline)
+      after_count = length(current)
+
+      if before >= 5 and after_count >= 3 * before do
+        [
+          %{
+            "kind" => "error_rate_increase",
+            "detector" => @rate_detector,
+            "issue_id" => issue,
+            "service" => service,
+            "baseline" => %{"start_ns" => start, "end_ns" => middle, "count" => before},
+            "current" => %{"start_ns" => middle, "end_ns" => finish, "count" => after_count},
+            "ratio" => after_count / before,
+            "coverage" => "retained_snapshot",
+            "evidence" => Enum.take(current, 3) |> Enum.map(&Map.take(&1, ~w(event_id timestamp_ns title service)))
+          }
+        ]
+      else
+        []
+      end
+    end)
+  end
+
   defp publish(tenant, project, next, changes, etag, config, deadline) do
     with {:ok, refs} <- write_pages(tenant, project, changes, config, deadline) do
       {expired, pages} = Enum.split(next["pages"] ++ refs, -64)
@@ -316,7 +389,22 @@ defmodule Pulso.Errors.Projection do
 
   defp write_pages(tenant, project, changes, config, deadline) do
     changes
-    |> Enum.chunk_every(64)
+    |> Enum.chunk_while(
+      {[], 2},
+      fn change, {page, bytes} ->
+        size = byte_size(Canonical.encode(change))
+
+        if page != [] and (length(page) == 64 or bytes + 1 + size > @page_bytes) do
+          {:cont, Enum.reverse(page), {[change], 2 + size}}
+        else
+          {:cont, {[change | page], bytes + size + if(page == [], do: 0, else: 1)}}
+        end
+      end,
+      fn
+        {[], _} = acc -> {:cont, acc}
+        {page, _} -> {:cont, Enum.reverse(page), {[], 2}}
+      end
+    )
     |> Enum.reduce_while({:ok, []}, fn page, {:ok, refs} ->
       bytes = Canonical.encode(page)
       digest = Canonical.digest(bytes)
@@ -440,8 +528,15 @@ defmodule Pulso.Errors.Projection do
       "lag_ns" => nil,
       "lag_status" => "unknown",
       "novelty" => "new_in_retained_history",
-      "grouping" => "sentry-group-v1"
+      "grouping" => "sentry-group-v1",
+      "rate_detector" => rate_status(root)
     })
+  end
+
+  defp rate_status(root) do
+    state = root["rate_detector"] || %{"detector" => @rate_detector, "status" => "baseline_pending"}
+    state = Map.delete(state, "emitted")
+    if root["backlog_segments"] > 0, do: Map.put(state, "status", "catching_up"), else: state
   end
 
   defp matchers(project), do: [{"error_source", :eq, "sentry"}, {"error_project", :eq, project}]

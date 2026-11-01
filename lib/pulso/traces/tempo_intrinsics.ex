@@ -1,7 +1,7 @@
 defmodule Pulso.Traces.TempoIntrinsics do
   @moduledoc "Static Tempo vocabulary and canonical routing for separately scanned stored intrinsic values."
 
-  @names ~w(duration event:name event:timeSinceStart instrumentation:name instrumentation:version kind name rootName rootServiceName span:duration span:kind span:name span:status span:statusMessage status statusMessage trace:duration trace:rootName trace:rootService traceDuration)
+  @names ~w(duration event:name event:timeSinceStart instrumentation:name instrumentation:version kind link:spanID link:traceID name rootName rootServiceName span:duration span:id span:kind span:name span:parentID span:status span:statusMessage status statusMessage trace:duration trace:id trace:rootName trace:rootService traceDuration)
   @status ~w(error ok unset)
   @kind ~w(client consumer internal producer server unspecified)
   @keys ~w(status span:status kind span:kind duration span:duration traceDuration)
