@@ -38,14 +38,18 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, use-cross: true }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, use-cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, use-cross: true }
-          # macos-13 was retired by GitHub in Dec 2025 (macos-14 and newer
-          # runners are Apple Silicon). x86_64-apple-darwin builds would
-          # need a hosted or self-managed Intel Mac; drop that target
-          # until we add one — Apple Silicon users are covered.
-          - { target: aarch64-apple-darwin, os: macos-14, use-cross: false }
+          # Tuist's macOS runners are Apple Silicon. Intel macOS artifacts
+          # remain unsupported until we add a corresponding build target.
+          - { target: aarch64-apple-darwin, os: tuist-macos-27-0, use-cross: false }
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust for macOS
+        if: matrix.job.target == 'aarch64-apple-darwin'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
 
       - name: Extract project info
         id: extract
