@@ -16,48 +16,57 @@ defmodule Pulso.PromQL.DiscoveryTest do
     Pulso.JSON.decode!(json)
   end
 
-  test "native labels-only scans agree with the bounded reference across matchers and hash collisions" do
-    rows =
-      for n <- 0..1199 do
-        labels = %{
-          "__name__" => if(rem(n, 2) == 0, do: "work", else: "other"),
-          "env" => Enum.at(["dev", "prod", ""], rem(n, 3))
-        }
-
-        labels =
-          case rem(n, 4) do
-            0 -> labels
-            1 -> Map.put(labels, "host", "")
-            2 -> Map.put(labels, "host", "node")
-            _ -> Map.put(labels, "host", "µ\"\\\n")
-          end
-
-        %MetricSample{series_id: 7, timestamp_ns: n, value: :stale, labels: labels}
-      end
-
-    :ok = Memory.append(:metrics, "reference", rows)
-
-    blobs =
-      for chunk <- Enum.chunk_every(rows, 173) do
-        assert {:ok, blob, _, _, _} = NIF.encode_metric_segment_parquet_indexed_v1(chunk)
-        blob
-      end
-
-    for {start, finish} <- [{0, 1199}, {99, 700}, {1200, 1201}],
-        selectors <- [
+  # Each window/selector owns its fixture and the normal test deadline. Keep
+  # all 45 mode comparisons without one test accumulating every scan's wait.
+  for {start, finish} <- [{0, 1199}, {99, 700}, {1200, 1201}],
+      {selectors, index} <-
+        Enum.with_index([
           [],
           [[{"__name__", :eq, "work"}, {"host", :eq, ""}]],
           [[{"__name__", :re, "work|other"}, {"env", :nre, "dev"}, {"host", :neq, "node"}]],
           [[{"__name__", :eq, "work"}, {"host", :re, "node|µ.*"}], [{"__name__", :eq, "other"}, {"env", :eq, "dev"}]]
-        ],
-        {mode, key} <- [{"names", ""}, {"values", "host"}, {"values", "env"}, {"series", ""}],
-        mode != "series" or selectors != [] do
-      assert {:ok, expected} =
-               Discovery.reference(Memory, "reference", mode, key, selectors, start_ts: start, end_ts: finish)
+        ]) do
+    @tag :native_reference_matrix
+    @tag selectors: selectors, window: {start, finish}
+    test "native labels-only scans agree with the reference for #{start}..#{finish}, selector #{index}", %{
+      selectors: selectors,
+      window: {start, finish}
+    } do
+      rows =
+        for n <- 0..1199 do
+          labels = %{
+            "__name__" => if(rem(n, 2) == 0, do: "work", else: "other"),
+            "env" => Enum.at(["dev", "prod", ""], rem(n, 3))
+          }
 
-      expected = Pulso.JSON.decode!(expected)
-      assert native(mode, key, selectors, blobs, start, finish) == expected
-      assert native(mode, key, selectors, Enum.reverse(blobs, blobs), start, finish) == expected
+          labels =
+            case rem(n, 4) do
+              0 -> labels
+              1 -> Map.put(labels, "host", "")
+              2 -> Map.put(labels, "host", "node")
+              _ -> Map.put(labels, "host", "µ\"\\\n")
+            end
+
+          %MetricSample{series_id: 7, timestamp_ns: n, value: :stale, labels: labels}
+        end
+
+      :ok = Memory.append(:metrics, "reference", rows)
+
+      blobs =
+        for chunk <- Enum.chunk_every(rows, 173) do
+          assert {:ok, blob, _, _, _} = NIF.encode_metric_segment_parquet_indexed_v1(chunk)
+          blob
+        end
+
+      for {mode, key} <- [{"names", ""}, {"values", "host"}, {"values", "env"}, {"series", ""}],
+          mode != "series" or selectors != [] do
+        assert {:ok, expected} =
+                 Discovery.reference(Memory, "reference", mode, key, selectors, start_ts: start, end_ts: finish)
+
+        expected = Pulso.JSON.decode!(expected)
+        assert native(mode, key, selectors, blobs, start, finish) == expected
+        assert native(mode, key, selectors, Enum.reverse(blobs, blobs), start, finish) == expected
+      end
     end
   end
 

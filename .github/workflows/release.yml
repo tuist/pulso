@@ -68,6 +68,12 @@ jobs:
         # immutable-action risk (a maintainer or attacker could move the
         # tag). Bump this SHA when upgrading the action.
         uses: philss/rustler-precompiled-action@853ac56183f29a080304df3ff8a194b5bbdc24cc
+        env:
+          # musl defaults to static CRT linkage, which disables cdylib output.
+          # cross forwards CARGO_* variables into its build containers; keep
+          # these flags target-scoped so GNU and macOS builds are unchanged.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=-crt-static"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=-crt-static"
         with:
           project-name: ${{ matrix.crate }}
           project-version: ${{ steps.extract.outputs.version }}
