@@ -41,13 +41,19 @@ defmodule Pulso.PromQL.OracleTest do
   end
 
   for adapter <- [Memory, NativeQueryStorage] do
-    test "independently verified numerical, label, offset and stale cases through #{inspect(adapter)}", ctx do
-      Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: unquote(adapter))
-      assert length(ctx.cases) == 946
+    # Keep all 946 oracle cases per adapter without accumulating every query's
+    # scheduler/native wait under one test's normal 60-second deadline.
+    for batch <- 0..9 do
+      @tag oracle_batch: batch
+      test "independently verified numerical, label, offset and stale cases through #{inspect(adapter)}, batch #{batch + 1}/10",
+           ctx do
+        Pulso.Runtime.put_env(:pulso, Pulso.Storage, adapter: unquote(adapter))
+        assert length(ctx.cases) == 946
 
-      for test <- ctx.cases do
-        assert {:ok, result} = Evaluator.query(test["expr"], "oracle", %{end_ts_ns: test["seconds"] * 1_000_000_000})
-        assert_result(result["data"], test["data"], test["expr"])
+        for test <- Enum.slice(ctx.cases, ctx.oracle_batch * 100, 100) do
+          assert {:ok, result} = Evaluator.query(test["expr"], "oracle", %{end_ts_ns: test["seconds"] * 1_000_000_000})
+          assert_result(result["data"], test["data"], test["expr"])
+        end
       end
     end
 

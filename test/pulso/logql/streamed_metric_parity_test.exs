@@ -114,6 +114,9 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
     end
   end
 
+  # Keep the 150 comparisons and their aggregate data-coverage guard together;
+  # allow for scheduler contention during the full concurrent CI suite.
+  @tag timeout: 180_000
   test "random range aggregations match the materializing evaluator" do
     tenant = "streamed-parity-#{System.unique_integer([:positive])}"
     records(tenant)
