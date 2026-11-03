@@ -65,9 +65,7 @@ defmodule Pulso.SelfMetrics do
     for reason <- @alert_skip_reasons, do: increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 0)
     increment("pulso_keyed_publication_conflicts_total", "", 0)
 
-    for {layer, reasons} <- @admission_reasons,
-        reason <- reasons,
-        do: increment("pulso_admission_rejections_total", ~s(layer="#{layer}",reason="#{reason}"), 0)
+    seed_admission_rejections()
 
     for direction <- [:read, :write], do: object_bytes(direction, 0)
     compaction(:compact, {:ok, %{merged: 0}})
@@ -86,6 +84,12 @@ defmodule Pulso.SelfMetrics do
     end
 
     {:ok, nil}
+  end
+
+  defp seed_admission_rejections do
+    for {layer, reasons} <- @admission_reasons,
+        reason <- reasons,
+        do: increment("pulso_admission_rejections_total", ~s(layer="#{layer}",reason="#{reason}"), 0)
   end
 
   # Owned (scoped) instances must not detach the handlers other instances share.
