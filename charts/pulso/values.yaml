@@ -441,9 +441,11 @@ prometheusRule:
   enabled: false
   labels: {}
 
-# Starting points, not measured capacity. Each node runs at most four
-# concurrent queries with a heap ceiling per query; size memory for that plus
-# ingest traffic, then adjust from the self-monitoring metrics.
+# Starting points, not measured capacity. Each node runs three interactive
+# queries plus one alerting and one reliability query, each with a 128 MiB heap
+# ceiling (PULSO_QUERY_MAX_CONCURRENT and PULSO_QUERY_MAX_HEAP_MB via extraEnv);
+# size memory for that plus ingest traffic (ingestBatching.maxConcurrentRequests),
+# then adjust from the self-monitoring metrics.
 resources:
   requests:
     cpu: 500m

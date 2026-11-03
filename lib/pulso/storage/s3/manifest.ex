@@ -71,12 +71,30 @@ defmodule Pulso.Storage.S3.Manifest do
   per-segment binary allocations.
   """
   @spec encode(t()) :: iodata()
-  def encode(%__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor} = manifest) do
-    {wire_segments, names, labels} = encode_segments(segments)
+  def encode(%__MODULE__{} = manifest), do: manifest |> encode_with(nil) |> elem(0)
+
+  @doc """
+  Encode like `encode/1`, reusing each unchanged segment's JSON from `cache`.
+
+  A flat manifest is rewritten on every publication, so re-encoding every
+  segment (including base64 of trace blooms) makes each flush proportional to
+  the whole history. The cache maps a segment key to the exact segment term and
+  its encoded object; an entry is reused only when the segment is identical.
+  Dictionary IDs are still assigned per call in segment order, so the result is
+  the same document `encode/1` produces. Returns the cache for the next call,
+  holding only current segments.
+  """
+  @spec encode(t(), map()) :: {iodata(), map()}
+  def encode(%__MODULE__{} = manifest, cache) when is_map(cache), do: encode_with(manifest, cache)
+
+  defp encode_with(
+         %__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor} = manifest,
+         cache
+       ) do
+    {wire_segments, names, labels, cache} = encode_segments(segments, cache)
 
     wire = %{
       "v" => version,
-      "s" => wire_segments,
       "retired" => Map.new(retired, fn {key, retirement} -> {key, Retirement.to_wire(retirement)} end),
       "cleanup_cursor" => cursor
     }
@@ -84,14 +102,16 @@ defmodule Pulso.Storage.S3.Manifest do
     wire = if version == 3, do: Map.put(wire, "p", manifest.paging), else: wire
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
     wire = if labels == [], do: wire, else: Map.put(wire, "labels", labels)
-    json = Pulso.JSON.encode_to_iodata!(wire)
+    # `wire` always holds "v", so its object has at least one member to follow.
+    rest = wire |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_to_binary()
+    json = ["{\"s\":[", Enum.intersperse(wire_segments, ?,), "],", binary_part(rest, 1, byte_size(rest) - 1)]
 
     if version == 3 do
       # Verify exact payload bytes, independent of OTP term encoding or JSON
       # map iteration order across reader/writer upgrades.
-      ["{\"root_sha\":\"", root_digest(json), "\",\"payload\":", json, "}"]
+      {["{\"root_sha\":\"", root_digest(json), "\",\"payload\":", json, "}"], cache}
     else
-      json
+      {json, cache}
     end
   end
 
@@ -236,19 +256,54 @@ defmodule Pulso.Storage.S3.Manifest do
   # Exact name sets repeat across ingest batches. One dictionary entry per set
   # keeps that repetition off the hot manifest, with a hard byte budget for
   # distinct sets. Omitted sets remain unknown, so budget exhaustion is safe.
-  defp encode_segments(segments) do
-    state = %{ids: %{}, names: [], bytes: 2, segments: [], label_ids: %{}, labels: [], label_bytes: 2}
+  defp encode_segments(segments, cache) do
+    state = %{ids: %{}, names: [], bytes: 2, segments: [], label_ids: %{}, labels: [], label_bytes: 2, cache: cache}
     state = Enum.reduce(segments, state, &encode_segment/2)
-    {Enum.reverse(state.segments), Enum.reverse(state.names), Enum.reverse(state.labels)}
+    cache = prune_cache(state.cache, segments)
+    {Enum.reverse(state.segments), Enum.reverse(state.names), Enum.reverse(state.labels), cache}
   end
 
   defp encode_segment(segment, state) do
-    wire = Segment.to_wire(segment) |> Map.drop(["n", "l"])
+    {fragment, state} = segment_fragment(segment, state)
     {name_id, state} = dictionary_id(segment.metric_names, state)
     {label_id, state} = label_dictionary_id(segment.metric_labels, state)
-    wire = if is_nil(name_id), do: wire, else: Map.put(wire, "ni", name_id)
-    wire = if is_nil(label_id), do: wire, else: Map.put(wire, "li", label_id)
-    %{state | segments: [wire | state.segments]}
+    %{state | segments: [with_dictionary_ids(fragment, name_id, label_id) | state.segments]}
+  end
+
+  # The fragment is the segment's JSON object without its name/label sets,
+  # which the per-call dictionaries replace with "ni"/"li" IDs.
+  defp segment_fragment(segment, %{cache: nil} = state), do: {encode_fragment(segment), state}
+
+  defp segment_fragment(%{key: key} = segment, %{cache: cache} = state) do
+    case cache do
+      %{^key => {^segment, fragment}} -> {fragment, state}
+      _ -> encode_fragment(segment) |> then(&{&1, %{state | cache: Map.put(cache, key, {segment, &1})}})
+    end
+  end
+
+  # A fresh binary, so a cached fragment never pins a larger payload.
+  defp encode_fragment(segment),
+    do: segment |> Segment.to_wire() |> Map.drop(["n", "l"]) |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_to_binary()
+
+  defp with_dictionary_ids(fragment, nil, nil), do: fragment
+
+  defp with_dictionary_ids(fragment, name_id, label_id) do
+    [
+      binary_part(fragment, 0, byte_size(fragment) - 1),
+      dictionary_member("ni", name_id),
+      dictionary_member("li", label_id),
+      ?}
+    ]
+  end
+
+  defp dictionary_member(_, nil), do: []
+  defp dictionary_member(field, id), do: [",\"", field, "\":", Integer.to_string(id)]
+
+  # Appends only add keys; drop entries for removed segments when there are any.
+  defp prune_cache(nil, _segments), do: nil
+
+  defp prune_cache(cache, segments) do
+    if map_size(cache) > length(segments), do: Map.take(cache, Enum.map(segments, & &1.key)), else: cache
   end
 
   defp dictionary_id(nil, state), do: {nil, state}
@@ -345,7 +400,10 @@ defmodule Pulso.Storage.S3.Manifest do
     %{manifest | segments: merged, retired: retired}
   end
 
+  # Return already-thin segments unchanged, so they stay identical terms for the
+  # owner's encode cache instead of being rebuilt on every merge.
   defp thin_flat_trace_summary(%{trace_summary: nil} = segment), do: segment
+  defp thin_flat_trace_summary(%{trace_summary: %{lookup_hashes: nil}} = segment), do: segment
   defp thin_flat_trace_summary(segment), do: %{segment | trace_summary: %{segment.trace_summary | lookup_hashes: nil}}
 
   defp retry_retired(segment, retired) do

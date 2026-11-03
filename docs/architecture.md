@@ -326,6 +326,10 @@ tenant, `tenants/<t>/v4/metadata/metrics.json`, outside the signal manifests.
 Writers merge into it with conditional PUTs (`If-Match`, or `If-None-Match: *`
 to create) and jittered retries, so concurrent instances never drop each
 other's variants; a push that changes nothing costs one GET and no write.
+Each instance also keeps a disposable, bounded record of entries it has seen
+published for the day, so repeated pushes (remote write 2.0 attaches metadata to
+every request) skip that GET. Other writers only add variants or refresh days,
+so a remembered entry stays true for its day.
 Readers GET it directly, so there is no cross-instance staleness. Merges apply
 expiry and size bounds (`Pulso.MetricMetadata`), keeping the object bounded
 without a separate retention job, and retention sweeps never touch it.

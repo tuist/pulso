@@ -192,8 +192,8 @@ defmodule Pulso.OTLP.Logs do
 
   defp id(_, _), do: :error
   defp original_id(_raw, value) when is_binary(value), do: value
-  defp original_id(raw, nil), do: :binary.copy(raw)
-  defp text(value) when is_binary(value), do: {:ok, :binary.copy(value)}
+  defp original_id(raw, nil), do: Pulso.JSON.detach(raw)
+  defp text(value) when is_binary(value), do: {:ok, Pulso.JSON.detach(value)}
   defp text(_), do: :error
   defp service(value) when is_binary(value), do: value
   defp service(_), do: nil

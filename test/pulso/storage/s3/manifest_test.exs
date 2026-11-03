@@ -3,6 +3,7 @@ defmodule Pulso.Storage.S3.ManifestTest do
 
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.TraceSummary
 
   defp seg(key, min_ts, max_ts, rows \\ 1) do
     Segment.build(key, min_ts, max_ts, rows)
@@ -148,6 +149,46 @@ defmodule Pulso.Storage.S3.ManifestTest do
     assert {:ok, ^updated} = updated |> Manifest.encode() |> IO.iodata_to_binary() |> Manifest.decode()
     assert {:error, :compaction_conflict} = Manifest.replace(updated, ["a", "b"], replacement, 456)
   end
+
+  test "cached encoding matches a fresh encoding across appends, edits, removals and dictionary changes" do
+    metric = fn key, ts, names, job ->
+      %{seg(key, ts, ts + 1) | metric_names: names, metric_labels: %{"job" => [job]}}
+    end
+
+    trace = fn key, ts, id ->
+      %{seg(key, ts, ts + 1) | trace_summary: TraceSummary.from_values(["svc"], [id])}
+    end
+
+    id = fn n -> n |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(32, "0") end
+
+    m1 =
+      Manifest.merge(Manifest.new(), [
+        metric.("a", 1, ["up"], "x"),
+        metric.("b", 3, ["up"], "x"),
+        trace.("t", 5, id.(1))
+      ])
+
+    # "a" is listed last, so its dictionary IDs shift once "c" introduces a new set ahead of it.
+    m2 = Manifest.merge(m1, [metric.("c", 7, ["down"], "y")])
+    m3 = Manifest.merge(m2, [%{metric.("b", 3, ["other"], "z") | row_count: 9}])
+    {:ok, m4} = Manifest.replace(m3, ["a", "c"], metric.("ac", 1, ["up"], "x"), 99)
+
+    Enum.reduce([m1, m2, m3, m4], %{}, fn manifest, cache ->
+      {iodata, cache} = Manifest.encode(manifest, cache)
+      cached = IO.iodata_to_binary(iodata)
+      fresh = manifest |> Manifest.encode() |> IO.iodata_to_binary()
+
+      assert byte_size(cached) == byte_size(fresh)
+      assert Manifest.decode(cached) == Manifest.decode(fresh)
+      assert {:ok, %{segments: segments}} = Manifest.decode(cached)
+      assert segments == Enum.map(manifest.segments, &thin/1)
+      assert cache |> Map.keys() |> Enum.sort() == manifest.segments |> Enum.map(& &1.key) |> Enum.sort()
+      cache
+    end)
+  end
+
+  defp thin(%{trace_summary: nil} = segment), do: segment
+  defp thin(segment), do: %{segment | trace_summary: %{segment.trace_summary | lookup_hashes: nil}}
 
   test "invalid retirement deadlines fail closed" do
     assert {:error, :invalid_manifest} = Manifest.decode(~s({"v":1,"s":[],"retired":{"a":"soon"}}))

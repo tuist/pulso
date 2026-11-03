@@ -47,7 +47,26 @@ defmodule Pulso.Storage.S3.MetricMetadataStoreTest do
       allow_http: true
     }
 
-    {:ok, config: config, tenant: "metadata-#{System.unique_integer([:positive])}"}
+    {:ok, config: config, tenant: "metadata-#{System.unique_integer([:positive])}", store: store}
+  end
+
+  test "entries already published today skip the object read; new entries and days still publish", ctx do
+    start_supervised!(MetricMetadataStore)
+    requests = fn -> Agent.get(ctx.store, &length(&1.requests)) end
+    up = {"up", "gauge", "Target up.", ""}
+
+    assert :ok = MetricMetadataStore.put(ctx.config, ctx.tenant, [up], 100)
+    published = requests.()
+    assert :ok = MetricMetadataStore.put(ctx.config, ctx.tenant, [up], 100)
+    assert requests.() == published
+
+    # Another instance's variant is still merged with, not overwritten.
+    assert :ok = MetricMetadataStore.put(ctx.config, ctx.tenant, [{"up", "gauge", "Other.", ""}], 100)
+    assert :ok = MetricMetadataStore.put(ctx.config, ctx.tenant, [up], 101)
+    assert requests.() > published
+
+    assert {:ok, %{"up" => variants}} = MetricMetadataStore.get(ctx.config, ctx.tenant)
+    assert variants == %{{"gauge", "Target up.", ""} => 101, {"gauge", "Other.", ""} => 100}
   end
 
   test "concurrent writers merge rather than overwrite each other's variants", ctx do

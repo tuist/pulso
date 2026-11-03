@@ -482,6 +482,6 @@ defmodule Pulso.OTLP.Metrics do
        else: :ok
   end
 
-  defp text(value) when is_binary(value), do: {:ok, :binary.copy(value)}
+  defp text(value) when is_binary(value), do: {:ok, Pulso.JSON.detach(value)}
   defp text(_), do: :error
 end

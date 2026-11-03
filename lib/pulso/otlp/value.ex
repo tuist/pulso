@@ -40,7 +40,7 @@ defmodule Pulso.OTLP.Value do
   defp pair(%{"key" => key} = pair, {:ok, values, typed}) when is_binary(key) and byte_size(key) > 0 do
     with false <- Map.has_key?(values, key),
          {:ok, value, raw} <- decode(Map.get(pair, "value", %{})) do
-      key = :binary.copy(key)
+      key = Pulso.JSON.detach(key)
       {:cont, {:ok, Map.put(values, key, value), [%{"key" => key, "value" => raw} | typed]}}
     else
       _ -> {:halt, :error}
@@ -50,7 +50,7 @@ defmodule Pulso.OTLP.Value do
   defp pair(_, _), do: {:halt, :error}
 
   defp member("stringValue" = key, value) when is_binary(value) do
-    value = :binary.copy(value)
+    value = Pulso.JSON.detach(value)
     {:ok, value, %{key => value}}
   end
 

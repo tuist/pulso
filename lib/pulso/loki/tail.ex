@@ -150,7 +150,9 @@ defmodule Pulso.Loki.Tail do
 
   def publish(tenant, records) do
     case Registry.lookup(Runtime.name(__MODULE__.FollowerRegistry), tenant) do
-      [{pid, credit} | _] -> TailDelivery.deliver(pid, credit, :published, records)
+      # Request records slice the whole decoded request body; queued batches
+      # must not pin those buffers beyond the bytes their credits count.
+      [{pid, credit} | _] -> TailDelivery.deliver(pid, credit, :published, Pulso.JSON.detach(records))
       [] -> :ok
     end
 

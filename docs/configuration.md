@@ -405,8 +405,9 @@ raise that signal's reserve.
 
 Manifests are the other memory consumer that grows. With retention disabled,
 each signal's manifest is a flat list with one entry per append, kept forever.
-Every publication rewrites it and every query decodes it, so memory and CPU grow
-with history (roughly 1 MiB of encoded manifest per hour per signal at about two
+Every publication rewrites it (reusing each unchanged entry's encoding, which
+keeps about one more manifest's worth of bytes in memory per tenant and signal)
+and every query decodes it, so memory and CPU grow with history (roughly 1 MiB of encoded manifest per hour per signal at about two
 appends a second, more for traces). Pulso logs a warning once a flat manifest
 passes 20,000 segments. For a long-running deployment, enable
 [retention](retention.md) so manifests become bounded pages, enable compaction to
@@ -513,6 +514,8 @@ these variables (through `extraEnv` in the Helm chart):
 | `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read. |
 | `PULSO_QUERY_MAX_SCAN_BYTES` | `134217728` | Stored bytes a query may read. |
 | `PULSO_QUERY_TIMEOUT_MS` | `10000` | Wall-clock limit for one query, including object-store reads (1000 to 300000). Queries past it fail with a timeout. Keep it below the client's own timeout (Grafana's datasource default is 30 s). |
+| `PULSO_QUERY_MAX_CONCURRENT` | `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
+| `PULSO_QUERY_MAX_HEAP_MB` | `128` | Process heap ceiling of one query worker, `16..16384`. A query past it fails with a resource-limit error. Off-heap segment reads (up to the prefetch depth) and native accumulators come on top, so size memory for about (`PULSO_QUERY_MAX_CONCURRENT` + 2) × this plus prefetched segments, and lower both on small nodes. |
 | `PULSO_QUERY_PREFETCH` | `4` | Segments fetched ahead of the one being processed, hiding object-store latency. A query that scans many segments is latency-bound: with 25 ms per request, scanning 1,000 segments took about 25 s at 1, 5.8 s at 4 and 2.8 s at 8, with no more requests or memory. Larger values can read up to that many minus one segments more when a query stops early or exhausts a budget, and hold that many segments in memory per query. |
 
 Log metric queries stream: they hold one decoded chunk of a segment plus
@@ -528,7 +531,7 @@ returning a partial result.
 
 ## Fixed limits
 
-Each node admits four concurrent queries, at most two per tenant, and bounds
-each query's duration and memory. Requests are capped at 4 MiB on the wire and
+Each node admits `PULSO_QUERY_MAX_CONCURRENT` interactive queries (three by
+default), at most two per tenant, and bounds each query's duration and memory. Requests are capped at 4 MiB on the wire and
 16 MiB after decompression. Requests over these limits fail with an explicit
 error rather than a partial result.

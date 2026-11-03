@@ -74,6 +74,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   @default_flush_batch_max 256
   @cas_max_retries 5
   @published_payload {__MODULE__, :published_payload}
+  @wire_cache {__MODULE__, :wire_cache}
   # A cached manifest is served without I/O for this long after its
   # last refresh; beyond it, `ensure_loaded/3` issues a conditional GET
   # to pick up cross-node writes. This is the bound on cross-node
@@ -388,7 +389,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       {:ok, manifest, etag} ->
         # Reply with the encoded bytes: a decoded manifest sent as a message is
         # flattened, losing the summary sharing the caller regains by decoding.
-        payload = IO.iodata_to_binary(Manifest.encode(manifest))
+        payload = encode_cached(manifest)
         ManifestCache.put_snapshot(state.tenant, state.signal, {manifest, payload}, etag, token)
         state = %{state | manifest: manifest, etag: etag, loaded?: true}
         {:reply, {:ok, {:encoded, payload, etag}}, state, @idle_hibernate_ms}
@@ -638,7 +639,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp prepare_publication(state, segments, _eligible), do: {:ok, Manifest.merge(state.manifest, segments)}
 
   defp publish(%{state: state, merged: merged} = attempt) do
-    payload = merged |> Manifest.encode() |> IO.iodata_to_binary()
+    payload = encode_cached(merged)
 
     case attempt_cas(state, payload) do
       {:ok, new_etag} ->
@@ -650,6 +651,15 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         # Resolve internally retried/lost CAS responses before returning failure.
         state |> load_manifest(false) |> resolve_cas_failure(Map.put(attempt, :error, error))
     end
+  end
+
+  # Flat roots are rewritten whole on every flush; reuse each unchanged
+  # segment's encoded JSON so a flush encodes only what changed. The cache is a
+  # disposable owner-local optimization holding only the current segments.
+  defp encode_cached(manifest) do
+    {iodata, cache} = Manifest.encode(manifest, Process.get(@wire_cache, %{}))
+    Process.put(@wire_cache, cache)
+    IO.iodata_to_binary(iodata)
   end
 
   defp published(manifest, etag) do

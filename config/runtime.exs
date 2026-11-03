@@ -351,8 +351,14 @@ config :pulso, Pulso.IngestAdmission,
 
 config :pulso, Pulso.IngestLimits, ingest_limits
 
-# Wall-clock limit for one query, including object-store reads.
-config :pulso, Pulso.QueryRunner, timeout_ms: parse_integer.("PULSO_QUERY_TIMEOUT_MS", 10_000, 1_000..300_000)
+# Wall-clock limit for one query, plus the node's query memory envelope:
+# interactive slots (alerting and reliability run one each outside them), each
+# with a process heap ceiling. Size slots * heap well below the memory limit.
+config :pulso, Pulso.QueryRunner,
+  timeout_ms: parse_integer.("PULSO_QUERY_TIMEOUT_MS", 10_000, 1_000..300_000),
+  max_interactive: parse_integer.("PULSO_QUERY_MAX_CONCURRENT", 3, 1..64),
+  max_heap_words: div(parse_integer.("PULSO_QUERY_MAX_HEAP_MB", 128, 16..16_384) * 1_048_576, 8)
+
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(env_var.("PORT", "4000"))]
 
 # Browser origins allowed to call POST /mcp, comma-separated

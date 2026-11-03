@@ -405,6 +405,9 @@ defmodule Pulso.Storage.S3 do
   # a partial cursor could silently lose unread sources to compaction.
   @follow_window_ns 3_600_000_000_000
   @follow_max_segments 64
+  # One poll materializes its records in the follower; bound what it may read
+  # and expand, as for queries.
+  @follow_budget [max_scan_bytes: 134_217_728, max_scan_rows: 1_000_000, max_decoded_bytes: 33_554_432]
 
   @impl Pulso.Storage
   def follow_logs(tenant, seen) do
@@ -448,8 +451,17 @@ defmodule Pulso.Storage.S3 do
     if length(unseen) > @follow_max_segments do
       {:error, :tail_lag_limit}
     else
-      with {:ok, records} <- scan_segments(:logs, config, unseen, nil, nil, [], nil) do
-        {:ok, records, seen |> MapSet.intersection(current) |> MapSet.union(MapSet.new(unseen, & &1.key))}
+      case scan_segments(:logs, config, unseen, nil, nil, @follow_budget, nil) do
+        {:ok, records} ->
+          {:ok, records, seen |> MapSet.intersection(current) |> MapSet.union(MapSet.new(unseen, & &1.key))}
+
+        # Retrying the same oversized backlog would rescan it every poll; close
+        # like any other lag and let reconnects query history instead.
+        {:error, reason} when reason in [:query_scan_limit, :query_decoded_limit] ->
+          {:error, :tail_lag_limit}
+
+        {:error, _} = error ->
+          error
       end
     end
   end
@@ -987,6 +999,9 @@ defmodule Pulso.Storage.S3 do
         signal: signal,
         config: config,
         segments: segments,
+        # Early-stop checks look at the next segment after every visit; index a
+        # tuple instead of walking the list, which is quadratic in the scan.
+        indexed: List.to_tuple(segments),
         start_ts: start_ts,
         end_ts: end_ts,
         opts: opts,
@@ -1037,12 +1052,15 @@ defmodule Pulso.Storage.S3 do
 
   # Segments are visited newest first. A fold may stop once the next segment
   # cannot contribute, judged from that segment's newest timestamp.
-  defp fold_done?(%{opts: opts, segments: segments}, acc, index) do
+  defp fold_done?(%{opts: opts} = ctx, acc, index) do
     case opts[:log_fold_stop] do
       nil -> false
-      stop -> stop.(acc, segments |> Enum.at(index + 1) |> then(&(&1 && &1.max_ts)))
+      stop -> stop.(acc, ctx |> next_segment(index) |> then(&(&1 && &1.max_ts)))
     end
   end
+
+  defp next_segment(%{indexed: indexed}, index) when index + 1 < tuple_size(indexed), do: elem(indexed, index + 1)
+  defp next_segment(_ctx, _index), do: nil
 
   defp candidate_segments(segments, service),
     do: Enum.filter(segments, &TraceSummary.candidate_source?(&1.trace_summary, service))
@@ -1482,7 +1500,7 @@ defmodule Pulso.Storage.S3 do
   defp continue_or_halt(state, blob, index, %{native: native} = ctx) when not is_nil(native) do
     case native_result(NIF.trace_query_add(native, blob)) do
       {:ok, {count, kth, _rows}} ->
-        next = Enum.at(ctx.segments, index + 1)
+        next = next_segment(ctx, index)
         done? = is_nil(next) or (is_integer(kth) and is_integer(next.max_ts) and kth > next.max_ts)
         state = %{state | count: count}
         if done?, do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
@@ -1533,7 +1551,7 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp continue_or_halt(state, %MetricFooterReader{body: nil}, index, ctx) do
-    if can_short_circuit?(state, ctx.limit, ctx.segments, index), do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
+    if can_short_circuit?(state, ctx.limit, ctx, index), do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
   end
 
   defp continue_or_halt(state, %MetricFooterReader{body: body}, index, ctx),
@@ -1557,7 +1575,7 @@ defmodule Pulso.Storage.S3 do
         top: top_timestamps(state.top, batch, ctx.limit)
       }
 
-      if can_short_circuit?(new_state, ctx.limit, ctx.segments, index),
+      if can_short_circuit?(new_state, ctx.limit, ctx, index),
         do: {:halt, {:ok, new_state}},
         else: {:cont, {:ok, new_state}}
     else
@@ -1595,10 +1613,10 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp can_short_circuit?(_state, nil, _segments, _index), do: false
+  defp can_short_circuit?(_state, nil, _ctx, _index), do: false
 
-  defp can_short_circuit?(state, limit, segments, index) when state.count >= limit do
-    case Enum.at(segments, index + 1) do
+  defp can_short_circuit?(state, limit, ctx, index) when state.count >= limit do
+    case next_segment(ctx, index) do
       nil ->
         true
 
@@ -1611,7 +1629,7 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp can_short_circuit?(_state, _limit, _segments, _index), do: false
+  defp can_short_circuit?(_state, _limit, _ctx, _index), do: false
 
   defp top_timestamps(top, _batch, nil), do: top
 
