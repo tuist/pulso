@@ -4,11 +4,13 @@ defmodule Pulso.Auth.WorkloadIdentityTest do
   import ExUnit.CaptureLog
 
   alias Pulso.Auth
+  alias Pulso.Auth.JWKS
   alias Pulso.Auth.SharedSecret
   alias Pulso.Auth.WorkloadIdentity
   alias Pulso.Record.Log
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.JWKSServer
 
   @moduletag :capture_log
 
@@ -18,8 +20,20 @@ defmodule Pulso.Auth.WorkloadIdentityTest do
 
   setup_all do
     # Two clusters sharing kubeadm's default issuer: only the pinned key differs.
+    # The TLS chain is for the JWKS URL tests' local HTTPS issuer.
+    san = {:Extension, {2, 5, 29, 17}, false, [dNSName: ~c"localhost"]}
+    rsa = [key: {:rsa, 2048, 65_537}]
+
+    tls =
+      :public_key.pkix_test_data(%{
+        server_chain: %{root: rsa, intermediates: [], peer: rsa ++ [extensions: [san]]},
+        client_chain: %{root: rsa, intermediates: [], peer: rsa}
+      })
+
     {:ok,
-     trusted: :public_key.generate_key({:rsa, 2048, 65_537}), other: :public_key.generate_key({:rsa, 2048, 65_537})}
+     trusted: :public_key.generate_key({:rsa, 2048, 65_537}),
+     other: :public_key.generate_key({:rsa, 2048, 65_537}),
+     tls: tls}
   end
 
   setup %{trusted: trusted} do
@@ -265,7 +279,6 @@ defmodule Pulso.Auth.WorkloadIdentityTest do
       Map.put(valid, "audiences", []),
       Map.put(valid, "unexpected", true),
       Map.put(valid, "max_token_ttl_seconds", 31_536_000),
-      Map.put(valid, "keys", %{"type" => "url", "url" => "https://kubernetes.default.svc/openid/v1/jwks"}),
       Map.put(valid, "bindings", []),
       Map.put(valid, "bindings", [%{"subject" => @subject, "tenant" => "tuist", "capabilities" => ["admin"]}]),
       Map.put(valid, "bindings", [%{"subject" => "atlas", "tenant" => "tuist", "capabilities" => ["read"]}]),
@@ -305,5 +318,167 @@ defmodule Pulso.Auth.WorkloadIdentityTest do
 
     Pulso.Runtime.put_env("PULSO_WORKLOAD_IDENTITY_JSON", "{")
     assert_raise RuntimeError, fn -> Config.Reader.read!(path, env: :test, target: :host) end
+  end
+
+  describe "JWKS URL key source" do
+    @describetag :tmp_dir
+    @alloy "system:serviceaccount:monitoring:alloy"
+
+    # An HTTPS "API server" with its own CA, plus an unrelated CA and a pod token.
+    setup %{tmp_dir: dir, tls: %{server_config: server, client_config: client}} do
+      pem = fn name, entries -> Path.join(dir, name) |> tap(&File.write!(&1, :public_key.pem_encode(entries))) end
+      {key_type, key_der} = server[:key]
+      certfile = pem.("server.pem", [{:Certificate, server[:cert], :not_encrypted}])
+      keyfile = pem.("server-key.pem", [{key_type, key_der, :not_encrypted}])
+      ca = pem.("ca.pem", for(der <- client[:cacerts], do: {:Certificate, der, :not_encrypted}))
+      # Each config's cacerts also lists the server root; keep only the unrelated CA.
+      other_ca =
+        pem.("other-ca.pem", for(der <- server[:cacerts] -- client[:cacerts], do: {:Certificate, der, :not_encrypted}))
+
+      token_file = Path.join(dir, "token") |> tap(&File.write!(&1, "pod-token\n"))
+
+      agent = start_supervised!({Agent, fn -> %{status: 200, body: "{}", requests: []} end})
+
+      server =
+        start_supervised!(
+          {Bandit,
+           plug: {JWKSServer, agent: agent},
+           scheme: :https,
+           certfile: certfile,
+           keyfile: keyfile,
+           ip: {127, 0, 0, 1},
+           port: 0}
+        )
+
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+      {:ok,
+       agent: agent, url: "https://localhost:#{port}/openid/v1/jwks", ca: ca, other_ca: other_ca, token_file: token_file}
+    end
+
+    defp url_entry(ctx, overrides \\ %{}) do
+      source =
+        Map.merge(%{"type" => "url", "url" => ctx.url, "ca_file" => ctx.ca, "token_file" => ctx.token_file}, overrides)
+
+      bindings = [%{"subject" => @alloy, "tenant" => "tuist", "capabilities" => ["ingest"]}]
+      Map.merge(entry(ctx.trusted, bindings), %{"name" => "local-cluster", "keys" => source})
+    end
+
+    defp serve(agent, keys), do: Agent.update(agent, &%{&1 | body: JSON.encode!(%{"keys" => keys})})
+    defp requests(agent), do: Agent.get(agent, &length(&1.requests))
+
+    defp alloy_claims do
+      claims(%{
+        "sub" => @alloy,
+        "kubernetes.io" => %{"namespace" => "monitoring", "serviceaccount" => %{"name" => "alloy"}}
+      })
+    end
+
+    # Returns once the initial scheduled fetch has completed.
+    defp start_cache(trust, opts \\ []) do
+      Pulso.Runtime.put_env(:pulso, WorkloadIdentity, trust: trust)
+      pid = start_supervised!({JWKS, Keyword.put(opts, :trust, trust)})
+      _ = :sys.get_state(pid)
+      pid
+    end
+
+    test "fetches keys over TLS with the CA bundle and pod token", %{agent: agent, trusted: key} = ctx do
+      # Non-RSA keys the cluster also publishes are skipped, not fatal.
+      serve(agent, [%{"kty" => "EC", "kid" => "ec", "crv" => "P-256", "x" => "AA", "y" => "AA"}, jwk(key, @kid)])
+      start_cache(WorkloadIdentity.parse!([url_entry(ctx)]))
+      token = sign(key, alloy_claims())
+
+      assert Auth.verify(conn_with(token), "tuist", :ingest) == :ok
+      assert Auth.verify(conn_with(token), "tuist", :read) == {:error, :forbidden}
+      assert Agent.get(agent, & &1.requests) |> Enum.uniq() == [["Bearer pod-token"]]
+    end
+
+    test "a server outside the configured CA is never trusted", %{agent: agent, trusted: key} = ctx do
+      serve(agent, [jwk(key, @kid)])
+
+      log =
+        capture_log(fn ->
+          start_cache(WorkloadIdentity.parse!([url_entry(ctx, %{"ca_file" => ctx.other_ca})]))
+          assert Auth.verify(conn_with(sign(key, alloy_claims())), "tuist", :ingest) == {:error, :auth_unavailable}
+        end)
+
+      assert log =~ "JWKS refresh failed for trust local-cluster"
+      refute log =~ "pod-token"
+      assert requests(agent) == 0
+    end
+
+    test "unavailable keys answer 503, and so do issuer errors", %{agent: agent, trusted: key} = ctx do
+      trust = WorkloadIdentity.parse!([url_entry(ctx)])
+      Pulso.Runtime.put_env(:pulso, WorkloadIdentity, trust: trust)
+      token = sign(key, alloy_claims())
+
+      # No cache process at all.
+      assert Auth.verify(conn_with(token), "tuist", :ingest) == {:error, :auth_unavailable}
+
+      Agent.update(agent, &%{&1 | status: 403, body: ~s({"kind":"Status"})})
+      start_cache(trust)
+
+      conn =
+        token
+        |> conn_with()
+        |> put_req_header("content-type", "application/json")
+        |> post(~p"/loki/api/v1/push", %{"streams" => []})
+
+      assert json_response(conn, 503) == %{"error" => "auth_unavailable"}
+    end
+
+    test "an unknown kid picks up rotated keys, rate-limited per source", %{agent: agent, trusted: a, other: b} = ctx do
+      serve(agent, [jwk(a, @kid)])
+      start_cache(WorkloadIdentity.parse!([url_entry(ctx)]), min_refresh_ms: 0)
+      rotated = sign(b, alloy_claims(), %{"alg" => "RS256", "kid" => "rotated"})
+
+      assert Auth.verify(conn_with(sign(a, alloy_claims())), "tuist", :ingest) == :ok
+      assert requests(agent) == 1
+
+      serve(agent, [jwk(a, @kid), jwk(b, "rotated")])
+      assert Auth.verify(conn_with(rotated), "tuist", :ingest) == :ok
+      assert requests(agent) == 2
+
+      stop_supervised!(JWKS)
+      serve(agent, [jwk(a, @kid)])
+      start_cache(WorkloadIdentity.parse!([url_entry(ctx)]))
+      before = requests(agent)
+
+      for kid <- ~w(x1 x2 x3 x4 x5) do
+        forged = sign(b, alloy_claims(), %{"alg" => "RS256", "kid" => kid})
+        assert Auth.verify(conn_with(forged), "tuist", :ingest) == {:error, :invalid_token}
+      end
+
+      assert requests(agent) == before
+    end
+
+    test "a fetched key that is also pinned inline is ambiguous", %{agent: agent, trusted: key} = ctx do
+      serve(agent, [jwk(key, @kid)])
+      inline = Map.put(entry(key), "name", "inline")
+      trust = WorkloadIdentity.parse!([inline, url_entry(ctx)])
+      start_cache(trust)
+
+      assert {:error, {:ambiguous_key, nil}} = WorkloadIdentity.authenticate(sign(key, claims()), trust, now())
+    end
+
+    test "URL sources are validated at boot", ctx do
+      for overrides <- [
+            %{"url" => "http://kubernetes.default.svc/openid/v1/jwks"},
+            %{"url" => "not a url"},
+            %{"ca_file" => Path.join(ctx.tmp_dir, "missing.crt")},
+            %{"token_file" => Path.join(ctx.tmp_dir, "missing")},
+            %{"refresh_interval_seconds" => 5},
+            %{"headers" => %{}}
+          ] do
+        assert_raise ArgumentError, ~r/PULSO_WORKLOAD_IDENTITY_JSON/, fn ->
+          WorkloadIdentity.parse!([url_entry(ctx, overrides)])
+        end
+      end
+
+      assert [%{keys: [], jwks_url: %{refresh_interval_seconds: 300, token_file: token}}] =
+               WorkloadIdentity.parse!([url_entry(ctx)])
+
+      assert token == ctx.token_file
+    end
   end
 end

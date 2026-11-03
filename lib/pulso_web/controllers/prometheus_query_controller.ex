@@ -32,6 +32,9 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, {:unauthorized, :forbidden}} ->
         error(conn, :forbidden, "forbidden", "forbidden")
 
+      {:error, {:unauthorized, :auth_unavailable}} ->
+        error(conn, :service_unavailable, "unavailable", "auth_unavailable")
+
       {:error, {:unauthorized, _}} ->
         error(conn, :unauthorized, "unauthorized", "unauthorized")
 

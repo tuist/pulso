@@ -9,10 +9,16 @@ defmodule Pulso.Auth.WorkloadIdentity do
   attributed to the entry whose pinned key verified its signature, and only
   then are that entry's issuer, audience and bindings checked.
 
+  Keys are either pinned inline or fetched from a JWKS URL by
+  `Pulso.Auth.JWKS`, which caches them node-locally. While a URL source has no
+  fresh keys, tokens that no other key verifies fail as `:auth_unavailable`
+  rather than being attributed to any entry.
+
   Only RS256 is accepted. Tokens are never logged; rejections log the detailed
   reason and the trust entry name only.
   """
 
+  alias Pulso.Auth.JWKS
   alias Pulso.Runtime
 
   require Logger
@@ -22,6 +28,7 @@ defmodule Pulso.Auth.WorkloadIdentity do
   @default_max_ttl 3600
   @capabilities %{"read" => :read, "ingest" => :ingest}
   @entry_keys ~w(name issuer audiences max_token_ttl_seconds keys bindings)
+  @url_keys ~w(type url ca_file token_file refresh_interval_seconds)
   @sa_prefix "system:serviceaccount:"
 
   @type capability :: :read | :ingest
@@ -41,10 +48,13 @@ defmodule Pulso.Auth.WorkloadIdentity do
 
   @doc """
   Verifies `token` and authorizes it for `tenant` and `capability`. Returns
-  `:invalid_token` for every authentication failure and `:forbidden` when an
-  authenticated principal lacks a binding for the tenant and capability.
+  `:invalid_token` for every authentication failure, `:forbidden` when an
+  authenticated principal lacks a binding for the tenant and capability, and
+  `:auth_unavailable` when no key verified the token while a JWKS URL source
+  could not supply fresh keys.
   """
-  @spec verify(String.t(), String.t(), capability(), list(), integer()) :: :ok | {:error, :invalid_token | :forbidden}
+  @spec verify(String.t(), String.t(), capability(), list(), integer()) ::
+          :ok | {:error, :invalid_token | :forbidden | :auth_unavailable}
   def verify(token, tenant, capability, trust \\ trust(), now \\ System.os_time(:second)) do
     case authenticate(token, trust, now) do
       {:ok, principal} ->
@@ -58,6 +68,10 @@ defmodule Pulso.Auth.WorkloadIdentity do
 
           {:error, :forbidden}
         end
+
+      {:error, {:keys_unavailable, _}} ->
+        Logger.warning("workload identity unavailable: a JWKS URL source has no fresh keys")
+        {:error, :auth_unavailable}
 
       {:error, {reason, trust_name}} ->
         Logger.warning("workload identity rejected: #{reason} (trust #{trust_name || "none"})")
@@ -111,23 +125,52 @@ defmodule Pulso.Auth.WorkloadIdentity do
 
   defp check_header(_header), do: {:error, :unsupported_algorithm}
 
-  # Kids are unique across entries (enforced by `parse!/1`), so at most one
-  # pinned key, and therefore one entry, can match.
+  # Inline kids are unique (enforced by `parse!/1`), but fetched kids are only
+  # known at runtime, so exactly one candidate key must verify the signature;
+  # a key shared by two entries is ambiguous and rejected. An unknown kid asks
+  # URL sources for a rate-limited refresh, which covers issuer key rotation.
   defp verify_signature(trust, kid, signing_input, signature) do
-    case for(entry <- trust, key <- entry.keys, key.kid == kid, do: {entry, key}) do
-      [] -> {:error, {:unknown_kid, nil}}
-      [{entry, key}] -> signed_payload(entry, key, signing_input, signature)
+    {candidates, unavailable?} =
+      case candidates(trust, kid) do
+        {[], _} ->
+          for entry <- trust, entry.jwks_url, do: JWKS.refresh(entry)
+          candidates(trust, kid)
+
+        found ->
+          found
+      end
+
+    case Enum.filter(candidates, fn {_entry, key} -> signed_by?(key, signing_input, signature) end) do
+      [{entry, _key}] ->
+        [_, payload] = String.split(signing_input, ".")
+        {:ok, entry, Base.url_decode64!(payload, padding: false)}
+
+      [_, _ | _] ->
+        {:error, {:ambiguous_key, nil}}
+
+      [] ->
+        {:error, {no_key_reason(candidates, unavailable?), nil}}
     end
   end
 
-  defp signed_payload(entry, key, signing_input, signature) do
-    if byte_size(signature) == key.size and :crypto.verify(:rsa, :sha256, signing_input, signature, [key.e, key.n]) do
-      [_, payload] = String.split(signing_input, ".")
-      {:ok, entry, Base.url_decode64!(payload, padding: false)}
-    else
-      {:error, {:invalid_signature, nil}}
-    end
+  defp candidates(trust, kid) do
+    Enum.reduce(trust, {[], false}, fn entry, {found, unavailable?} ->
+      case entry_keys(entry) do
+        :unavailable -> {found, true}
+        keys -> {found ++ for(key <- keys, key.kid == kid, do: {entry, key}), unavailable?}
+      end
+    end)
   end
+
+  defp entry_keys(%{jwks_url: nil, keys: keys}), do: keys
+  defp entry_keys(entry), do: JWKS.cached(entry)
+
+  defp no_key_reason([], true), do: :keys_unavailable
+  defp no_key_reason([], false), do: :unknown_kid
+  defp no_key_reason(_candidates, _unavailable?), do: :invalid_signature
+
+  defp signed_by?(key, signing_input, signature),
+    do: byte_size(signature) == key.size and :crypto.verify(:rsa, :sha256, signing_input, signature, [key.e, key.n])
 
   defp decode_json(binary, reason) do
     case JSON.decode(binary) do
@@ -210,13 +253,15 @@ defmodule Pulso.Auth.WorkloadIdentity do
     )
 
     check!(is_integer(ttl) and ttl in 600..86_400, "#{name}: max_token_ttl_seconds must be an integer in 600..86400")
+    {keys, jwks_url} = key_source!(raw["keys"], name)
 
     %{
       name: name,
       issuer: issuer,
       audiences: audiences,
       max_token_ttl_seconds: ttl,
-      keys: keys!(raw["keys"], name),
+      keys: keys,
+      jwks_url: jwks_url,
       bindings: bindings!(raw["bindings"], name)
     }
   end
@@ -225,39 +270,85 @@ defmodule Pulso.Auth.WorkloadIdentity do
 
   # `jwks` is the JWKS object, or that document as a JSON string so operators
   # can paste `/openid/v1/jwks` output verbatim.
-  defp keys!(%{"type" => "inline", "jwks" => jwks} = source, name) when is_binary(jwks) and map_size(source) == 2 do
+  defp key_source!(%{"type" => "inline", "jwks" => jwks} = source, name)
+       when is_binary(jwks) and map_size(source) == 2 do
     case JSON.decode(jwks) do
-      {:ok, %{} = decoded} -> keys!(%{source | "jwks" => decoded}, name)
+      {:ok, %{} = decoded} -> key_source!(%{source | "jwks" => decoded}, name)
       _ -> fail!("#{name}: keys.jwks is not a valid JSON document")
     end
   end
 
-  defp keys!(%{"type" => "inline", "jwks" => %{"keys" => [_ | _] = keys}} = source, name) when map_size(source) == 2,
-    do: Enum.map(keys, &jwk!(&1, name))
+  defp key_source!(%{"type" => "inline", "jwks" => %{"keys" => [_ | _] = keys}} = source, name)
+       when map_size(source) == 2, do: {Enum.map(keys, &jwk!(&1, name)), nil}
 
-  defp keys!(_source, name),
-    do: fail!(~s(#{name}: keys must be {"type": "inline", "jwks": {"keys": [...]}} with at least one key))
+  defp key_source!(%{"type" => "url"} = source, name) do
+    check!(
+      Map.keys(source) -- @url_keys == [],
+      "#{name}: keys has unknown fields (expected #{Enum.join(@url_keys, ", ")})"
+    )
 
-  defp jwk!(%{"kty" => "RSA", "kid" => kid, "n" => n, "e" => e} = jwk, name) when is_binary(kid) and kid != "" do
-    cond do
-      Map.has_key?(jwk, "d") -> fail!("#{name}: key #{kid} contains private key material")
-      Map.get(jwk, "alg", "RS256") != "RS256" -> fail!("#{name}: key #{kid} must be RS256")
-      Map.get(jwk, "use", "sig") != "sig" -> fail!("#{name}: key #{kid} must be a signing key")
-      true -> :ok
+    url = source["url"]
+    uri = is_binary(url) && URI.parse(url)
+    check!((uri && uri.scheme == "https") and uri.host not in [nil, ""], "#{name}: keys.url must be an https URL")
+    refresh = Map.get(source, "refresh_interval_seconds", 300)
+    check!(is_integer(refresh) and refresh in 60..3600, "#{name}: keys.refresh_interval_seconds must be in 60..3600")
+
+    # Files are mounted by the deployment, so their absence is a misconfiguration
+    # worth stopping for; their contents are read again on every fetch.
+    for field <- ["ca_file", "token_file"], Map.has_key?(source, field) do
+      path = source[field]
+      check!(is_binary(path) and File.regular?(path), "#{name}: keys.#{field} must name a readable file")
     end
 
+    {[], %{url: url, ca_file: source["ca_file"], token_file: source["token_file"], refresh_interval_seconds: refresh}}
+  end
+
+  defp key_source!(_source, name),
+    do:
+      fail!(
+        ~s(#{name}: keys must be {"type": "inline", "jwks": {"keys": [...]}} with at least one key, ) <>
+          ~s(or {"type": "url", "url": "https://..."})
+      )
+
+  @doc """
+  Parses a fetched JWKS document. Keys Pulso cannot use (non-RSA, non-RS256,
+  weak, or carrying private material) are skipped; at least one must remain.
+  """
+  def parse_jwks(document) do
+    with {:ok, %{"keys" => keys}} when is_list(keys) <- JSON.decode(document),
+         [_ | _] = usable <- for(raw <- keys, {:ok, key} <- [jwk(raw)], do: key) do
+      {:ok, usable}
+    else
+      [] -> {:error, :no_usable_keys}
+      _ -> {:error, :invalid_jwks}
+    end
+  end
+
+  defp jwk!(raw, name) do
+    case jwk(raw) do
+      {:ok, key} -> key
+      {:error, message} -> fail!("#{name}: #{message}")
+    end
+  end
+
+  defp jwk(%{"kty" => "RSA", "kid" => kid, "n" => n, "e" => e} = jwk) when is_binary(kid) and kid != "" do
     with {:ok, n} when is_binary(n) <- decode_uint(n),
          {:ok, e} when is_binary(e) <- decode_uint(e),
          bits when bits >= 2048 <- bit_size(n) - leading_zero_bits(n),
          true <- odd_at_least?(n, 3) and odd_at_least?(e, 3) do
-      %{kid: kid, n: n, e: e, size: div(bits + 7, 8)}
+      cond do
+        Map.has_key?(jwk, "d") -> {:error, "key #{kid} contains private key material"}
+        Map.get(jwk, "alg", "RS256") != "RS256" -> {:error, "key #{kid} must be RS256"}
+        Map.get(jwk, "use", "sig") != "sig" -> {:error, "key #{kid} must be a signing key"}
+        true -> {:ok, %{kid: kid, n: n, e: e, size: div(bits + 7, 8)}}
+      end
     else
-      _ -> fail!("#{name}: key #{kid} must have a base64url RSA modulus of at least 2048 bits and an odd exponent >= 3")
+      _ -> {:error, "key #{kid} must have a base64url RSA modulus of at least 2048 bits and an odd exponent >= 3"}
     end
   end
 
-  defp jwk!(_jwk, name),
-    do: fail!(~s(#{name}: every key must be an RSA JWK with kid, n and e \(quote "n" in YAML, which reads n as false\)))
+  defp jwk(_jwk),
+    do: {:error, ~s(every key must be an RSA JWK with kid, n and e \(quote "n" in YAML, which reads n as false\))}
 
   defp decode_uint(value) when is_binary(value) and value != "", do: Base.url_decode64(value, padding: false)
   defp decode_uint(_), do: :error

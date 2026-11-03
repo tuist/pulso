@@ -112,6 +112,12 @@ defmodule PulsoWeb.LokiController do
       {:error, :forbidden} ->
         conn |> put_status(:forbidden) |> json(%{error: "forbidden"})
 
+      {:error, :auth_unavailable} ->
+        conn
+        |> put_resp_header("retry-after", "5")
+        |> put_status(:service_unavailable)
+        |> json(%{error: "auth_unavailable"})
+
       {:error, :keyed_content_mismatch} ->
         conn |> put_status(:conflict) |> json(%{error: "keyed_content_mismatch"})
 

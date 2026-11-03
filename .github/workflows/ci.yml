@@ -151,6 +151,13 @@ jobs:
           helm template pulso charts/pulso --set storage.bucket=ci --set storage.region=us-east-1 \
             --set storage.accessKeyId=ci --set storage.secretAccessKey=ci --set-json "workloadIdentity.trust=${trust}" \
             | grep -A1 'name: PULSO_WORKLOAD_IDENTITY_JSON' | grep -q 'system:serviceaccount:ci:ci'
+          # JWKS URL sources can read the opt-in projected Kubernetes API token and CA.
+          helm template pulso charts/pulso "${args[@]}" --set workloadIdentity.kubernetesApiToken.enabled=true \
+            | grep -A3 'serviceAccountToken:' | grep -q 'path: token'
+          if helm template pulso charts/pulso "${args[@]}" | grep -q 'kube-root-ca.crt'; then
+            echo "the Kubernetes API token must not be mounted by default" >&2
+            exit 1
+          fi
           if helm template pulso charts/pulso "${args[@]}" --set-json 'workloadIdentity.trust=[{"name":"ci"}]' > /dev/null 2>&1; then
             echo "rendering with an incomplete workload identity entry should fail" >&2
             exit 1

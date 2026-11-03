@@ -59,6 +59,31 @@ workloadIdentity:
   #     - subject: system:serviceaccount:atlas-production:atlas
   #       tenant: tuist
   #       capabilities: [read]
+  #
+  # For workloads in Pulso's own cluster, fetch the keys from the API server
+  # instead, authenticating with the token mounted by kubernetesApiToken below:
+  # - name: local-cluster
+  #   issuer: https://kubernetes.default.svc.cluster.local
+  #   audiences: [pulso.tuist.dev]
+  #   keys:
+  #     type: url
+  #     url: https://kubernetes.default.svc/openid/v1/jwks
+  #     ca_file: /var/run/secrets/pulso/kubernetes-api/ca.crt
+  #     token_file: /var/run/secrets/pulso/kubernetes-api/token
+  #     refresh_interval_seconds: 300   # optional, 60..3600
+  #   bindings:
+  #     - subject: system:serviceaccount:monitoring:alloy
+  #       tenant: tuist
+  #       capabilities: [ingest]
+
+  # Mounts a projected token for the Kubernetes API (its default audience) and
+  # the cluster CA at /var/run/secrets/pulso/kubernetes-api/{token,ca.crt}, for
+  # JWKS URL key sources. It does not enable serviceAccount.automount. Kubernetes
+  # binds system:service-account-issuer-discovery to every ServiceAccount by
+  # default, which is all /openid/v1/jwks needs.
+  kubernetesApiToken:
+    enabled: false
+    expirationSeconds: 3600
 
 storage:
   # Bucket that holds every acknowledged record. Required.

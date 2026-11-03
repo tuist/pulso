@@ -126,6 +126,12 @@ defmodule PulsoWeb.RemoteWriteController do
       {:error, :forbidden} ->
         conn |> put_status(:forbidden) |> json(%{error: "forbidden"})
 
+      {:error, :auth_unavailable} ->
+        conn
+        |> put_resp_header("retry-after", "5")
+        |> put_status(:service_unavailable)
+        |> json(%{error: "auth_unavailable"})
+
       {:error, :owner_overloaded} ->
         # 429 — Prometheus retries on 5xx and 429 with backoff. The
         # typed `:owner_overloaded` from `ManifestOwner.register_segments`

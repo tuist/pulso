@@ -79,8 +79,11 @@ crash on boot.
 {{- if not (and $entry.name $entry.issuer $entry.audiences $entry.keys $entry.bindings) }}
 {{- fail (printf "workloadIdentity.trust[%d] needs name, issuer, audiences, keys, and bindings" $i) }}
 {{- end }}
-{{- if ne (toString $entry.keys.type) "inline" }}
-{{- fail (printf "workloadIdentity.trust[%d].keys.type must be \"inline\"" $i) }}
+{{- if not (has (toString $entry.keys.type) (list "inline" "url")) }}
+{{- fail (printf "workloadIdentity.trust[%d].keys.type must be \"inline\" or \"url\"" $i) }}
+{{- end }}
+{{- if and (eq (toString $entry.keys.type) "url") (not (hasPrefix "https://" (toString $entry.keys.url))) }}
+{{- fail (printf "workloadIdentity.trust[%d].keys.url must be an https URL" $i) }}
 {{- end }}
 {{- if kindIs "map" $entry.keys.jwks }}
 {{- range $entry.keys.jwks.keys }}

@@ -848,6 +848,9 @@ defmodule PulsoWeb.LokiQueryController do
   defp render_error(conn, {:error, :forbidden}),
     do: conn |> put_status(:forbidden) |> json(%{"status" => "error", "error" => "forbidden"})
 
+  defp render_error(conn, {:error, :auth_unavailable}),
+    do: conn |> put_status(:service_unavailable) |> json(%{"status" => "error", "error" => "auth_unavailable"})
+
   defp render_error(conn, {:error, reason})
        when reason in [
               :query_overloaded,

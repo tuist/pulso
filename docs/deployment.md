@@ -80,7 +80,8 @@ The ones you are most likely to change:
 | --- | --- |
 | `storage.*` | Bucket, region, endpoint, and credentials. |
 | `tenantTokens` | Tenant name to token digest. Optional when `workloadIdentity.trust` is set. |
-| `workloadIdentity.trust` | Trusted Kubernetes ServiceAccount token issuers with pinned public keys and subject-to-tenant/capability bindings. See [workload identity](configuration.md#workload-identity). |
+| `workloadIdentity.trust` | Trusted Kubernetes ServiceAccount token issuers with inline or URL-fetched public keys and subject-to-tenant/capability bindings. See [workload identity](configuration.md#workload-identity). |
+| `workloadIdentity.kubernetesApiToken.enabled` | Mount a projected Kubernetes API token and the cluster CA for [JWKS URL key sources](configuration.md#jwks-url-key-sources). Default `false`. |
 | `existingSecret` | Use a Secret you manage instead of chart-rendered credentials. |
 | `ingress.*` | Expose ingestion and queries outside the cluster. |
 | `serviceMonitor.enabled` | Create a Prometheus Operator `ServiceMonitor` for self-monitoring. |
@@ -151,6 +152,31 @@ YAML reads a bare `n` as `false`. The chart rejects keys without `"n"`. The
 chart renders this as `PULSO_WORKLOAD_IDENTITY_JSON`. See
 [workload identity](configuration.md#workload-identity) for the checks Pulso
 applies and how to rotate keys.
+
+For workloads in Pulso's own cluster, such as Grafana Alloy, let Pulso fetch
+the keys from the API server so key rotation needs no values change:
+
+```yaml
+workloadIdentity:
+  kubernetesApiToken:
+    enabled: true   # mounts a projected API token and the cluster CA
+  trust:
+    - name: local-cluster
+      issuer: https://kubernetes.default.svc.cluster.local
+      audiences: [pulso.tuist.dev]
+      keys:
+        type: url
+        url: https://kubernetes.default.svc/openid/v1/jwks
+        ca_file: /var/run/secrets/pulso/kubernetes-api/ca.crt
+        token_file: /var/run/secrets/pulso/kubernetes-api/token
+      bindings:
+        - subject: system:serviceaccount:monitoring:alloy
+          tenant: tuist
+          capabilities: [ingest]
+```
+
+See [JWKS URL key sources](configuration.md#jwks-url-key-sources) for refresh
+and failure behavior.
 
 ## Networking and TLS
 

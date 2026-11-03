@@ -133,7 +133,7 @@ defmodule PulsoWeb.CompatController do
 
       {:error, reason} ->
         conn
-        |> put_status(if(reason == :forbidden, do: :forbidden, else: :unauthorized))
+        |> put_status(Map.get(%{forbidden: :forbidden, auth_unavailable: :service_unavailable}, reason, :unauthorized))
         |> json(%{"status" => "error", "errorType" => "unauthorized", "error" => to_string(reason)})
     end
   end

@@ -354,7 +354,7 @@ defmodule PulsoWeb.TempoController do
   defp authorize(conn, tenant) do
     case Auth.verify(conn, tenant, :read) do
       :ok -> :ok
-      {:error, :forbidden} -> {:error, :forbidden}
+      {:error, reason} when reason in [:forbidden, :auth_unavailable] -> {:error, reason}
       {:error, _} -> {:error, :unauthorized}
     end
   end
@@ -422,6 +422,7 @@ defmodule PulsoWeb.TempoController do
 
   defp failure(conn, :unauthorized), do: error(conn, 401, "unauthorized")
   defp failure(conn, :forbidden), do: error(conn, 403, "forbidden")
+  defp failure(conn, :auth_unavailable), do: error(conn, 503, "auth_unavailable")
 
   defp failure(conn, :invalid_tenant_header),
     do: error(conn, 400, "exactly one nonempty tenant header is required when supplied")

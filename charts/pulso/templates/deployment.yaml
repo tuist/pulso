@@ -209,9 +209,27 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
+            - name: kubernetes-api
+              mountPath: /var/run/secrets/pulso/kubernetes-api
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
+        - name: kubernetes-api
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ include "pulso.boundedInteger" (list "workloadIdentity.kubernetesApiToken.expirationSeconds" .Values.workloadIdentity.kubernetesApiToken.expirationSeconds 600 86400) }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

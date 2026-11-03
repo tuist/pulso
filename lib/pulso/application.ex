@@ -6,6 +6,7 @@ defmodule Pulso.Application do
   use Application
 
   alias Pulso.Alerting.Subscriptions
+  alias Pulso.Auth.JWKS
   alias Pulso.Codec.NIF
   alias Pulso.Health.StorageMonitor
   alias Pulso.Loki.Tail
@@ -36,7 +37,9 @@ defmodule Pulso.Application do
         {DNSCluster, query: Application.get_env(:pulso, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Pulso.PubSub},
         Tail
-      ] ++ storage_children() ++ Pulso.Alerting.Supervisor.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
+      ] ++
+        storage_children() ++
+        Pulso.Alerting.Supervisor.children() ++ JWKS.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
