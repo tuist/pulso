@@ -164,7 +164,7 @@ defmodule PulsoWeb.OTLPGRPC do
     result =
       with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
            :ok <- S3.validate_tenant(tenant),
-           :ok <- Pulso.Auth.verify(conn, tenant),
+           :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
         Ingest.ingest(signal, tenant, key, Map.fetch!(@decoders, signal).decode_protobuf(body))
       end
@@ -180,6 +180,7 @@ defmodule PulsoWeb.OTLPGRPC do
   def to_grpc({:error, {429, message}}), do: {8, message, status_details(8, message, retry_info(1))}
   def to_grpc({:error, {503, message}}), do: {14, message, ""}
   def to_grpc({:error, {401, message}}), do: {16, message, ""}
+  def to_grpc({:error, {403, message}}), do: {7, message, ""}
   def to_grpc({:error, {409, message}}), do: {6, message, ""}
   # Too large to ever succeed: RESOURCE_EXHAUSTED without RetryInfo is permanent.
   def to_grpc({:error, {413, message}}), do: {8, message, ""}

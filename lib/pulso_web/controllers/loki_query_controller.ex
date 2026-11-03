@@ -5,7 +5,7 @@ defmodule PulsoWeb.LokiQueryController do
   Routes served here are the read-side complement of
   `PulsoWeb.LokiController`'s push endpoint. They accept the same
   `X-Scope-OrgID` tenant header and pass every request through
-  `Pulso.Auth.verify/2` so a shared-secret deployment applies uniformly
+  `Pulso.Auth.verify/3` so a shared-secret deployment applies uniformly
   across ingest and query.
 
   Finite reads accept `X-Loki-Query-Limits: {"maxQueryLength":"1m"}` as
@@ -64,7 +64,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp run_query(conn, params, mode) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- parse_query(query_str),
          {:ok, opts} <- HTTPParams.query(params, mode),
@@ -144,7 +144,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp discover(conn, params, mode, key, selector_param) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, selectors} <- discovery_selectors(params, selector_param),
          {:ok, times} <- discovery_times(params),
          {:ok, times} <- query_window_limits(conn, times),
@@ -207,7 +207,7 @@ defmodule PulsoWeb.LokiQueryController do
   def index_stats(conn, params) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, selectors} <- discovery_selectors(params, "query"),
          {:ok, times} <- discovery_times(params),
          {:ok, times} <- query_window_limits(conn, times),
@@ -247,7 +247,7 @@ defmodule PulsoWeb.LokiQueryController do
   def volume_range(conn, params), do: volume(conn, params, :range)
 
   defp volume(conn, params, mode) do
-    with :ok <- Auth.verify(conn, tenant_from(conn)),
+    with :ok <- Auth.verify(conn, tenant_from(conn), :read),
          {:ok, _opts} <- HTTPParams.query(params, mode),
          :ok <- volume_aggregation(params["aggregateBy"]) do
       if params["aggregateBy"] == "labels",
@@ -370,7 +370,7 @@ defmodule PulsoWeb.LokiQueryController do
   def detected_labels(conn, params) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, selectors} <- discovery_selectors(params, "query"),
          {:ok, window} <- detected_window(params),
          {:ok, window} <- query_window_limits(conn, window),
@@ -418,7 +418,7 @@ defmodule PulsoWeb.LokiQueryController do
   defp detected_request(conn, params) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- tail_query(query_str),
          :ok <- tail_validate(ast),
@@ -454,7 +454,7 @@ defmodule PulsoWeb.LokiQueryController do
   def patterns(conn, params) do
     tenant = tenant_from(conn)
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, query_str} <- require_query(params),
          {:ok, ast} <- tail_query(query_str),
          {:ok, window} <- detected_window(params),
@@ -488,7 +488,7 @@ defmodule PulsoWeb.LokiQueryController do
     tenant = tenant_from(conn)
     config = Pulso.Runtime.get_env(:pulso, Tail, [])
 
-    with :ok <- Auth.verify(conn, tenant),
+    with :ok <- Auth.verify(conn, tenant, :read),
          :ok <- tail_query_limits(conn),
          :ok <- websocket_upgrade(conn),
          {:ok, query_str} <- require_query(params),
@@ -844,6 +844,9 @@ defmodule PulsoWeb.LokiQueryController do
   defp render_error(conn, {:error, reason}) when reason in [:missing_token, :invalid_token, :unknown_tenant] do
     conn |> put_status(:unauthorized) |> json(%{"status" => "error", "error" => to_string(reason)})
   end
+
+  defp render_error(conn, {:error, :forbidden}),
+    do: conn |> put_status(:forbidden) |> json(%{"status" => "error", "error" => "forbidden"})
 
   defp render_error(conn, {:error, reason})
        when reason in [

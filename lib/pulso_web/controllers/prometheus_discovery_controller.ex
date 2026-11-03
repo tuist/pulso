@@ -24,6 +24,9 @@ defmodule PulsoWeb.PrometheusDiscoveryController do
       {:error, :unauthorized} ->
         failure(conn, 401, "unauthorized", "unauthorized")
 
+      {:error, :forbidden} ->
+        failure(conn, 403, "forbidden", "forbidden")
+
       {:error, :query_overloaded} ->
         failure(conn, 429, "execution", "Query capacity is busy; retry later.")
 
@@ -73,7 +76,13 @@ defmodule PulsoWeb.PrometheusDiscoveryController do
     end
   end
 
-  defp authorize(conn, tenant), do: if(Auth.verify(conn, tenant) == :ok, do: :ok, else: {:error, :unauthorized})
+  defp authorize(conn, tenant) do
+    case Auth.verify(conn, tenant, :read) do
+      :ok -> :ok
+      {:error, :forbidden} -> {:error, :forbidden}
+      {:error, _} -> {:error, :unauthorized}
+    end
+  end
 
   defp parameters(conn) do
     query = conn.query_params

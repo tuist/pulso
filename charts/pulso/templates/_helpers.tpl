@@ -75,9 +75,29 @@ crash on boot.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- range $i, $entry := .Values.workloadIdentity.trust }}
+{{- if not (and $entry.name $entry.issuer $entry.audiences $entry.keys $entry.bindings) }}
+{{- fail (printf "workloadIdentity.trust[%d] needs name, issuer, audiences, keys, and bindings" $i) }}
+{{- end }}
+{{- if ne (toString $entry.keys.type) "inline" }}
+{{- fail (printf "workloadIdentity.trust[%d].keys.type must be \"inline\"" $i) }}
+{{- end }}
+{{- if kindIs "map" $entry.keys.jwks }}
+{{- range $entry.keys.jwks.keys }}
+{{- if not (hasKey . "n") }}
+{{- fail (printf "workloadIdentity.trust[%d].keys.jwks: every key needs \"n\" (quote it: YAML reads a bare n as false), or paste the JWKS as a JSON string" $i) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $entry.bindings }}
+{{- if not (and .subject .tenant .capabilities) }}
+{{- fail (printf "workloadIdentity.trust[%d].bindings need subject, tenant, and capabilities" $i) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if not .Values.existingSecret }}
-{{- if not .Values.tenantTokens }}
-{{- fail "tenantTokens needs at least one tenant (or set existingSecret)" }}
+{{- if and (not .Values.tenantTokens) (not .Values.workloadIdentity.trust) }}
+{{- fail "tenantTokens needs at least one tenant unless workloadIdentity.trust is set (or set existingSecret)" }}
 {{- end }}
 {{- range $tenant, $digest := .Values.tenantTokens }}
 {{- if not (regexMatch "^[A-Za-z0-9_.-]{1,128}$" $tenant) }}

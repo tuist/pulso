@@ -66,7 +66,7 @@ defmodule PulsoWeb.RemoteWriteController do
     opts = append_opts(conn)
 
     with :ok <- validate_tenant(tenant),
-         :ok <- Auth.verify(conn, tenant),
+         :ok <- Auth.verify(conn, tenant, :ingest),
          {:ok, version} <- message_version(conn),
          :ok <- validate_content_encoding(conn),
          :ok <- validate_version_header(conn) do
@@ -122,6 +122,9 @@ defmodule PulsoWeb.RemoteWriteController do
 
       {:error, reason} when reason in [:missing_token, :invalid_token, :unknown_tenant] ->
         conn |> put_status(:unauthorized) |> json(%{error: to_string(reason)})
+
+      {:error, :forbidden} ->
+        conn |> put_status(:forbidden) |> json(%{error: "forbidden"})
 
       {:error, :owner_overloaded} ->
         # 429 — Prometheus retries on 5xx and 429 with backoff. The

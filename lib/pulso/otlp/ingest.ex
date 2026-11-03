@@ -80,6 +80,8 @@ defmodule Pulso.OTLP.Ingest do
   def classify(_signal, reason) when reason in [:missing_token, :invalid_token, :unknown_tenant],
     do: {401, Atom.to_string(reason)}
 
+  def classify(_signal, :forbidden), do: {403, "forbidden"}
+
   def classify(:traces, reason) when reason in [:unsupported_content_type, :unsupported_content_encoding],
     do: {415, "unsupported media type or encoding"}
 

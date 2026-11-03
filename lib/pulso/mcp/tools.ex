@@ -855,7 +855,7 @@ defmodule Pulso.MCP.Tools do
     end
   end
 
-  # Every tool that names a tenant runs it through `Pulso.Auth.verify/2`.
+  # Every tool that names a tenant runs it through `Pulso.Auth.verify/3` as `:read`.
   # MCP is the same JSON-RPC transport for read and write; without this hop
   # the ingest boundary's auth check would be bypassable via the read path.
   #
@@ -867,7 +867,7 @@ defmodule Pulso.MCP.Tools do
   defp verify(context, tenant) do
     conn = Map.get(context, :conn) || %Plug.Conn{}
 
-    case Auth.verify(conn, tenant) do
+    case Auth.verify(conn, tenant, :read) do
       :ok -> :ok
       {:error, reason} -> {:error, {:unauthorized, reason}}
     end

@@ -11,14 +11,14 @@ describes what each one means.
 | Variable | Meaning |
 | --- | --- |
 | `SECRET_KEY_BASE` | Random secret of at least 64 characters, used by the web framework. Generate one with `openssl rand -base64 48`. The chart generates and keeps one for you. |
-| `PULSO_TENANT_TOKENS` | JSON object mapping each tenant name to the SHA-256 digest of its bearer token. See [Tenants and tokens](#tenants-and-tokens). |
+| `PULSO_TENANT_TOKENS` | JSON object mapping each tenant name to the SHA-256 digest of its bearer token. See [Tenants and tokens](#tenants-and-tokens). May be empty (`{}`) only when `PULSO_WORKLOAD_IDENTITY_JSON` configures [workload identity](#workload-identity). |
 | `PULSO_S3_BUCKET` | Bucket that stores every acknowledged record. |
 | `PULSO_S3_REGION` | Region passed to the S3 client. Providers that ignore regions still need a value, such as `auto` for Cloudflare R2. |
 | `PULSO_S3_ACCESS_KEY_ID` | Access key for the bucket. |
 | `PULSO_S3_SECRET_ACCESS_KEY` | Secret key for the bucket. |
 
-Pulso only uses the static credentials above. It does not read instance
-profiles, workload identity, or other ambient cloud credentials.
+For object storage, Pulso only uses the static credentials above. It does not
+read instance profiles, cloud workload identity, or other ambient cloud credentials.
 
 ## Optional
 
@@ -43,6 +43,7 @@ profiles, workload identity, or other ambient cloud credentials.
 | `PULSO_ERROR_PROJECTION_ENABLED` | `false` | Enable the experimental S3-derived issue index, bounded error-rate detector and replayable change feed. Independent of ingestion and diagnosis; see [error monitoring](error-monitoring.md). |
 | `PULSO_ERROR_HISTORY_DAYS` | `1` | Derived error history in whole days, integer `1..365`. Newness and counts are limited to this horizon and raw log retention. Changing it rebaselines the index. |
 | `PULSO_ERROR_PROJECTION_INTERVAL_MS` | `5000` | Derived-index worker cadence, integer `1000..60000`. Each pass visits one configured project and at most 32 new segments; catchup and freshness depend on project count and storage latency. |
+| `PULSO_WORKLOAD_IDENTITY_JSON` | `[]` | Trusted Kubernetes ServiceAccount token issuers with pinned keys and subject bindings. See [Workload identity](#workload-identity). |
 | `PULSO_ALERTING_PRINCIPALS_JSON` | `[]` | Dedicated alerting principal array with `tenant`, `id`, `type`, `token_hash` and `capabilities`; at most 256 entries. See [alerting credentials](alerting.md#configure-credentials-and-evaluation). |
 | `PULSO_ALERTING_EVALUATION_ENABLED` | `false` | Enable experimental native threshold/recording evaluation and durable recording outbox draining. Grafana execution remains unsupported; native Slack delivery has a separate opt-in. |
 | `PULSO_ALERTING_NOTIFICATIONS_ENABLED` | `false` | Enable native Slack delivery from committed bounded outboxes. See [delivery semantics](alerting.md#native-slack-delivery). |
@@ -119,6 +120,111 @@ while they roll over. Changing the variable requires a restart.
 Data is isolated per tenant: a token for one tenant cannot read or write
 another. Tenants are not a quota mechanism; [ingest limits](ingest-limits.md)
 and query budgets apply to the whole node.
+
+## Workload identity
+
+Services running in Kubernetes can authenticate with a projected
+ServiceAccount token instead of a tenant token. They send it as
+`Authorization: Bearer <jwt>` on every request. Pulso verifies the token
+offline against public keys you pin in configuration. It never calls the
+issuing cluster, so the issuing cluster's JWKS endpoint does not need to be
+reachable or anonymously readable.
+
+`PULSO_WORKLOAD_IDENTITY_JSON` is a JSON array of up to 64 trust entries:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Unique label for the entry, used in logs. |
+| `issuer` | Exact `iss` claim, for example `https://kubernetes.default.svc.cluster.local`. |
+| `audiences` | Accepted `aud` values. A token must carry at least one. |
+| `max_token_ttl_seconds` | Optional, `600..86400`, default `3600`. Tokens whose `exp - iat` is longer are rejected. |
+| `keys` | `{"type": "inline", "jwks": ...}`: the issuing cluster's public signing keys, as a JWKS object or as the JWKS document in a JSON string (the verbatim output of `/openid/v1/jwks`). |
+| `bindings` | Up to 1024 objects `{"subject", "tenant", "capabilities"}`. `subject` is an exact `system:serviceaccount:<namespace>:<name>`; `capabilities` is `["read"]`, `["ingest"]` or both. |
+
+```json
+[
+  {
+    "name": "atlas-production",
+    "issuer": "https://kubernetes.default.svc.cluster.local",
+    "audiences": ["pulso.tuist.dev"],
+    "max_token_ttl_seconds": 3600,
+    "keys": {"type": "inline", "jwks": {"keys": [
+      {"kty": "RSA", "alg": "RS256", "use": "sig", "kid": "<kid>", "n": "<modulus>", "e": "AQAB"}
+    ]}},
+    "bindings": [
+      {"subject": "system:serviceaccount:atlas-production:atlas", "tenant": "tuist", "capabilities": ["read"]}
+    ]
+  }
+]
+```
+
+`read` covers every query API and the MCP endpoint. `ingest` covers the
+push and write APIs (OTLP over HTTP and gRPC, Loki push, and Prometheus remote
+write). Tenant tokens keep working alongside workload identity and still grant
+both capabilities. Alerting administration keeps its own
+[principals](alerting.md).
+
+Many clusters share kubeadm's default issuer string, so Pulso does not treat
+the issuer as proof of origin. It identifies the trusted cluster by the pinned
+key that verifies the signature, then checks that entry's issuer, audience
+and bindings. Key IDs must be unique across entries. Pulso accepts a token
+only when all of these hold:
+
+* The header uses `RS256`, names a `kid` that matches a pinned key, and has no
+  `crit` parameter. `none`, HMAC and every other algorithm are rejected.
+* The signature verifies against that key. Pinned keys must be RSA, with a
+  modulus of at least 2048 bits and an odd exponent of at least 3. Keys that
+  include private material are refused at startup.
+* `iss` matches exactly, and `aud` contains an accepted audience.
+* `exp` and `iat` are integers, and so is `nbf` if present. The token has not
+  expired and is already valid, with 60 seconds of clock skew. Its lifetime,
+  `exp - iat`, is within `max_token_ttl_seconds`.
+* `sub` is a ServiceAccount subject whose namespace and name match the
+  `kubernetes.io` claims, and a binding names that subject.
+
+A token that fails any check gets `401 invalid_token`. A valid token with no
+binding for the requested tenant and capability gets `403 forbidden`. Pulso
+logs the reason and the trust entry name, never the token. Invalid
+configuration stops the node at startup.
+
+Verification is offline, so Pulso cannot revoke a token. Deleting the pod or
+ServiceAccount does not invalidate a token that has already been issued: a
+leaked token stays valid until its `exp`, plus the skew. Keep
+`expirationSeconds` and `max_token_ttl_seconds` short. To cut off a principal
+immediately, remove its binding and restart Pulso.
+
+Bearer values shaped like a JWT, three base64url segments whose header is a
+JSON object with `alg`, go to workload identity whenever trust entries are
+configured. Other values go to tenant-token checks. Random tenant tokens never
+have this shape.
+
+Read the issuing cluster's keys with a credential that may access the
+ServiceAccount issuer discovery endpoint:
+
+```sh
+kubectl --context <issuing-cluster> get --raw /openid/v1/jwks
+```
+
+Configure the workload with a projected token for Pulso's audience:
+
+```yaml
+volumes:
+  - name: pulso-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            audience: pulso.tuist.dev
+            expirationSeconds: 3600
+            path: token
+```
+
+The kubelet rotates the file before expiry, so read it again for each request
+or when it changes. When the issuing cluster rotates its signing key, add the
+new key next to the old one, roll Pulso, and remove the old key once tokens
+signed with it have expired. Pasting the JWKS verbatim works only while every
+key in it is RSA. A cluster that also publishes EC keys fails startup, so pin
+only its RSA keys. Fetching JWKS from a URL is not supported yet; only inline
+keys are.
 
 ## Object storage
 

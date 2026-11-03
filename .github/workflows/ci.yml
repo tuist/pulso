@@ -146,6 +146,15 @@ jobs:
             echo "rendering with an unknown node setting should fail" >&2
             exit 1
           fi
+          # Workload identity alone satisfies the credential requirement and reaches runtime.
+          trust='[{"name":"ci","issuer":"https://kubernetes.default.svc.cluster.local","audiences":["pulso"],"keys":{"type":"inline","jwks":{"keys":[{"kty":"RSA","kid":"k","n":"AQAB","e":"AQAB"}]}},"bindings":[{"subject":"system:serviceaccount:ci:ci","tenant":"ci","capabilities":["read"]}]}]'
+          helm template pulso charts/pulso --set storage.bucket=ci --set storage.region=us-east-1 \
+            --set storage.accessKeyId=ci --set storage.secretAccessKey=ci --set-json "workloadIdentity.trust=${trust}" \
+            | grep -A1 'name: PULSO_WORKLOAD_IDENTITY_JSON' | grep -q 'system:serviceaccount:ci:ci'
+          if helm template pulso charts/pulso "${args[@]}" --set-json 'workloadIdentity.trust=[{"name":"ci"}]' > /dev/null 2>&1; then
+            echo "rendering with an incomplete workload identity entry should fail" >&2
+            exit 1
+          fi
           # Required values must fail at render time.
           if helm template pulso charts/pulso > /dev/null 2>&1; then
             echo "rendering without required values should fail" >&2

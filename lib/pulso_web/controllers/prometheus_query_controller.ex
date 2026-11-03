@@ -29,6 +29,9 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, :unauthorized} ->
         error(conn, :unauthorized, "unauthorized", "unauthorized")
 
+      {:error, {:unauthorized, :forbidden}} ->
+        error(conn, :forbidden, "forbidden", "forbidden")
+
       {:error, {:unauthorized, _}} ->
         error(conn, :unauthorized, "unauthorized", "unauthorized")
 
@@ -149,7 +152,7 @@ defmodule PulsoWeb.PrometheusQueryController do
   end
 
   defp authorize(conn, tenant) do
-    case Auth.verify(conn, tenant) do
+    case Auth.verify(conn, tenant, :read) do
       :ok -> :ok
       {:error, reason} -> {:error, {:unauthorized, reason}}
     end

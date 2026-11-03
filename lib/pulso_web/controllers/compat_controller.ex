@@ -127,13 +127,13 @@ defmodule PulsoWeb.CompatController do
         _ -> "default"
       end
 
-    case Auth.verify(conn, tenant) do
+    case Auth.verify(conn, tenant, :read) do
       :ok ->
         respond(conn, if(is_function(fun, 1), do: fun.(tenant), else: fun.()))
 
       {:error, reason} ->
         conn
-        |> put_status(:unauthorized)
+        |> put_status(if(reason == :forbidden, do: :forbidden, else: :unauthorized))
         |> json(%{"status" => "error", "errorType" => "unauthorized", "error" => to_string(reason)})
     end
   end

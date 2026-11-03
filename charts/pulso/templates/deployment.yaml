@@ -132,6 +132,8 @@ spec:
               value: {{ .Values.alerting.pollIntervalMs | quote }}
             - name: PULSO_ALERTING_PRINCIPALS_JSON
               value: {{ .Values.alerting.principals | toJson | quote }}
+            - name: PULSO_WORKLOAD_IDENTITY_JSON
+              value: {{ .Values.workloadIdentity.trust | toJson | quote }}
             - name: PULSO_INGEST_FLUSH_INTERVAL_MS
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
             - name: PULSO_RETENTION_ENABLED

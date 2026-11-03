@@ -57,7 +57,7 @@ defmodule PulsoWeb.LokiController do
     opts = append_opts(conn)
 
     with :ok <- validate_tenant(tenant),
-         :ok <- Auth.verify(conn, tenant) do
+         :ok <- Auth.verify(conn, tenant, :ingest) do
       case decode_body(conn, params) do
         {:ok, records, rejected, conn} -> finish(conn, tenant, opts, {:ok, records, rejected})
         {:error, reason, conn} -> finish(conn, tenant, opts, {:error, reason, conn})
@@ -108,6 +108,9 @@ defmodule PulsoWeb.LokiController do
         conn
         |> put_status(:unauthorized)
         |> json(%{error: to_string(reason)})
+
+      {:error, :forbidden} ->
+        conn |> put_status(:forbidden) |> json(%{error: "forbidden"})
 
       {:error, :keyed_content_mismatch} ->
         conn |> put_status(:conflict) |> json(%{error: "keyed_content_mismatch"})

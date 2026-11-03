@@ -352,7 +352,11 @@ defmodule PulsoWeb.TempoController do
   end
 
   defp authorize(conn, tenant) do
-    if Auth.verify(conn, tenant) == :ok, do: :ok, else: {:error, :unauthorized}
+    case Auth.verify(conn, tenant, :read) do
+      :ok -> :ok
+      {:error, :forbidden} -> {:error, :forbidden}
+      {:error, _} -> {:error, :unauthorized}
+    end
   end
 
   defp trace_id(value) when is_binary(value) and byte_size(value) in 1..32 do
@@ -417,6 +421,7 @@ defmodule PulsoWeb.TempoController do
   end
 
   defp failure(conn, :unauthorized), do: error(conn, 401, "unauthorized")
+  defp failure(conn, :forbidden), do: error(conn, 403, "forbidden")
 
   defp failure(conn, :invalid_tenant_header),
     do: error(conn, 400, "exactly one nonempty tenant header is required when supplied")

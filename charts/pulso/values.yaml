@@ -32,9 +32,33 @@ secretKeyBase: ""
 #
 #   printf '%s' "$TOKEN" | shasum -a 256 | awk '{print "sha256$" $1}'
 #
-# At least one tenant is required.
+# At least one tenant is required unless workloadIdentity.trust is set.
 tenantTokens: {}
 #  production: "sha256$5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+
+workloadIdentity:
+  # Trusted Kubernetes projected ServiceAccount token issuers. Callers send the
+  # token as `Authorization: Bearer <jwt>`; tenantTokens keep working alongside.
+  # Each entry pins the issuing cluster's public signing keys, so clusters that
+  # share an issuer string (kubeadm's default) stay distinct. Only RS256 keys
+  # and explicitly bound subjects are accepted; capabilities are "read" (query
+  # APIs and MCP) and "ingest" (push/write APIs). These are public keys, not
+  # secrets. See docs/configuration.md#workload-identity.
+  trust: []
+  # - name: atlas-production
+  #   issuer: https://kubernetes.default.svc.cluster.local
+  #   audiences: [pulso.tuist.dev]
+  #   max_token_ttl_seconds: 3600   # optional, 600..86400, default 3600
+  #   keys:
+  #     type: inline
+  #     # The JWKS document as a JSON string, verbatim from
+  #     # `kubectl get --raw /openid/v1/jwks` on the issuing cluster, or as a
+  #     # YAML object (then quote "n": YAML reads a bare n as false).
+  #     jwks: '{"keys":[{"use":"sig","kty":"RSA","kid":"<kid>","alg":"RS256","n":"<modulus>","e":"AQAB"}]}'
+  #   bindings:
+  #     - subject: system:serviceaccount:atlas-production:atlas
+  #       tenant: tuist
+  #       capabilities: [read]
 
 storage:
   # Bucket that holds every acknowledged record. Required.

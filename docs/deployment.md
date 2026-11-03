@@ -79,7 +79,8 @@ The ones you are most likely to change:
 | Value | Purpose |
 | --- | --- |
 | `storage.*` | Bucket, region, endpoint, and credentials. |
-| `tenantTokens` | Tenant name to token digest. |
+| `tenantTokens` | Tenant name to token digest. Optional when `workloadIdentity.trust` is set. |
+| `workloadIdentity.trust` | Trusted Kubernetes ServiceAccount token issuers with pinned public keys and subject-to-tenant/capability bindings. See [workload identity](configuration.md#workload-identity). |
 | `existingSecret` | Use a Secret you manage instead of chart-rendered credentials. |
 | `ingress.*` | Expose ingestion and queries outside the cluster. |
 | `serviceMonitor.enabled` | Create a Prometheus Operator `ServiceMonitor` for self-monitoring. |
@@ -120,6 +121,36 @@ kubectl -n observability create secret generic pulso-credentials \
 The chart then ignores `secretKeyBase`, `tenantTokens`, and the storage
 credentials in values. Pods do not restart automatically when an external Secret
 changes; run `kubectl rollout restart deployment/pulso` after updating it.
+
+### Workload identity
+
+To let a Kubernetes workload, including one in another cluster, authenticate
+with its projected ServiceAccount token, pin the issuing cluster's public keys
+and bind the ServiceAccount to a tenant. The keys are public, so they can live
+in values:
+
+```yaml
+workloadIdentity:
+  trust:
+    - name: atlas-production
+      issuer: https://kubernetes.default.svc.cluster.local
+      audiences: [pulso.tuist.dev]
+      max_token_ttl_seconds: 3600
+      keys:
+        type: inline
+        # Output of: kubectl --context <issuing-cluster> get --raw /openid/v1/jwks
+        jwks: '{"keys":[{"use":"sig","kty":"RSA","kid":"<kid>","alg":"RS256","n":"<modulus>","e":"AQAB"}]}'
+      bindings:
+        - subject: system:serviceaccount:atlas-production:atlas
+          tenant: tuist
+          capabilities: [read]
+```
+
+`jwks` may also be a YAML object. In that case, quote the `"n"` key, because
+YAML reads a bare `n` as `false`. The chart rejects keys without `"n"`. The
+chart renders this as `PULSO_WORKLOAD_IDENTITY_JSON`. See
+[workload identity](configuration.md#workload-identity) for the checks Pulso
+applies and how to rotate keys.
 
 ## Networking and TLS
 

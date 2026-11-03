@@ -13,7 +13,7 @@ defmodule PulsoWeb.OTLPHTTP do
   def export(conn, signal, decoder) do
     with {:ok, tenant} <- single_header(conn, "x-scope-orgid", "default"),
          :ok <- S3.validate_tenant(tenant),
-         :ok <- Pulso.Auth.verify(conn, tenant),
+         :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
          {:ok, key} <- single_header(conn, "idempotency-key", nil),
          {:ok, format} <- format(conn),
          :ok <- encoding(conn) do

@@ -20,6 +20,7 @@ alias Pulso.Alerting.GraphPreview
 alias Pulso.Alerting.Principal
 alias Pulso.Alerting.Targets
 alias Pulso.Auth.SharedSecret
+alias Pulso.Auth.WorkloadIdentity
 alias Pulso.Errors.Projection
 alias Pulso.Loki.Tail
 alias Pulso.PromQL.Evaluator
@@ -132,6 +133,14 @@ if investigation_url != "" do
      do: raise("Reliability investigation handoff requires a fixed HTTPS URL and bearer token")
 end
 
+# Workload identity: trusted Kubernetes ServiceAccount token issuers, each pinned
+# to its signing keys and explicit subject => tenant/capability bindings.
+workload_trust =
+  case JSON.decode(env_var.("PULSO_WORKLOAD_IDENTITY_JSON", "[]")) do
+    {:ok, entries} -> WorkloadIdentity.parse!(entries)
+    _ -> raise "PULSO_WORKLOAD_IDENTITY_JSON is not valid JSON"
+  end
+
 config :pulso, Pulso.Reliability,
   enabled: reliability_enabled,
   tenants: reliability_tenants,
@@ -149,6 +158,7 @@ config :pulso, Pulso.Reliability,
   investigation_token: investigation_token
 
 config :pulso, Pulso.Sentry, projects: sentry_projects
+config :pulso, WorkloadIdentity, trust: workload_trust
 
 for field <- [:id, :token_hash] do
   keys =
@@ -397,10 +407,14 @@ case config_env() do
               raise "PULSO_TENANT_TOKENS is not valid JSON: #{inspect(reason)}"
           end
 
+        _ when workload_trust != [] ->
+          %{}
+
         _ ->
           raise """
           environment variable PULSO_TENANT_TOKENS is missing or empty.
-          Pulso.Auth.SharedSecret requires at least one tenant token in prod.
+          Pulso.Auth.SharedSecret requires at least one tenant token in prod
+          unless PULSO_WORKLOAD_IDENTITY_JSON configures workload identity.
           """
       end
 
