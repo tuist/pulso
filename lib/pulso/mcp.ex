@@ -169,7 +169,7 @@ defmodule Pulso.MCP do
             {:ok, %{"content" => content, "isError" => false}}
 
           {:error, reason} ->
-            {:ok, %{"content" => [%{"type" => "text", "text" => inspect(reason)}], "isError" => true}}
+            {:ok, %{"content" => [%{"type" => "text", "text" => error_text(name, reason)}], "isError" => true}}
         end
     end
   end
@@ -280,4 +280,30 @@ defmodule Pulso.MCP do
   end
 
   defp readable_id(_msg), do: nil
+
+  # Keep the inspected reason first (clients match on it) and say which bound
+  # fired and how to stay inside it. Budgets are fixed per request.
+  @trace_hints %{
+    {"query_traces", :query_resource_limit} =>
+      "matching spans exceeded the 16 MiB candidate budget (full span payloads, regardless of fields); " <>
+        "pass a smaller limit, such as 500, or narrow start_ts_ns/end_ts_ns",
+    {"query_traces", :query_sample_limit} => "more than 5,000 spans matched; pass a limit or narrow the time window",
+    {"get_trace", :query_sample_limit} =>
+      "the trace has more than 5,000 stored spans; use query_traces with trace_id, a time window and a limit",
+    {"get_trace", :query_resource_limit} =>
+      "the trace exceeds the 16 MiB assembly budget; use query_traces with trace_id, a time window and a limit",
+    {"get_trace", :query_timeout} =>
+      "assembling every stored span of this trace exceeded the query deadline; " <>
+        "use query_traces with trace_id, a time window and a limit",
+    {"get_trace", :query_scan_limit} =>
+      "the trace spans more stored segments than one query may read; " <>
+        "use query_traces with trace_id, a time window and a limit"
+  }
+
+  defp error_text(name, reason) do
+    case Map.fetch(@trace_hints, {name, reason}) do
+      {:ok, hint} -> "#{inspect(reason)}: #{hint}"
+      :error -> inspect(reason)
+    end
+  end
 end

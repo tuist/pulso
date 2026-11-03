@@ -241,6 +241,10 @@ ingestBatching:
   # Buffers hold at most 128 callers, 100000 rows and 10 MiB of estimated terms.
   # Overflow uses the original direct path. Keyed requests always remain direct.
   flushIntervalMs: 0
+  # Node-local bound on concurrently processed ingest requests (HTTP and gRPC),
+  # 1..100000. Excess requests get a retryable 429 / RESOURCE_EXHAUSTED with a
+  # one-second Retry-After. Size it to memory: see docs/configuration.md.
+  maxConcurrentRequests: 32
 
 alerting:
   # Experimental native Prometheus/LogQL/mixed thresholds, recordings and Slack delivery. Grafana

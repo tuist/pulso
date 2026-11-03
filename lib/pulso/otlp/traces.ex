@@ -5,29 +5,59 @@ defmodule Pulso.OTLP.Traces do
   alias Pulso.Record.Span
 
   @max_timestamp 9_223_372_036_854_775_807
+  @max_u32 4_294_967_295
+  # Atom key: decoded JSON and native protobuf maps only have binary keys.
+  @duplicates :duplicate_attributes
 
-  def decode(%{} = payload) do
+  @rejection_reasons ~w(invalid_span invalid_trace_id invalid_span_id invalid_parent_span_id invalid_start_time
+                        invalid_end_time end_before_start invalid_name invalid_trace_state invalid_kind invalid_status
+                        empty_attribute_key invalid_attribute_value invalid_flags
+                        invalid_dropped_count invalid_event invalid_link)a
+
+  @doc "Fixed vocabulary of per-span rejection reasons returned by `decode_detailed/1`."
+  def rejection_reasons, do: @rejection_reasons
+
+  def decode(payload), do: summarize(decode_detailed(payload))
+
+  def decode_protobuf(body), do: summarize(decode_protobuf_detailed(body))
+
+  @doc """
+  Like `decode/1`, but also returns rejected spans grouped by
+  `{reason, service}`, where `reason` is one of `rejection_reasons/0`.
+  """
+  def decode_detailed(%{} = payload) do
     with :ok <- shape(payload),
          :ok <- Pulso.IngestLimits.validate(:otlp_traces, payload),
+         payload = normalize(payload),
          :ok <- metadata(payload) do
-      {spans, rejected} =
-        Enum.reduce(Map.get(payload, "resourceSpans", []), {[], 0}, &decode_resource/2)
+      {spans, rejections} =
+        Enum.reduce(Map.get(payload, "resourceSpans", []), {[], %{}}, &decode_resource/2)
 
       spans = Enum.reverse(spans)
 
       with {:ok, _bytes} <- NIF.trace_payload_size(Enum.map(spans, &Span.to_map/1), 16_777_216),
-           do: {:ok, spans, rejected}
+           do: {:ok, spans, rejections |> Map.values() |> Enum.sum(), rejections}
     end
   end
 
-  def decode(_), do: {:error, :invalid_otlp}
+  def decode_detailed(_), do: {:error, :invalid_otlp}
+
+  def decode_protobuf_detailed(body) do
+    case NIF.decode_otlp_traces(body, native_limits()) do
+      {:ok, payload} -> decode_detailed(payload)
+      {:error, _} = error -> error
+    end
+  end
+
+  defp summarize({:ok, spans, rejected, _rejections}), do: {:ok, spans, rejected}
+  defp summarize(error), do: error
 
   defp decode_resource(resource, acc) do
     res = Map.get(resource, "resource", %{})
     attrs = attributes(res)
     typed = typed_attributes(res)
     # Resource/scope counts have already passed whole-request metadata validation.
-    {:ok, dropped} = u32(Map.get(res, "droppedAttributesCount", 0))
+    {:ok, dropped} = dropped_attributes(res)
 
     base = %Span{
       resource: attrs,
@@ -51,18 +81,74 @@ defmodule Pulso.OTLP.Traces do
     Enum.reduce(Map.get(scope, "spans", []), acc, &collect_span(&1, base, &2))
   end
 
-  defp collect_span(raw, base, {spans, rejected}) do
+  defp collect_span(raw, base, {spans, rejections}) do
     case span(raw, base) do
-      {:ok, span} -> {[span | spans], rejected}
-      :error -> {spans, rejected + 1}
+      {:ok, span} -> {[span | spans], rejections}
+      {:error, reason} -> {spans, Map.update(rejections, {reason, base.service}, 1, &(&1 + 1))}
     end
   end
 
-  def decode_protobuf(body) do
-    case NIF.decode_otlp_traces(body, native_limits()) do
-      {:ok, payload} -> decode(payload)
-      {:error, _} = error -> error
+  # OTLP requires unique attribute keys, but common SDKs emit repeats: the
+  # Erlang SDK keeps atom and binary keys apart (`:"client.address"` and
+  # `"client.address"`), and the Rust SDK and tracing-opentelemetry append a
+  # re-recorded field. Collectors and Tempo keep such spans. Keep the last
+  # occurrence of each owner-level key, as repeated attribute sets mean, and
+  # count the discarded ones as dropped. Nested kvlists stay strict.
+  defp normalize(payload) do
+    update_list(payload, "resourceSpans", fn resource ->
+      resource
+      |> update_map("resource", &dedupe/1)
+      |> update_list("scopeSpans", fn scope ->
+        scope |> update_map("scope", &dedupe/1) |> update_list("spans", &normalize_span/1)
+      end)
+    end)
+  end
+
+  defp normalize_span(%{} = span),
+    do: span |> dedupe() |> update_list("events", &dedupe/1) |> update_list("links", &dedupe/1)
+
+  defp normalize_span(span), do: span
+
+  defp update_map(%{} = map, key, fun) do
+    case map do
+      %{^key => %{} = value} -> %{map | key => fun.(value)}
+      _ -> map
     end
+  end
+
+  defp update_map(other, _key, _fun), do: other
+
+  defp update_list(%{} = map, key, fun) do
+    case map do
+      %{^key => list} when is_list(list) -> %{map | key => Enum.map(list, fun)}
+      _ -> map
+    end
+  end
+
+  defp update_list(other, _key, _fun), do: other
+
+  defp dedupe(%{"attributes" => pairs} = owner) when is_list(pairs) do
+    {kept, _seen, removed} =
+      pairs
+      |> Enum.reverse()
+      |> Enum.reduce({[], MapSet.new(), 0}, fn
+        %{"key" => key} = pair, {kept, seen, removed} when is_binary(key) ->
+          if MapSet.member?(seen, key),
+            do: {kept, seen, removed + 1},
+            else: {[pair | kept], MapSet.put(seen, key), removed}
+
+        pair, {kept, seen, removed} ->
+          {[pair | kept], seen, removed}
+      end)
+
+    if removed == 0, do: owner, else: %{owner | "attributes" => kept} |> Map.put(@duplicates, removed)
+  end
+
+  defp dedupe(owner), do: owner
+
+  defp dropped_attributes(owner) do
+    with {:ok, dropped} <- u32(Map.get(owner, "droppedAttributesCount", 0)),
+         do: {:ok, min(dropped + Map.get(owner, @duplicates, 0), @max_u32)}
   end
 
   defp native_limits do
@@ -116,19 +202,19 @@ defmodule Pulso.OTLP.Traces do
   end
 
   defp span(%{} = raw, base) do
-    with {:ok, trace_id} <- id(raw["traceId"], 32),
-         {:ok, span_id} <- id(raw["spanId"], 16),
-         {:ok, parent} <- parent_id(raw["parentSpanId"]),
-         {:ok, start} <- timestamp(Map.get(raw, "startTimeUnixNano", 0)),
-         {:ok, finish} <- timestamp(Map.get(raw, "endTimeUnixNano", 0)),
-         true <- finish >= start,
-         true <- valid_span?(raw),
-         {:ok, flags} <- u32(Map.get(raw, "flags", 0)),
-         {:ok, dropped_attributes} <- u32(Map.get(raw, "droppedAttributesCount", 0)),
-         {:ok, dropped_events} <- u32(Map.get(raw, "droppedEventsCount", 0)),
-         {:ok, dropped_links} <- u32(Map.get(raw, "droppedLinksCount", 0)),
-         {:ok, events} <- events(Map.get(raw, "events", [])),
-         {:ok, links} <- links(Map.get(raw, "links", [])) do
+    with {:ok, trace_id} <- reason(id(raw["traceId"], 32), :invalid_trace_id),
+         {:ok, span_id} <- reason(id(raw["spanId"], 16), :invalid_span_id),
+         {:ok, parent} <- reason(parent_id(raw["parentSpanId"]), :invalid_parent_span_id),
+         {:ok, start} <- reason(timestamp(Map.get(raw, "startTimeUnixNano", 0)), :invalid_start_time),
+         {:ok, finish} <- reason(timestamp(Map.get(raw, "endTimeUnixNano", 0)), :invalid_end_time),
+         :ok <- if(finish >= start, do: :ok, else: {:error, :end_before_start}),
+         :ok <- valid_span(raw),
+         {:ok, flags} <- reason(u32(Map.get(raw, "flags", 0)), :invalid_flags),
+         {:ok, dropped_attributes} <- reason(dropped_attributes(raw), :invalid_dropped_count),
+         {:ok, dropped_events} <- reason(u32(Map.get(raw, "droppedEventsCount", 0)), :invalid_dropped_count),
+         {:ok, dropped_links} <- reason(u32(Map.get(raw, "droppedLinksCount", 0)), :invalid_dropped_count),
+         {:ok, events} <- reason(events(Map.get(raw, "events", [])), :invalid_event),
+         {:ok, links} <- reason(links(Map.get(raw, "links", [])), :invalid_link) do
       {:ok,
        %{
          base
@@ -156,12 +242,13 @@ defmodule Pulso.OTLP.Traces do
                "links" => Enum.map(Map.get(raw, "links", []), &typed_attributes/1)
              })
        }}
-    else
-      _ -> :error
     end
   end
 
-  defp span(_, _), do: :error
+  defp span(_, _), do: {:error, :invalid_span}
+
+  defp reason({:ok, _} = ok, _reason), do: ok
+  defp reason(_, reason), do: {:error, reason}
 
   defp string_service(attributes) do
     Enum.reduce(attributes, nil, fn
@@ -171,14 +258,32 @@ defmodule Pulso.OTLP.Traces do
     end)
   end
 
-  defp valid_span?(raw) do
+  defp valid_span(raw) do
     status = Map.get(raw, "status", %{})
 
-    is_binary(Map.get(raw, "name", "")) and is_binary(Map.get(raw, "traceState", "")) and
-      int_zero(Map.get(raw, "kind", 0)) in 0..5 and is_map(status) and int_zero(Map.get(status, "code", 0)) in 0..2 and
-      is_binary(Map.get(status, "message", "")) and
-      valid_attributes?(raw)
+    cond do
+      not is_binary(Map.get(raw, "name", "")) -> {:error, :invalid_name}
+      not is_binary(Map.get(raw, "traceState", "")) -> {:error, :invalid_trace_state}
+      int_zero(Map.get(raw, "kind", 0)) not in 0..5 -> {:error, :invalid_kind}
+      not (is_map(status) and int_zero(Map.get(status, "code", 0)) in 0..2) -> {:error, :invalid_status}
+      not is_binary(Map.get(status, "message", "")) -> {:error, :invalid_status}
+      not valid_attributes?(raw) -> {:error, attribute_reason(Map.get(raw, "attributes"))}
+      true -> :ok
+    end
   end
+
+  # Classify only already-invalid owner attributes; nested values report as values.
+  defp attribute_reason(pairs) when is_list(pairs) do
+    keys = for %{"key" => key} when is_binary(key) <- pairs, do: key
+
+    if "" in keys do
+      :empty_attribute_key
+    else
+      :invalid_attribute_value
+    end
+  end
+
+  defp attribute_reason(_), do: :invalid_attribute_value
 
   def id(value, length) when is_binary(value) and byte_size(value) == length do
     case Base.decode16(value, case: :mixed) do
@@ -199,7 +304,7 @@ defmodule Pulso.OTLP.Traces do
         with {:ok, ts} <- timestamp(Map.get(e, "timeUnixNano", 0)),
              true <- is_binary(Map.get(e, "name", "")),
              true <- valid_attributes?(e),
-             {:ok, dropped} <- u32(Map.get(e, "droppedAttributesCount", 0)) do
+             {:ok, dropped} <- dropped_attributes(e) do
           {:ok,
            %{
              "timestamp_ns" => ts,
@@ -224,7 +329,7 @@ defmodule Pulso.OTLP.Traces do
         with {:ok, tid} <- id(link["traceId"], 32),
              {:ok, sid} <- id(link["spanId"], 16),
              true <- valid_attributes?(link) and is_binary(Map.get(link, "traceState", "")),
-             {:ok, dropped} <- u32(Map.get(link, "droppedAttributesCount", 0)),
+             {:ok, dropped} <- dropped_attributes(link),
              {:ok, flags} <- u32(Map.get(link, "flags", 0)) do
           {:ok,
            %{
@@ -260,7 +365,7 @@ defmodule Pulso.OTLP.Traces do
   end
 
   defp decode_scope(scope) when is_map(scope) do
-    {:ok, dropped} = u32(Map.get(scope, "droppedAttributesCount", 0))
+    {:ok, dropped} = dropped_attributes(scope)
 
     %{
       "name" => Map.get(scope, "name", ""),

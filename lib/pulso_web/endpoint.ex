@@ -43,6 +43,8 @@ defmodule PulsoWeb.Endpoint do
   plug PulsoWeb.MCPRequestGate
   plug PulsoWeb.TraceRequestLimits
   plug PulsoWeb.PrometheusDiscoveryRequestGate
+  # Node-local concurrent ingest bound, before any ingest body is read.
+  plug PulsoWeb.IngestAdmission
 
   plug PulsoWeb.SentryBody
 

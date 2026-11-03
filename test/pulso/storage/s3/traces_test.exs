@@ -8,6 +8,8 @@ defmodule Pulso.Storage.S3.TracesTest do
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.TraceSummary
   alias Pulso.Test.CompactionStore
@@ -390,6 +392,68 @@ defmodule Pulso.Storage.S3.TracesTest do
     start_supervised!(ManifestSupervision)
     assert {:error, :query_scan_limit} = S3.query(:traces, ctx.tenant, limit: 1, max_scan_rows: 1)
     assert {:ok, [%{timestamp_ns: 20}]} = S3.query(:traces, ctx.tenant, limit: 1, max_scan_rows: 2)
+  end
+
+  test "get_trace stops reading segments once a trace exceeds 5,000 spans", ctx do
+    [base | _] = ctx.spans
+
+    for segment <- 1..60 do
+      spans =
+        for row <- 1..100 do
+          ts = 1_700_000_000_000_000_000 + segment * 1_000_000 + row
+
+          %{
+            base
+            | timestamp_ns: ts,
+              end_timestamp_ns: ts + 1,
+              span_id: Base.encode16(<<segment::32, row::32>>, case: :lower)
+          }
+        end
+
+      assert :ok = S3.append(:traces, ctx.tenant, spans, [])
+    end
+
+    Agent.update(ctx.agent, &%{&1 | reads: []})
+
+    assert {:error, :query_sample_limit} =
+             Tools.call("get_trace", %{"tenant" => ctx.tenant, "trace_id" => base.trace_id})
+
+    reads = Agent.get(ctx.agent, fn state -> Enum.count(state.reads, &String.ends_with?(&1, ".parquet")) end)
+    assert reads in 51..59
+  end
+
+  test "appends never copy a large cached flat manifest into the request process", ctx do
+    # Retain-forever flat manifests gain one entry per append. Ingest must not
+    # deep-copy them out of the cache per request: Alloy keeps many keep-alive
+    # connection processes, and each copy outlived the request as garbage.
+    config = Map.new(Runtime.get_env(:pulso, S3))
+    prefix = "tenants/#{ctx.tenant}/v4/signal=traces/date=2023-11-14/hour=22/"
+    ids = for n <- 1..40, do: Base.encode16(<<n::128>>, case: :lower)
+
+    segments =
+      for n <- 1..20_000 do
+        min = 1_700_000_000_000_000_000 + n * 1_000_000_000
+
+        "#{prefix}#{min}-#{min + 999}-#{n}.parquet"
+        |> Segment.build(min, min + 999, 150, 40_000)
+        |> Map.put(:trace_summary, TraceSummary.from_values(["tuist-server"], ids))
+      end
+
+    body = IO.iodata_to_binary(Manifest.encode(%{Manifest.new() | segments: Enum.reverse(segments)}))
+    assert {:ok, _etag} = Pulso.ObjectStore.put(config, Manifest.manifest_key(ctx.tenant, "traces"), body)
+    assert {:ok, %{manifest: cached}} = ManifestOwner.ensure_loaded(ctx.tenant, "traces", config)
+    assert length(cached.segments) == 20_000
+    cap = div(:erts_debug.size(cached), 4)
+
+    task =
+      Task.Supervisor.async_nolink(ctx.tasks, fn ->
+        Process.flag(:max_heap_size, %{size: cap, kill: true, error_logger: false})
+        S3.append(:traces, ctx.tenant, ctx.spans, [])
+      end)
+
+    assert Task.await(task, 30_000) == :ok
+    assert {:ok, %{manifest: manifest}} = ManifestOwner.ensure_loaded(ctx.tenant, "traces", config)
+    assert length(manifest.segments) == 20_001
   end
 
   test "ack follows segment PUT and manifest CAS, retries deduplicate, and filters isolate signals", ctx do

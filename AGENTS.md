@@ -10,6 +10,17 @@ Pulso is agent-native from day one. It does not ship a UI. Consumers are humans 
 
 ## Where the project is right now
 
+Trace ingest keeps the last occurrence of repeated owner-level attribute keys
+(Erlang atom/binary key pairs, re-recorded Rust tracing fields) and counts the
+rest as dropped, as the Collector and Tempo do; nested kvlists stay strict.
+Remaining rejections carry fixed reasons: partial-success `errorMessage`,
+`pulso_ingest_rejected_records_total{signal,reason}` and a per-reason
+rate-limited log. `ManifestCache` stores encoded manifest binaries in ETS and
+callers decode locally (ETS flattens decoded summary sharing ~50x); ingest and
+publication read only `ManifestCache.info/2`. `Pulso.IngestAdmission` bounds
+concurrent ingest per node (`PULSO_INGEST_MAX_CONCURRENT_REQUESTS`, retryable
+429). Flat manifests still grow without retention; see `docs/configuration.md#ingest-memory`.
+
 Current trace search capability is **5**, tuple `{2,1,3,5,12}`, superseding the
 search4 snapshot references below. Unscoped original-string/int64 search uses
 span-key presence before resource fallback; sampled values may include both

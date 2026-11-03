@@ -197,6 +197,9 @@ defmodule Pulso.Storage.S3 do
       |> Keyword.take([:max_scan_segments, :max_scan_bytes, :max_scan_rows, :deadline_ms])
       |> Keyword.put(:trace_id, trace_id)
       |> Keyword.put(:limit, 5001)
+      # Fail at the 5,001st stored span instead of reading every candidate
+      # segment of a huge trace first and failing only at finish.
+      |> Keyword.put(:max_records, 5000)
       |> Keyword.put(:assemble_trace, trace_id)
 
     query_traces_json(tenant, opts, nil)
@@ -586,15 +589,16 @@ defmodule Pulso.Storage.S3 do
   def check_retention(signal, tenant, records, config) do
     name = signal_string(signal)
 
-    cached = ManifestCache.get(tenant, name)
+    # Only the cached version is needed; never copy the manifest per append.
+    {version, _etag, _token} = ManifestCache.info(tenant, name)
 
     cond do
       # Managed roots check eligibility and capacity; enforcing nodes also gate
       # legacy roots behind conversion.
-      (cached != nil and cached.manifest.version == 3) or Retention.enforcing?(config, name) ->
+      version == 3 or Retention.enforcing?(config, name) ->
         do_check_retention(signal, tenant, records, config)
 
-      cached != nil ->
+      version != nil ->
         :ok
 
       # A cold scope probes the marker so a managed prefix is checked before
@@ -612,11 +616,11 @@ defmodule Pulso.Storage.S3 do
   @doc false
   def retained_traces(tenant, spans) do
     config = config!()
-    cached = ManifestCache.get(tenant, "traces")
+    {version, _etag, _token} = ManifestCache.info(tenant, "traces")
 
     managed? =
-      (cached != nil and cached.manifest.version == 3) or Retention.enforcing?(config, "traces") or
-        (cached == nil and cached_marker(config, tenant, "traces") == {:ok, true})
+      version == 3 or Retention.enforcing?(config, "traces") or
+        (version == nil and cached_marker(config, tenant, "traces") == {:ok, true})
 
     if managed? do
       with {:ok, entry} <- ManifestOwner.ensure_loaded(tenant, "traces", config),
@@ -1066,8 +1070,14 @@ defmodule Pulso.Storage.S3 do
     concurrency = Map.get(ctx.config, :query_prefetch, 1)
 
     if concurrency > 1 and length(items) > 1 and prefetchable?(ctx) do
+      # Each task copies its closure: capture only the config, the byte limit
+      # and one key, never `ctx` with its candidate segment list and options.
+      config = ctx.config
+      limit = ctx.opts[:max_scan_bytes]
+
       items
-      |> Pulso.Runtime.Task.async_stream(fn {segment, _} -> prefetch(ctx, segment) end,
+      |> Stream.map(fn {segment, _} -> segment.key end)
+      |> Pulso.Runtime.Task.async_stream(&prefetch(config, limit, &1),
         max_concurrency: concurrency,
         ordered: true,
         timeout: :infinity
@@ -1085,12 +1095,8 @@ defmodule Pulso.Storage.S3 do
 
   defp prefetchable?(_ctx), do: true
 
-  defp prefetch(ctx, segment) do
-    case ctx.opts[:max_scan_bytes] do
-      limit when is_integer(limit) -> read_bounded_segment(ctx.config, segment.key, limit)
-      _ -> ObjectStore.get(ctx.config, segment.key)
-    end
-  end
+  defp prefetch(config, limit, key) when is_integer(limit), do: read_bounded_segment(config, key, limit)
+  defp prefetch(config, _limit, key), do: ObjectStore.get(config, key)
 
   defp scan_context(_ctx, _first, state, <<>>), do: {:ok, state}
 

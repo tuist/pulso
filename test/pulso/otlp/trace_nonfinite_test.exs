@@ -80,15 +80,19 @@ defmodule Pulso.OTLP.TraceNonfiniteTest do
   end
 
   test "non-string service names never become promoted string services" do
-    for values <- [
-          [%{"stringValue" => "a"}, %{"stringValue" => "b"}],
-          [%{"stringValue" => "a"}, %{"doubleValue" => "NaN"}],
-          [%{"doubleValue" => "NaN"}, %{"stringValue" => "b"}]
+    # Repeated keys keep their last occurrence, so only a final string promotes.
+    for {values, service} <- [
+          {[%{"stringValue" => "a"}, %{"stringValue" => "b"}], "b"},
+          {[%{"stringValue" => "a"}, %{"doubleValue" => "NaN"}], nil},
+          {[%{"doubleValue" => "NaN"}, %{"stringValue" => "b"}], "b"}
         ] do
       attributes = Enum.map(values, &%{"key" => "service.name", "value" => &1})
       payload = put_in(Fixture.payload(), ["resourceSpans", Access.at(0), "resource", "attributes"], attributes)
-      assert Traces.decode(payload) == {:error, :invalid_otlp}
-      assert Traces.decode_protobuf(Fixture.protobuf(payload)) == {:error, :invalid_otlp}
+      assert {:ok, [span], 0} = Traces.decode(payload)
+      assert span.service == service
+      assert span.otlp["resource"] == [%{"key" => "service.name", "value" => List.last(values)}]
+      assert span.resource_dropped_attributes_count == 2
+      assert Traces.decode_protobuf(Fixture.protobuf(payload)) == Traces.decode(payload)
     end
 
     for value <- [

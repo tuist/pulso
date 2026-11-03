@@ -7,6 +7,7 @@ defmodule Pulso.MCP.TracesTest do
   alias Pulso.Storage
   alias Pulso.Storage.Memory
   alias Pulso.Storage.S3
+  alias Pulso.Test.MCPMessages
   alias Pulso.Test.NativeQueryStorage
   alias Pulso.Test.OTLPTraceFixture, as: Fixture
 
@@ -249,6 +250,20 @@ defmodule Pulso.MCP.TracesTest do
     :ok = Storage.append(:traces, "large", List.duplicate(span, 5001))
     assert {:error, :query_sample_limit} = Tools.call("query_traces", %{"tenant" => "large"})
     assert {:error, :query_sample_limit} = Tools.call("get_trace", %{"tenant" => "large", "trace_id" => span.trace_id})
+
+    {:reply, response} =
+      Pulso.MCP.dispatch(
+        MCPMessages.request(1, "tools/call", %{
+          "name" => "get_trace",
+          "arguments" => %{"tenant" => "large", "trace_id" => span.trace_id}
+        })
+      )
+
+    assert response["result"]["isError"]
+
+    assert [%{"text" => ":query_sample_limit: the trace has more than 5,000 stored spans; use query_traces" <> _}] =
+             response["result"]["content"]
+
     assert {:ok, [%{"text" => text}]} = Tools.call("query_traces", %{"tenant" => "large", "limit" => 2})
     assert length(Pulso.JSON.decode!(text)) == 2
   end

@@ -61,7 +61,10 @@ Merging does **not** bypass admission:
   Attribute-node accounting can therefore exceed the size of the final tree.
 - Existing source-point, expanded-sample, full metadata, normalized segment and
   result ceilings are unchanged. Merging cannot make a wide distribution fit.
-- Duplicate attribute keys remain invalid. Resource entity references and
+- Duplicate attribute keys remain invalid for logs and metrics, and inside
+  trace kvlist values. Trace owner attribute lists keep the last occurrence of a
+  repeated key instead (see [traces](traces.md#acknowledgments-and-limits)).
+  Resource entity references and
   unsupported signal types are not made supported by message merging.
 
 The merge plan adds transient native memory proportional to supplied known

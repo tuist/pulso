@@ -10,38 +10,54 @@ defmodule Pulso.OTLP.Ingest do
   """
 
   alias Pulso.OTLP.Logs
+  alias Pulso.OTLP.Metrics
+  alias Pulso.OTLP.Rejections
+  alias Pulso.OTLP.Traces
   alias Pulso.Storage
   alias Pulso.Storage.S3
 
   @type signal :: :logs | :metrics | :traces
   @type status :: 400 | 401 | 409 | 413 | 415 | 429 | 503
 
-  @spec ingest(signal(), String.t(), String.t() | nil, {:ok, list(), non_neg_integer()} | {:error, term()}) ::
-          {:ok, non_neg_integer()} | {:error, term()}
+  @spec ingest(signal(), String.t(), String.t() | nil, tuple()) ::
+          {:ok, non_neg_integer(), String.t()} | {:error, term()}
   def ingest(:logs, tenant, key, decoded) do
     with {:ok, records, rejected} <- decoded,
          :ok <- keyed_records(key, rejected, :invalid_otlp),
          {:ok, records} <- Logs.prepare(records, key),
          :ok <- append(:logs, tenant, records, rejected, key_opts(key)),
-         do: {:ok, rejected}
+         do: {:ok, rejected, Rejections.message(%{})}
   end
 
   def ingest(:metrics, tenant, key, decoded) do
     with {:ok, samples, rejected} <- decoded,
          :ok <- keyed_records(key, rejected, :invalid_otlp),
          :ok <- append(:metrics, tenant, samples, rejected, key_opts(key)),
-         do: {:ok, rejected}
+         do: {:ok, rejected, Rejections.message(%{})}
   end
+
+  def ingest(:traces, tenant, key, {:ok, spans, rejected}),
+    do: ingest(:traces, tenant, key, {:ok, spans, rejected, %{}})
 
   def ingest(:traces, tenant, key, decoded) do
     opts = key_opts(key)
 
-    with {:ok, spans, rejected} <- decoded,
+    with {:ok, spans, rejected, rejections} <- decoded,
+         :ok <- Rejections.record(:traces, tenant, rejections),
          :ok <- keyed_records(key, rejected, :invalid_keyed_batch),
-         {:ok, spans, rejected} <- retained_spans(opts, tenant, spans, rejected),
+         {:ok, spans, rejected, rejections} <- retained_spans(opts, tenant, spans, rejected, rejections),
          :ok <- append(:traces, tenant, spans, rejected, opts),
-         do: {:ok, rejected}
+         do: {:ok, rejected, Rejections.message(rejections)}
   end
+
+  @doc "Decode one export for `signal`, keeping per-record rejection reasons where the decoder has them."
+  def decode(:traces, :json, input), do: Traces.decode_detailed(input)
+  def decode(:traces, :protobuf, input), do: Traces.decode_protobuf_detailed(input)
+  def decode(signal, :json, input), do: decoder(signal).decode(input)
+  def decode(signal, :protobuf, input), do: decoder(signal).decode_protobuf(input)
+
+  defp decoder(:logs), do: Logs
+  defp decoder(:metrics), do: Metrics
 
   @doc "The partial-success field naming rejected items for a signal."
   @spec rejected_field(signal()) :: String.t()
@@ -50,11 +66,12 @@ defmodule Pulso.OTLP.Ingest do
   def rejected_field(:traces), do: "rejectedSpans"
 
   @doc "Encoded `Export*ServiceResponse`: empty, or a partial success naming rejected items."
-  @spec response_protobuf(non_neg_integer()) :: binary()
-  def response_protobuf(0), do: ""
+  @spec response_protobuf(non_neg_integer(), String.t()) :: binary()
+  def response_protobuf(rejected, message \\ Rejections.message(%{}))
+  def response_protobuf(0, _message), do: ""
 
-  def response_protobuf(rejected) do
-    partial = IO.iodata_to_binary([<<8>>, varint(rejected), field_bytes(2, "invalid records rejected")])
+  def response_protobuf(rejected, message) do
+    partial = IO.iodata_to_binary([<<8>>, varint(rejected), field_bytes(2, message)])
     IO.iodata_to_binary(field_bytes(1, partial))
   end
 
@@ -145,11 +162,20 @@ defmodule Pulso.OTLP.Ingest do
     :exit, _ -> {:error, :storage_unavailable}
   end
 
-  defp retained_spans(opts, tenant, spans, rejected) do
+  defp expired(_tenant, retained, rejected, rejections, 0), do: {:ok, retained, rejected, rejections}
+
+  defp expired(tenant, retained, rejected, rejections, expired) do
+    expiry = %{{:retention_expired, nil} => expired}
+    :ok = Rejections.record(:traces, tenant, expiry)
+    {:ok, retained, rejected + expired, Map.merge(rejections, expiry, fn _, a, b -> a + b end)}
+  end
+
+  defp retained_spans(opts, tenant, spans, rejected, rejections) do
     if spans != [] and Storage.adapter() == S3 and opts == [] do
-      with {:ok, retained, expired} <- S3.retained_traces(tenant, spans), do: {:ok, retained, rejected + expired}
+      with {:ok, retained, expired} <- S3.retained_traces(tenant, spans),
+           do: expired(tenant, retained, rejected, rejections, expired)
     else
-      {:ok, spans, rejected}
+      {:ok, spans, rejected, rejections}
     end
   catch
     :exit, _ -> {:error, :storage_unavailable}

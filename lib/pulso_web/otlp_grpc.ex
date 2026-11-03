@@ -25,15 +25,11 @@ defmodule PulsoWeb.OTLPGRPC do
 
   alias Pulso.OTLP.GRPC.NIF
   alias Pulso.OTLP.Ingest
-  alias Pulso.OTLP.Logs
-  alias Pulso.OTLP.Metrics
-  alias Pulso.OTLP.Traces
   alias Pulso.Runtime
   alias Pulso.Storage.S3
   alias PulsoWeb.OTLPHTTP
 
   @heap_words 16_000_000
-  @decoders %{logs: Logs, metrics: Metrics, traces: Traces}
 
   def child_spec(opts) do
     %{id: Keyword.get(opts, :name, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
@@ -162,21 +158,31 @@ defmodule PulsoWeb.OTLPGRPC do
     conn = PulsoWeb.BasicTenant.call(%Plug.Conn{req_headers: headers}, [])
 
     result =
-      with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
+      with :ok <- admit(),
+           {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
            :ok <- S3.validate_tenant(tenant),
            :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
-        Ingest.ingest(signal, tenant, key, Map.fetch!(@decoders, signal).decode_protobuf(body))
+        Ingest.ingest(signal, tenant, key, Ingest.decode(signal, :protobuf, body))
       end
 
     case result do
-      {:ok, rejected} -> {:ok, rejected}
+      {:ok, rejected, message} -> {:ok, rejected, message}
       {:error, reason} -> {:error, Ingest.classify(signal, reason)}
     end
   end
 
+  # Each call runs in its own task, so its slot is released when it exits.
+  defp admit do
+    case Pulso.IngestAdmission.acquire() do
+      :ok -> :ok
+      {:error, :ingest_overloaded} -> {:error, :owner_overloaded}
+    end
+  end
+
   @doc false
-  def to_grpc({:ok, rejected}), do: {0, "", Ingest.response_protobuf(rejected)}
+  def to_grpc({:ok, rejected}), do: to_grpc({:ok, rejected, "invalid records rejected"})
+  def to_grpc({:ok, rejected, message}), do: {0, "", Ingest.response_protobuf(rejected, message)}
   def to_grpc({:error, {429, message}}), do: {8, message, status_details(8, message, retry_info(1))}
   def to_grpc({:error, {503, message}}), do: {14, message, ""}
   def to_grpc({:error, {401, message}}), do: {16, message, ""}

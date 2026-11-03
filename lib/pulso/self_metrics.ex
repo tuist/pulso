@@ -6,6 +6,7 @@ defmodule Pulso.SelfMetrics do
   """
   use Pulso.Runtime.GenServer
 
+  alias Pulso.OTLP.Rejections
   alias Pulso.Runtime.GenServer
   alias Pulso.Runtime.Registry
   alias Pulso.Storage.S3.ManifestRegistry
@@ -25,6 +26,7 @@ defmodule Pulso.SelfMetrics do
     {"pulso_operations_total", "counter", "Completed operations by layer and outcome."},
     {"pulso_operation_duration_seconds", "summary", "Operation latency; count and sum only, no quantiles."},
     {"pulso_ingest_records_total", "counter", "Decoded records accepted, rejected, or failed at publication."},
+    {"pulso_ingest_rejected_records_total", "counter", "Records dropped from accepted requests, by bounded reason."},
     {"pulso_object_payload_bytes_total", "counter",
      "Successful object payload bytes, excluding wire overhead and internal retries."},
     {"pulso_compaction_segments_total", "counter", "Source segments merged by successful compaction."},
@@ -56,6 +58,7 @@ defmodule Pulso.SelfMetrics do
         outcome <- [:accepted, :rejected, :failed],
         do: records(signal, outcome, 0)
 
+    for reason <- Rejections.reasons(:traces), do: rejected_records(:traces, reason, 0)
     for reason <- @alert_skip_reasons, do: increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 0)
     increment("pulso_keyed_publication_conflicts_total", "", 0)
     for direction <- [:read, :write], do: object_bytes(direction, 0)
@@ -126,6 +129,32 @@ defmodule Pulso.SelfMetrics do
     increment("pulso_ingest_records_total", ~s(signal="#{signal}",outcome="#{outcome}"), count)
   end
 
+  @doc "Count records dropped for a fixed-vocabulary reason; no tenant, service or payload data."
+  def rejected_records(signal, reason, count)
+      when signal in [:logs, :metrics, :traces] and is_atom(reason) and is_integer(count) and count >= 0 do
+    increment("pulso_ingest_rejected_records_total", ~s(signal="#{signal}",reason="#{reason}"), count)
+  end
+
+  @doc """
+  True at most once per `interval_ms` for `key` on this node. Racing callers
+  may both see true; this only rate-limits diagnostics.
+  """
+  def due?(key, interval_ms) do
+    now = System.monotonic_time(:millisecond)
+    slot = {:due, key}
+
+    case :ets.lookup(table(), slot) do
+      [{_, last}] when now - last < interval_ms ->
+        false
+
+      _ ->
+        :ets.insert(table(), {slot, now})
+        true
+    end
+  rescue
+    ArgumentError -> false
+  end
+
   def object_bytes(direction, count) when direction in [:read, :write] and is_integer(count) and count >= 0 do
     increment("pulso_object_payload_bytes_total", ~s(direction="#{direction}"), count)
   end
@@ -178,7 +207,10 @@ defmodule Pulso.SelfMetrics do
 
     values =
       samples
-      |> Enum.filter(fn {{sample_name, _labels}, _value} -> sample_name in names end)
+      |> Enum.filter(fn
+        {{sample_name, _labels}, _value} -> sample_name in names
+        _ -> false
+      end)
       |> Enum.sort()
       |> Enum.map(&render_sample/1)
 

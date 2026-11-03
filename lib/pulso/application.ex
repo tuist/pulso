@@ -27,6 +27,7 @@ defmodule Pulso.Application do
     children =
       [
         Pulso.SelfMetrics,
+        Pulso.IngestAdmission,
         Pulso.Metrics,
         PulsoWeb.Telemetry,
         {Task.Supervisor,

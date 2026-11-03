@@ -1294,12 +1294,8 @@ defmodule PulsoWeb.TracesEndToEndTest do
   end
 
   test "a keyed batch with rejected span metadata never acknowledges a valid subset", ctx do
-    duplicate = [
-      %{"key" => "same", "value" => %{"stringValue" => "a"}},
-      %{"key" => "same", "value" => %{"stringValue" => "b"}}
-    ]
-
-    payload = Fixture.payload([Fixture.span(), Map.put(Fixture.span(), "attributes", duplicate)])
+    empty_key = [%{"key" => "", "value" => %{"stringValue" => "a"}}]
+    payload = Fixture.payload([Fixture.span(), Map.put(Fixture.span(), "attributes", empty_key)])
     before = Agent.get(ctx.store, & &1.objects)
 
     headers = [

@@ -62,7 +62,7 @@ defmodule PulsoWeb.OTLPGRPCTest do
       )
 
     assert response.status == 0
-    assert response.body == Ingest.response_protobuf(1)
+    assert response.body == Ingest.response_protobuf(1, "invalid records rejected: invalid_trace_id=1")
   end
 
   test "malformed messages are INVALID_ARGUMENT", ctx do

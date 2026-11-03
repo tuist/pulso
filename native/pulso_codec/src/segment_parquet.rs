@@ -448,9 +448,9 @@ pub fn decode<'a>(
     blob: &Binary<'a>,
     filter: &Filter,
 ) -> Result<(Vec<Term<'a>>, usize), DecodeError> {
-    // One copy from the Erlang heap into a Rust-owned `Bytes` so the
-    // Parquet reader owns something with `'static` lifetime.
-    let bytes = Bytes::copy_from_slice(blob.as_slice());
+    // Borrow the Erlang binary for the reader's `'static` lifetime instead of
+    // copying the whole segment, as the metric and discovery readers do.
+    let bytes = crate::erlang_bytes::from_binary(*blob);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|_| Fallback)?;
     let metadata = builder.metadata().clone();
 
@@ -1400,7 +1400,8 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(blob: &Binary<'_>, filter: Filter<'_>) -> Res<Option<Self>> {
-        let bytes = Bytes::copy_from_slice(blob.as_slice());
+        // Keep the segment borrowed from the BEAM across the chunk loop.
+        let bytes = crate::erlang_bytes::from_binary(*blob);
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| Fallback)?;
         let metadata = builder.metadata().clone();
         let ts_col = metadata

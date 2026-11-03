@@ -73,6 +73,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   @default_flush_interval_ms 10
   @default_flush_batch_max 256
   @cas_max_retries 5
+  @published_payload {__MODULE__, :published_payload}
   # A cached manifest is served without I/O for this long after its
   # last refresh; beyond it, `ensure_loaded/3` issues a conditional GET
   # to pick up cross-node writes. This is the bound on cross-node
@@ -200,12 +201,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
     case Retention.fetch_root(tenant, signal, config, etag, version) do
       :not_modified when is_map(entry) ->
-        cache_snapshot(tenant, signal, entry.manifest, entry.etag, token)
+        ManifestCache.touch(tenant, signal, token)
+        {:ok, %{manifest: entry.manifest, etag: entry.etag, refreshed_at_mono: System.monotonic_time(:millisecond)}}
 
       {:ok, fresh_etag, body} ->
         case decode_manifest(body, tenant, signal) do
           {:ok, manifest} ->
-            cache_snapshot(tenant, signal, manifest, fresh_etag, token)
+            cache_snapshot(tenant, signal, {manifest, body}, fresh_etag, token)
 
           {:error, _} = error ->
             ManifestCache.drop(tenant, signal)
@@ -221,8 +223,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  defp cache_snapshot(tenant, signal, manifest, etag, token) do
-    ManifestCache.put_snapshot(tenant, signal, manifest, etag, token)
+  defp cache_snapshot(tenant, signal, {manifest, _body} = encoded, etag, token) do
+    ManifestCache.put_snapshot(tenant, signal, encoded, etag, token)
     {:ok, %{manifest: manifest, etag: etag, refreshed_at_mono: System.monotonic_time(:millisecond)}}
   end
 
@@ -235,8 +237,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         end
 
       nil ->
-        with {:ok, pid} <- ensure_started(tenant, signal, config) do
-          call_owner(pid, :ensure_loaded, 15_000)
+        with {:ok, pid} <- ensure_started(tenant, signal, config),
+             {:ok, {:encoded, payload, etag}} <- call_owner(pid, :ensure_loaded, 15_000),
+             {:ok, manifest} <- Manifest.decode(payload) do
+          {:ok, %{manifest: manifest, etag: etag, refreshed_at_mono: System.monotonic_time(:millisecond)}}
         end
     end
   end
@@ -266,14 +270,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       :not_modified ->
         # No new writes; just touch the freshness timestamp so we don't
         # keep issuing 304s on every query.
-        touched = %{entry | refreshed_at_mono: System.monotonic_time(:millisecond)}
-        ManifestCache.put_snapshot(tenant, signal, touched.manifest, touched.etag, entry.token)
-        touched
+        ManifestCache.touch(tenant, signal, entry.token)
+        %{entry | refreshed_at_mono: System.monotonic_time(:millisecond)}
 
       {:ok, new_etag, body} ->
         case decode_manifest(body, tenant, signal) do
           {:ok, manifest} ->
-            ManifestCache.put_snapshot(tenant, signal, manifest, new_etag, entry.token)
+            ManifestCache.put_snapshot(tenant, signal, {manifest, body}, new_etag, entry.token)
 
             %{
               manifest: manifest,
@@ -379,20 +382,16 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   def handle_call(:ensure_loaded, _from, state) do
     # A cache miss must not turn an old owner snapshot into a fresh query
     # snapshot after another node has published compaction or new ingest.
-    {_entry, token} = ManifestCache.snapshot(state.tenant, state.signal)
+    token = ManifestCache.token(state.tenant, state.signal)
 
     case load_manifest(state) do
       {:ok, manifest, etag} ->
-        ManifestCache.put_snapshot(state.tenant, state.signal, manifest, etag, token)
+        # Reply with the encoded bytes: a decoded manifest sent as a message is
+        # flattened, losing the summary sharing the caller regains by decoding.
+        payload = IO.iodata_to_binary(Manifest.encode(manifest))
+        ManifestCache.put_snapshot(state.tenant, state.signal, {manifest, payload}, etag, token)
         state = %{state | manifest: manifest, etag: etag, loaded?: true}
-
-        entry = %{
-          manifest: manifest,
-          etag: etag,
-          refreshed_at_mono: System.monotonic_time(:millisecond)
-        }
-
-        {:reply, {:ok, entry}, state, @idle_hibernate_ms}
+        {:reply, {:ok, {:encoded, payload, etag}}, state, @idle_hibernate_ms}
 
       {:error, _} = error ->
         {:reply, error, state, @idle_hibernate_ms}
@@ -403,7 +402,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     if state.loaded? do
       enqueue_and_maybe_flush(state, from, segments)
     else
-      {_entry, token} = ManifestCache.snapshot(state.tenant, state.signal)
+      token = ManifestCache.token(state.tenant, state.signal)
 
       case load_manifest(state, false) do
         {:ok, manifest, etag} ->
@@ -495,13 +494,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     base = ManifestCache.publication_base(state.tenant, state.signal)
     state = %{state | timer_ref: nil}
 
+    # Copy a cached root only when another path (retention) replaced it.
     state =
-      case ManifestCache.get(state.tenant, state.signal) do
-        %{manifest: %{version: 3} = manifest, etag: etag} when etag != state.etag ->
-          %{state | manifest: manifest, etag: etag, loaded?: true}
-
-        _ ->
-          state
+      with {3, etag, _token} when etag != state.etag <- ManifestCache.info(state.tenant, state.signal),
+           %{manifest: %{version: 3} = manifest, etag: ^etag} <- ManifestCache.get(state.tenant, state.signal) do
+        %{state | manifest: manifest, etag: etag, loaded?: true}
+      else
+        _ -> state
       end
 
     {state, deferred} = partition_waiters(state)
@@ -513,7 +512,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       {kind, manifest, etag, outcomes} when kind in [:ok, :skipped] ->
         # Rejected-only attempts performed neither CAS nor a fresh authority
         # read. Their private root must never repopulate an invalidated cache.
-        if kind == :ok, do: ManifestCache.publish(state.tenant, state.signal, manifest, etag, state.etag, base)
+        if kind == :ok,
+          do: ManifestCache.publish(state.tenant, state.signal, published(manifest, etag), etag, state.etag, base)
+
+        warn_flat_growth(state, manifest)
+
         Enum.each(outcomes, fn {from, result} -> GenServer.reply(from, result) end)
 
         {:noreply,
@@ -539,6 +542,22 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         {:noreply, %{state | pending: remaining, waiters: deferred} |> schedule_deferred(), @idle_hibernate_ms}
     end
   end
+
+  # Flat (unretained) manifests are rewritten whole on every flush and decoded
+  # by every query, so their cost grows with history. Say so, rarely.
+  @flat_warning_segments 20_000
+  defp warn_flat_growth(state, %Manifest{version: version, segments: segments}) when version != 3 do
+    count = length(segments)
+
+    if count >= @flat_warning_segments and Pulso.SelfMetrics.due?({:flat_manifest, state.signal}, 600_000) do
+      Logger.warning(
+        "flat #{state.signal} manifest tenant=#{state.tenant} has #{count} segments and grows with every append; " <>
+          "enable retention (and compaction) to bound manifest memory and publication cost"
+      )
+    end
+  end
+
+  defp warn_flat_growth(_state, _manifest), do: :ok
 
   # An eligible caller shares the publication failure; an ineligible one keeps its own reason.
   defp failure_reply(:ok, error), do: error
@@ -623,11 +642,20 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
     case attempt_cas(state, payload) do
       {:ok, new_etag} ->
+        # Let the cache store these exact bytes instead of encoding again.
+        Process.put(@published_payload, {new_etag, payload})
         {:ok, merged, new_etag, attempt.outcomes}
 
       {:error, _} = error ->
         # Resolve internally retried/lost CAS responses before returning failure.
         state |> load_manifest(false) |> resolve_cas_failure(Map.put(attempt, :error, error))
+    end
+  end
+
+  defp published(manifest, etag) do
+    case Process.delete(@published_payload) do
+      {^etag, payload} -> {manifest, payload}
+      _ -> manifest
     end
   end
 

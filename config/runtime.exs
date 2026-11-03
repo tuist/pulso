@@ -233,6 +233,13 @@ ingest_flush_interval_ms =
     _ -> raise "PULSO_INGEST_FLUSH_INTERVAL_MS must be an integer in 0..1000"
   end
 
+# Node-local bound on concurrently processed ingest requests (HTTP and gRPC).
+# Excess requests receive a retryable 429 / RESOURCE_EXHAUSTED.
+case Integer.parse(env_var.("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", "32")) do
+  {value, ""} when value in 1..100_000 -> config :pulso, Pulso.IngestAdmission, max_concurrent: value
+  _ -> raise "PULSO_INGEST_MAX_CONCURRENT_REQUESTS must be an integer in 1..100000"
+end
+
 # Optional per-request ingest budgets. Only supplied environment values
 # override config/config.exs; invalid values fail at startup, not on traffic.
 parse_ingest_limit = fn name, raw ->

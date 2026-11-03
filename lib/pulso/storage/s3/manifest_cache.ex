@@ -13,6 +13,14 @@ defmodule Pulso.Storage.S3.ManifestCache do
   an order for opaque tags. Delayed reads and maintenance responses must not
   overwrite a newer acknowledged publication. Both paths remain lock-free.
 
+  ETS stores each manifest as its encoded wire binary, not the decoded
+  struct. ETS flattens every term it stores, which expands the name and
+  label dictionaries that decoded segments share; for metrics the flattened
+  struct is about 50 times the wire size, and flat (unretained) manifests grow
+  with every append. The refcounted binary is stored once without copying,
+  and each reader decodes a compact, sharing copy. Use `info/2` or `token/2`
+  when only the version, ETag or generation is needed.
+
   The entry shape carries the manifest struct, the ETag it was fetched
   with (used on the next conditional GET to short-circuit an unchanged
   read), and the monotonic timestamp of the last refresh (used by the
@@ -59,10 +67,54 @@ defmodule Pulso.Storage.S3.ManifestCache do
   def snapshot(tenant, signal) do
     case :ets.lookup(table(), {tenant, signal}) do
       [{_, %{invalidated?: true, token: token}}] -> {nil, token}
-      [{_, entry}] -> {entry, entry.token}
+      [{_, entry}] -> {expand(entry), entry.token}
       [] -> {nil, nil}
     end
   end
+
+  # Cached payloads were produced by `Manifest.encode/1` (or validated fetched
+  # bodies), so decoding cannot fail.
+  defp expand(%{payload: payload} = entry) do
+    {:ok, manifest} = Manifest.decode(payload)
+    entry |> Map.delete(:payload) |> Map.put(:manifest, manifest)
+  end
+
+  @doc """
+  The cached entry's `{version, etag, token}` without copying its manifest.
+  `:ets.lookup/2` copies the whole decoded manifest into the caller's heap;
+  flat manifests grow with every segment, so ingest and publication paths
+  that only need these fields must use this instead. Invalidated or missing
+  entries return `{nil, nil, token}`.
+  """
+  def info(tenant, signal) do
+    key = {tenant, signal}
+
+    case :ets.select(table(), [
+           {{key, %{invalidated?: true, token: :"$1"}}, [], [{{nil, nil, :"$1"}}]},
+           {{key, %{version: :"$1", etag: :"$2", token: :"$3"}}, [], [{{:"$1", :"$2", :"$3"}}]}
+         ]) do
+      [info | _] -> info
+      [] -> {nil, nil, nil}
+    end
+  end
+
+  @doc """
+  Mark an unchanged cached manifest fresh (after a 304) without re-encoding
+  or copying it, only while `token` is still the cached generation.
+  """
+  def touch(tenant, signal, token) do
+    key = {tenant, signal}
+
+    with [{^key, %{token: ^token, payload: _} = entry}] <- :ets.lookup(table(), key) do
+      touched = %{entry | refreshed_at_mono: System.monotonic_time(:millisecond)}
+      :ets.select_replace(table(), [{{key, %{token: token}}, [], [{:const, {key, touched}}]}])
+    end
+
+    :ok
+  end
+
+  @doc "Cache generation token, without copying the manifest."
+  def token(tenant, signal), do: elem(info(tenant, signal), 2)
 
   @doc "Install a read only if its exact cache generation is still current."
   def put_snapshot(tenant, signal, manifest, etag, token) do
@@ -123,9 +175,9 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
   @doc false
   def publication_base(tenant, signal) do
-    case snapshot(tenant, signal) do
-      {nil, token} -> {:cold, token}
-      {_entry, token} -> {:warm, token}
+    case info(tenant, signal) do
+      {nil, _etag, token} -> {:cold, token}
+      {_version, _etag, token} -> {:warm, token}
     end
   end
 
@@ -138,8 +190,11 @@ defmodule Pulso.Storage.S3.ManifestCache do
   defp install_cold(_object, {:warm, _token}), do: false
 
   defp entry(tenant, signal, manifest, etag) do
+    {manifest, payload} = wire(manifest)
+
     entry = %{
-      manifest: manifest,
+      payload: payload,
+      version: manifest.version,
       etag: etag,
       token: make_ref(),
       refreshed_at_mono: System.monotonic_time(:millisecond)
@@ -162,6 +217,11 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
     entry
   end
+
+  # Callers that already hold the exact encoded bytes (a publication payload or
+  # a validated fetched body) pass `{manifest, payload}` to avoid re-encoding.
+  defp wire({%Manifest{} = manifest, payload}) when is_binary(payload), do: {manifest, payload}
+  defp wire(%Manifest{} = manifest), do: {manifest, IO.iodata_to_binary(Manifest.encode(manifest))}
 
   @doc "Small node-local summaries for fixed-cardinality retention gauges, without storage I/O."
   def retention_statistics do

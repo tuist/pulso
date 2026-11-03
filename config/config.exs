@@ -30,6 +30,10 @@ config :pulso, Pulso.Auth, module: Open
 config :pulso, PulsoWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
+  # Exporters keep HTTP/1.1 connections alive. Bandit's default full GC every
+  # fifth request lets each connection process hold several requests' decoded
+  # bodies and records as garbage; collect after every ingest request instead.
+  http: [http_1_options: [gc_every_n_keepalive_requests: 1]],
   render_errors: [
     formats: [json: PulsoWeb.ErrorJSON],
     layout: false

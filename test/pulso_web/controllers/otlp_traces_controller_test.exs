@@ -2,6 +2,7 @@ defmodule PulsoWeb.OTLPTracesControllerTest do
   use PulsoWeb.ConnCase, async: true
 
   alias Pulso.Auth.SharedSecret
+  alias Pulso.OTLP.Ingest
   alias Pulso.Storage
   alias Pulso.Storage.Memory
   alias Pulso.Test.FailingStorage
@@ -44,6 +45,79 @@ defmodule PulsoWeb.OTLPTracesControllerTest do
     assert get_resp_header(conn, "content-type") == ["application/x-protobuf"]
     assert <<10, _length, 8, 1, 18, _message_length, _message::binary>> = conn.resp_body
     assert {:ok, [_]} = Storage.query(:traces, "default")
+  end
+
+  test "real SDK exports with repeated attribute keys are stored, keeping the last value" do
+    dir = Path.expand("../../fixtures/traces/duplicate_keys", __DIR__)
+
+    for {file, spans, name, key, value} <- [
+          {"erlang-sdk.protobuf", 5, "GET /fixture", "url.path", "/fixture"},
+          {"rust-sdk.protobuf", 2, "GET /up", "http.response.status_code", "200"}
+        ] do
+      tenant = "dup-" <> Path.rootname(file)
+      conn = request(File.read!(Path.join(dir, file)), "application/x-protobuf", [{"x-scope-orgid", tenant}])
+      assert conn.status == 200
+      assert conn.resp_body == ""
+      assert {:ok, stored} = Storage.query(:traces, tenant)
+      assert length(stored) == spans
+      span = Enum.find(stored, &(&1.name == name))
+      assert span.attributes[key] == value
+      keys = Enum.map(span.otlp["attributes"], & &1["key"])
+      assert keys == Enum.uniq(keys)
+      assert span.dropped_attributes_count > 0
+    end
+  end
+
+  test "partial success names the rejection reasons and counts them by bounded reason" do
+    bad_id = Map.put(Fixture.span(), "spanId", String.duplicate("0", 16))
+    backwards = Map.put(Fixture.span(), "endTimeUnixNano", "1")
+    payload = Fixture.payload([Fixture.span(), bad_id, backwards, backwards])
+
+    partial = json_response(request(Pulso.JSON.encode!(payload)), 200)["partialSuccess"]
+    assert partial["rejectedSpans"] == "3"
+    assert partial["errorMessage"] == "invalid records rejected: end_before_start=2, invalid_span_id=1"
+
+    conn = request(Fixture.protobuf(payload), "application/x-protobuf")
+    message = "invalid records rejected: end_before_start=2, invalid_span_id=1"
+    assert conn.resp_body == Ingest.response_protobuf(3, message)
+
+    metrics = Pulso.SelfMetrics.render()
+    assert metrics =~ ~s(pulso_ingest_rejected_records_total{signal="traces",reason="end_before_start"} 4)
+    assert metrics =~ ~s(pulso_ingest_rejected_records_total{signal="traces",reason="invalid_span_id"} 2)
+    assert metrics =~ ~s(pulso_ingest_rejected_records_total{signal="traces",reason="invalid_kind"} 0)
+    refute metrics =~ "tuist-server"
+  end
+
+  test "the node-local concurrent ingest bound answers a retryable 429 and frees slots of exited requests" do
+    start_supervised!(Pulso.IngestAdmission)
+    Pulso.Runtime.put_env(:pulso, Pulso.IngestAdmission, max_concurrent: 1)
+    owner = self()
+
+    holder =
+      spawn(
+        Pulso.Runtime.capture(fn ->
+          :ok = Pulso.IngestAdmission.acquire()
+          send(owner, :holding)
+          receive do: (:stop -> :ok)
+        end)
+      )
+
+    assert_receive :holding
+    conn = request(Fixture.protobuf(), "application/x-protobuf")
+    assert conn.status == 429
+    assert get_resp_header(conn, "retry-after") == ["1"]
+    assert {:ok, []} = Storage.query(:traces, "default")
+
+    # A holder that exits without releasing (for example, killed at its heap
+    # cap) gives its slot back through the monitor.
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, _, _}
+    _ = :sys.get_state(Pulso.Runtime.whereis(Pulso.IngestAdmission))
+    assert Pulso.IngestAdmission.in_flight() == 0
+
+    for _ <- 1..2, do: assert(request(Fixture.protobuf(), "application/x-protobuf").status == 200)
+    assert Pulso.IngestAdmission.in_flight() == 0
   end
 
   test "empty batches and malformed requests" do

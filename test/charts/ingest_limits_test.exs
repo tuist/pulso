@@ -10,6 +10,7 @@ defmodule Pulso.Charts.IngestLimitsTest do
     assert {manifest, 0} = render("max_trace_nodes=123456,ingestLimits.max_otlp_nodes=234567")
     assert manifest =~ ~r/name: PULSO_INGEST_MAX_TRACE_NODES\s+value: "123456"/
     assert manifest =~ ~r/name: PULSO_INGEST_MAX_OTLP_NODES\s+value: "234567"/
+    assert manifest =~ ~r/name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS\s+value: "32"/
   end
 
   test "metric footer pruning is explicitly opt-in" do

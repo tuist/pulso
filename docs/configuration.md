@@ -51,6 +51,7 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_ALERTING_SOURCE_BINDINGS_JSON` | `[]` | Explicit read-only imported graph mappings (`tenant`, original datasource `uid`, `type: native_promql` or `native_logql`), at most 256 unique pairs; no URLs. Same-tenant native Prometheus instant or metric-producing LogQL instant/range previews only. Does not enable imports or prove residency; see [graph previews](alerting.md#preview-an-imported-expression-graph). |
 | `PULSO_ALERTING_POLL_INTERVAL_MS` | `5000` | Native evaluator discovery interval, integer `1000..60000`; measure object-store read cost before reducing it. |
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
+| `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest memory](#ingest-memory). |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request source-record, attribute and request-node budgets for ingestion. OTLP distributions also cap expanded float samples at `PULSO_INGEST_MAX_RECORDS`; the separate fixed 16 MiB repeated-source metadata ceiling is unchanged. |
 | `PULSO_INGEST_MAX_OTLP_NODES` | `262144` | Request-wide log/metric JSON-shaped node ceiling, independent of per-set nodes. Applies to JSON/protobuf logs and metrics; see [OTLP logs](logs.md) and [OTLP metrics](metrics.md). |
@@ -335,6 +336,30 @@ modify that prefix. Its readiness check lists the `.pulso/` prefix. Do not confi
 bucket lifecycle rules that expire objects under `tenants/`: Pulso tracks live
 objects in per-tenant manifests, so an object that disappears underneath it makes
 queries fail. Use Pulso's own [retention](retention.md) to expire data instead.
+
+## Ingest memory
+
+Per-request limits cap one request (4 MiB on the wire, 16 MiB decompressed, plus
+record and attribute budgets), but exporters send in parallel, and replay their
+retry queues in bursts after a restart. `PULSO_INGEST_MAX_CONCURRENT_REQUESTS`
+(chart `ingestBatching.maxConcurrentRequests`) bounds how many ingest requests a
+node decodes and appends at once; further requests get a retryable `429` with
+`Retry-After: 1`, which Grafana Alloy, the Collector and Prometheus honor. It is
+a per-instance bound, not a cluster limit: add instances to add capacity.
+
+Budget roughly 32 MiB per slot for worst-case requests (compressed and
+decompressed bodies plus decoded records); typical exporter batches use far less.
+With the default 32 slots, a 1 GiB node is only safe for typical batches. Lower it
+(for example to 16) on small nodes, or raise memory.
+
+Manifests are the other memory consumer that grows. With retention disabled,
+each signal's manifest is a flat list with one entry per append, kept forever.
+Every publication rewrites it and every query decodes it, so memory and CPU grow
+with history (roughly 1 MiB of encoded manifest per hour per signal at about two
+appends a second, more for traces). Pulso logs a warning once a flat manifest
+passes 20,000 segments. For a long-running deployment, enable
+[retention](retention.md) so manifests become bounded pages, enable compaction to
+reduce segment counts, and consider [ingest coalescing](#ingest-coalescing).
 
 ## Ingest coalescing
 

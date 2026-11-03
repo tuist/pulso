@@ -10,17 +10,17 @@ defmodule PulsoWeb.OTLPHTTP do
   Handle one OTLP/HTTP export request for `signal`: tenant, authorization,
   idempotency, media type and encoding, then the shared `Pulso.OTLP.Ingest`.
   """
-  def export(conn, signal, decoder) do
+  def export(conn, signal) do
     with {:ok, tenant} <- single_header(conn, "x-scope-orgid", "default"),
          :ok <- S3.validate_tenant(tenant),
          :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
          {:ok, key} <- single_header(conn, "idempotency-key", nil),
          {:ok, format} <- format(conn),
          :ok <- encoding(conn) do
-      {conn, decoded} = decode(conn, format, decoder)
+      {conn, decoded} = decode(conn, format, signal)
 
       case Ingest.ingest(signal, tenant, key, decoded) do
-        {:ok, rejected} -> success(conn, format, rejected, Ingest.rejected_field(signal))
+        {:ok, rejected, message} -> success(conn, format, rejected, Ingest.rejected_field(signal), message)
         {:error, reason} -> failure(conn, signal, reason)
       end
     else
@@ -63,9 +63,9 @@ defmodule PulsoWeb.OTLPHTTP do
       else: {:error, :unsupported_content_encoding}
   end
 
-  def decode(conn, :json, decoder), do: {conn, decoder.decode(conn.body_params)}
+  def decode(conn, :json, signal), do: {conn, Ingest.decode(signal, :json, conn.body_params)}
 
-  def decode(conn, :protobuf, decoder) do
+  def decode(conn, :protobuf, signal) do
     # Keep the consumed adapter state even when decompression/decoding fails.
     # Sending on the original conn would drain already-read socket bytes again,
     # deadlocking large HTTP/1 bodies until the read timeout.
@@ -73,7 +73,7 @@ defmodule PulsoWeb.OTLPHTTP do
       {:ok, body, conn} ->
         result =
           with {:ok, body} <- PulsoWeb.CompressedBodyReader.decompress(conn, body),
-               do: decoder.decode_protobuf(body)
+               do: Ingest.decode(signal, :protobuf, body)
 
         {conn, result}
 
@@ -85,15 +85,14 @@ defmodule PulsoWeb.OTLPHTTP do
     end
   end
 
-  def success(conn, :json, 0, _field), do: json(conn, 200, %{})
+  def success(conn, :json, 0, _field, _message), do: json(conn, 200, %{})
 
-  def success(conn, :json, rejected, field) do
-    json(conn, 200, %{
-      "partialSuccess" => %{field => Integer.to_string(rejected), "errorMessage" => "invalid records rejected"}
-    })
+  def success(conn, :json, rejected, field, message) do
+    json(conn, 200, %{"partialSuccess" => %{field => Integer.to_string(rejected), "errorMessage" => message}})
   end
 
-  def success(conn, :protobuf, rejected, _field), do: protobuf(conn, 200, Ingest.response_protobuf(rejected))
+  def success(conn, :protobuf, rejected, _field, message),
+    do: protobuf(conn, 200, Ingest.response_protobuf(rejected, message))
 
   def error(conn, status, message) do
     code =

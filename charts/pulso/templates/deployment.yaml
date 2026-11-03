@@ -136,6 +136,8 @@ spec:
               value: {{ .Values.workloadIdentity.trust | toJson | quote }}
             - name: PULSO_INGEST_FLUSH_INTERVAL_MS
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
+            - name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS
+              value: {{ .Values.ingestBatching.maxConcurrentRequests | quote }}
             - name: PULSO_RETENTION_ENABLED
               value: {{ .Values.retention.enabled | quote }}
             - name: PULSO_LOGS_RETENTION_DAYS

@@ -110,9 +110,31 @@ provide the lifecycle management or query breadth required for a full cutover.
 
 HTTP **200** means the accepted spans are durable: the segment PUT and manifest
 conditional write have both succeeded. Invalid individual spans are omitted and
-reported through `partialSuccess.rejectedSpans`, with an error message. For JSON,
+reported through `partialSuccess.rejectedSpans`. Its `errorMessage` lists the
+rejected counts by reason, for example
+`invalid records rejected: end_before_start=2, invalid_span_id=1`. For JSON,
 this count is a decimal string, as required for an int64 OTLP field. Do not retry
 partial-success responses as if the whole batch failed.
+
+Each rejection also increments
+`pulso_ingest_rejected_records_total{signal="traces",reason=...}` (see
+[self-monitoring](self-monitoring.md)), and Pulso logs one warning per reason per
+minute with the count, tenant and up to five `service.name` values. Payload
+contents and credentials are never logged. Reasons: `invalid_span`,
+`invalid_trace_id`, `invalid_span_id`, `invalid_parent_span_id`,
+`invalid_start_time`, `invalid_end_time`, `end_before_start`, `invalid_name`,
+`invalid_trace_state`, `invalid_kind`, `invalid_status`, `empty_attribute_key`,
+`invalid_attribute_value` (including duplicate keys inside a kvlist value),
+`invalid_flags`, `invalid_dropped_count`, `invalid_event`, `invalid_link` and,
+with enforced retention, `retention_expired`.
+
+Repeated attribute keys on a resource, scope, span, event or link are accepted,
+as the Collector and Tempo accept them, although OTLP asks for unique keys. Common
+SDKs emit them: the Erlang SDK exports both `:"client.address"` (set by
+instrumentation) and `"client.address"` (set by an application), and the Rust SDK
+appends a `tracing` field recorded twice. Pulso keeps the **last** occurrence of
+each key and adds the discarded ones to that owner's `droppedAttributesCount`.
+Earlier releases rejected these spans.
 
 - **400**: invalid tenant, malformed OTLP/protobuf/gzip, invalid input, a keyed
   batch with any rejected span (`invalid_keyed_batch`), or a keyed batch containing
@@ -1541,8 +1563,10 @@ The tool scans all matching active segments in the selected storage snapshot;
 it does not accept time bounds, projection, a result limit, or pagination that
 could silently omit part of the trace. More than 5,000 stored spans, exhausted
 scan/deadline budgets, or excessive result/metadata bytes return an error, not a
-partial trace. On S3 the reconciliation and response remain native until the
-final response binary. Complete stored-span coverage does not guarantee every
+partial trace. The span cap stops the scan as soon as the 5,001st stored span
+is read. MCP error text names the bound that fired and suggests `query_traces`
+with `trace_id`, a time window and a `limit` instead. On S3 the reconciliation
+and response remain native until the final response binary. Complete stored-span coverage does not guarantee every
 span was exported: sampling, delayed delivery, retention, and missing parents
 can still leave an incomplete application trace.
 

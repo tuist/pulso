@@ -1267,7 +1267,8 @@ stay distinct in the envelope. Non-finite doubles use OTLP JSON spellings,
 signed zero survives numeric-string/unquoted JSON and protobuf, and retained
 strings are copied rather than pinning request arenas. General JSON semantics
 remain unchanged: an OTLP-only spelling adapter preserves unquoted `-0` and zero-mantissa exponents such as `-0e0`.
-Empty/duplicate keys reject semantically. Unsupported resource entity refs and
+Empty/duplicate keys reject semantically, except that trace owner attribute
+lists keep the last occurrence of a repeated key and count the rest as dropped. Unsupported resource entity refs and
 invalid resource/scope metadata reject whole requests; unkeyed record errors
 return partial success, while keyed invalid batches are never rewritten.
 
