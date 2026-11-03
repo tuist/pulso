@@ -19,7 +19,11 @@ rate-limited log. `ManifestCache` stores encoded manifest binaries in ETS and
 callers decode locally (ETS flattens decoded summary sharing ~50x); ingest and
 publication read only `ManifestCache.info/2`. `Pulso.IngestAdmission` bounds
 concurrent ingest per node (`PULSO_INGEST_MAX_CONCURRENT_REQUESTS`, retryable
-429). Flat manifests still grow without retention; see `docs/configuration.md#ingest-memory`.
+429) with exact per-signal reserves plus a shared pool, and lets coalesced
+requests trade their slot for a bounded pending-bytes budget while they wait for
+the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
+16 per tenant/signal) so uploads overlap the serialized manifest CAS. Flat
+manifests still grow without retention; see `docs/configuration.md#ingest-admission`.
 
 Current trace search capability is **5**, tuple `{2,1,3,5,12}`, superseding the
 search4 snapshot references below. Unscoped original-string/int64 search uses

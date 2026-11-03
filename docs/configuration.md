@@ -51,7 +51,9 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_ALERTING_SOURCE_BINDINGS_JSON` | `[]` | Explicit read-only imported graph mappings (`tenant`, original datasource `uid`, `type: native_promql` or `native_logql`), at most 256 unique pairs; no URLs. Same-tenant native Prometheus instant or metric-producing LogQL instant/range previews only. Does not enable imports or prove residency; see [graph previews](alerting.md#preview-an-imported-expression-graph). |
 | `PULSO_ALERTING_POLL_INTERVAL_MS` | `5000` | Native evaluator discovery interval, integer `1000..60000`; measure object-store read cost before reducing it. |
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
-| `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest memory](#ingest-memory). |
+| `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`, shared between signals. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest admission](#ingest-admission). |
+| `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` | an eighth of the slots | Slots that metrics, logs and traces each keep for themselves, `0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3`. The rest are shared. See [Ingest admission](#ingest-admission). |
+| `PULSO_INGEST_MAX_PENDING_BYTES` | `67108864` | Estimated memory of coalesced requests that have released their slot while they wait for durable publication, `0..17179869184`; `0` disables the handoff. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request source-record, attribute and request-node budgets for ingestion. OTLP distributions also cap expanded float samples at `PULSO_INGEST_MAX_RECORDS`; the separate fixed 16 MiB repeated-source metadata ceiling is unchanged. |
 | `PULSO_INGEST_MAX_OTLP_NODES` | `262144` | Request-wide log/metric JSON-shaped node ceiling, independent of per-set nodes. Applies to JSON/protobuf logs and metrics; see [OTLP logs](logs.md) and [OTLP metrics](metrics.md). |
@@ -350,7 +352,42 @@ a per-instance bound, not a cluster limit: add instances to add capacity.
 Budget roughly 32 MiB per slot for worst-case requests (compressed and
 decompressed bodies plus decoded records); typical exporter batches use far less.
 With the default 32 slots, a 1 GiB node is only safe for typical batches. Lower it
-(for example to 16) on small nodes, or raise memory.
+(for example to 16) on small nodes, or raise memory. With
+[ingest coalescing](#ingest-coalescing) enabled, add
+`PULSO_INGEST_MAX_PENDING_BYTES` (64 MiB by default) for requests that wait for
+publication without a slot.
+
+### Ingest admission
+
+Slots are shared fairly between three signal classes: metrics (remote write,
+OTLP metrics), logs (Loki push, OTLP logs, Sentry) and traces (OTLP traces).
+Each class keeps `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` slots (chart
+`ingestBatching.reservedRequestsPerSignal`, by default an eighth of the slots)
+that the others cannot take. The remaining slots are a shared pool that any class
+can borrow from. A remote-write replay after an outage can therefore use its
+reserve plus the whole pool and receive `429`s beyond that, while Loki pushes and
+trace exports still get their reserved slots. Loki's `loki.write` drops a batch
+after its retries run out, so do not set the reserve to `0` unless logs have
+another path. With 32 slots the default is 4 reserved per signal and 20 shared,
+so a single signal can use up to 24 slots.
+
+With coalescing enabled, a request holds its slot only while it is decoded and
+queued. Once its records are in the coalescing buffer, it moves to a node-wide
+pending budget (`PULSO_INGEST_MAX_PENDING_BYTES`, chart
+`ingestBatching.maxPendingBytes`) and waits there for the durable write. Its
+charge is the memory the waiting request actually retains plus the buffer's copy.
+When that budget is full, new requests keep their slots while they wait, so memory
+stays bounded by the slots plus the budget. This only changes how long a request
+holds a slot, not when it is acknowledged; see
+[Ingest coalescing](#ingest-coalescing).
+
+Watch `pulso_ingest_admission_total{signal,outcome}` (`admitted`, `rejected`,
+`handed_off`), `pulso_ingest_admission_in_flight{signal}` and
+`pulso_ingest_admission_pending_bytes`; see
+[self-monitoring](self-monitoring.md). A steady `rejected` rate for one signal
+means its exporters retry: add instances, raise the slots together with memory,
+or raise that signal's reserve. Fairness is per signal, not per tenant: one tenant
+can still use all of a signal's slots.
 
 Manifests are the other memory consumer that grows. With retention disabled,
 each signal's manifest is a flat list with one entry per append, kept forever.
@@ -363,23 +400,34 @@ reduce segment counts, and consider [ingest coalescing](#ingest-coalescing).
 
 ## Ingest coalescing
 
-Set `PULSO_INGEST_FLUSH_INTERVAL_MS=50` (chart `ingestBatching.flushIntervalMs: 50`)
+Set `PULSO_INGEST_FLUSH_INTERVAL_MS=20` (chart `ingestBatching.flushIntervalMs: 20`)
 to let concurrent unkeyed requests for the same tenant and signal share a Parquet
 segment and manifest publication. It is disabled by default. Keyed requests
 always use the original direct path, preserving their retry fingerprints.
 Sequential producers cannot share a flush, so they gain no request savings.
 
-Each node-local buffer reserves at most 128 callers, 100,000 rows, and 10 MiB of
+Flushes are pipelined. A batch is flushed when its window expires or when it
+reaches a quarter of the buffer bounds, whichever comes first. Up to 16 flushes
+per tenant and signal upload their segments at the same time, and the manifest
+owner folds every segment that finished uploading into the next conditional
+manifest write. A node therefore never waits for one flush's manifest write
+before it starts the next upload. Short windows work best: from 10 to 50 ms,
+throughput changes little, and each millisecond of window adds latency. Use
+20 ms unless provider request counts matter more than latency.
+
+Each node-local buffer reserves at most 512 callers, 400,000 rows, and 32 MiB of
 estimated input term bytes, including work already executing. Oversized requests
 and overflow go through the original unbuffered path, not an unbounded queue.
-These bounds are not node-wide ingest rate limits or exact heap-memory ceilings;
-encoding and the request processes need additional memory. Idle buffers terminate
-after 30 seconds. Buffers for different tenants, signals, or storage configurations
-are isolated.
+These bounds are per buffer, not node-wide; node memory is bounded by the
+admission slots and the pending budget (see [Ingest admission](#ingest-admission)).
+Idle buffers terminate after 30 seconds. Buffers for different tenants, signals,
+or storage configurations are isolated.
 
 The window adds up to its configured delay before storage I/O. Every request
 still waits for the shared segment PUT and manifest conditional write before
-acknowledgment. No local WAL is introduced; a node crash before acknowledgment
+acknowledgment, exactly as without coalescing: an acknowledged request is in a
+segment object referenced by a committed manifest. Releasing the admission slot
+while it waits does not change that. No local WAL is introduced; a node crash before acknowledgment
 requires collector retry. Unkeyed delivery remains at-least-once: a lost response
 and retry can duplicate data, just as on the unbuffered path. A shared storage
 failure fails all requests in that flush; it never falls back to individual writes

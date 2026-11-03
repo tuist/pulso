@@ -517,6 +517,60 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, service: "large")
   end
 
+  test "flushes pipeline: a later batch uploads while an earlier one waits on its manifest CAS", ctx do
+    start_supervised!(Pulso.IngestAdmission)
+    first = %Log{timestamp_ns: 1, service: "first"}
+    second = %Log{timestamp_ns: 2, service: "second"}
+    manifest_key = Manifest.manifest_key(ctx.tenant, "logs")
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", manifest_key} => owner}})
+
+    # Each waiting caller hands its admission slot to the pending budget.
+    admitted = fn records ->
+      fn ->
+        :ok = Pulso.IngestAdmission.acquire(:logs)
+        S3.append(:logs, ctx.tenant, records)
+      end
+    end
+
+    [early] = enqueue_with(ctx, [admitted.([first])])
+    assert_receive {:storage_barrier, writer, "PUT", ^manifest_key}, 30_000
+    assert Pulso.IngestAdmission.in_flight(:logs) == 0
+    assert Pulso.IngestAdmission.pending_bytes() > 0
+
+    [late] = enqueue_with(ctx, [admitted.([second])])
+    buffer = ctx.buffer
+    refute_received {:trace, ^buffer, :receive, :flushed}
+    # The second segment is uploaded before the first publication finishes.
+    wait_for_segment_puts(ctx.agent, 2)
+    assert Task.yield(early, 0) == nil
+
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    send(writer, {:release_storage, manifest_key})
+    assert Task.await(early, 10_000) == :ok
+    assert Task.await(late, 10_000) == :ok
+    assert {:ok, records} = S3.query(:logs, ctx.tenant, [])
+    assert Enum.sort_by(records, & &1.timestamp_ns) == [first, second]
+  end
+
+  defp enqueue_with(ctx, funs) do
+    token = make_ref()
+    :sys.replace_state(ctx.buffer, fn state -> %{state | timer: {token, token}} end)
+    tasks = Enum.map(funs, &Task.Supervisor.async_nolink(ctx.tasks, &1))
+    buffer = ctx.buffer
+    for _ <- funs, do: assert_receive({:trace, ^buffer, :receive, {:"$gen_call", _, {:append, _, _, _, _}}}, 30_000)
+    send(buffer, {:flush, token})
+    tasks
+  end
+
+  defp wait_for_segment_puts(agent, count) do
+    # Uploads are observed through the fake store, not timed.
+    if !(segment_puts(agent) >= count) do
+      :erlang.yield()
+      wait_for_segment_puts(agent, count)
+    end
+  end
+
   test "a caller timeout cannot release queued input reservations before publication", ctx do
     record = %Log{timestamp_ns: 1, service: "timed-out"}
     records = [record]
@@ -546,7 +600,9 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 1, bytes, 1}]
     Agent.update(ctx.agent, &%{&1 | barriers: %{}})
     send(writer, {:release_storage, key})
-    _ = :sys.get_state(ctx.buffer)
+    # Flushes publish in their own process and report back when done.
+    buffer = ctx.buffer
+    assert_receive {:trace, ^buffer, :receive, :flushed}, 30_000
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
     assert %{etag: etag} = ManifestCache.get(ctx.tenant, "logs")
     assert is_binary(etag)

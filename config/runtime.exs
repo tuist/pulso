@@ -235,10 +235,36 @@ ingest_flush_interval_ms =
 
 # Node-local bound on concurrently processed ingest requests (HTTP and gRPC).
 # Excess requests receive a retryable 429 / RESOURCE_EXHAUSTED.
-case Integer.parse(env_var.("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", "32")) do
-  {value, ""} when value in 1..100_000 -> config :pulso, Pulso.IngestAdmission, max_concurrent: value
-  _ -> raise "PULSO_INGEST_MAX_CONCURRENT_REQUESTS must be an integer in 1..100000"
-end
+ingest_max_concurrent =
+  case Integer.parse(env_var.("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", "32")) do
+    {value, ""} when value in 1..100_000 -> value
+    _ -> raise "PULSO_INGEST_MAX_CONCURRENT_REQUESTS must be an integer in 1..100000"
+  end
+
+# Slots each signal (metrics, logs, traces) keeps for itself; the rest are shared.
+# Empty means an eighth of the slots.
+ingest_reserved =
+  case env_var.("PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL", "") do
+    "" ->
+      div(ingest_max_concurrent, 8)
+
+    raw ->
+      case Integer.parse(raw) do
+        {value, ""} when value >= 0 and value * 3 <= ingest_max_concurrent ->
+          value
+
+        _ ->
+          raise "PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL must be an integer in 0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3"
+      end
+  end
+
+# Estimated record bytes of requests that released their slot while waiting
+# for durable publication of their coalesced segment.
+ingest_max_pending_bytes =
+  case Integer.parse(env_var.("PULSO_INGEST_MAX_PENDING_BYTES", "67108864")) do
+    {value, ""} when value in 0..17_179_869_184 -> value
+    _ -> raise "PULSO_INGEST_MAX_PENDING_BYTES must be an integer in 0..17179869184"
+  end
 
 # Optional per-request ingest budgets. Only supplied environment values
 # override config/config.exs; invalid values fail at startup, not on traffic.
@@ -317,6 +343,11 @@ query_budgets =
       ],
       env_var.(name, nil) not in [nil, ""],
       do: {key, parse_integer.(name, default, range)}
+
+config :pulso, Pulso.IngestAdmission,
+  max_concurrent: ingest_max_concurrent,
+  reserved_per_signal: ingest_reserved,
+  max_pending_bytes: ingest_max_pending_bytes
 
 config :pulso, Pulso.IngestLimits, ingest_limits
 

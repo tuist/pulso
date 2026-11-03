@@ -133,7 +133,7 @@ defmodule Pulso.Storage.S3 do
     with :ok <- validate_tenant(tenant),
          :ok <- check_retention(signal, tenant, records, config) do
       case AppendBuffer.append(signal, tenant, records, config, opts) do
-        :unbuffered -> append_unbuffered(signal, tenant, records, opts, config)
+        {:unbuffered, records} -> append_unbuffered(signal, tenant, records, opts, config)
         result -> result
       end
     end
@@ -158,13 +158,24 @@ defmodule Pulso.Storage.S3 do
           idempotency_key
         )
 
-      with :ok <- append_admission(signal, tenant, records, config, opts),
-           :ok <- put_segment(config, key, payload, idempotency_key not in [nil, ""], opts) do
+      with :ok <- append_admission(signal, tenant, records, config, opts) do
         segment = Segment.build(key, min_ts, max_ts, length(records), byte_size(payload))
-        segment = summarize_segment(signal, segment, records, pruning_safe?)
-        ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
+        publish_segment(signal, tenant, segment, records, payload, pruning_safe?, opts, config)
       end
     end
+  end
+
+  # The PUT is provider I/O and the payload a shared binary: upload in a task
+  # while this process builds the manifest summary, so summary CPU hides under
+  # upload latency instead of adding to every acknowledgment. Registration
+  # still waits for the upload, so durability is unchanged.
+  defp publish_segment(signal, tenant, segment, records, payload, pruning_safe?, opts, config) do
+    keyed? = opts[:idempotency_key] not in [nil, ""]
+    upload = Pulso.Runtime.Task.async(fn -> put_segment(config, segment.key, payload, keyed?, opts) end)
+    segment = summarize_segment(signal, segment, records, pruning_safe?)
+
+    with :ok <- Pulso.Runtime.Task.await(upload, :infinity),
+         do: ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
   end
 
   defp put_segment(config, key, payload, true, opts), do: KeyedPublication.put(config, key, payload, opts)

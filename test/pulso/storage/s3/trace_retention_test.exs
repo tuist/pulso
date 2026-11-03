@@ -577,10 +577,15 @@ defmodule Pulso.Storage.S3.TraceRetentionTest do
         {{self(), fresh_ref}, [fresh], 10, 1, []},
         {{self(), old_ref}, [old], 10, 1, [trace_retention_cutoff_ns: 0]}
       ],
+      pending_bytes: 20,
+      pending_rows: 2,
+      flushing: 0,
       timer: {nil, token}
     }
 
-    assert {:noreply, %{pending: []}, _} = AppendBuffer.handle_info({:flush, token}, state)
+    assert {:noreply, %{pending: [], flushing: 1}, _} = AppendBuffer.handle_info({:flush, token}, state)
+    # The flush publishes in a linked process that reports back to its buffer.
+    assert_receive :flushed, 30_000
     assert_receive {^old_ref, {:error, :retention_expired}}
     assert_receive {^fresh_ref, :ok}
     assert {:ok, [^fresh]} = S3.query(:traces, ctx.tenant, [])

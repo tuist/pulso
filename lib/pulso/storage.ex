@@ -196,15 +196,22 @@ defmodule Pulso.Storage do
 
   @spec append(signal, tenant, [signal_record], append_opts) :: :ok | {:error, term()}
   def append(signal, tenant, records, opts \\ []) when is_atom(signal) and is_binary(tenant) and is_list(records) do
-    result = adapter().append(signal, tenant, records, opts)
-    outcome = if result == :ok, do: :accepted, else: :failed
-    if signal == :logs and result == :ok, do: Tail.publish(tenant, records)
-    Pulso.SelfMetrics.records(signal, outcome, length(records))
-    result
-  catch
-    kind, reason ->
-      Pulso.SelfMetrics.records(signal, :failed, length(records))
-      :erlang.raise(kind, reason, __STACKTRACE__)
+    count = length(records)
+
+    # Only logs need their records after a successful append (live tail).
+    # Other signals must not keep them alive while publication is pending.
+    publish = if signal == :logs, do: fn -> Tail.publish(tenant, records) end, else: fn -> :ok end
+
+    try do
+      result = adapter().append(signal, tenant, records, opts)
+      if result == :ok, do: publish.()
+      Pulso.SelfMetrics.records(signal, if(result == :ok, do: :accepted, else: :failed), count)
+      result
+    catch
+      kind, reason ->
+        Pulso.SelfMetrics.records(signal, :failed, count)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   @spec query(signal, tenant, query_opts) :: {:ok, [signal_record]} | {:error, term()}

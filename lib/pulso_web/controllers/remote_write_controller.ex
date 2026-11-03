@@ -88,12 +88,15 @@ defmodule PulsoWeb.RemoteWriteController do
   defp finish(conn, tenant, opts, version, decoded) do
     # Metadata publishes first: if it fails, nothing is stored and the
     # sender's retry of the whole request cannot duplicate samples.
+    # Written counts are taken before append so a request waiting for durable
+    # publication no longer retains its decoded samples (see IngestAdmission).
     with {:ok, samples, rejected, metadata} <- decoded,
+         written = written_counts(version, samples),
          :ok <- Pulso.MetricMetadata.record(tenant, metadata),
          :ok <- append_samples(tenant, samples, rejected, opts) do
       conn
       |> put_rejected_header(rejected)
-      |> put_written_headers(version, samples)
+      |> put_written_headers(written)
       |> written(version, rejected)
     else
       {:error, :unsupported_content_type} ->
@@ -109,7 +112,10 @@ defmodule PulsoWeb.RemoteWriteController do
         conn |> put_status(:bad_request) |> json(%{error: "invalid_snappy"})
 
       {:error, :invalid_protobuf} ->
-        conn |> put_written_headers(version, []) |> put_status(:bad_request) |> json(%{error: "invalid_protobuf"})
+        conn
+        |> put_written_headers(written_counts(version, []))
+        |> put_status(:bad_request)
+        |> json(%{error: "invalid_protobuf"})
 
       {:error, :payload_too_large} ->
         conn |> put_status(:request_entity_too_large) |> json(%{error: "payload_too_large"})
@@ -163,13 +169,16 @@ defmodule PulsoWeb.RemoteWriteController do
   defp written(conn, _version, _rejected), do: send_resp(conn, :no_content, "")
 
   # Remote Write 2.0 senders treat a 2xx without these as a 1.0-only receiver.
-  defp put_written_headers(conn, :v1, _samples), do: conn
+  defp written_counts(:v1, _samples), do: nil
 
-  defp put_written_headers(conn, :v2, samples) do
-    floats = Enum.count(samples, &(not is_nil(&1.value)))
-    histograms = Enum.count(samples, & &1.histogram)
-    exemplars = Enum.reduce(samples, 0, &(length(&1.exemplars || []) + &2))
+  defp written_counts(:v2, samples) do
+    {Enum.count(samples, &(not is_nil(&1.value))), Enum.count(samples, & &1.histogram),
+     Enum.reduce(samples, 0, &(length(&1.exemplars || []) + &2))}
+  end
 
+  defp put_written_headers(conn, nil), do: conn
+
+  defp put_written_headers(conn, {floats, histograms, exemplars}) do
     conn
     |> Plug.Conn.put_resp_header("x-prometheus-remote-write-samples-written", Integer.to_string(floats))
     |> Plug.Conn.put_resp_header("x-prometheus-remote-write-histograms-written", Integer.to_string(histograms))

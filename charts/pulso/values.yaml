@@ -237,14 +237,23 @@ retention:
 
 ingestBatching:
   # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
-  # 0 disables it; 1..1000 adds up to that many ms before durable publication.
-  # Buffers hold at most 128 callers, 100000 rows and 10 MiB of estimated terms.
-  # Overflow uses the original direct path. Keyed requests always remain direct.
+  # 0 disables it; 1..1000 adds up to that many ms before durable publication
+  # (20 is a good value). Flushes are pipelined; buffers hold at most 512
+  # callers, 400000 rows and 32 MiB of estimated terms. Overflow uses the
+  # original direct path. Keyed requests always remain direct.
   flushIntervalMs: 0
   # Node-local bound on concurrently processed ingest requests (HTTP and gRPC),
   # 1..100000. Excess requests get a retryable 429 / RESOURCE_EXHAUSTED with a
   # one-second Retry-After. Size it to memory: see docs/configuration.md.
   maxConcurrentRequests: 32
+  # Slots that metrics, logs and traces each keep for themselves, so one
+  # signal's burst cannot starve the others; the rest are shared. Empty means
+  # an eighth of maxConcurrentRequests. At most maxConcurrentRequests / 3.
+  reservedRequestsPerSignal: ""
+  # Estimated bytes of coalesced requests that released their slot while they
+  # wait for durable publication (acknowledgment is unchanged). Budget this
+  # in addition to the slots; 0 disables the handoff.
+  maxPendingBytes: 67108864
 
 alerting:
   # Experimental native Prometheus/LogQL/mixed thresholds, recordings and Slack delivery. Grafana

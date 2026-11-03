@@ -31,8 +31,15 @@ defmodule Pulso.Storage.S3.MetricLabelSummary do
 
   defp collect_record(record, sets) do
     if Enum.all?(Map.keys(record.labels), &valid_utf8?/1) do
-      sets = Map.new(sets, fn {name, values} -> {name, collect(values, Map.get(record.labels, name, ""))} end)
-      {:cont, sets}
+      # An overflowed (nil) set never recovers and is skipped when building the
+      # summary, so drop it; once none remain, later records cannot add anything.
+      sets =
+        for {name, values} <- sets,
+            values = collect(values, Map.get(record.labels, name, "")),
+            into: %{},
+            do: {name, values}
+
+      if map_size(sets) == 0, do: {:halt, sets}, else: {:cont, sets}
     else
       # Native JSON materialization normalizes invalid UTF-8 keys, which
       # could collide with a selected name. Never summarize that case.

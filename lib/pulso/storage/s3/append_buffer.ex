@@ -6,6 +6,15 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   bytes, and rows before a request enters the mailbox. Overflow uses the original
   unbuffered path; this is not ingest rate admission. Acknowledgments wait for the
   combined segment PUT and manifest CAS. Keyed requests never enter this process.
+
+  Flushes are pipelined: each one encodes, uploads and registers its segment in
+  its own linked process, so up to 16 segment uploads per tenant and signal
+  overlap while the manifest owner folds their registrations into shared CAS
+  commits. A batch flushes when its window expires or once it reaches a quarter
+  of the reservation bounds, whichever comes first.
+
+  A reserved caller hands its admission slot to the node's pending budget
+  (`Pulso.IngestAdmission.handoff/1`) while it waits; see that module.
   """
   use Pulso.Runtime.GenServer
 
@@ -15,9 +24,14 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   alias Pulso.Storage.S3.AppendRegistry
   alias Pulso.Storage.S3.AppendSupervisor
 
-  @max_callers 128
-  @max_rows 100_000
-  @max_bytes 10 * 1024 * 1024
+  @max_callers 512
+  @max_rows 400_000
+  @max_bytes 32 * 1024 * 1024
+  # One flush carries at most a quarter of the reservation, so a full buffer
+  # always has several uploads in flight rather than one large serialized one.
+  @flush_rows div(@max_rows, 4)
+  @flush_bytes div(@max_bytes, 4)
+  @max_flushes 16
   @idle_ms 30_000
 
   @doc "Read node-local buffer reservations without messaging owners or doing storage I/O."
@@ -50,8 +64,10 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     rows = length(records)
     bytes = :erlang.external_size(records)
 
+    # `{:unbuffered, records}` hands the records back for the direct path, so
+    # callers need not keep their own reference while a buffered append waits.
     if rows > @max_rows or bytes > @max_bytes do
-      :unbuffered
+      {:unbuffered, records}
     else
       # Copy before reservation: a heap/watchdog kill during detachment must
       # not strand credits for a message the owner never received.
@@ -59,7 +75,10 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
       with {:ok, pid, admission} <- ensure_started(signal, tenant, config),
            :ok <- reserve(admission, bytes, rows) do
-        call(pid, {:append, records, bytes, rows, opts})
+        call(pid, {:append, records, bytes, rows, opts}, bytes)
+      else
+        :unbuffered -> {:unbuffered, records}
+        other -> other
       end
     end
   end
@@ -80,14 +99,39 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   defp release(table, bytes, rows), do: :ets.update_counter(table, :pending, [{2, -1}, {3, -bytes}, {4, -rows}])
 
-  defp call(pid, request) do
-    GenServer.call(pid, request, 15_000)
-  catch
-    # A timed-out caller does NOT release its reservation: its message or
-    # native publication can still be in progress. Only the owner releases it.
-    :exit, {:timeout, {GenServer, :call, _}} -> {:error, :timeout}
-    :exit, {:noproc, {GenServer, :call, _}} -> {:error, :owner_overloaded}
-    :exit, {:normal, {GenServer, :call, _}} -> {:error, :owner_overloaded}
+  # `GenServer.call/3`, split so the caller can drop its copy of the records
+  # once the buffer has it: send, collect garbage, hand the admission slot to
+  # the pending budget, then wait. The reply alias discards late replies.
+  defp call(pid, request, bytes) do
+    mref = Process.monitor(pid, alias: :demonitor)
+    send(pid, {:"$gen_call", {self(), [:alias | mref]}, request})
+    # Charge what the waiting caller still retains (its compacted heap and
+    # referenced binaries) plus the buffer's copy, about twice its external size.
+    Pulso.IngestAdmission.handoff(retained_bytes() + 2 * bytes)
+
+    receive do
+      {[:alias | ^mref], reply} ->
+        Process.demonitor(mref, [:flush])
+        reply
+
+      {:DOWN, ^mref, _, _, reason} when reason in [:noproc, :normal] ->
+        {:error, :owner_overloaded}
+
+      {:DOWN, ^mref, _, _, reason} ->
+        exit({reason, {GenServer, :call, [pid, :append, 15_000]}})
+    after
+      # A timed-out caller does NOT release its reservation: its message or
+      # native publication can still be in progress. Only the owner releases it.
+      15_000 ->
+        Process.demonitor(mref, [:flush])
+        {:error, :timeout}
+    end
+  end
+
+  defp retained_bytes do
+    :erlang.garbage_collect()
+    [memory: memory, binary: binaries] = Process.info(self(), [:memory, :binary])
+    Enum.reduce(binaries, memory, fn {_id, size, _refc}, total -> total + size end)
   end
 
   defp ensure_started(signal, tenant, config) do
@@ -134,6 +178,9 @@ defmodule Pulso.Storage.S3.AppendBuffer do
       config: opts[:config],
       admission: admission,
       pending: [],
+      pending_bytes: 0,
+      pending_rows: 0,
+      flushing: 0,
       timer: nil
     }
 
@@ -142,9 +189,20 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   @impl true
   def handle_call({:append, records, bytes, rows, opts}, from, state) do
-    pending = [{from, records, bytes, rows, opts} | state.pending]
-    state = %{state | pending: pending}
-    state = if state.timer, do: state, else: schedule(state)
+    state = %{
+      state
+      | pending: [{from, records, bytes, rows, opts} | state.pending],
+        pending_bytes: state.pending_bytes + bytes,
+        pending_rows: state.pending_rows + rows
+    }
+
+    state =
+      cond do
+        state.pending_bytes >= @flush_bytes or state.pending_rows >= @flush_rows -> flush(state)
+        state.timer -> state
+        true -> schedule(state)
+      end
+
     {:noreply, state, @idle_ms}
   end
 
@@ -155,8 +213,43 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   end
 
   @impl true
-  def handle_info({:flush, token}, %{timer: {_ref, token}} = state) do
+  def handle_info({:flush, token}, %{timer: {_ref, token}} = state),
+    do: {:noreply, flush(%{state | timer: nil}), @idle_ms}
+
+  def handle_info({:flush, _obsolete}, state), do: {:noreply, state, @idle_ms}
+
+  def handle_info(:flushed, state) do
+    state = %{state | flushing: state.flushing - 1}
+    # A batch that became due while every upload slot was busy goes now.
+    state = if state.pending != [] and state.timer == nil, do: flush(state), else: state
+    {:noreply, state, @idle_ms}
+  end
+
+  def handle_info(:timeout, %{pending: [], flushing: 0} = state), do: {:stop, :normal, state}
+  def handle_info(:timeout, state), do: {:noreply, state, @idle_ms}
+
+  # At the upload limit the batch keeps growing (within the reservation) and
+  # goes when an upload finishes. The obsolete timer, if any, is ignored.
+  defp flush(%{pending: []} = state), do: state
+  defp flush(%{flushing: flushing} = state) when flushing >= @max_flushes, do: %{state | timer: nil}
+
+  defp flush(state) do
+    if state.timer, do: Process.cancel_timer(elem(state.timer, 0))
     pending = Enum.reverse(state.pending)
+    buffer = self()
+
+    # Linked: a crashed upload takes the buffer and its callers down, exactly
+    # as an inline flush would, instead of leaving callers without a reply.
+    {:ok, _pid} =
+      Pulso.Runtime.Task.start_link(fn ->
+        publish(pending, state)
+        send(buffer, :flushed)
+      end)
+
+    %{state | pending: [], pending_bytes: 0, pending_rows: 0, flushing: state.flushing + 1, timer: nil}
+  end
+
+  defp publish(pending, state) do
     records = Enum.flat_map(pending, fn {_from, records, _bytes, _rows, _opts} -> records end)
     result = S3.append_unbuffered(state.signal, state.tenant, records, [split_admission_errors: true], state.config)
 
@@ -183,12 +276,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
       Enum.each(pending, &reply_pending(&1, result, state))
     end
-
-    {:noreply, %{state | pending: [], timer: nil}, @idle_ms}
   end
-
-  def handle_info({:flush, _obsolete}, state), do: {:noreply, state, @idle_ms}
-  def handle_info(:timeout, %{pending: []} = state), do: {:stop, :normal, state}
 
   defp split_reply({_from, records, _bytes, _rows, opts} = pending, state) do
     result =

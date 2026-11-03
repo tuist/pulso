@@ -138,6 +138,10 @@ spec:
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
             - name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS
               value: {{ .Values.ingestBatching.maxConcurrentRequests | quote }}
+            - name: PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL
+              value: {{ .Values.ingestBatching.reservedRequestsPerSignal | quote }}
+            - name: PULSO_INGEST_MAX_PENDING_BYTES
+              value: {{ .Values.ingestBatching.maxPendingBytes | int64 | quote }}
             - name: PULSO_RETENTION_ENABLED
               value: {{ .Values.retention.enabled | quote }}
             - name: PULSO_LOGS_RETENTION_DAYS

@@ -148,19 +148,19 @@ defmodule Pulso.Metrics do
     # Storage owns accepted/failed canonical counts; decoder rejections are
     # known here, before append. The detailed delivery view has its own family.
     :ok = Pulso.SelfMetrics.records(signal, :rejected, rejected)
-    result = Pulso.Storage.append(signal, tenant, records, opts)
+    # Count first: a caller waiting for durable publication must not keep its
+    # records alive (see Pulso.IngestAdmission.handoff/1).
+    count = length(records)
 
-    record_counts(
-      signal,
-      if(result == :ok, do: length(records), else: 0),
-      rejected + if(result == :ok, do: 0, else: length(records))
-    )
-
-    result
-  catch
-    kind, reason ->
-      record_counts(signal, 0, rejected + length(records))
-      :erlang.raise(kind, reason, __STACKTRACE__)
+    try do
+      result = Pulso.Storage.append(signal, tenant, records, opts)
+      record_counts(signal, if(result == :ok, do: count, else: 0), rejected + if(result == :ok, do: 0, else: count))
+      result
+    catch
+      kind, reason ->
+        record_counts(signal, 0, rejected + count)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   defp record_counts(signal, accepted, rejected) when signal in [:logs, :metrics, :traces] do

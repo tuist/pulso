@@ -197,9 +197,27 @@ defmodule Pulso.SelfMetrics do
       families,
       "# HELP pulso_manifest_queue_depth Pending publication callers plus owner mailbox messages.\n",
       "# TYPE pulso_manifest_queue_depth gauge\n",
-      "pulso_manifest_queue_depth #{manifest_queue_depth()}\n"
+      "pulso_manifest_queue_depth #{manifest_queue_depth()}\n",
+      render_admission(Pulso.IngestAdmission.stats())
     ]
     |> IO.iodata_to_binary()
+  end
+
+  # Node-local ingest admission by signal class; outcomes are a fixed enum.
+  defp render_admission(stats) do
+    [
+      "# HELP pulso_ingest_admission_total Ingest requests admitted to, rejected by (429), or handed off from a slot.\n",
+      "# TYPE pulso_ingest_admission_total counter\n",
+      for {signal, row} <- stats, outcome <- [:admitted, :rejected, :handed_off] do
+        ~s(pulso_ingest_admission_total{signal="#{signal}",outcome="#{outcome}"} #{Map.fetch!(row, outcome)}\n)
+      end,
+      "# HELP pulso_ingest_admission_in_flight Ingest requests holding an admission slot.\n",
+      "# TYPE pulso_ingest_admission_in_flight gauge\n",
+      for({signal, row} <- stats, do: ~s(pulso_ingest_admission_in_flight{signal="#{signal}"} #{row.in_flight}\n)),
+      "# HELP pulso_ingest_admission_pending_bytes Estimated bytes of slot-free requests awaiting durable publication.\n",
+      "# TYPE pulso_ingest_admission_pending_bytes gauge\n",
+      "pulso_ingest_admission_pending_bytes #{Pulso.IngestAdmission.pending_bytes()}\n"
+    ]
   end
 
   defp render_family({name, type, help}, samples) do
