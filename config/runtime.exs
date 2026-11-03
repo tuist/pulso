@@ -233,10 +233,33 @@ ingest_flush_interval_ms =
     _ -> raise "PULSO_INGEST_FLUSH_INTERVAL_MS must be an integer in 0..1000"
   end
 
+# One node memory budget sizes ingest and query concurrency (see
+# Pulso.ResourceBudget). PULSO_MEMORY_BUDGET_MB sets it explicitly; production
+# releases otherwise read the container's cgroup memory limit. Without either,
+# fixed defaults apply. Explicit per-setting variables below always win.
+memory_budget_mb =
+  case env_var.("PULSO_MEMORY_BUDGET_MB", "") do
+    "" ->
+      if config_env() == :prod, do: Pulso.ResourceBudget.cgroup_limit_mb()
+
+    raw ->
+      case Integer.parse(raw) do
+        {value, ""} when value in 256..1_048_576 -> value
+        _ -> raise "PULSO_MEMORY_BUDGET_MB must be an integer in 256..1048576"
+      end
+  end
+
+envelope =
+  if memory_budget_mb,
+    do: Pulso.ResourceBudget.derive(memory_budget_mb),
+    else: %{budget_mb: nil, ingest_slots: 32, query_slots: 3, query_heap_mb: 128}
+
+config :pulso, Pulso.ResourceBudget, budget_mb: envelope.budget_mb
+
 # Node-local bound on concurrently processed ingest requests (HTTP and gRPC).
 # Excess requests receive a retryable 429 / RESOURCE_EXHAUSTED.
 ingest_max_concurrent =
-  case Integer.parse(env_var.("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", "32")) do
+  case Integer.parse(env_var.("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", Integer.to_string(envelope.ingest_slots))) do
     {value, ""} when value in 1..100_000 -> value
     _ -> raise "PULSO_INGEST_MAX_CONCURRENT_REQUESTS must be an integer in 1..100000"
   end
@@ -349,15 +372,19 @@ config :pulso, Pulso.IngestAdmission,
   reserved_per_signal: ingest_reserved,
   max_pending_bytes: ingest_max_pending_bytes
 
-config :pulso, Pulso.IngestLimits, ingest_limits
-
 # Wall-clock limit for one query, plus the node's query memory envelope:
 # interactive slots (alerting and reliability run one each outside them), each
 # with a process heap ceiling. Size slots * heap well below the memory limit.
+query_slots = parse_integer.("PULSO_QUERY_MAX_CONCURRENT", envelope.query_slots, 1..64)
+
+config :pulso, Pulso.IngestLimits, ingest_limits
+
 config :pulso, Pulso.QueryRunner,
   timeout_ms: parse_integer.("PULSO_QUERY_TIMEOUT_MS", 10_000, 1_000..300_000),
-  max_interactive: parse_integer.("PULSO_QUERY_MAX_CONCURRENT", 3, 1..64),
-  max_heap_words: div(parse_integer.("PULSO_QUERY_MAX_HEAP_MB", 128, 16..16_384) * 1_048_576, 8)
+  max_interactive: query_slots,
+  # Interactive slots plus the alerting and reliability workers.
+  max_global: query_slots + 2,
+  max_heap_words: div(parse_integer.("PULSO_QUERY_MAX_HEAP_MB", envelope.query_heap_mb, 16..16_384) * 1_048_576, 8)
 
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(env_var.("PORT", "4000"))]
 

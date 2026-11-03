@@ -30,6 +30,9 @@ fn result<'a, T: Encoder>(env: Env<'a>, value: Result<T, Error>) -> Term<'a> {
         Err(Error::QueryBytes) => {
             (crate::atoms::error(), crate::atoms::query_resource_limit()).encode(env)
         }
+        Err(Error::ProjectionTie) => {
+            (crate::atoms::error(), crate::atoms::trace_projection_tie()).encode(env)
+        }
         Err(_) => crate::atoms::fallback().encode(env),
     }
 }
@@ -100,6 +103,11 @@ fn new_query<'a>(
             return Err(Error::Invalid);
         }
         let attributes = trace_segment_parquet::attribute_filters(env, filters)?;
+        // Callers rerun with complete keys after a `trace_projection_tie`.
+        let full_keys = filters
+            .map_get("full_sort_keys".encode(env))
+            .is_ok_and(|value| matches!(value.decode::<bool>(), Ok(true)));
+        let projection = if full_keys { None } else { fields.clone() };
         let owned = OwnedEnv::new();
         let saved = owned.save(filters);
         Ok(ResourceArc::new(Query(Mutex::new(State {
@@ -112,7 +120,7 @@ fn new_query<'a>(
             max,
             limit,
             fields,
-            selection: Some(Selection::default()),
+            selection: Some(Selection::projected(projection)),
         }))))
     };
     result(env, build())

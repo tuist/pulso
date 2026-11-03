@@ -51,7 +51,8 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_ALERTING_SOURCE_BINDINGS_JSON` | `[]` | Explicit read-only imported graph mappings (`tenant`, original datasource `uid`, `type: native_promql` or `native_logql`), at most 256 unique pairs; no URLs. Same-tenant native Prometheus instant or metric-producing LogQL instant/range previews only. Does not enable imports or prove residency; see [graph previews](alerting.md#preview-an-imported-expression-graph). |
 | `PULSO_ALERTING_POLL_INTERVAL_MS` | `5000` | Native evaluator discovery interval, integer `1000..60000`; measure object-store read cost before reducing it. |
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
-| `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`, shared between signals. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest admission](#ingest-admission). |
+| `PULSO_MEMORY_BUDGET_MB` | container memory limit | Memory budget, `256..1048576` MiB, that sizes ingest and query slots when they are not set explicitly. Production releases read the container's cgroup limit when it is unset; without a limit the fixed defaults below apply. See [Node memory envelope](#node-memory-envelope). |
+| `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | derived, else `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`, shared between signals; derived from the memory budget when unset. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` | an eighth of the slots | Slots that metrics, logs and traces each keep for themselves, `0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3`. The rest are shared. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_MAX_PENDING_BYTES` | `67108864` | Estimated memory of coalesced requests that have released their slot while they wait for durable publication, `0..17179869184`; `0` disables the handoff. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
@@ -339,6 +340,32 @@ bucket lifecycle rules that expire objects under `tenants/`: Pulso tracks live
 objects in per-tenant manifests, so an object that disappears underneath it makes
 queries fail. Use Pulso's own [retention](retention.md) to expire data instead.
 
+## Node memory envelope
+
+Each node bounds its memory with admission slots rather than relying on load
+staying low. When `PULSO_MEMORY_BUDGET_MB` is set, or a production release runs
+under a container memory limit, Pulso derives the slots from that budget:
+
+- 256 MiB is reserved for the runtime, caches and manifests;
+- half of the rest backs ingest slots at 32 MiB each (2 to 256 slots);
+- the other half backs query workers: interactive slots plus one alerting and
+  one reliability worker, each with a heap ceiling of up to 128 MiB (1 to 64
+  interactive slots).
+
+| Memory limit | Ingest slots | Interactive query slots | Query heap |
+| --- | --- | --- | --- |
+| 512 MiB | 4 | 2 | 32 MiB |
+| 1 GiB | 12 | 3 | 76 MiB |
+| 2 GiB | 28 | 5 | 128 MiB |
+| 4 GiB | 60 | 13 | 128 MiB |
+
+`PULSO_INGEST_MAX_CONCURRENT_REQUESTS`, `PULSO_QUERY_MAX_CONCURRENT` and
+`PULSO_QUERY_MAX_HEAP_MB` override individual values. Requests beyond the slots
+get retryable overload errors, counted by `pulso_admission_rejections_total`,
+and the slot gauges show saturation for autoscaling; see [scaling](scaling.md).
+Flat manifests of tenants without retention still grow with history and are not
+covered by the reserve.
+
 ## Ingest memory
 
 Per-request limits cap one request (4 MiB on the wire, 16 MiB decompressed, plus
@@ -351,8 +378,9 @@ a per-instance bound, not a cluster limit: add instances to add capacity.
 
 Budget roughly 32 MiB per slot for worst-case requests (compressed and
 decompressed bodies plus decoded records); typical exporter batches use far less.
-With the default 32 slots, a 1 GiB node is only safe for typical batches. Lower it
-(for example to 16) on small nodes, or raise memory. With
+Under a container memory limit the slot count is derived from it (see
+[Node memory envelope](#node-memory-envelope)); without one the default is 32,
+which a 1 GiB node only survives for typical batches. With
 [ingest coalescing](#ingest-coalescing) enabled, add
 `PULSO_INGEST_MAX_PENDING_BYTES` (64 MiB by default) for requests that wait for
 publication without a slot.
@@ -369,7 +397,8 @@ reserve plus the whole pool and receive `429`s beyond that, while Loki pushes an
 trace exports still get their reserved slots. Loki's `loki.write` drops a batch
 after its retries run out, so do not set the reserve to `0` unless logs have
 another path. With 32 slots the default is 4 reserved per signal and 20 shared,
-so a single signal can use up to 24 slots.
+so a single signal can use up to 24 slots; the 12 slots derived for a 1 GiB
+limit give 1 reserved per signal and 9 shared.
 
 With coalescing enabled, a request holds its slot only while it is decoded and
 queued. Once its records are in the coalescing buffer, it moves to a node-wide
@@ -514,8 +543,8 @@ these variables (through `extraEnv` in the Helm chart):
 | `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read. |
 | `PULSO_QUERY_MAX_SCAN_BYTES` | `134217728` | Stored bytes a query may read. |
 | `PULSO_QUERY_TIMEOUT_MS` | `10000` | Wall-clock limit for one query, including object-store reads (1000 to 300000). Queries past it fail with a timeout. Keep it below the client's own timeout (Grafana's datasource default is 30 s). |
-| `PULSO_QUERY_MAX_CONCURRENT` | `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
-| `PULSO_QUERY_MAX_HEAP_MB` | `128` | Process heap ceiling of one query worker, `16..16384`. A query past it fails with a resource-limit error. Off-heap segment reads (up to the prefetch depth) and native accumulators come on top, so size memory for about (`PULSO_QUERY_MAX_CONCURRENT` + 2) × this plus prefetched segments, and lower both on small nodes. |
+| `PULSO_QUERY_MAX_CONCURRENT` | derived, else `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
+| `PULSO_QUERY_MAX_HEAP_MB` | derived, else `128` | Process heap ceiling of one query worker, `16..16384`. A query past it fails with a resource-limit error. Off-heap segment reads (up to the prefetch depth) and native accumulators come on top, so size memory for about (`PULSO_QUERY_MAX_CONCURRENT` + 2) × this plus prefetched segments, and lower both on small nodes. |
 | `PULSO_QUERY_PREFETCH` | `4` | Segments fetched ahead of the one being processed, hiding object-store latency. A query that scans many segments is latency-bound: with 25 ms per request, scanning 1,000 segments took about 25 s at 1, 5.8 s at 4 and 2.8 s at 8, with no more requests or memory. Larger values can read up to that many minus one segments more when a query stops early or exhausts a budget, and hold that many segments in memory per query. |
 
 Log metric queries stream: they hold one decoded chunk of a segment plus

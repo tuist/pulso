@@ -30,8 +30,11 @@ defmodule Pulso.SelfMetrics do
     {"pulso_object_payload_bytes_total", "counter",
      "Successful object payload bytes, excluding wire overhead and internal retries."},
     {"pulso_compaction_segments_total", "counter", "Source segments merged by successful compaction."},
-    {"pulso_compaction_deleted_objects_total", "counter", "Retired objects deleted by successful cleanup."}
+    {"pulso_compaction_deleted_objects_total", "counter", "Retired objects deleted by successful cleanup."},
+    {"pulso_admission_rejections_total", "counter",
+     "Requests refused with a retryable overload error, by layer and bounded reason."}
   ]
+  @admission_reasons %{ingest: [:node, :tenant_concurrency, :tenant_rate], query: [:node, :tenant, :class]}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -61,6 +64,11 @@ defmodule Pulso.SelfMetrics do
     for reason <- Rejections.reasons(:traces), do: rejected_records(:traces, reason, 0)
     for reason <- @alert_skip_reasons, do: increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 0)
     increment("pulso_keyed_publication_conflicts_total", "", 0)
+
+    for {layer, reasons} <- @admission_reasons,
+        reason <- reasons,
+        do: increment("pulso_admission_rejections_total", ~s(layer="#{layer}",reason="#{reason}"), 0)
+
     for direction <- [:read, :write], do: object_bytes(direction, 0)
     compaction(:compact, {:ok, %{merged: 0}})
     compaction(:cleanup, {:ok, 0})
@@ -168,6 +176,13 @@ defmodule Pulso.SelfMetrics do
   end
 
   def compaction(_operation, _result), do: :ok
+
+  @doc "Count a request refused for capacity; reasons are a fixed vocabulary, never tenants."
+  def admission_rejection(layer, reason) do
+    if reason in Map.get(@admission_reasons, layer, []),
+      do: increment("pulso_admission_rejections_total", ~s(layer="#{layer}",reason="#{reason}"), 1),
+      else: :ok
+  end
 
   @doc "Count a byte-conflicting keyed append without retaining tenant/key/content data."
   def keyed_publication_conflict, do: increment("pulso_keyed_publication_conflicts_total", "", 1)

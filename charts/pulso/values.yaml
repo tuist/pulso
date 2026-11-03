@@ -244,8 +244,9 @@ ingestBatching:
   flushIntervalMs: 0
   # Node-local bound on concurrently processed ingest requests (HTTP and gRPC),
   # 1..100000. Excess requests get a retryable 429 / RESOURCE_EXHAUSTED with a
-  # one-second Retry-After. Size it to memory: see docs/configuration.md.
-  maxConcurrentRequests: 32
+  # one-second Retry-After. Empty derives it from the container memory limit
+  # (about 32 MiB per slot; see docs/configuration.md#node-memory-envelope).
+  maxConcurrentRequests: ""
   # Slots that metrics, logs and traces each keep for themselves, so one
   # signal's burst cannot starve the others; the rest are shared. Empty means
   # an eighth of maxConcurrentRequests. At most maxConcurrentRequests / 3.
@@ -441,11 +442,11 @@ prometheusRule:
   enabled: false
   labels: {}
 
-# Starting points, not measured capacity. Each node runs three interactive
-# queries plus one alerting and one reliability query, each with a 128 MiB heap
-# ceiling (PULSO_QUERY_MAX_CONCURRENT and PULSO_QUERY_MAX_HEAP_MB via extraEnv);
-# size memory for that plus ingest traffic (ingestBatching.maxConcurrentRequests),
-# then adjust from the self-monitoring metrics.
+# Starting points, not measured capacity. Pulso sizes its ingest and query
+# slots from limits.memory (docs/configuration.md#node-memory-envelope), so
+# raising memory raises concurrency; overload beyond the slots is a retryable
+# 429. Override slots with ingestBatching.maxConcurrentRequests, or
+# PULSO_QUERY_MAX_CONCURRENT / PULSO_QUERY_MAX_HEAP_MB via extraEnv.
 resources:
   requests:
     cpu: 500m

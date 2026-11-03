@@ -66,6 +66,8 @@ stores raw records, indefinitely unless event-time expiry is configured.
   int64/status/span-duration conditions, same-span AND/OR, costs and upgrade fence.
 - [Configuration](configuration.md): every environment variable, tenants and
   tokens, object storage requirements, and metrics compaction.
+- [Scaling](scaling.md): per-instance memory envelopes, autoscaling signals,
+  and what does and does not scale with more instances.
 - [Querying](querying.md): the Model Context Protocol tools, the Prometheus and
   Loki query APIs, the supported query subset, and query limits.
 - [Alerting](alerting.md): experimental native threshold/recording evaluation,

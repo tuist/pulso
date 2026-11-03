@@ -198,7 +198,15 @@ defmodule Pulso.Storage.S3 do
 
   @impl Pulso.Storage
   def query_traces_json(tenant, opts, fields) do
-    query(:traces, tenant, Keyword.put(opts, :native_json_fields, fields))
+    opts = Keyword.put(opts, :native_json_fields, fields)
+
+    # Projected candidates keep digests instead of complete sort keys. Two
+    # different stored copies of one span cannot be ordered from digests, so
+    # rerun such (rare) queries with complete keys, reading the sources again.
+    case query(:traces, tenant, opts) do
+      {:error, :trace_projection_tie} -> query(:traces, tenant, Keyword.put(opts, :full_sort_keys, true))
+      result -> result
+    end
   end
 
   @impl true
@@ -1284,14 +1292,18 @@ defmodule Pulso.Storage.S3 do
         if opts[:assemble_trace] do
           NIF.trace_query_new_trace(opts[:assemble_trace], start, maximum)
         else
-          filters = Map.put_new(trace_filters(opts), "limit", 5001)
-          NIF.trace_query_new(start, finish, filters, opts[:native_json_fields], maximum)
+          NIF.trace_query_new(start, finish, span_query_filters(opts), opts[:native_json_fields], maximum)
         end
 
       native_result(result)
     else
       {:ok, nil}
     end
+  end
+
+  defp span_query_filters(opts) do
+    filters = Map.put_new(trace_filters(opts), "limit", 5001)
+    if opts[:full_sort_keys], do: Map.put(filters, "full_sort_keys", true), else: filters
   end
 
   defp native_result(:fallback), do: {:error, {:decode_failed, :parquet_decoder_rejected_input}}

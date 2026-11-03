@@ -1434,9 +1434,13 @@ Matching native artifacts are required; stale search artifacts fail startup.
   false positives can still exceed scan budgets.
 - `fields`: an optional list of returned fields, for example
   `["trace_id", "span_id", "name", "duration_ns"]`. Omit it for full spans.
-  Projection reduces rendered fields, not the independent full-candidate payload
-  and sort-key budgets. Very wide rows can still fail a 5,000-result query even
-  when only timestamps are requested; narrow the limit rather than expect clipping.
+  Projected queries retain only the requested fields of each candidate, plus a
+  fixed-size digest of its complete sort key, so the 16 MiB candidate budgets
+  count what the result can contain: narrow fields fit 5,000 wide spans that
+  full results cannot. When two different stored copies of one span (same start,
+  trace ID and span ID) are retained, the query reruns once with complete sort
+  keys and full-payload budgets, reading its sources again, so results keep the
+  same order as full queries.
 - `limit`: `1..5000`. Results sort by start time descending with deterministic
   tie breaking. Without a limit, more than 5,000 matching spans returns an error.
 

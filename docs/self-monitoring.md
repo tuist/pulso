@@ -60,6 +60,7 @@ with count and sum only, without quantiles.
 | `pulso_operation_duration_seconds_count`, `_sum` | Summary | Same as above | Operation latency count and sum, including failed operations |
 | `pulso_ingest_records_total` | Counter | `signal`, `outcome` | `accepted`: valid decoded records whose append succeeded; `rejected`: decoder drops; `failed`: valid decoded records whose append failed |
 | `pulso_ingest_rejected_records_total` | Counter | `signal`, `reason` | Records dropped from accepted (partial-success) requests, by fixed reason. Currently only traces report reasons; see [traces](traces.md#acknowledgments-and-limits). Services and tenants appear only in the rate-limited warning log, never as labels |
+| `pulso_admission_rejections_total` | Counter | `layer`, `reason` | Requests refused with a retryable overload error. `layer="ingest"`: `node` (all ingest slots busy), `tenant_concurrency`, `tenant_rate` (tenant quotas). `layer="query"`: `node` (interactive slots busy), `tenant`, `class`. Tenants never appear as labels |
 | `pulso_object_payload_bytes_total` | Counter | `direction` (`read`, `write`) | Consumed successful GET body bytes (including keyed-verification mismatches) and PUT payload bytes, including manifests; not provider-billed wire traffic or SDK retries |
 | `pulso_keyed_publication_conflicts_total` | Counter | None | Keyed appends permanently rejected because existing bytes differ; inspect writer compatibility and coherent storage history rather than retrying, overwriting or rotating keys. See [keyed ingestion](keyed-ingestion.md). |
 | `pulso_compaction_segments_total` | Counter | None | Source segments merged by successful compactions |
@@ -129,6 +130,15 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_retention_managed_scopes` | Gauge | None | Retention-managed tenant/signal scopes cached on this node |
 | `pulso_vm_memory_bytes` | Gauge | None | Total BEAM-reported memory |
 | `pulso_vm_run_queue` | Gauge | None | BEAM scheduler run-queue length |
+| `pulso_ingest_inflight_requests` | Gauge | None | Ingest requests holding an admission slot |
+| `pulso_ingest_max_concurrent_requests` | Gauge | None | Ingest admission slots on this node |
+| `pulso_query_inflight` | Gauge | None | Interactive queries holding a slot |
+| `pulso_query_max_concurrent` | Gauge | None | Interactive query slots on this node |
+| `pulso_memory_budget_bytes` | Gauge | None | Memory budget that sized this node's slots, `0` when fixed defaults apply |
+
+Slot occupancy divided by slots (for example
+`pulso_ingest_inflight_requests / pulso_ingest_max_concurrent_requests`) is the
+saturation signal to autoscale on; see [scaling](scaling.md).
 
 Detailed operation labels:
 

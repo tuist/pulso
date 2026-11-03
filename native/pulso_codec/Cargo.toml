@@ -21,7 +21,7 @@ parquet = { version = "54", default-features = false, features = ["arrow", "zstd
 bytes = "1"
 # Byte-for-byte compatible with Prometheus's `github.com/cespare/xxhash/v2`,
 # which Prometheus's `labels.StableHash` uses — see src/stable_hash.rs.
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 # RE2-flavour regex, used by both the LogQL evaluator (query_filter.rs)
 # and the Prometheus remote_write matcher pushdown
 # (metric_segment_parquet.rs). The feature set keeps the heavier

@@ -95,6 +95,7 @@ mod atoms {
         query_resource_limit,
         query_result_limit,
         query_decoded_limit,
+        trace_projection_tie,
         storage,
         lines,
         eq,

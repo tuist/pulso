@@ -285,7 +285,7 @@ defmodule Pulso.MCP do
   # fired and how to stay inside it. Budgets are fixed per request.
   @trace_hints %{
     {"query_traces", :query_resource_limit} =>
-      "matching spans exceeded the 16 MiB candidate budget (full span payloads, regardless of fields); " <>
+      "retained spans exceeded the 16 MiB candidate budget; request only the fields you need, " <>
         "pass a smaller limit, such as 500, or narrow start_ts_ns/end_ts_ns",
     {"query_traces", :query_sample_limit} => "more than 5,000 spans matched; pass a limit or narrow the time window",
     {"get_trace", :query_sample_limit} =>

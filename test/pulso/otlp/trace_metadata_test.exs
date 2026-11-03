@@ -72,7 +72,10 @@ defmodule Pulso.OTLP.TraceMetadataTest do
     assert {:ok, records} = S3.decode_segment(:traces, merged, nil, nil, [])
     assert Enum.count(records, &is_nil(&1.otlp)) == 1
     assert Enum.find(records, & &1.otlp).otlp === span.otlp
+    # Legacy and rich copies of one span need complete keys to order.
     assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 2}, ["otlp"], 100)
+    assert {:error, :trace_projection_tie} = NIF.trace_query_add(query, merged)
+    assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 2, "full_sort_keys" => true}, ["otlp"], 100)
     assert {:ok, _} = NIF.trace_query_add(query, merged)
     assert {:ok, json} = NIF.trace_query_finish(query, 100)
     assert Enum.find(Pulso.JSON.decode!(json), &Map.has_key?(&1, "otlp"))["otlp"] === span.otlp
@@ -137,15 +140,65 @@ defmodule Pulso.OTLP.TraceMetadataTest do
     end
   end
 
-  test "rich sort-key ceilings fail instead of dropping metadata even with narrow projection" do
+  test "rich sort keys fail full results whole, while narrow projections budget only what they return" do
     raw = Fixture.span() |> Map.put("events", []) |> Map.put("links", [])
     attrs = Map.new(1..25, &{"attr.#{&1}", %{"stringValue" => "v#{&1}"}})
-    assert {:ok, [span], 0} = Traces.decode(Fixture.payload([Map.put(raw, "attributes", Fixture.pairs(attrs))]))
-    assert SpanKey.size(span) * 5000 > 16_777_216
-    assert {:ok, blob, _, _} = S3.encode_segment(:traces, List.duplicate(span, 5000))
-    assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 5000}, ["timestamp_ns"], 10_000)
-    assert {:error, :query_resource_limit} = NIF.trace_query_add(query, blob)
-    assert :fallback = NIF.trace_query_finish(query, 10_000)
+    raw = Map.put(raw, "attributes", Fixture.pairs(attrs))
+    id = fn i -> i |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(16, "0") end
+
+    spans =
+      for chunk <- Enum.chunk_every(1..5000, 500) do
+        assert {:ok, spans, 0} = Traces.decode(Fixture.payload(for i <- chunk, do: Map.put(raw, "spanId", id.(i))))
+        spans
+      end
+      |> List.flatten()
+
+    assert SpanKey.size(hd(spans)) * 5000 > 16_777_216
+    assert {:ok, blob, _, _} = S3.encode_segment(:traces, spans)
+
+    for mode <- [nil, %{"full_sort_keys" => true}] do
+      filters = Map.merge(%{"limit" => 5000}, mode || %{})
+      fields = if mode, do: ["span_id"]
+      assert {:ok, query} = NIF.trace_query_new(nil, nil, filters, fields, 10_000)
+      assert {:error, :query_resource_limit} = NIF.trace_query_add(query, blob)
+    end
+
+    assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 5000}, ["span_id"], 10_000)
+    assert {:ok, {5000, _, 5000}} = NIF.trace_query_add(query, blob)
+    assert {:ok, json} = NIF.trace_query_finish(query, 10_000)
+    expected = spans |> SortOrder.sort(:traces) |> Enum.map(&%{"span_id" => &1.span_id})
+    assert Pulso.JSON.decode!(json) == expected
+  end
+
+  test "projected candidates rerun with complete keys only for different copies of one span" do
+    raw = Fixture.span() |> Map.put("events", []) |> Map.put("links", [])
+    assert {:ok, [span, copy], 0} = Traces.decode(Fixture.payload([raw, Map.put(raw, "name", "other")]))
+    ordered = SortOrder.sort([span, copy], :traces)
+
+    # Identical copies share a digest and need no complete key.
+    assert {:ok, blob, _, _} = S3.encode_segment(:traces, [span, span])
+    assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 2}, ["name"], 10)
+    assert {:ok, _} = NIF.trace_query_add(query, blob)
+    assert {:ok, json} = NIF.trace_query_finish(query, 10)
+    assert Pulso.JSON.decode!(json) == [%{"name" => span.name}, %{"name" => span.name}]
+
+    # A different copy in a later segment still conflicts with the retained one.
+    assert {:ok, first, _, _} = S3.encode_segment(:traces, [span])
+    assert {:ok, second, _, _} = S3.encode_segment(:traces, [copy])
+    assert {:ok, query} = NIF.trace_query_new(nil, nil, %{"limit" => 1}, ["name"], 10)
+    assert {:ok, _} = NIF.trace_query_add(query, first)
+    assert {:error, :trace_projection_tie} = NIF.trace_query_add(query, second)
+
+    filters = %{"limit" => 1, "full_sort_keys" => true}
+    assert {:ok, query} = NIF.trace_query_new(nil, nil, filters, ["name", "duration_ns"], 10)
+    assert {:ok, _} = NIF.trace_query_add(query, first)
+    assert {:ok, _} = NIF.trace_query_add(query, second)
+    assert {:ok, json} = NIF.trace_query_finish(query, 10)
+    [winner | _] = ordered
+
+    assert Pulso.JSON.decode!(json) == [
+             %{"name" => winner.name, "duration_ns" => winner.end_timestamp_ns - winner.timestamp_ns}
+           ]
   end
 
   test "repeated owner metadata exceeding normalized ceiling rejects before append" do

@@ -78,9 +78,27 @@ defmodule Pulso.QueryRunner do
     end
   end
 
-  defp acquire(_key, max) when not is_integer(max) or max < 1, do: {:error, :query_overloaded}
+  @doc "Interactive queries holding a slot on this node."
+  def interactive_in_flight do
+    QuerySlots |> Registry.select([{{{:class, :interactive, :_}, :_, :_}, [], [true]}]) |> length()
+  rescue
+    ArgumentError -> 0
+  end
 
-  defp acquire(key, max), do: acquire_slot(key, max, 0)
+  @doc "This node's interactive query slot count."
+  def max_interactive, do: config(:max_interactive, 3)
+
+  defp acquire(key, max) do
+    with {:error, :query_overloaded} = error <-
+           if(is_integer(max) and max >= 1, do: acquire_slot(key, max, 0), else: {:error, :query_overloaded}) do
+      Pulso.SelfMetrics.admission_rejection(:query, rejection_reason(key))
+      error
+    end
+  end
+
+  defp rejection_reason({_tenant}), do: :tenant
+  defp rejection_reason({:class, :interactive}), do: :node
+  defp rejection_reason({:class, _class}), do: :class
   defp acquire_slot(_key, max, max), do: {:error, :query_overloaded}
 
   defp acquire_slot(key, max, slot) do
@@ -99,7 +117,7 @@ defmodule Pulso.QueryRunner do
   defp config(key, default), do: Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), key, default)
 
   defp acquire_interactive(class) when class in [:alerting, :reliability_callback], do: :ok
-  defp acquire_interactive(_class), do: acquire({:class, :interactive}, config(:max_interactive, 3))
+  defp acquire_interactive(_class), do: acquire({:class, :interactive}, max_interactive())
 
   defp class_limit(class) do
     default = if class in [:raw, :discovery, :alerting, :reliability_callback], do: 1, else: 3

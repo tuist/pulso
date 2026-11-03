@@ -15,6 +15,7 @@ use rustler::{Binary, Env, ListIterator, Term};
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub enum Error {
@@ -23,6 +24,9 @@ pub enum Error {
     TooMany,
     PayloadTooLarge,
     QueryBytes,
+    /// A projected query retained two different copies of one span (same start,
+    /// trace ID and span ID) and cannot order them from digests alone.
+    ProjectionTie,
 }
 type Res<T> = Result<T, Error>;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -482,8 +486,31 @@ pub struct Selection {
     pub matches: usize,
     payload_bytes: usize,
     key_bytes: usize,
+    projection: Option<Projection>,
 }
+
+/// With output fields, candidates retain only those members and a 128-bit
+/// digest of their complete metadata key, so the candidate budgets count what a
+/// result can contain. The digest orders nothing: complete keys only break ties
+/// between rows with the same start, trace ID and span ID, and such rows with
+/// different digests end the query with `ProjectionTie` so the caller reruns it
+/// with complete keys. Equal digests mean identical rows.
+struct Projection {
+    fields: Vec<String>,
+    retained: HashMap<(i64, String, String), (u128, usize)>,
+}
+
 impl Selection {
+    pub fn projected(fields: Option<Vec<String>>) -> Self {
+        Self {
+            projection: fields.map(|fields| Projection {
+                fields,
+                retained: HashMap::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
     pub fn kth(&self, limit: usize) -> Option<i64> {
         if self.candidates.len() >= limit && limit > 0 {
             self.candidates.peek().map(|c| c.0.key.0)
@@ -595,6 +622,7 @@ pub(crate) fn select_prepared<'a>(
         matches,
         payload_bytes,
         key_bytes,
+        projection,
     } = selection;
     for batch in reader {
         let batch = batch.map_err(|_| Error::Invalid)?;
@@ -675,12 +703,30 @@ pub(crate) fn select_prepared<'a>(
             {
                 continue;
             }
+            let full =
+                trace_sort_key::span_key(payload.as_bytes(), false).map_err(|_| Error::Invalid)?;
+            let digest = projection
+                .as_ref()
+                .map(|_| xxhash_rust::xxh3::xxh3_128(&full));
             let key = (
                 prefix.0,
                 prefix.1.to_owned(),
                 prefix.2.to_owned(),
-                trace_sort_key::span_key(payload.as_bytes(), false).map_err(|_| Error::Invalid)?,
+                match digest {
+                    Some(digest) => digest.to_be_bytes().to_vec(),
+                    None => full,
+                },
             );
+            if let (Some(projection), Some(digest)) = (projection.as_ref(), digest) {
+                let id = (key.0, key.1.clone(), key.2.clone());
+                if projection
+                    .retained
+                    .get(&id)
+                    .is_some_and(|(retained, _)| *retained != digest)
+                {
+                    return Err(Error::ProjectionTie);
+                }
+            }
             if limit.is_some_and(|k| candidates.len() == k) {
                 if candidates.peek().is_some_and(|c| key <= c.0.key) {
                     continue;
@@ -688,7 +734,28 @@ pub(crate) fn select_prepared<'a>(
                 let removed = candidates.pop().unwrap().0;
                 *payload_bytes -= removed.payload.len();
                 *key_bytes -= removed.key.3.len();
+                if let Some(projection) = projection.as_mut() {
+                    let id = (removed.key.0, removed.key.1, removed.key.2);
+                    if let Some(entry) = projection.retained.get_mut(&id) {
+                        entry.1 -= 1;
+                        if entry.1 == 0 {
+                            projection.retained.remove(&id);
+                        }
+                    }
+                }
             }
+            let payload = match projection.as_mut() {
+                Some(projection) => {
+                    let id = (key.0, key.1.clone(), key.2.clone());
+                    projection
+                        .retained
+                        .entry(id)
+                        .or_insert((digest.unwrap(), 0))
+                        .1 += 1;
+                    project(payload, &projection.fields)?
+                }
+                None => payload.to_owned(),
+            };
             *payload_bytes += payload.len();
             *key_bytes += key.3.len();
             if *payload_bytes > MAX_PAYLOAD_BYTES || *key_bytes > MAX_PAYLOAD_BYTES {
@@ -696,7 +763,7 @@ pub(crate) fn select_prepared<'a>(
             }
             candidates.push(Reverse(Candidate {
                 key,
-                payload: payload.to_owned(),
+                payload,
                 duration,
             }));
         }
@@ -860,6 +927,30 @@ impl Selection {
         }
         Ok(out.finish(env))
     }
+}
+
+/// The members of `payload` named in `fields`, raw and in their original order.
+/// `write_candidates` applies its own filters to them, so the output bytes equal
+/// those written from the whole payload.
+fn project(payload: &str, fields: &[String]) -> Res<String> {
+    let values = Parser::new(payload.as_bytes())
+        .raw_object()
+        .map_err(|_| Error::Invalid)?;
+    let mut out = Vec::with_capacity(64);
+    out.push(b'{');
+    for (key, value) in values {
+        if !fields.iter().any(|f| f.as_bytes() == key.as_ref()) {
+            continue;
+        }
+        if out.len() > 1 {
+            out.push(b',');
+        }
+        crate::json_write::write_str(&mut out, key.as_ref());
+        out.push(b':');
+        out.extend_from_slice(value);
+    }
+    out.push(b'}');
+    String::from_utf8(out).map_err(|_| Error::Invalid)
 }
 
 fn write_candidates(

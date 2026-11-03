@@ -28,6 +28,11 @@ defmodule Pulso.QueryRunnerTest do
 
     assert {:error, :query_overloaded} = QueryRunner.run("shared", :raw, fn _ -> {:ok, :unexpected} end)
     assert Pulso.Metrics.render() =~ "pulso_query_occupied_slots 2\n"
+    # Saturation for autoscaling: both workers hold interactive node slots.
+    metrics = Pulso.Metrics.render()
+    assert metrics =~ "pulso_query_inflight 2\n"
+    assert metrics =~ "pulso_query_max_concurrent 3\n"
+    assert Pulso.SelfMetrics.render() =~ ~s(pulso_admission_rejections_total{layer="query",reason="tenant"} 1\n)
     assert {:ok, :other} = QueryRunner.run("other", :raw, fn _ -> {:ok, :other} end)
 
     for pid <- workers do

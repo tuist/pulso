@@ -12,6 +12,7 @@ defmodule Pulso.Storage.S3.TracesTest do
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.TraceSummary
+  alias Pulso.Storage.SortOrder
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.OTLPTraceFixture, as: Fixture
   alias Pulso.Traces.Tempo
@@ -110,6 +111,39 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert {:ok, [%{"text" => full}]} = Tools.call("query_traces", %{"tenant" => ctx.tenant, "limit" => 5000})
     assert length(Pulso.JSON.decode!(full)) == 5000
     assert {:error, :query_sample_limit} = Tools.call("query_traces", %{"tenant" => ctx.tenant})
+  end
+
+  test "MCP projections budget returned fields and keep canonical order for conflicting copies", ctx do
+    attrs = 1..25 |> Map.new(&{"attr.#{&1}", %{"stringValue" => "v#{&1}"}}) |> Fixture.pairs()
+    raw = Fixture.span() |> Map.merge(%{"attributes" => attrs, "events" => [], "links" => []})
+    id = &Base.encode16(<<&1::128>>, case: :lower)
+    at = &Map.merge(raw, %{"traceId" => id.(&1), "startTimeUnixNano" => "#{&1}", "endTimeUnixNano" => "#{&1 + 1000}"})
+
+    records =
+      for chunk <- Enum.chunk_every(1..5000, 500) do
+        assert {:ok, spans, 0} = Traces.decode(Fixture.payload(Enum.map(chunk, at)))
+        spans
+      end
+      |> List.flatten()
+
+    assert SpanKey.size(hd(records)) * 5000 > 16_777_216
+    assert :ok = S3.append(:traces, ctx.tenant, records)
+    call = &Tools.call("query_traces", Map.merge(%{"tenant" => ctx.tenant, "limit" => 5000}, &1))
+    assert {:error, :query_resource_limit} = call.(%{})
+    assert {:ok, [%{"text" => text}]} = call.(%{"fields" => ["trace_id", "duration_ns"]})
+    rows = Pulso.JSON.decode!(text)
+    assert length(rows) == 5000
+    assert hd(rows) == %{"trace_id" => id.(5000), "duration_ns" => 1000}
+
+    # A different stored copy of the newest span (same start, trace and span
+    # ID) forces the complete-key rerun; both orders match the canonical one.
+    assert {:ok, [copy], 0} = Traces.decode(Fixture.payload([Map.put(at.(5000), "name", "retried")]))
+    assert :ok = S3.append(:traces, ctx.tenant, [copy])
+    ordered = SortOrder.sort([List.last(records), copy], :traces)
+    assert {:ok, [%{"text" => text}]} = call.(%{"limit" => 2, "fields" => ["name"]})
+    assert Pulso.JSON.decode!(text) == Enum.map(ordered, &%{"name" => &1.name})
+    assert {:ok, [%{"text" => text}]} = call.(%{"limit" => 1, "fields" => ["name"]})
+    assert Pulso.JSON.decode!(text) == [%{"name" => hd(ordered).name}]
   end
 
   @tag timeout: 120_000

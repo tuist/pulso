@@ -101,6 +101,11 @@ defmodule Pulso.Metrics do
     "pulso_retention_pending_buckets" => "Expired buckets awaiting reclamation in locally cached managed scopes.",
     "pulso_retention_managed_scopes" => "Retention-managed tenant/signal scopes cached on this node.",
     "pulso_vm_memory_bytes" => "Total BEAM-reported memory in bytes.",
+    "pulso_ingest_inflight_requests" => "Ingest requests holding a node-local admission slot.",
+    "pulso_ingest_max_concurrent_requests" => "Node-local ingest admission slots.",
+    "pulso_query_inflight" => "Interactive queries holding a node-local slot.",
+    "pulso_query_max_concurrent" => "Node-local interactive query slots.",
+    "pulso_memory_budget_bytes" => "Memory budget that sized this node's slots; 0 when fixed defaults apply.",
     "pulso_vm_run_queue" => "BEAM scheduler run-queue length."
   }
 
@@ -385,8 +390,21 @@ defmodule Pulso.Metrics do
       gauge("pulso_retention_pending_buckets", expired),
       gauge("pulso_retention_managed_scopes", length(retention)),
       gauge("pulso_vm_memory_bytes", :erlang.memory(:total)),
+      # Saturation, for autoscaling on slot occupancy rather than memory.
+      gauge("pulso_ingest_inflight_requests", Pulso.IngestAdmission.in_flight()),
+      gauge("pulso_ingest_max_concurrent_requests", Pulso.IngestAdmission.limits().max),
+      gauge("pulso_query_inflight", Pulso.QueryRunner.interactive_in_flight()),
+      gauge("pulso_query_max_concurrent", Pulso.QueryRunner.max_interactive()),
+      gauge("pulso_memory_budget_bytes", memory_budget_bytes()),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue))
     ]
+  end
+
+  defp memory_budget_bytes do
+    case Keyword.get(Pulso.Runtime.get_env(:pulso, Pulso.ResourceBudget, []), :budget_mb) do
+      mb when is_integer(mb) -> mb * 1_048_576
+      _ -> 0
+    end
   end
 
   defp manifest_queues do
