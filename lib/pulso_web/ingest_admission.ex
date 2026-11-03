@@ -29,6 +29,7 @@ defmodule PulsoWeb.IngestAdmission do
          :ok <- Pulso.IngestAdmission.acquire(signal, tenant(conn), limited) do
       register_before_send(conn, fn conn ->
         Pulso.IngestAdmission.release()
+        meter(conn, format, signal)
         conn
       end)
     else
@@ -65,18 +66,27 @@ defmodule PulsoWeb.IngestAdmission do
     end
   end
 
+  # A successful response means the controller verified the caller for the
+  # tenant it named. Sentry tenants come from project bindings, so Sentry
+  # usage is metered by stored records only.
+  defp meter(%Plug.Conn{status: status} = conn, format, signal) when status in 200..299 and format != :sentry,
+    do: Pulso.Usage.request(signal, tenant(conn), content_length(conn))
+
+  defp meter(_conn, _format, _signal), do: :ok
+
+  defp content_length(conn) do
+    with [value] <- get_req_header(conn, "content-length"),
+         {n, ""} <- Integer.parse(value) do
+      n
+    else
+      _ -> nil
+    end
+  end
+
   defp rate(_conn, nil), do: :ok
 
   defp rate(conn, tenant) do
-    bytes =
-      with [value] <- get_req_header(conn, "content-length"),
-           {n, ""} <- Integer.parse(value) do
-        n
-      else
-        _ -> nil
-      end
-
-    with {:error, :tenant_rate} = error <- Pulso.TenantLimits.take_ingest_bytes(tenant, bytes) do
+    with {:error, :tenant_rate} = error <- Pulso.TenantLimits.take_ingest_bytes(tenant, content_length(conn)) do
       Pulso.SelfMetrics.admission_rejection(:ingest, :tenant_rate)
       error
     end

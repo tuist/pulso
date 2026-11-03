@@ -703,8 +703,21 @@ other roles 503. `Pulso.TenantLimits` (`PULSO_TENANT_LIMITS_JSON`) adds
 per-instance tenant ingest concurrency/byte-rate and query concurrency, charged
 only after credentials verify. The chart supports replicas, HPAs, `pools.*` and
 `clustering.enabled` (headless DNSCluster). Not built: cluster-wide quotas,
-tenant metering/lifecycle, per-tenant retention, ingest forwarding. See
+stored-bytes metering, per-tenant retention, ingest forwarding. See
 `docs/scaling.md`.
+
+Opt-in `Pulso.Tenants` (`PULSO_TENANT_REGISTRY_ENABLED`) keeps tenant state
+(active/suspended/deleting/deleted) and token digests in
+`system/tenants/v1/<tenant>.json`, changed by conditional writes through the
+admin API (`PulsoWeb.AdminController`, `PULSO_ADMIN_TOKENS` digests). `Pulso.Auth.verify/3`
+refuses non-active tenants (403) after any credential; records are cached
+node-locally (TTL, 100k entries, per-instance miss-read budget, 503 beyond).
+Compaction/retention/alerting skip non-active tenants. `Pulso.Tenants.Purger`
+(maintenance) deletes `tenants/<t>/` after the deletion grace, then tombstones
+the name forever. Opt-in `Pulso.Usage` (`PULSO_USAGE_ENABLED`) counts per
+tenant-hour acknowledged ingest requests/bytes/records and admitted queries,
+overwriting cumulative per-instance objects under `usage/v1/` (never
+double-counts; a crash loses at most one flush interval). See `docs/tenants.md`.
 
 Keyed S3 appends for every signal use conditional creation and native streaming
 exact-byte verification before CAS registration. Different existing encodings,

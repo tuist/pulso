@@ -67,7 +67,8 @@ defmodule PulsoWeb.SentryController do
   defp ingest(conn, _id, _project, _headers, nil, discarded), do: success(conn, nil, discarded)
 
   defp ingest(conn, id, project, headers, event, discarded) do
-    with {:ok, record} <- Errors.record(event, headers, id, project),
+    with :ok <- Pulso.Tenants.check(project["tenant"]),
+         {:ok, record} <- Errors.record(event, headers, id, project),
          :ok <- Pulso.Metrics.append(:logs, project["tenant"], [record], 0, []) do
       success(conn, record.resource["error_event_id"], discarded)
     else
@@ -86,6 +87,7 @@ defmodule PulsoWeb.SentryController do
   end
 
   defp failure(conn, {:error, :invalid_sentry_key}), do: conn |> put_status(403) |> json(%{error: "invalid_sentry_key"})
+  defp failure(conn, {:error, :forbidden}), do: conn |> put_status(403) |> json(%{error: "forbidden"})
 
   defp failure(conn, {:error, reason})
        when reason in [:event_too_large, :too_many_items, :attributes_too_large, :too_many_records],

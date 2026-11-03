@@ -73,7 +73,8 @@ defmodule Pulso.Alerting.Worker do
   defp evaluate_tenant(prefix, total, nodes, opts) do
     tenant = prefix |> String.trim_trailing("/") |> String.split("/") |> List.last()
 
-    case Repository.list(tenant, opts) do
+    # Suspended and deleted tenants are not evaluated.
+    case if(Pulso.Tenants.active?(tenant), do: Repository.list(tenant, opts), else: :inactive) do
       {:ok, ids} -> Enum.reduce(ids, total, &evaluate_owned(tenant, &1, &2, nodes, opts))
       _ -> total
     end

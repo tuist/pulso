@@ -31,6 +31,9 @@ defmodule Pulso.SelfMetrics do
      "Successful object payload bytes, excluding wire overhead and internal retries."},
     {"pulso_compaction_segments_total", "counter", "Source segments merged by successful compaction."},
     {"pulso_compaction_deleted_objects_total", "counter", "Retired objects deleted by successful cleanup."},
+    {"pulso_usage_dropped_total", "counter",
+     "Usage counts dropped because an instance already tracks its maximum tenant-hours."},
+    {"pulso_tenant_purged_objects_total", "counter", "Objects deleted while purging deleted tenants."},
     {"pulso_admission_rejections_total", "counter",
      "Requests refused with a retryable overload error, by layer and bounded reason."}
   ]
@@ -64,6 +67,8 @@ defmodule Pulso.SelfMetrics do
     for reason <- Rejections.reasons(:traces), do: rejected_records(:traces, reason, 0)
     for reason <- @alert_skip_reasons, do: increment("pulso_alert_evaluation_skips_total", ~s(reason="#{reason}"), 0)
     increment("pulso_keyed_publication_conflicts_total", "", 0)
+    increment("pulso_usage_dropped_total", "", 0)
+    increment("pulso_tenant_purged_objects_total", "", 0)
 
     seed_admission_rejections()
 
@@ -190,6 +195,10 @@ defmodule Pulso.SelfMetrics do
 
   @doc "Count a byte-conflicting keyed append without retaining tenant/key/content data."
   def keyed_publication_conflict, do: increment("pulso_keyed_publication_conflicts_total", "", 1)
+
+  def usage_dropped, do: increment("pulso_usage_dropped_total", "", 1)
+
+  def tenant_purged_objects(count), do: increment("pulso_tenant_purged_objects_total", "", count)
 
   @doc "Record a skipped native tick without retaining tenant/rule/query/provider data."
   def alert_evaluation_skip(reason) when reason in @alert_skip_reasons do

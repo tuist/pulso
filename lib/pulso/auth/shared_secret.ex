@@ -27,8 +27,8 @@ defmodule Pulso.Auth.SharedSecret do
   @impl Pulso.Auth
   def verify(conn, tenant) when is_binary(tenant) do
     with {:ok, presented} <- extract_token(conn, tenant),
-         {:ok, stored_hash} <- fetch_stored_hash(tenant) do
-      compare_hash(presented, stored_hash)
+         {:ok, stored_hashes} <- fetch_stored_hashes(tenant) do
+      compare_hash(presented, stored_hashes)
     end
   end
 
@@ -51,7 +51,9 @@ defmodule Pulso.Auth.SharedSecret do
     end
   end
 
-  defp fetch_stored_hash(tenant) do
+  # Configured tokens win; otherwise an active registry record's hashes
+  # (`Pulso.Tenants`), several of which may be valid during rotation.
+  defp fetch_stored_hashes(tenant) do
     tokens =
       case Runtime.get_env(:pulso, Pulso.Auth) do
         nil -> %{}
@@ -59,19 +61,29 @@ defmodule Pulso.Auth.SharedSecret do
       end
 
     case Map.fetch(tokens, tenant) do
-      {:ok, "sha256$" <> hex} when byte_size(hex) == 64 -> {:ok, hex}
-      {:ok, _malformed} -> {:error, :invalid_token}
-      :error -> {:error, :unknown_tenant}
+      {:ok, "sha256$" <> hex} when byte_size(hex) == 64 ->
+        {:ok, [hex]}
+
+      {:ok, _malformed} ->
+        {:error, :invalid_token}
+
+      :error ->
+        case Pulso.Tenants.token_hashes(tenant) do
+          {:ok, []} -> {:error, :unknown_tenant}
+          {:ok, hashes} -> {:ok, Enum.map(hashes, fn "sha256$" <> hex -> hex end)}
+          {:error, _} = error -> error
+        end
     end
   end
 
-  defp compare_hash(presented, stored_hex) do
+  # Every stored hash is compared, so timing does not reveal which matched.
+  defp compare_hash(presented, stored_hexes) do
     computed_hex =
       :sha256
       |> :crypto.hash(presented)
       |> Base.encode16(case: :lower)
 
-    if Plug.Crypto.secure_compare(computed_hex, stored_hex) do
+    if Enum.reduce(stored_hexes, false, &(Plug.Crypto.secure_compare(computed_hex, &1) or &2)) do
       :ok
     else
       {:error, :invalid_token}

@@ -182,6 +182,16 @@ spec:
             - name: PULSO_TENANT_LIMITS_JSON
               value: {{ . | toJson | quote }}
             {{- end }}
+            - name: PULSO_TENANT_REGISTRY_ENABLED
+              value: {{ .Values.tenantRegistry.enabled | quote }}
+            - name: PULSO_TENANT_REGISTRY_CACHE_TTL_MS
+              value: {{ include "pulso.boundedInteger" (list "tenantRegistry.cacheTtlMs" .Values.tenantRegistry.cacheTtlMs 1000 300000) | quote }}
+            - name: PULSO_TENANT_DELETION_GRACE_MS
+              value: {{ include "pulso.boundedInteger" (list "tenantRegistry.deletionGraceMs" .Values.tenantRegistry.deletionGraceMs 60000 2592000000) | quote }}
+            - name: PULSO_USAGE_ENABLED
+              value: {{ .Values.usage.enabled | quote }}
+            - name: PULSO_USAGE_FLUSH_INTERVAL_MS
+              value: {{ include "pulso.boundedInteger" (list "usage.flushIntervalMs" .Values.usage.flushIntervalMs 1000 3600000) | quote }}
             - name: PULSO_INGEST_FLUSH_INTERVAL_MS
               value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
             {{- if ne (toString .Values.ingestBatching.maxConcurrentRequests) "" }}
@@ -233,6 +243,13 @@ spec:
                   name: {{ include "pulso.secretName" $root }}
                   key: {{ $key }}
             {{- end }}
+            # Optional, so existing secrets without admin tokens keep working.
+            - name: PULSO_ADMIN_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulso.secretName" $root }}
+                  key: PULSO_ADMIN_TOKENS
+                  optional: true
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

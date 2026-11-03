@@ -17,6 +17,7 @@ defmodule Pulso.Application do
   alias Pulso.Storage.S3.CompactionWorker
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.RetentionWorker
+  alias Pulso.Tenants.Purger
 
   @impl true
   def start(_type, _args) do
@@ -28,6 +29,8 @@ defmodule Pulso.Application do
       [
         Pulso.SelfMetrics,
         Pulso.IngestAdmission,
+        Pulso.Tenants,
+        Pulso.Usage,
         Pulso.Metrics,
         PulsoWeb.Telemetry,
         {Task.Supervisor,
@@ -98,7 +101,8 @@ defmodule Pulso.Application do
             CompactionWorker.children(config) ++
               RetentionWorker.children(config) ++
               Pulso.Errors.Supervisor.children() ++
-              Pulso.Reliability.Supervisor.children()
+              Pulso.Reliability.Supervisor.children() ++
+              Purger.children()
           )
 
       _ ->

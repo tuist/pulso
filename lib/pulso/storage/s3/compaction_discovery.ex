@@ -26,7 +26,8 @@ defmodule Pulso.Storage.S3.CompactionDiscovery do
   defp tenant(key) do
     case String.split(String.trim_trailing(key, "/"), "/") do
       ["tenants", tenant] ->
-        if S3.validate_tenant(tenant) == :ok, do: [tenant], else: []
+        # Suspended and deleted tenants get no background work.
+        if S3.validate_tenant(tenant) == :ok and Pulso.Tenants.active?(tenant), do: [tenant], else: []
 
       _ ->
         []

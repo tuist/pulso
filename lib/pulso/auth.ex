@@ -7,6 +7,9 @@ defmodule Pulso.Auth do
   whether the caller is allowed to speak for the tenant they named; they do **not** decide which tenant a
   request belongs to (that is a routing concern, e.g. `X-Scope-OrgID`).
 
+  After any credential verifies, `Pulso.Tenants.check/1` refuses tenants the
+  registry marks suspended or deleted.
+
   Two implementations ship in-tree:
 
     * `Pulso.Auth.Open` — accepts everything. Default for dev and test.
@@ -42,13 +45,17 @@ defmodule Pulso.Auth do
   """
   @spec verify(Conn.t(), String.t(), WorkloadIdentity.capability()) :: :ok | {:error, reason()}
   def verify(conn, tenant, capability) when is_binary(tenant) and capability in [:read, :ingest] do
-    with trust when trust != [] <- WorkloadIdentity.trust(),
-         {:ok, token} <- bearer(conn),
-         true <- WorkloadIdentity.jwt?(token) do
-      WorkloadIdentity.verify(token, tenant, capability, trust)
-    else
-      _ -> module().verify(conn, tenant)
-    end
+    verified =
+      with trust when trust != [] <- WorkloadIdentity.trust(),
+           {:ok, token} <- bearer(conn),
+           true <- WorkloadIdentity.jwt?(token) do
+        WorkloadIdentity.verify(token, tenant, capability, trust)
+      else
+        _ -> module().verify(conn, tenant)
+      end
+
+    # Suspended and deleted tenants are refused whatever the credential.
+    with :ok <- verified, do: Pulso.Tenants.check(tenant)
   end
 
   defp bearer(conn) do

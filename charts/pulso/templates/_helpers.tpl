@@ -99,8 +99,13 @@ crash on boot.
 {{- end }}
 {{- end }}
 {{- if not .Values.existingSecret }}
-{{- if and (not .Values.tenantTokens) (not .Values.workloadIdentity.trust) }}
-{{- fail "tenantTokens needs at least one tenant unless workloadIdentity.trust is set (or set existingSecret)" }}
+{{- if and (not .Values.tenantTokens) (not .Values.workloadIdentity.trust) (not .Values.tenantRegistry.enabled) }}
+{{- fail "tenantTokens needs at least one tenant unless workloadIdentity.trust or tenantRegistry.enabled is set (or set existingSecret)" }}
+{{- end }}
+{{- range .Values.admin.tokenHashes }}
+{{- if not (regexMatch "^sha256\\$[0-9a-f]{64}$" (toString .)) }}
+{{- fail "admin.tokenHashes entries must be \"sha256$\" followed by 64 lowercase hex characters (digests, not tokens)" }}
+{{- end }}
 {{- end }}
 {{- range $tenant, $digest := .Values.tenantTokens }}
 {{- if not (regexMatch "^[A-Za-z0-9_.-]{1,128}$" $tenant) }}
@@ -232,7 +237,7 @@ change. A generated secret key base is excluded: it never changes once
 created, and hashing a second random draw would differ from the stored one.
 */}}
 {{- define "pulso.secretChecksum" -}}
-{{- dict "secretKeyBase" .Values.secretKeyBase "tenantTokens" .Values.tenantTokens "accessKeyId" .Values.storage.accessKeyId "secretAccessKey" .Values.storage.secretAccessKey | toJson | sha256sum }}
+{{- dict "secretKeyBase" .Values.secretKeyBase "tenantTokens" .Values.tenantTokens "adminTokenHashes" .Values.admin.tokenHashes "accessKeyId" .Values.storage.accessKeyId "secretAccessKey" .Values.storage.secretAccessKey | toJson | sha256sum }}
 {{- end }}
 
 {{/*

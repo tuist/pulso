@@ -370,6 +370,11 @@ query_budgets =
 # with a process heap ceiling. Size slots * heap well below the memory limit.
 query_slots = parse_integer.("PULSO_QUERY_MAX_CONCURRENT", envelope.query_slots, 1..64)
 
+# Tenant registry and lifecycle (Pulso.Tenants); see docs/tenants.md.
+tenant_registry_enabled = env_var.("PULSO_TENANT_REGISTRY_ENABLED", "false") in ["1", "true", "yes"]
+tenant_cache_ttl_ms = parse_integer.("PULSO_TENANT_REGISTRY_CACHE_TTL_MS", 30_000, 1_000..300_000)
+tenant_deletion_grace_ms = parse_integer.("PULSO_TENANT_DELETION_GRACE_MS", 600_000, 60_000..2_592_000_000)
+
 config :pulso, Pulso.IngestAdmission,
   max_concurrent: ingest_max_concurrent,
   reserved_per_signal: ingest_reserved,
@@ -391,6 +396,35 @@ config :pulso, Pulso.Roles, roles: Pulso.Roles.parse!(env_var.("PULSO_ROLES", "i
 
 # Per-tenant admission limits; see Pulso.TenantLimits and docs/scaling.md.
 config :pulso, Pulso.TenantLimits, limits: Pulso.TenantLimits.parse!(env_var.("PULSO_TENANT_LIMITS_JSON", "{}"))
+
+if tenant_deletion_grace_ms < 2 * tenant_cache_ttl_ms,
+  do: raise("PULSO_TENANT_DELETION_GRACE_MS must be at least twice PULSO_TENANT_REGISTRY_CACHE_TTL_MS")
+
+# Admin API credentials: a JSON array of "sha256$<hex>" digests of admin tokens.
+admin_token_hashes =
+  case JSON.decode(env_var.("PULSO_ADMIN_TOKENS", "[]")) do
+    {:ok, hashes} when is_list(hashes) ->
+      if Enum.all?(hashes, &(is_binary(&1) and Regex.match?(~r/\Asha256\$[0-9a-f]{64}\z/, &1))),
+        do: hashes,
+        else: raise("PULSO_ADMIN_TOKENS entries must be sha256$<64 lowercase hex> digests")
+
+    _ ->
+      raise "PULSO_ADMIN_TOKENS must be a JSON array of sha256$<hex> digests"
+  end
+
+config :pulso, Pulso.Tenants,
+  enabled: tenant_registry_enabled,
+  cache_ttl_ms: tenant_cache_ttl_ms,
+  deletion_grace_ms: tenant_deletion_grace_ms,
+  purge_interval_ms: parse_integer.("PULSO_TENANT_PURGE_INTERVAL_MS", 60_000, 1_000..3_600_000),
+  max_lookups_per_second: parse_integer.("PULSO_TENANT_REGISTRY_MAX_LOOKUPS_PER_SECOND", 100, 1..100_000)
+
+# Per-tenant usage metering (Pulso.Usage); see docs/tenants.md#usage-metering.
+config :pulso, Pulso.Usage,
+  enabled: env_var.("PULSO_USAGE_ENABLED", "false") in ["1", "true", "yes"],
+  flush_interval_ms: parse_integer.("PULSO_USAGE_FLUSH_INTERVAL_MS", 60_000, 1_000..3_600_000)
+
+config :pulso, PulsoWeb.AdminController, token_hashes: admin_token_hashes
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(env_var.("PORT", "4000"))]
 
 # Browser origins allowed to call POST /mcp, comma-separated
@@ -483,14 +517,15 @@ case config_env() do
               raise "PULSO_TENANT_TOKENS is not valid JSON: #{inspect(reason)}"
           end
 
-        _ when workload_trust != [] ->
+        _ when workload_trust != [] or tenant_registry_enabled ->
           %{}
 
         _ ->
           raise """
           environment variable PULSO_TENANT_TOKENS is missing or empty.
           Pulso.Auth.SharedSecret requires at least one tenant token in prod
-          unless PULSO_WORKLOAD_IDENTITY_JSON configures workload identity.
+          unless PULSO_WORKLOAD_IDENTITY_JSON configures workload identity or
+          PULSO_TENANT_REGISTRY_ENABLED provisions tenants through the admin API.
           """
       end
 

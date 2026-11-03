@@ -13,7 +13,8 @@ defmodule Pulso.QueryRunner do
 
   def run(tenant, class, fun, opts \\ %{}) when is_binary(tenant) and is_function(fun, 1) do
     with {:ok, timeout} <- timeout(opts) do
-      deadline = System.monotonic_time(:millisecond) + timeout
+      started = System.monotonic_time(:millisecond)
+      deadline = started + timeout
 
       task =
         try do
@@ -38,7 +39,12 @@ defmodule Pulso.QueryRunner do
           RuntimeError -> nil
         end
 
-      await(task, max(1, deadline - System.monotonic_time(:millisecond)))
+      result = await(task, max(1, deadline - System.monotonic_time(:millisecond)))
+      # Refused queries are not metered; everything admitted is, whatever its outcome.
+      if result != {:error, :query_overloaded},
+        do: Pulso.Usage.query(tenant, System.monotonic_time(:millisecond) - started)
+
+      result
     end
   end
 

@@ -204,7 +204,12 @@ defmodule Pulso.Storage do
 
     try do
       result = adapter().append(signal, tenant, records, opts)
-      if result == :ok, do: publish.()
+
+      if result == :ok do
+        publish.()
+        Pulso.Usage.records(signal, tenant, count)
+      end
+
       Pulso.SelfMetrics.records(signal, if(result == :ok, do: :accepted, else: :failed), count)
       result
     catch

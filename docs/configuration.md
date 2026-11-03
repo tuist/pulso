@@ -11,7 +11,7 @@ describes what each one means.
 | Variable | Meaning |
 | --- | --- |
 | `SECRET_KEY_BASE` | Random secret of at least 64 characters, used by the web framework. Generate one with `openssl rand -base64 48`. The chart generates and keeps one for you. |
-| `PULSO_TENANT_TOKENS` | JSON object mapping each tenant name to the SHA-256 digest of its bearer token. See [Tenants and tokens](#tenants-and-tokens). May be empty (`{}`) only when `PULSO_WORKLOAD_IDENTITY_JSON` configures [workload identity](#workload-identity). |
+| `PULSO_TENANT_TOKENS` | JSON object mapping each tenant name to the SHA-256 digest of its bearer token. See [Tenants and tokens](#tenants-and-tokens). May be empty (`{}`) only when `PULSO_WORKLOAD_IDENTITY_JSON` configures [workload identity](#workload-identity) or the [tenant registry](tenants.md#tenant-registry) is enabled. |
 | `PULSO_S3_BUCKET` | Bucket that stores every acknowledged record. |
 | `PULSO_S3_REGION` | Region passed to the S3 client. Providers that ignore regions still need a value, such as `auto` for Cloudflare R2. |
 | `PULSO_S3_ACCESS_KEY_ID` | Access key for the bucket. |
@@ -56,6 +56,14 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` | an eighth of the slots, at least 1 | Slots that metrics, logs and traces each keep for themselves, `0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3`. The rest are shared. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_MAX_PENDING_BYTES` | `67108864` | Estimated memory of coalesced requests that have released their slot while they wait for durable publication, `0..17179869184`; `0` disables the handoff. See [Ingest admission](#ingest-admission). |
 | `PULSO_TENANT_LIMITS_JSON` | `{}` | Per-tenant ingest concurrency, ingest byte rate and query concurrency, per instance. See [per-tenant limits](scaling.md#per-tenant-limits). |
+| `PULSO_ADMIN_TOKENS` | `[]` | JSON array of `sha256$<hex>` digests of admin Bearer tokens for `/api/v1/admin`; empty hides the admin API. See [admin API](tenants.md#admin-api). |
+| `PULSO_TENANT_REGISTRY_ENABLED` | `false` | Runtime tenant provisioning, suspension and deletion through the admin API, stored in the bucket. Needs S3 storage. See [tenant registry](tenants.md#tenant-registry). |
+| `PULSO_TENANT_REGISTRY_CACHE_TTL_MS` | `30000` | How long instances cache a tenant's record, `1000..300000`; state changes reach every instance within it. |
+| `PULSO_TENANT_REGISTRY_MAX_LOOKUPS_PER_SECOND` | `100` | Bucket reads per instance per second for uncached tenants, `1..100000`; beyond it, uncached tenants get a retryable `503`. |
+| `PULSO_TENANT_DELETION_GRACE_MS` | `600000` | Wait between a deletion request and the purge of the tenant's data, `60000..2592000000`, at least twice the cache TTL. See [deletion](tenants.md#deletion). |
+| `PULSO_TENANT_PURGE_INTERVAL_MS` | `60000` | How often maintenance instances purge deleted tenants, `1000..3600000`. |
+| `PULSO_USAGE_ENABLED` | `false` | Per-tenant usage metering written to `usage/v1/` in the bucket. Needs S3 storage. See [usage metering](tenants.md#usage-metering). |
+| `PULSO_USAGE_FLUSH_INTERVAL_MS` | `60000` | How often each instance writes its usage, `1000..3600000`; a crash can lose at most this much usage. |
 | `PULSO_ROLES` | `ingest,query,maintenance` | Comma-separated work this instance takes on. Requests for a role it does not run get a retryable `503`; background workers (compaction, retention, alerting, error projection, reliability) run only with `maintenance`. See [scaling](scaling.md#separate-pools). |
 | `DNS_CLUSTER_QUERY` | none | DNS name whose A records list the other instances, to join one Erlang cluster for rendezvous ownership. Set `RELEASE_DISTRIBUTION=name`, `RELEASE_NODE=pulso@<pod IP>` and a shared `RELEASE_COOKIE` too; the chart does this with `clustering.enabled`. |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |

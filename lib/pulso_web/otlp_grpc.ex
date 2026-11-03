@@ -163,7 +163,11 @@ defmodule PulsoWeb.OTLPGRPC do
            :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
            :ok <- admit(signal, tenant, byte_size(body)),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
-        Ingest.ingest(signal, tenant, key, Ingest.decode(signal, :protobuf, body))
+        with {:ok, _rejected, _message} = ok <-
+               Ingest.ingest(signal, tenant, key, Ingest.decode(signal, :protobuf, body)) do
+          Pulso.Usage.request(signal, tenant, byte_size(body))
+          ok
+        end
       end
 
     case result do

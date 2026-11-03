@@ -73,6 +73,31 @@ defmodule Pulso.Charts.IngestLimitsTest do
     assert manifest =~ "native_logql"
   end
 
+  test "tenant registry, admin digests and usage metering render and validate" do
+    digest = "sha256$" <> String.duplicate("a", 64)
+
+    settings =
+      "tenantRegistry.enabled=true,tenantRegistry.cacheTtlMs=15000,usage.enabled=true,admin.tokenHashes[0]=#{digest}"
+
+    assert {manifest, 0} =
+             System.cmd(@helm, ["template", "synthetic", @chart, "-f", @values, "--set", settings],
+               stderr_to_stdout: true
+             )
+
+    assert manifest =~ ~r/name: PULSO_TENANT_REGISTRY_ENABLED\s+value: "true"/
+    assert manifest =~ ~r/name: PULSO_TENANT_REGISTRY_CACHE_TTL_MS\s+value: "15000"/
+    assert manifest =~ ~r/name: PULSO_USAGE_ENABLED\s+value: "true"/
+    assert manifest =~ "PULSO_ADMIN_TOKENS: \"#{Base.encode64(~s(["#{digest}"]))}\""
+
+    assert {message, status} =
+             System.cmd(@helm, ["template", "synthetic", @chart, "-f", @values, "--set", "admin.tokenHashes[0]=plain"],
+               stderr_to_stdout: true
+             )
+
+    assert status != 0
+    assert message =~ "admin.tokenHashes"
+  end
+
   test "unknown and nonpositive node settings fail chart validation" do
     for key <- ["max_trace_nodes", "max_otlp_nodes"] do
       assert {message, status} = render("#{key}=0")

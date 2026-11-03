@@ -56,6 +56,12 @@ defmodule PulsoWeb.Router do
 
     post "/api/v1/reliability/investigations/:id/complete", ReliabilityController, :complete
 
+    get "/api/v1/admin/tenants", AdminController, :index
+    get "/api/v1/admin/tenants/:tenant", AdminController, :show
+    put "/api/v1/admin/tenants/:tenant", AdminController, :update
+    delete "/api/v1/admin/tenants/:tenant", AdminController, :delete
+    get "/api/v1/admin/tenants/:tenant/usage", AdminController, :usage
+
     post "/api/v1/alerting/import/preview", AlertingController, :import_preview
     get "/api/v1/alerting/rules", AlertingController, :index
     get "/api/v1/alerting/rules/:id", AlertingController, :show

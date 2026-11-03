@@ -64,7 +64,8 @@ defmodule Pulso.Storage.S3.RetentionWorker do
         do: {[], state.local_cursor},
         else: ManifestCache.scopes_page(state.local_cursor, local_slots)
 
-    queue = Enum.uniq(state.queue ++ chosen)
+    # Suspended and deleted tenants are skipped, so a purge converges.
+    queue = Enum.uniq(state.queue ++ Enum.filter(chosen, fn {tenant, _signal} -> Pulso.Tenants.active?(tenant) end))
     # Never advance durable discovery past scopes that did not fit in the queue.
     slots = min(16, div(64 - length(queue), length(Retention.signals())))
 
@@ -75,7 +76,9 @@ defmodule Pulso.Storage.S3.RetentionWorker do
 
     case discovery do
       {:ok, tenants, cursor} ->
-        discovered = for tenant <- tenants, signal <- Retention.signals(), do: {tenant, signal}
+        discovered =
+          for tenant <- tenants, Pulso.Tenants.active?(tenant), signal <- Retention.signals(), do: {tenant, signal}
+
         queue = Enum.uniq(queue ++ discovered)
         state = %{state | discovery: cursor, local_cursor: local_cursor, queue: queue}
         maintain(state, 8, System.monotonic_time(:millisecond) + Map.get(state.config, :retention_timeout_ms, 30_000))
