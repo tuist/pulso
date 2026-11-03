@@ -127,7 +127,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       when is_binary(tenant) and is_binary(signal) and is_list(segments) and is_map(config) do
     with {:ok, pid} <- ensure_started(tenant, signal, config),
          :ok <- guard_mailbox(pid, config) do
-      call_owner(pid, {:register_segments, segments}, timeout)
+      # The send time lets the owner report mailbox wait as manifest_wait.
+      call_owner(pid, {:register_segments, segments, System.monotonic_time()}, timeout)
     end
   end
 
@@ -371,7 +372,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       loaded?: false,
       pending: [],
       waiters: [],
-      timer_ref: nil
+      timer_ref: nil,
+      # Moving average of recent publication durations (ms); see commit_eta/2.
+      commit_ms: nil
     }
 
     # Load on the first request so an initial registration can create the
@@ -399,9 +402,12 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  def handle_call({:register_segments, segments}, from, state) do
+  def handle_call({:register_segments, segments}, from, state),
+    do: handle_call({:register_segments, segments, System.monotonic_time()}, from, state)
+
+  def handle_call({:register_segments, segments, sent}, from, state) do
     if state.loaded? do
-      enqueue_and_maybe_flush(state, from, segments)
+      enqueue_and_maybe_flush(state, from, segments, sent)
     else
       token = ManifestCache.token(state.tenant, state.signal)
 
@@ -413,7 +419,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
           state
           |> Map.merge(%{manifest: manifest, etag: etag, loaded?: true})
-          |> enqueue_and_maybe_flush(from, segments)
+          |> enqueue_and_maybe_flush(from, segments, sent)
 
         {:error, _} = err ->
           {:reply, err, state, @idle_hibernate_ms}
@@ -442,8 +448,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # Enqueue the caller's segments, register them as a waiter, and — if
   # the batch cap trips — flush immediately instead of waiting for the
   # timer. Under bursty load this bounds tail latency.
-  defp enqueue_and_maybe_flush(state, from, segments) do
-    state = %{state | pending: state.pending ++ segments, waiters: [{from, segments} | state.waiters]}
+  defp enqueue_and_maybe_flush(state, from, segments, sent) do
+    waiter = {from, segments, sent}
+    state = %{state | pending: state.pending ++ segments, waiters: [waiter | state.waiters]}
     publish_queue_depth(state)
 
     cond do
@@ -459,10 +466,49 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  defp publish_queue_depth(state) do
+  # While publishing, `committing` is `{started_ms, queued}`: the publication
+  # start and the segments deferred to a later one. Gauges keep counting the
+  # segments and waiters in flight.
+  defp publish_queue_depth(state, committing \\ nil) do
+    {committing_since, queued} = committing || {nil, length(state.pending)}
+
     Registry.update_value(@registry, {state.tenant, state.signal}, fn _ ->
-      %{pending: length(state.pending), waiters: length(state.waiters)}
+      %{
+        pending: length(state.pending),
+        waiters: length(state.waiters),
+        queued: queued,
+        committing_since: committing_since,
+        commit_ms: state.commit_ms,
+        flush_interval_ms: state.flush_interval_ms
+      }
     end)
+  end
+
+  @doc """
+  When the owner of `(tenant, signal)` is publishing, a map with the
+  publication's start (`:since`) and expected end (`:eta`) in monotonic
+  milliseconds, the duration `:estimate`, the owner's `:flush_interval_ms` and
+  its `:queued` segments; otherwise `nil`. Reads the owner's registry value,
+  without messaging it. The estimate is a moving average of recent
+  publications, so it is only a hint for scheduling, never for correctness.
+  """
+  def commit_eta(tenant, signal) do
+    case Registry.lookup(@registry, {tenant, signal}) do
+      [{_pid, %{committing_since: since, commit_ms: estimate} = info}]
+      when is_integer(since) and is_integer(estimate) ->
+        %{
+          since: since,
+          eta: since + estimate,
+          estimate: estimate,
+          flush_interval_ms: info.flush_interval_ms,
+          queued: info.queued
+        }
+
+      _ ->
+        nil
+    end
+  rescue
+    ArgumentError -> nil
   end
 
   defp cancel_timer(%{timer_ref: nil} = state), do: state
@@ -505,8 +551,18 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       end
 
     {state, deferred} = partition_waiters(state)
-    result = cas_with_retry(state, state.pending, @cas_max_retries)
+    started = System.monotonic_time()
+    for {_from, _segments, enqueued} <- state.waiters, do: Pulso.Metrics.stage(state.signal, :manifest_wait, enqueued)
     remaining = Enum.flat_map(deferred, &elem(&1, 1))
+
+    publish_queue_depth(
+      %{state | pending: state.pending ++ remaining, waiters: state.waiters ++ deferred},
+      {System.convert_time_unit(started, :native, :millisecond), length(remaining)}
+    )
+
+    result = cas_with_retry(state, state.pending, @cas_max_retries)
+    for _waiter <- state.waiters, do: Pulso.Metrics.stage(state.signal, :manifest_commit, started)
+    state = %{state | commit_ms: average_commit(state.commit_ms, started)}
     publish_queue_depth(%{state | pending: remaining, waiters: deferred})
 
     case result do
@@ -560,6 +616,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp warn_flat_growth(_state, _manifest), do: :ok
 
+  # Weighted toward recent publications: flat roots grow steadily, and a
+  # conflict retry should not dominate the estimate for long.
+  defp average_commit(previous, started) do
+    elapsed = System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond)
+    if previous, do: div(previous * 3 + elapsed, 4), else: elapsed
+  end
+
   # An eligible caller shares the publication failure; an ineligible one keeps its own reason.
   defp failure_reply(:ok, error), do: error
   defp failure_reply(outcome, _error), do: outcome
@@ -569,7 +632,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp partition_waiters(%{manifest: %{version: 3}} = state) do
     {selected, deferred, _, _, _} =
-      Enum.reduce(Enum.reverse(state.waiters), {[], [], MapSet.new(), 0, 0}, fn {from, segments} = waiter,
+      Enum.reduce(Enum.reverse(state.waiters), {[], [], MapSet.new(), 0, 0}, fn {from, segments, _enqueued} = waiter,
                                                                                 {selected, deferred, starts, count,
                                                                                  bytes} ->
         own = MapSet.new(segments, &PagedManifest.bucket_start(state.manifest.paging, &1.max_ts))
@@ -731,13 +794,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp publication_requests(%{manifest: %{version: 3}} = state) do
     now = System.system_time(:nanosecond)
 
-    Enum.reduce(Enum.reverse(state.waiters), {[], []}, fn {from, segments}, {accepted, outcomes} ->
+    Enum.reduce(Enum.reverse(state.waiters), {[], []}, fn {from, segments, _enqueued}, {accepted, outcomes} ->
       result = eligibility(segments, state, now)
       {if(result == :ok, do: accepted ++ segments, else: accepted), [{from, result} | outcomes]}
     end)
   end
 
-  defp publication_requests(state), do: {state.pending, Enum.map(state.waiters, fn {from, _} -> {from, :ok} end)}
+  defp publication_requests(state), do: {state.pending, Enum.map(state.waiters, fn {from, _, _} -> {from, :ok} end)}
 
   # The first ineligible segment decides the caller's outcome.
   defp eligibility(segments, state, now) do

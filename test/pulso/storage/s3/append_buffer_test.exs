@@ -139,7 +139,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     buffer = ctx.buffer
     assert_receive {:trace, ^buffer, :receive, {:"$gen_call", _, {:append, _, _, _, _}}}, 30_000
     state = :sys.get_state(ctx.buffer)
-    [{_from, [stored], _bytes, _rows, _opts}] = state.pending
+    [{_from, [stored], _bytes, _rows, _opts, _enqueued}] = state.pending
     assert :binary.referenced_byte_size(stored.body) == 100
     {_timer, token} = state.timer
     send(ctx.buffer, {:flush, token})
@@ -517,6 +517,55 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, service: "large")
   end
 
+  @tag flush_interval_ms: 20
+  test "while a slow manifest write is in flight, requests beyond the window share the next segment", ctx do
+    key = Manifest.manifest_key(ctx.tenant, "logs")
+    owner = self()
+    buffer = ctx.buffer
+    hold = fn -> Agent.update(ctx.agent, &%{&1 | barriers: %{{"PUT", key} => owner}}) end
+
+    release = fn writer ->
+      Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+      send(writer, {:release_storage, key})
+    end
+
+    append = fn ts ->
+      Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: ts}]) end)
+    end
+
+    arrived = fn ts ->
+      assert_receive {:trace, ^buffer, :receive, {:"$gen_call", _, {:append, [%Log{timestamp_ns: ^ts}], _, _, _}}},
+                     30_000
+    end
+
+    # A first publication that takes 400 ms teaches the owner its commit time.
+    hold.()
+    first = append.(1)
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
+    Process.sleep(400)
+    release.(writer)
+    assert Task.await(first, 10_000) == :ok
+
+    hold.()
+    second = append.(2)
+    assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
+
+    # Requests 60 ms apart, three windows, would each flush alone; behind the
+    # in-flight write they keep collecting for the next one instead.
+    third = append.(3)
+    arrived.(3)
+    Process.sleep(60)
+    fourth = append.(4)
+    arrived.(4)
+    assert length(:sys.get_state(buffer).pending) == 2
+
+    release.(writer)
+    assert Enum.map([second, third, fourth], &Task.await(&1, 10_000)) == [:ok, :ok, :ok]
+    assert segment_puts(ctx.agent) == 3
+    assert {:ok, records} = S3.query(:logs, ctx.tenant, [])
+    assert records |> Enum.map(& &1.timestamp_ns) |> Enum.sort() == [1, 2, 3, 4]
+  end
+
   test "flushes pipeline: a later batch uploads while an earlier one waits on its manifest CAS", ctx do
     start_supervised!(Pulso.IngestAdmission)
     first = %Log{timestamp_ns: 1, service: "first"}
@@ -540,7 +589,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
 
     [late] = enqueue_with(ctx, [admitted.([second])])
     buffer = ctx.buffer
-    refute_received {:trace, ^buffer, :receive, :flushed}
+    refute_received {:trace, ^buffer, :receive, {:flushed, _}}
     # The second segment is uploaded before the first publication finishes.
     wait_for_segment_puts(ctx.agent, 2)
     assert Task.yield(early, 0) == nil
@@ -602,7 +651,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     send(writer, {:release_storage, key})
     # Flushes publish in their own process and report back when done.
     buffer = ctx.buffer
-    assert_receive {:trace, ^buffer, :receive, :flushed}, 30_000
+    assert_receive {:trace, ^buffer, :receive, {:flushed, _}}, 30_000
     assert :ets.lookup(ctx.admission, :pending) == [{:pending, 0, 0, 0}]
     assert %{etag: etag} = ManifestCache.get(ctx.tenant, "logs")
     assert is_binary(etag)

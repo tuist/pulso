@@ -72,7 +72,7 @@ defmodule PulsoWeb.RemoteWriteController do
          :ok <- validate_version_header(conn) do
       case read_full_body(conn) do
         {:ok, body, conn} ->
-          finish(conn, tenant, opts, version, Push.decode_with_metadata(body, @max_decompressed_bytes, version))
+          finish(conn, tenant, opts, version, decode(body, version))
 
         {:error, reason, conn} ->
           finish(conn, tenant, opts, version, {:error, reason})
@@ -85,6 +85,12 @@ defmodule PulsoWeb.RemoteWriteController do
     end
   end
 
+  defp decode(body, version),
+    do:
+      Pulso.Metrics.time_stage(:metrics, :decode, fn ->
+        Push.decode_with_metadata(body, @max_decompressed_bytes, version)
+      end)
+
   defp finish(conn, tenant, opts, version, decoded) do
     # Metadata publishes first: if it fails, nothing is stored and the
     # sender's retry of the whole request cannot duplicate samples.
@@ -92,7 +98,7 @@ defmodule PulsoWeb.RemoteWriteController do
     # publication no longer retains its decoded samples (see IngestAdmission).
     with {:ok, samples, rejected, metadata} <- decoded,
          written = written_counts(version, samples),
-         :ok <- Pulso.MetricMetadata.record(tenant, metadata),
+         :ok <- Pulso.Metrics.time_stage(:metrics, :prepare, fn -> Pulso.MetricMetadata.record(tenant, metadata) end),
          :ok <- append_samples(tenant, samples, rejected, opts) do
       conn
       |> put_rejected_header(rejected)

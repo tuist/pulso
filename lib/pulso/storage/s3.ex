@@ -145,7 +145,9 @@ defmodule Pulso.Storage.S3 do
 
     with :ok <- validate_tenant(tenant),
          {:ok, payload, min_ts, max_ts, pruning_safe?} <-
-           encode_for_append(signal, records, idempotency_key not in [nil, ""]) do
+           Pulso.Metrics.time_stage(signal, :encode, fn ->
+             encode_for_append(signal, records, idempotency_key not in [nil, ""])
+           end) do
       config = config || config!()
 
       key =
@@ -168,14 +170,23 @@ defmodule Pulso.Storage.S3 do
   # The PUT is provider I/O and the payload a shared binary: upload in a task
   # while this process builds the manifest summary, so summary CPU hides under
   # upload latency instead of adding to every acknowledgment. Registration
-  # still waits for the upload, so durability is unchanged.
+  # still waits for the upload, so durability is unchanged. `:on_uploaded`
+  # lets a coalescing buffer learn how long its flushes take to reach the owner.
   defp publish_segment(signal, tenant, segment, records, payload, pruning_safe?, opts, config) do
     keyed? = opts[:idempotency_key] not in [nil, ""]
-    upload = Pulso.Runtime.Task.async(fn -> put_segment(config, segment.key, payload, keyed?, opts) end)
-    segment = summarize_segment(signal, segment, records, pruning_safe?)
 
-    with :ok <- Pulso.Runtime.Task.await(upload, :infinity),
-         do: ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
+    upload =
+      Pulso.Runtime.Task.async(fn ->
+        Pulso.Metrics.time_stage(signal, :segment_put, fn -> put_segment(config, segment.key, payload, keyed?, opts) end)
+      end)
+
+    segment =
+      Pulso.Metrics.time_stage(signal, :summarize, fn -> summarize_segment(signal, segment, records, pruning_safe?) end)
+
+    with :ok <- Pulso.Runtime.Task.await(upload, :infinity) do
+      if on_uploaded = opts[:on_uploaded], do: on_uploaded.()
+      ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
+    end
   end
 
   defp put_segment(config, key, payload, true, opts), do: KeyedPublication.put(config, key, payload, opts)

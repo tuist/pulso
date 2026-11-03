@@ -240,7 +240,9 @@ retention:
 ingestBatching:
   # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
   # 0 disables it; 1..1000 adds up to that many ms before durable publication
-  # (20 is a good value). Flushes are pipelined; buffers hold at most 512
+  # (20 is a good value). While a manifest write for the same tenant and signal
+  # is in flight, the window stretches (up to 2 s) to meet the next one, which
+  # the batch would wait for anyway. Flushes are pipelined; buffers hold at most 512
   # callers, 400000 rows and 32 MiB of estimated terms. Overflow uses the
   # original direct path. Keyed requests always remain direct.
   flushIntervalMs: 0

@@ -362,6 +362,39 @@ defmodule Pulso.MetricsTest do
              ~s(pulso_detailed_operation_duration_seconds_bucket{kind="compaction",operation="compact",purpose="none",outcome="ok",le="0.005"})
   end
 
+  test "ingest stages are timed by signal, with ordered buckets and a fixed vocabulary" do
+    decode = [{"signal", "logs"}, {"stage", "decode"}]
+    before = value("pulso_ingest_stage_duration_seconds_count", decode)
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> post("/loki/api/v1/push", %{
+        "streams" => [%{"stream" => %{"service_name" => "api"}, "values" => [["1700000000000000000", "line"]]}]
+      })
+
+    assert conn.status == 204
+    assert value("pulso_ingest_stage_duration_seconds_count", decode) == before + 1
+
+    size = :ets.info(Pulso.Runtime.table(Metrics), :size)
+    started = System.monotonic_time()
+    Metrics.stage(:logs, :user_stage, started)
+    Metrics.stage(:profiles, :decode, started)
+    assert :ets.info(Pulso.Runtime.table(Metrics), :size) == size
+
+    rendered = Metrics.render()
+
+    bounds =
+      ~r/^pulso_ingest_stage_duration_seconds_bucket\{signal="logs",stage="decode",le="([^"]+)"\}/m
+      |> Regex.scan(rendered, capture: :all_but_first)
+      |> List.flatten()
+
+    assert bounds == ~w(0.001 0.005 0.01 0.025 0.05 0.1 0.25 0.5 1.0 2.5 5.0 +Inf)
+    assert rendered =~ ~r/^pulso_ingest_stage_duration_seconds_sum\{signal="logs",stage="decode"\} \d/m
+    assert rendered =~ ~r/^pulso_manifest_bytes\{signal="logs"\} \d+$/m
+    assert rendered =~ ~r/^pulso_manifest_segments\{signal="traces"\} \d+$/m
+  end
+
   test "measurement preserves successes, errors, throws and exceptions" do
     assert {:ok, :body} = Metrics.measure(:object, "get", fn -> {:ok, :body} end)
     assert {:error, :not_found} = Metrics.measure(:object, "get", fn -> {:error, :not_found} end)

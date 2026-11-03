@@ -11,7 +11,8 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   its own linked process, so up to 16 segment uploads per tenant and signal
   overlap while the manifest owner folds their registrations into shared CAS
   commits. A batch flushes when its window expires or once it reaches a quarter
-  of the reservation bounds, whichever comes first.
+  of the reservation bounds, whichever comes first. While the owner is
+  publishing, the window stretches to meet its next CAS (see `flush_delay/1`).
 
   A reserved caller hands its admission slot to the node's pending budget
   (`Pulso.IngestAdmission.handoff/1`) while it waits; see that module.
@@ -23,6 +24,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.AppendRegistry
   alias Pulso.Storage.S3.AppendSupervisor
+  alias Pulso.Storage.S3.ManifestOwner
 
   @max_callers 512
   @max_rows 400_000
@@ -32,6 +34,8 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   @flush_rows div(@max_rows, 4)
   @flush_bytes div(@max_bytes, 4)
   @max_flushes 16
+  # Upper bound on a window stretched to meet the manifest owner's next CAS.
+  @max_adaptive_ms 2_000
   @idle_ms 30_000
 
   @doc "Read node-local buffer reservations without messaging owners or doing storage I/O."
@@ -181,6 +185,12 @@ defmodule Pulso.Storage.S3.AppendBuffer do
       pending_bytes: 0,
       pending_rows: 0,
       flushing: 0,
+      # Flushes still encoding or uploading, the moving average of how long a
+      # flush takes to reach the manifest owner (ms), and when one last did.
+      uploading: 0,
+      upload_ms: nil,
+      upload_deviation_ms: 0,
+      registered_at: nil,
       timer: nil
     }
 
@@ -191,7 +201,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   def handle_call({:append, records, bytes, rows, opts}, from, state) do
     state = %{
       state
-      | pending: [{from, records, bytes, rows, opts} | state.pending],
+      | pending: [{from, records, bytes, rows, opts, System.monotonic_time()} | state.pending],
         pending_bytes: state.pending_bytes + bytes,
         pending_rows: state.pending_rows + rows
     }
@@ -208,9 +218,49 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   defp schedule(state) do
     token = make_ref()
-    ref = Process.send_after(self(), {:flush, token}, Map.fetch!(state.config, :ingest_flush_interval_ms))
+    ref = Process.send_after(self(), {:flush, token}, flush_delay(state))
     %{state | timer: {ref, token}}
   end
+
+  # The manifest owner publishes one CAS at a time, and every flush must wait
+  # for the publication in flight before its own. A segment that reaches the
+  # owner before that publication ends joins the next one, and one that
+  # arrives later waits a whole publication more. So while the owner is
+  # publishing, keep collecting until just early enough to make the next CAS:
+  # the window adapts to the owner's commit time, more requests share one
+  # segment, and acknowledgments come about as early as with a short window. An
+  # idle owner, or no estimate yet, keeps the configured window.
+  defp flush_delay(state) do
+    base = Map.fetch!(state.config, :ingest_flush_interval_ms)
+
+    with upload when is_integer(upload) <- state.upload_ms,
+         %{} = commit <- ManifestOwner.commit_eta(state.tenant, Atom.to_string(state.signal)) do
+      now = System.monotonic_time(:millisecond)
+      # Encode and PUT must finish before the owner's next flush. Requests
+      # arriving within the lead wait a whole publication more, so keep it
+      # tight: two mean deviations cover upload jitter, as in TCP RTO.
+      lead = upload + 2 * state.upload_deviation_ms + commit.flush_interval_ms
+      deadline = commit.eta + commit.flush_interval_ms - lead
+
+      # Too late for the next publication? If something else will start it
+      # anyway, aim for the one after; otherwise this flush starts it.
+      deadline =
+        if deadline - now < base and next_commit_follows?(state, commit),
+          do: deadline + commit.estimate + commit.flush_interval_ms,
+          else: deadline
+
+      deadline |> Kernel.-(now) |> max(base) |> min(max(base, @max_adaptive_ms))
+    else
+      _ -> base
+    end
+  end
+
+  # Segments queued at the owner, still uploading, or registered after the
+  # publication in flight began all start another one when it ends.
+  defp next_commit_follows?(state, commit),
+    do:
+      commit.queued > 0 or state.uploading > 0 or
+        (is_integer(state.registered_at) and state.registered_at >= commit.since)
 
   @impl true
   def handle_info({:flush, token}, %{timer: {_ref, token}} = state),
@@ -218,8 +268,23 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   def handle_info({:flush, _obsolete}, state), do: {:noreply, state, @idle_ms}
 
-  def handle_info(:flushed, state) do
-    state = %{state | flushing: state.flushing - 1}
+  def handle_info({:uploaded, started}, state) do
+    now = System.monotonic_time(:millisecond)
+    elapsed = now - started
+
+    {average, deviation} =
+      case state.upload_ms do
+        nil -> {elapsed, div(elapsed, 2)}
+        average -> {div(average * 7 + elapsed, 8), div(state.upload_deviation_ms * 3 + abs(elapsed - average), 4)}
+      end
+
+    state = %{state | uploading: state.uploading - 1, registered_at: now}
+    {:noreply, %{state | upload_ms: average, upload_deviation_ms: deviation}, @idle_ms}
+  end
+
+  def handle_info({:flushed, uploaded?}, state) do
+    # A flush that failed before its upload finished is no longer uploading.
+    state = %{state | flushing: state.flushing - 1, uploading: state.uploading - if(uploaded?, do: 0, else: 1)}
     # A batch that became due while every upload slot was busy goes now.
     state = if state.pending != [] and state.timer == nil, do: flush(state), else: state
     {:noreply, state, @idle_ms}
@@ -242,16 +307,37 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     # as an inline flush would, instead of leaving callers without a reply.
     {:ok, _pid} =
       Pulso.Runtime.Task.start_link(fn ->
-        publish(pending, state)
-        send(buffer, :flushed)
+        publish(pending, state, buffer)
+        send(buffer, {:flushed, Process.get(:uploaded, false)})
       end)
 
-    %{state | pending: [], pending_bytes: 0, pending_rows: 0, flushing: state.flushing + 1, timer: nil}
+    %{
+      state
+      | pending: [],
+        pending_bytes: 0,
+        pending_rows: 0,
+        flushing: state.flushing + 1,
+        uploading: state.uploading + 1,
+        timer: nil
+    }
   end
 
-  defp publish(pending, state) do
-    records = Enum.flat_map(pending, fn {_from, records, _bytes, _rows, _opts} -> records end)
-    result = S3.append_unbuffered(state.signal, state.tenant, records, [split_admission_errors: true], state.config)
+  defp publish(pending, state, buffer) do
+    started = System.monotonic_time(:millisecond)
+
+    records =
+      Enum.flat_map(pending, fn {_from, records, _bytes, _rows, _opts, enqueued} ->
+        Pulso.Metrics.stage(state.signal, :buffer_wait, enqueued)
+        records
+      end)
+
+    uploaded = fn ->
+      Process.put(:uploaded, true)
+      send(buffer, {:uploaded, started})
+    end
+
+    opts = [split_admission_errors: true, on_uploaded: uploaded]
+    result = S3.append_unbuffered(state.signal, state.tenant, records, opts, state.config)
 
     # An invalid input must not poison other valid requests sharing a flush.
     # Encoding errors occur before any upload. Never fall back after a storage
@@ -278,7 +364,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     end
   end
 
-  defp split_reply({_from, records, _bytes, _rows, opts} = pending, state) do
+  defp split_reply({_from, records, _bytes, _rows, opts, _enqueued} = pending, state) do
     result =
       try do
         S3.append_unbuffered(state.signal, state.tenant, records, opts, state.config)
@@ -291,7 +377,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     reply_pending(pending, result, state)
   end
 
-  defp reply_pending({from, _records, bytes, rows, _opts}, result, state) do
+  defp reply_pending({from, _records, bytes, rows, _opts, _enqueued}, result, state) do
     # Native work keeps its reservation until it finishes, even if its caller
     # timed out. Replies are sent from the bounded tasks as each write completes.
     release(state.admission, bytes, rows)

@@ -17,9 +17,11 @@ defmodule Pulso.Metrics do
   @table __MODULE__
   @handler {__MODULE__, :metrics}
   @event [:pulso, :operation, :stop]
+  @stage_event [:pulso, :ingest, :stage]
   @timeout_event [:pulso, :compaction, :timeout]
   @events [
     @event,
+    @stage_event,
     @timeout_event,
     [:phoenix, :endpoint, :start],
     [:phoenix, :endpoint, :stop],
@@ -28,6 +30,13 @@ defmodule Pulso.Metrics do
   @request_start {__MODULE__, :request_start}
   @buckets [5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000]
   @bucket_labels Enum.map(@buckets, &{&1, Float.to_string(&1 / 1_000_000)})
+  # Stages are sub-second pieces of one request, so they need finer buckets.
+  @stage_buckets [1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000]
+  @stage_bucket_labels Enum.map(@stage_buckets, &{&1, Float.to_string(&1 / 1_000_000)})
+  @signals ["logs", "metrics", "traces"]
+  # Request stages (decode, prepare, buffer_wait) are per request; the others
+  # are per published segment, which a coalesced flush shares among requests.
+  @stages ~w(decode prepare buffer_wait encode summarize segment_put manifest_wait manifest_commit)
   @operations %{
     ingest: ["otlp", "otlp_traces", "otlp_metrics", "loki", "remote_write", "sentry"],
     query: [
@@ -75,6 +84,9 @@ defmodule Pulso.Metrics do
   @families [
     {"pulso_operations_total", "counter", "Completed node-local operations by bounded operation and outcome."},
     {"pulso_operation_duration_seconds", "histogram", "Duration of completed node-local operations in seconds."},
+    {"pulso_ingest_stage_duration_seconds", "histogram",
+     "Ingest time by signal and stage: decode, prepare and buffer_wait per request; encode, summarize, " <>
+       "segment_put, manifest_wait and manifest_commit per published segment."},
     {"pulso_ingest_records_total", "counter",
      "Known receiver record deliveries accepted or rejected, not unique stored rows."},
     {"pulso_object_bytes_total", "counter",
@@ -182,6 +194,25 @@ defmodule Pulso.Metrics do
     })
   end
 
+  @doc """
+  Report one ingest stage of `signal` that began at `started` (native monotonic
+  time). Signals and stages outside the fixed vocabulary are ignored.
+  """
+  def stage(signal, stage, started),
+    do:
+      :telemetry.execute(@stage_event, %{duration: System.monotonic_time() - started}, %{signal: signal, stage: stage})
+
+  @doc "Run `fun` as one ingest stage of `signal`, returning its result."
+  def time_stage(signal, stage, fun) do
+    started = System.monotonic_time()
+
+    try do
+      fun.()
+    after
+      stage(signal, stage, started)
+    end
+  end
+
   defp outcome({:error, reason}) when reason in [:already_exists, :precondition_failed], do: "conflict"
   defp outcome({:error, :not_found}), do: "not_found"
   defp outcome({:error, _}), do: "error"
@@ -202,6 +233,22 @@ defmodule Pulso.Metrics do
       record_work(kind, operation, purpose, measurements)
     end
   end
+
+  def handle_event(@stage_event, %{duration: duration}, %{signal: signal, stage: stage}, _config)
+      when is_integer(duration) and duration >= 0 do
+    {signal, stage} = {to_string(signal), to_string(stage)}
+
+    if signal in @signals and stage in @stages do
+      record_histogram(
+        "pulso_ingest_stage_duration_seconds",
+        [{"signal", signal}, {"stage", stage}],
+        System.convert_time_unit(duration, :native, :microsecond),
+        @stage_bucket_labels
+      )
+    end
+  end
+
+  def handle_event(@stage_event, _measurements, _metadata, _config), do: :ok
 
   def handle_event(@timeout_event, _measurements, metadata, _config) do
     operation = metadata[:operation]
@@ -241,18 +288,18 @@ defmodule Pulso.Metrics do
       is_integer(measurements[:duration]) and measurements.duration >= 0
   end
 
-  defp record_duration(labels, duration) do
-    increment({"pulso_operation_duration_seconds_count", labels}, 1)
-    increment({"pulso_operation_duration_seconds_sum", labels}, duration)
+  defp record_duration(labels, duration),
+    do: record_histogram("pulso_operation_duration_seconds", labels, duration, @bucket_labels)
 
-    for {bound, label} <- @bucket_labels do
-      increment(
-        {"pulso_operation_duration_seconds_bucket", labels ++ [{"le", label}]},
-        if(duration <= bound, do: 1, else: 0)
-      )
+  defp record_histogram(family, labels, duration, bucket_labels) do
+    increment({family <> "_count", labels}, 1)
+    increment({family <> "_sum", labels}, duration)
+
+    for {bound, label} <- bucket_labels do
+      increment({family <> "_bucket", labels ++ [{"le", label}]}, if(duration <= bound, do: 1, else: 0))
     end
 
-    increment({"pulso_operation_duration_seconds_bucket", labels ++ [{"le", "+Inf"}]}, 1)
+    increment({family <> "_bucket", labels ++ [{"le", "+Inf"}]}, 1)
   end
 
   defp record_work(:object, operation, purpose, measurements) do
@@ -329,24 +376,33 @@ defmodule Pulso.Metrics do
   defp counter_family({{name, _labels}, _value}) do
     case name do
       "pulso_operation_duration_seconds_" <> _ -> "pulso_operation_duration_seconds"
+      "pulso_ingest_stage_duration_seconds_" <> _ -> "pulso_ingest_stage_duration_seconds"
       _ -> name
     end
   end
 
   # Prometheus requires histogram buckets in numerical order, with +Inf last.
-  defp counter_order({{"pulso_operation_duration_seconds_bucket", labels}, _}) do
-    {"le", bound} = List.last(labels)
-    rank = if bound == "+Inf", do: 11, else: Enum.find_index(@bucket_labels, fn {_, label} -> label == bound end)
-    {"pulso_operation_duration_seconds", Enum.drop(labels, -1), rank}
-  end
+  defp counter_order({{"pulso_operation_duration_seconds_" <> suffix, labels}, _}),
+    do: histogram_order("pulso_operation_duration_seconds", suffix, labels, @bucket_labels)
 
-  defp counter_order({{"pulso_operation_duration_seconds_count", labels}, _}),
-    do: {"pulso_operation_duration_seconds", labels, 12}
-
-  defp counter_order({{"pulso_operation_duration_seconds_sum", labels}, _}),
-    do: {"pulso_operation_duration_seconds", labels, 13}
+  defp counter_order({{"pulso_ingest_stage_duration_seconds_" <> suffix, labels}, _}),
+    do: histogram_order("pulso_ingest_stage_duration_seconds", suffix, labels, @stage_bucket_labels)
 
   defp counter_order({{name, labels}, _}), do: {name, labels, 0}
+
+  defp histogram_order(family, "bucket", labels, bucket_labels) do
+    {"le", bound} = List.last(labels)
+
+    rank =
+      if bound == "+Inf",
+        do: length(bucket_labels),
+        else: Enum.find_index(bucket_labels, fn {_, label} -> label == bound end)
+
+    {family, Enum.drop(labels, -1), rank}
+  end
+
+  defp histogram_order(family, "count", labels, bucket_labels), do: {family, labels, length(bucket_labels) + 1}
+  defp histogram_order(family, "sum", labels, bucket_labels), do: {family, labels, length(bucket_labels) + 2}
 
   defp exported_name("pulso_operations_total"), do: "pulso_detailed_operations_total"
 
@@ -358,7 +414,10 @@ defmodule Pulso.Metrics do
   defp exported_name(name), do: name
 
   defp render_counter({{name, labels}, value}) do
-    value = if name == "pulso_operation_duration_seconds_sum", do: seconds(value), else: Integer.to_string(value)
+    value =
+      if name in ["pulso_operation_duration_seconds_sum", "pulso_ingest_stage_duration_seconds_sum"],
+        do: seconds(value),
+        else: Integer.to_string(value)
 
     [
       exported_name(name),
@@ -396,8 +455,28 @@ defmodule Pulso.Metrics do
       gauge("pulso_query_inflight", Pulso.QueryRunner.interactive_in_flight()),
       gauge("pulso_query_max_concurrent", Pulso.QueryRunner.max_interactive()),
       gauge("pulso_memory_budget_bytes", memory_budget_bytes()),
-      gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue))
+      gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue)),
+      manifest_size_gauges()
     ]
+  end
+
+  # Flat roots are rewritten whole on every publication, so their size is the
+  # main driver of manifest commit time.
+  defp manifest_size_gauges do
+    sizes = ManifestCache.sizes()
+
+    for {name, index, help} <- [
+          {"pulso_manifest_segments", 0, "Segments listed in cached manifest roots, summed over tenants."},
+          {"pulso_manifest_bytes", 1, "Encoded bytes of cached manifest roots, summed over tenants."}
+        ] do
+      [
+        metric_header(name, "gauge", help),
+        for signal <- @signals do
+          value = sizes |> Map.get(signal, {0, 0}) |> elem(index)
+          [name, "{signal=\"", signal, "\"} ", Integer.to_string(value), "\n"]
+        end
+      ]
+    end
   end
 
   defp memory_budget_bytes do

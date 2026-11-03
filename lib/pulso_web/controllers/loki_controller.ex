@@ -166,7 +166,7 @@ defmodule PulsoWeb.LokiController do
       :json ->
         case Pulso.IngestLimits.validate(:loki, params) do
           :ok ->
-            {records, rejected} = Push.decode(params)
+            {records, rejected} = decode_json(params)
             {:ok, records, rejected, conn}
 
           {:error, reason} ->
@@ -184,10 +184,15 @@ defmodule PulsoWeb.LokiController do
     end
   end
 
+  defp decode_json(params), do: Pulso.Metrics.time_stage(:logs, :decode, fn -> Push.decode(params) end)
+
   defp decode_protobuf(conn) do
     case read_full_body(conn) do
       {:ok, body, conn} ->
-        case Push.decode_protobuf(body, @max_decompressed_bytes) do
+        decoded =
+          Pulso.Metrics.time_stage(:logs, :decode, fn -> Push.decode_protobuf(body, @max_decompressed_bytes) end)
+
+        case decoded do
           {:ok, records, rejected} -> {:ok, records, rejected, conn}
           {:error, reason} -> {:error, reason, conn}
         end

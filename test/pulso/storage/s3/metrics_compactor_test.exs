@@ -411,7 +411,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:ok, samples} = S3.query(:metrics, ctx.tenant, [])
     assert length(samples) == 2
     [{_pid, info}] = Registry.lookup(ManifestRegistry, {ctx.tenant, "metrics"})
-    assert info == %{pending: 0, waiters: 0}
+    assert %{pending: 0, waiters: 0, queued: 0, committing_since: nil} = info
   end
 
   test "compacted name summaries preserve selective query budgets and retirement metadata", ctx do

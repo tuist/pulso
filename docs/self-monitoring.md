@@ -115,6 +115,9 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | --- | --- | --- | --- |
 | `pulso_detailed_operations_total` | Counter | `kind`, `operation`, `purpose`, `outcome` | Completed ingest requests, public queries, logical object calls, and maintenance attempts |
 | `pulso_detailed_operation_duration_seconds` | Histogram | Same as above, plus bucket `le` | Operation duration; buckets at 5 ms, 10 ms, 50 ms, 100 ms, 500 ms, 1 s, 5 s, 10 s, and +Inf |
+| `pulso_ingest_stage_duration_seconds` | Histogram | `signal`, `stage`, plus bucket `le` | Where ingest time goes. Per request: `decode` (receiver decoding after the body is read), `prepare` (OTLP log timestamp fill, trace retention filter, remote-write metadata publication) and `buffer_wait` (time in the coalescing window). Per published segment, which a coalesced flush shares: `encode` (Parquet), `summarize` (manifest summary), `segment_put`, `manifest_wait` (from handing the segment to the manifest owner until its publication starts, including queueing behind the publication in flight) and `manifest_commit` (merge, encode and conditional write of the manifest, including retries). Buckets at 1, 5, 10, 25, 50, 100, 250, 500 ms, 1, 2.5, 5 s and +Inf |
+| `pulso_manifest_segments` | Gauge | `signal` | Segments listed in manifest roots cached on this node, summed over tenants; for retention-managed roots, only the inline recent tail |
+| `pulso_manifest_bytes` | Gauge | `signal` | Encoded bytes of those cached manifest roots. A flat root is rewritten whole on every publication, so `manifest_commit` grows with it |
 | `pulso_ingest_delivery_records_total` | Counter | `signal`, `outcome` | Known receiver deliveries: `accepted` after append success; `rejected` combines decoder drops and decoded records whose append failed |
 | `pulso_object_bytes_total` | Counter | `operation`, `purpose`, `direction` | Successful logical GET body bytes and PUT payload bytes, partitioned by purpose |
 | `pulso_detailed_compaction_segments_total` | Counter | `operation` | Source segments merged by `compact`, or confirmed retirement deletions by `cleanup` |
@@ -246,6 +249,14 @@ pulso_manifest_queue_depth
 histogram_quantile(0.95, sum by (instance, le, operation) (
   rate(pulso_detailed_operation_duration_seconds_bucket{kind="ingest"}[5m])
 ))
+
+# Where ingest time goes: mean seconds per stage and signal. Request stages and
+# segment stages have different counts when coalescing shares a segment.
+sum by (signal, stage) (rate(pulso_ingest_stage_duration_seconds_sum[5m]))
+  / sum by (signal, stage) (rate(pulso_ingest_stage_duration_seconds_count[5m]))
+
+# Flat manifest size per signal, the main driver of manifest_commit.
+pulso_manifest_bytes
 
 # Detailed public query failures.
 sum by (instance, operation, outcome) (

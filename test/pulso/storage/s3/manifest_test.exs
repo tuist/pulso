@@ -151,6 +151,14 @@ defmodule Pulso.Storage.S3.ManifestTest do
   end
 
   test "cached encoding matches a fresh encoding across appends, edits, removals and dictionary changes" do
+    log = fn key, ts, services, project ->
+      %{
+        seg(key, ts, ts + 1)
+        | log_services: services,
+          log_labels: %{"error_project" => [project], "error_source" => [""]}
+      }
+    end
+
     metric = fn key, ts, names, job ->
       %{seg(key, ts, ts + 1) | metric_names: names, metric_labels: %{"job" => [job]}}
     end
@@ -165,26 +173,68 @@ defmodule Pulso.Storage.S3.ManifestTest do
       Manifest.merge(Manifest.new(), [
         metric.("a", 1, ["up"], "x"),
         metric.("b", 3, ["up"], "x"),
-        trace.("t", 5, id.(1))
+        trace.("t", 5, id.(1)),
+        log.("l1", 2, ["api", "web"], ""),
+        log.("l2", 4, ["web"], "")
       ])
 
     # "a" is listed last, so its dictionary IDs shift once "c" introduces a new set ahead of it.
-    m2 = Manifest.merge(m1, [metric.("c", 7, ["down"], "y")])
-    m3 = Manifest.merge(m2, [%{metric.("b", 3, ["other"], "z") | row_count: 9}])
+    m2 = Manifest.merge(m1, [metric.("c", 7, ["down"], "y"), log.("l3", 8, ["api", "worker"], "p")])
+    m3 = Manifest.merge(m2, [%{metric.("b", 3, ["other"], "z") | row_count: 9}, log.("l1", 2, ["db"], "")])
     {:ok, m4} = Manifest.replace(m3, ["a", "c"], metric.("ac", 1, ["up"], "x"), 99)
+    {:ok, m5} = Manifest.replace(m4, ["l1", "l3"], log.("l13", 2, ["api", "db", "worker"], "p"), 99)
 
-    Enum.reduce([m1, m2, m3, m4], %{}, fn manifest, cache ->
+    Enum.reduce([m1, m2, m3, m4, m5], %{}, fn manifest, cache ->
       {iodata, cache} = Manifest.encode(manifest, cache)
       cached = IO.iodata_to_binary(iodata)
       fresh = manifest |> Manifest.encode() |> IO.iodata_to_binary()
 
-      assert byte_size(cached) == byte_size(fresh)
+      # Cached log dictionary IDs persist across calls, so the bytes may
+      # differ from a fresh encoding; the decoded manifest may not.
       assert Manifest.decode(cached) == Manifest.decode(fresh)
       assert {:ok, %{segments: segments}} = Manifest.decode(cached)
       assert segments == Enum.map(manifest.segments, &thin/1)
-      assert cache |> Map.keys() |> Enum.sort() == manifest.segments |> Enum.map(& &1.key) |> Enum.sort()
+
+      assert cache |> Map.keys() |> Enum.filter(&is_binary/1) |> Enum.sort() ==
+               manifest.segments |> Enum.map(& &1.key) |> Enum.sort()
+
       cache
     end)
+  end
+
+  test "log summaries survive a cached service dictionary that overflows and restarts" do
+    # About 40 KiB of distinct names per generation; two generations exceed
+    # the 64 KiB dictionary that the cache would otherwise keep extending.
+    names = fn generation -> for i <- 1..200, do: "#{generation}-" <> String.duplicate("s", 190) <> "-#{i}" end
+
+    manifest = fn generation ->
+      segments =
+        generation
+        |> names.()
+        |> Enum.chunk_every(4)
+        |> Enum.with_index(fn services, i ->
+          %{seg("#{generation}-#{i}", i, i + 1) | log_services: Enum.sort(services)}
+        end)
+
+      Manifest.merge(Manifest.new(), segments)
+    end
+
+    Enum.reduce([manifest.("a"), manifest.("b"), manifest.("a")], %{}, fn manifest, cache ->
+      {iodata, cache} = Manifest.encode(manifest, cache)
+      assert {:ok, decoded} = iodata |> IO.iodata_to_binary() |> Manifest.decode()
+      assert decoded.segments == manifest.segments
+      cache
+    end)
+  end
+
+  test "dictionary-encoded log summaries with unknown IDs decode as unknown" do
+    body =
+      ~s({"v":1,"s":[{"k":"a","mn":1,"mx":3,"si":[0,5],"ei":3},{"k":"b","mn":1,"mx":2,"si":[1],"ei":0}],) <>
+        ~s("services":["api","web"],"log_labels":[{"error_source":[""]}]})
+
+    assert {:ok, %{segments: [a, b]}} = Manifest.decode(body)
+    assert {a.log_services, a.log_labels} == {nil, nil}
+    assert {b.log_services, b.log_labels} == {["web"], %{"error_source" => [""]}}
   end
 
   defp thin(%{trace_summary: nil} = segment), do: segment

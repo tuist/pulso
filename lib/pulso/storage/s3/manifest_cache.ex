@@ -194,6 +194,8 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
     entry = %{
       payload: payload,
+      # Root size for node-local gauges; a managed root counts only its tail.
+      segments: length(manifest.segments),
       version: manifest.version,
       etag: etag,
       token: make_ref(),
@@ -222,6 +224,18 @@ defmodule Pulso.Storage.S3.ManifestCache do
   # a validated fetched body) pass `{manifest, payload}` to avoid re-encoding.
   defp wire({%Manifest{} = manifest, payload}) when is_binary(payload), do: {manifest, payload}
   defp wire(%Manifest{} = manifest), do: {manifest, IO.iodata_to_binary(Manifest.encode(manifest))}
+
+  @doc "Cached root segment counts and encoded bytes per signal, summed over tenants, without copying payloads."
+  def sizes do
+    :ets.select(table(), [
+      {{{:_, :"$1"}, %{payload: :"$2", segments: :"$3"}}, [], [{{:"$1", :"$3", {:byte_size, :"$2"}}}]}
+    ])
+    |> Enum.reduce(%{}, fn {signal, segments, bytes}, acc ->
+      Map.update(acc, signal, {segments, bytes}, fn {s, b} -> {s + segments, b + bytes} end)
+    end)
+  rescue
+    ArgumentError -> %{}
+  end
 
   @doc "Small node-local summaries for fixed-cardinality retention gauges, without storage I/O."
   def retention_statistics do

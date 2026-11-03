@@ -39,6 +39,10 @@ defmodule Pulso.Storage.S3.Manifest do
 
   @schema_version 1
   @name_dictionary_bytes 65_536
+  # Encode-cache entry holding the log service-name and error-label-set
+  # dictionaries, each {entry => id string, entries in reverse ID order, bytes}.
+  @log_dictionaries :log_dictionaries
+  @empty_logs {{%{}, [], 2}, {%{}, [], 2}}
 
   # `tenant` and `signal` are not serialized — they are derivable from
   # the manifest object's own key. Keeping them off the wire keeps the
@@ -91,7 +95,7 @@ defmodule Pulso.Storage.S3.Manifest do
          %__MODULE__{version: version, segments: segments, retired: retired, cleanup_cursor: cursor} = manifest,
          cache
        ) do
-    {wire_segments, names, labels, cache} = encode_segments(segments, cache)
+    {wire_segments, names, labels, services, log_labels, cache} = encode_segments(segments, cache)
 
     wire = %{
       "v" => version,
@@ -102,6 +106,8 @@ defmodule Pulso.Storage.S3.Manifest do
     wire = if version == 3, do: Map.put(wire, "p", manifest.paging), else: wire
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
     wire = if labels == [], do: wire, else: Map.put(wire, "labels", labels)
+    wire = if services == [], do: wire, else: Map.put(wire, "services", services)
+    wire = if log_labels == [], do: wire, else: Map.put(wire, "log_labels", log_labels)
     # `wire` always holds "v", so its object has at least one member to follow.
     rest = wire |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_to_binary()
     json = ["{\"s\":[", Enum.intersperse(wire_segments, ?,), "],", binary_part(rest, 1, byte_size(rest) - 1)]
@@ -129,7 +135,13 @@ defmodule Pulso.Storage.S3.Manifest do
          {:ok, %{"v" => version, "s" => segments} = wire} <- safe_decode(payload),
          :ok <- validate_version(version),
          :ok <- validate_fields(version, wire),
-         {:ok, parsed} <- decode_segments(segments, name_dictionary(wire["names"]), name_dictionary(wire["labels"])),
+         {:ok, parsed} <-
+           decode_segments(
+             segments,
+             name_dictionary(wire["names"]),
+             name_dictionary(wire["labels"]),
+             {name_dictionary(wire["services"]), name_dictionary(wire["log_labels"])}
+           ),
          {:ok, retired} <- decode_retired(Map.get(wire, "retired", %{})),
          {:ok, cursor} <- decode_cursor(Map.get(wire, "cleanup_cursor")),
          :ok <- validate_paging(version, wire["p"]),
@@ -240,9 +252,9 @@ defmodule Pulso.Storage.S3.Manifest do
     e -> {:error, {:decode_failed, e}}
   end
 
-  defp decode_segments(list, dictionary, labels) when is_list(list) do
+  defp decode_segments(list, dictionary, labels, logs) when is_list(list) do
     Enum.reduce_while(list, {:ok, []}, fn wire, {:ok, acc} ->
-      wire = wire |> expand_names(dictionary) |> expand_labels(labels)
+      wire = wire |> expand_names(dictionary) |> expand_labels(labels) |> expand_log_summaries(logs)
 
       case Segment.from_wire(wire) do
         {:ok, segment} -> {:cont, {:ok, [segment | acc]}}
@@ -251,39 +263,137 @@ defmodule Pulso.Storage.S3.Manifest do
     end)
   end
 
-  defp decode_segments(_, _, _), do: {:error, :invalid_manifest}
+  defp decode_segments(_, _, _, _), do: {:error, :invalid_manifest}
 
   # Exact name sets repeat across ingest batches. One dictionary entry per set
   # keeps that repetition off the hot manifest, with a hard byte budget for
   # distinct sets. Omitted sets remain unknown, so budget exhaustion is safe.
+  #
+  # Log segments reference each promoted service name ("si") and their error
+  # label set ("ei") through two more dictionaries, which cuts a staging-shaped
+  # log entry by about 30%. Older readers ignore these fields and treat the
+  # summaries as unknown, which only disables pruning. These dictionaries live
+  # in the encode cache, so their IDs stay stable across flushes and a cached
+  # fragment keeps its own. They restart, re-encoding every fragment, only when
+  # a new entry exceeds an inherited dictionary's budget.
   defp encode_segments(segments, cache) do
-    state = %{ids: %{}, names: [], bytes: 2, segments: [], label_ids: %{}, labels: [], label_bytes: 2, cache: cache}
-    state = Enum.reduce(segments, state, &encode_segment/2)
-    cache = prune_cache(state.cache, segments)
-    {Enum.reverse(state.segments), Enum.reverse(state.names), Enum.reverse(state.labels), cache}
+    {logs, cache} = if cache, do: Map.pop(cache, @log_dictionaries, @empty_logs), else: {@empty_logs, nil}
+
+    state = %{
+      ids: %{},
+      names: [],
+      bytes: 2,
+      segments: [],
+      label_ids: %{},
+      labels: [],
+      label_bytes: 2,
+      logs: logs,
+      inherited?: logs != @empty_logs,
+      cache: cache
+    }
+
+    case Enum.reduce_while(segments, state, &encode_segment/2) do
+      :restart ->
+        encode_segments(segments, %{})
+
+      state ->
+        cache = if state.cache, do: state.cache |> prune_cache(segments) |> Map.put(@log_dictionaries, state.logs)
+        {services, error_labels} = state.logs
+
+        {Enum.reverse(state.segments), Enum.reverse(state.names), Enum.reverse(state.labels),
+         dictionary_entries(services), dictionary_entries(error_labels), cache}
+    end
   end
+
+  defp dictionary_entries({ids, _entries, _bytes}) when map_size(ids) == 0, do: []
+  defp dictionary_entries({_ids, entries, _bytes}), do: Enum.reverse(entries)
 
   defp encode_segment(segment, state) do
-    {fragment, state} = segment_fragment(segment, state)
-    {name_id, state} = dictionary_id(segment.metric_names, state)
-    {label_id, state} = label_dictionary_id(segment.metric_labels, state)
-    %{state | segments: [with_dictionary_ids(fragment, name_id, label_id) | state.segments]}
+    case segment_fragment(segment, state) do
+      :restart ->
+        {:halt, :restart}
+
+      {fragment, state} ->
+        {name_id, state} = dictionary_id(segment.metric_names, state)
+        {label_id, state} = label_dictionary_id(segment.metric_labels, state)
+        {:cont, %{state | segments: [with_dictionary_ids(fragment, name_id, label_id) | state.segments]}}
+    end
   end
 
-  # The fragment is the segment's JSON object without its name/label sets,
-  # which the per-call dictionaries replace with "ni"/"li" IDs.
-  defp segment_fragment(segment, %{cache: nil} = state), do: {encode_fragment(segment), state}
+  # The fragment is the segment's JSON object with its log summary IDs but
+  # without its metric name/label sets, which per-call dictionaries replace.
+  defp segment_fragment(segment, %{cache: nil} = state), do: encode_fragment(segment, state)
 
   defp segment_fragment(%{key: key} = segment, %{cache: cache} = state) do
     case cache do
-      %{^key => {^segment, fragment}} -> {fragment, state}
-      _ -> encode_fragment(segment) |> then(&{&1, %{state | cache: Map.put(cache, key, {segment, &1})}})
+      %{^key => {^segment, fragment}} ->
+        {fragment, state}
+
+      _ ->
+        with {fragment, state} <- encode_fragment(segment, state),
+             do: {fragment, %{state | cache: Map.put(state.cache, key, {segment, fragment})}}
     end
   end
 
   # A fresh binary, so a cached fragment never pins a larger payload.
-  defp encode_fragment(segment),
-    do: segment |> Segment.to_wire() |> Map.drop(["n", "l"]) |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_to_binary()
+  defp encode_fragment(segment, state) do
+    {services, error_labels} = state.logs
+
+    with {services_member, services} <- log_member(segment.log_services, services, "si", "ls", state.inherited?),
+         {labels_member, error_labels} <- log_member(segment.log_labels, error_labels, "ei", "el", state.inherited?) do
+      wire = segment |> Segment.to_wire() |> Map.drop(["n", "l", "ls", "el"]) |> Pulso.JSON.encode_to_iodata!()
+      wire = IO.iodata_to_binary(wire)
+
+      fragment =
+        if services_member == [] and labels_member == [],
+          do: wire,
+          else: IO.iodata_to_binary([binary_part(wire, 0, byte_size(wire) - 1), services_member, labels_member, ?}])
+
+      {fragment, %{state | logs: {services, error_labels}}}
+    end
+  end
+
+  # Services are listed by name ID, error label sets by set ID. An entry
+  # beyond the budget of a fresh dictionary keeps the summary inline; an
+  # inherited one may be full of entries no longer listed, so start over.
+  defp log_member(nil, dictionary, _field, _inline, _inherited?), do: {[], dictionary}
+
+  defp log_member(names, dictionary, "si", inline, inherited?) do
+    {ids, dictionary} = Enum.map_reduce(names, dictionary, &persistent_id/2)
+
+    if Enum.all?(ids, &is_binary/1),
+      do: {[",\"si\":[", Enum.intersperse(ids, ?,), ?]], dictionary},
+      else: overflow(names, dictionary, inline, inherited?)
+  end
+
+  defp log_member(labels, dictionary, field, inline, inherited?) do
+    case persistent_id(labels, dictionary) do
+      {nil, dictionary} -> overflow(labels, dictionary, inline, inherited?)
+      {id, dictionary} -> {[",\"", field, "\":", id], dictionary}
+    end
+  end
+
+  defp overflow(_value, _dictionary, _inline, true), do: :restart
+
+  defp overflow(value, dictionary, inline, false),
+    do: {[",\"", inline, "\":", Pulso.JSON.encode_to_iodata!(value)], dictionary}
+
+  defp persistent_id(value, {ids, entries, bytes} = dictionary) do
+    case ids do
+      %{^value => id} ->
+        {id, dictionary}
+
+      _ ->
+        size = value |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_length()
+
+        if bytes + size + 1 <= @name_dictionary_bytes do
+          id = Integer.to_string(map_size(ids))
+          {id, {Map.put(ids, value, id), [value | entries], bytes + size + 1}}
+        else
+          {nil, dictionary}
+        end
+    end
+  end
 
   defp with_dictionary_ids(fragment, nil, nil), do: fragment
 
@@ -300,8 +410,6 @@ defmodule Pulso.Storage.S3.Manifest do
   defp dictionary_member(field, id), do: [",\"", field, "\":", Integer.to_string(id)]
 
   # Appends only add keys; drop entries for removed segments when there are any.
-  defp prune_cache(nil, _segments), do: nil
-
   defp prune_cache(cache, segments) do
     if map_size(cache) > length(segments), do: Map.take(cache, Enum.map(segments, & &1.key)), else: cache
   end
@@ -357,6 +465,31 @@ defmodule Pulso.Storage.S3.Manifest do
 
   defp expand_labels(%{"li" => _} = wire, _), do: Map.put(wire, "l", nil)
   defp expand_labels(wire, _), do: wire
+
+  # Unknown or out-of-range IDs leave a summary unknown, never wrong.
+  defp expand_log_summaries(wire, {services, labels}),
+    do: wire |> expand_services(services) |> expand_error_labels(labels)
+
+  defp expand_services(%{"si" => ids} = wire, services) when is_list(ids) do
+    names =
+      Enum.map(ids, fn
+        id when is_integer(id) and id >= 0 and id < tuple_size(services) -> elem(services, id)
+        _ -> nil
+      end)
+
+    Map.put(wire, "ls", if(Enum.all?(names, &is_binary/1), do: names))
+  end
+
+  defp expand_services(%{"si" => _} = wire, _services), do: Map.put(wire, "ls", nil)
+  defp expand_services(wire, _services), do: wire
+
+  defp expand_error_labels(wire, labels) do
+    case wire do
+      %{"ei" => id} when is_integer(id) and id >= 0 and id < tuple_size(labels) -> Map.put(wire, "el", elem(labels, id))
+      %{"ei" => _} -> Map.put(wire, "el", nil)
+      _ -> wire
+    end
+  end
 
   defp name_dictionary(names) when is_list(names), do: List.to_tuple(names)
   defp name_dictionary(_), do: {}

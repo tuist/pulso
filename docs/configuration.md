@@ -468,9 +468,24 @@ reaches a quarter of the buffer bounds, whichever comes first. Up to 16 flushes
 per tenant and signal upload their segments at the same time, and the manifest
 owner folds every segment that finished uploading into the next conditional
 manifest write. A node therefore never waits for one flush's manifest write
-before it starts the next upload. Short windows work best: from 10 to 50 ms,
-throughput changes little, and each millisecond of window adds latency. Use
-20 ms unless provider request counts matter more than latency.
+before it starts the next upload.
+
+Manifest writes for one tenant and signal happen one at a time, so a segment
+that is ready while a write is in flight waits for it. The window therefore
+adapts: while a manifest write is in flight, the buffer keeps collecting until
+its encode and PUT would finish just before that write ends (at most 2 s), then
+flushes in time for the next one. Requests that would have waited anyway now
+share a segment, so fewer segments and manifest entries are written without
+later acknowledgments. The configured window applies when no manifest write is
+in flight. Use 20 ms: a longer fixed window only adds latency when the manifest
+owner is idle, and at a few requests per second per signal it rarely catches a
+second request. In a staging-shaped load test (4 Loki pushes/s from 8 senders,
+1.5 remote writes/s, 0.5 trace exports/s, flat manifests of 44,000 log and
+25,000 metric segments, S3 at 50–90 ms plus 45 MB/s), a 20 ms adaptive window
+wrote about a third fewer log segments than a fixed 20 ms window (18% fewer
+segments overall) at the same latency. Fixed windows of 100 and 250 ms merged
+less or similar and added 80 to 230 ms to remote-write and trace
+acknowledgments.
 
 Each node-local buffer reserves at most 512 callers, 400,000 rows, and 32 MiB of
 estimated input term bytes, including work already executing. Oversized requests

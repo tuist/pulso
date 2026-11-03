@@ -18,9 +18,14 @@ defmodule PulsoWeb.IngestLoadTest do
 
   import Bitwise
 
+  alias Pulso.Loki.PushProto.Entry
+  alias Pulso.Loki.PushProto.LabelPair
+  alias Pulso.Loki.PushProto.PushRequest
+  alias Pulso.Loki.PushProto.Timestamp
   alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.OTLPTraceFixture
   alias Pulso.Test.RuntimePlug
@@ -74,10 +79,15 @@ defmodule PulsoWeb.IngestLoadTest do
       end)
     end
 
+    # Optional upload bandwidth: large flat manifests then take longer to PUT,
+    # as they do on a real provider.
+    bytes_per_ms = env_int("PULSO_LOAD_S3_MB_PER_S", 0) * 1000
+
     delay = fn method, key, body ->
       kind = if String.ends_with?(key, "manifest.json"), do: :manifest, else: :object
       :ets.insert(stats, {:s3, method, kind, byte_size(body)})
-      Process.sleep(low + :rand.uniform(high - low + 1) - 1)
+      transfer = if bytes_per_ms > 0, do: div(byte_size(body), bytes_per_ms), else: 0
+      Process.sleep(low + :rand.uniform(high - low + 1) - 1 + transfer)
     end
 
     s3 =
@@ -121,7 +131,201 @@ defmodule PulsoWeb.IngestLoadTest do
     {:ok, {_, api_port}} = ThousandIsland.listener_info(api)
     start_supervised!({Finch, name: LoadFinch, pools: %{default: [size: 512, count: 1]}})
 
-    {:ok, api: "http://127.0.0.1:#{api_port}", stats: stats, trim: trim, latency: {low, high}}
+    {:ok, api: "http://127.0.0.1:#{api_port}", stats: stats, trim: trim, latency: {low, high}, store: store}
+  end
+
+  # Steady Alloy-shaped traffic against flat manifests already holding tens of
+  # thousands of segments, as a single node without retention accumulates:
+  #
+  #     PULSO_LOAD_S3_LATENCY_MS=40..90 PULSO_LOAD_S3_MB_PER_S=45 PULSO_LOAD_FLUSH_INTERVAL_MS=20 \\
+  #       mix test test/pulso_web/ingest_load_test.exs --only staging_load
+  @tag :staging_load
+  test "steady Alloy traffic over large flat manifests", ctx do
+    seconds = env_int("PULSO_LOAD_SECONDS", 60)
+    seed_manifests(ctx.store)
+    stats = ctx.stats
+
+    :telemetry.attach_many(
+      {__MODULE__, self()},
+      [[:pulso, :operation, :stop], [:pulso, :ingest, :stage]],
+      fn
+        [:pulso, :ingest, :stage], measurements, metadata, _ ->
+          :ets.insert(stats, {:stage, metadata.signal, metadata.stage, measurements.duration})
+
+        _event, measurements, metadata, _ ->
+          :ets.insert(stats, {:op, metadata.operation, metadata.purpose, measurements.duration})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, self()}) end)
+    results = :ets.new(:load_results, [:public, :duplicate_bag, write_concurrency: true])
+
+    # Warm up: the first request per signal loads its large manifest.
+    for signal <- [:loki_pb, :rw_steady, :traces] do
+      deliver(ctx, :ets.new(:warmup, [:public, :duplicate_bag]), signal, staging_body(signal, 0), 500, 4)
+    end
+
+    :ets.delete_all_objects(stats)
+    deadline = System.monotonic_time(:millisecond) + seconds * 1000
+    started = System.monotonic_time(:millisecond)
+
+    # Eight alloy-logs pods at 0.5 push/s each, one remote-write shard and one trace exporter.
+    pods = for pod <- 1..8, do: Task.async(fn -> pod_loop(ctx, results, deadline, pod) end)
+    rw = Task.async(fn -> paced(ctx, results, deadline, :rw_steady, 667) end)
+    traces = Task.async(fn -> paced(ctx, results, deadline, :traces, 2000) end)
+    Task.await_many([rw, traces | pods], :infinity)
+    elapsed = (System.monotonic_time(:millisecond) - started) / 1000
+
+    IO.puts(staging_report(results, ctx, elapsed))
+    assert :ets.select_count(results, [{{:loki_pb, :attempt, 204, :_}, [], [true]}]) > 0
+  end
+
+  defp pod_loop(ctx, results, deadline, pod) do
+    # Each pod starts at its own phase and keeps a jittered two-second interval.
+    Process.sleep(:rand.uniform(2000))
+    paced(ctx, results, deadline, :loki_pb, 2000, pod)
+  end
+
+  defp paced(ctx, results, deadline, signal, interval, variant \\ 0) do
+    if System.monotonic_time(:millisecond) < deadline do
+      started = System.monotonic_time(:millisecond)
+      task = Task.async(fn -> deliver(ctx, results, signal, staging_body(signal, variant), 500, 4) end)
+      wait = interval - 200 + :rand.uniform(400) - (System.monotonic_time(:millisecond) - started)
+      if wait > 0, do: Process.sleep(wait)
+      paced(ctx, results, deadline, signal, interval, variant)
+      Task.await(task, :infinity)
+    else
+      :ok
+    end
+  end
+
+  @staging_services ~w(alloy-logs cilium-agent containerd.service ingress-nginx kubelet.service kura pomerium
+    postgresql pulso tailscale tuist tuist-runner omada-controller metrics-server docker external-dns)
+
+  defp staging_body(:loki_pb, pod) do
+    now = System.system_time(:nanosecond)
+    services = @staging_services |> Enum.shuffle() |> Enum.take(2 + rem(pod, 4))
+
+    streams =
+      for {service, s} <- Enum.with_index(services) do
+        labels =
+          ~s({cluster="tuist-staging", container="#{service}", job="ns/#{service}", namespace="ns", ) <>
+            ~s(pod="#{service}-#{pod}", service_name="#{service}", stream="stdout"})
+
+        entries =
+          for i <- 1..5 do
+            ts = now - (5 - i) * 1_000_000 + s
+
+            %Entry{
+              timestamp: %Timestamp{seconds: div(ts, 1_000_000_000), nanos: rem(ts, 1_000_000_000)},
+              line: "#{service} level=info msg=\"handled request #{i}\" path=/api/projects duration=#{i}ms",
+              structured_metadata: [%LabelPair{name: "detected_level", value: "info"}]
+            }
+          end
+
+        %Pulso.Loki.PushProto.Stream{labels: labels, entries: entries}
+      end
+
+    {iodata, _} = PushRequest.encode!(%PushRequest{streams: streams})
+    {:ok, compressed} = :snappyer.compress(IO.iodata_to_binary(iodata))
+    compressed
+  end
+
+  defp staging_body(:rw_steady, _), do: remote_write_body(:rand.uniform(1000), 500)
+  defp staging_body(:traces, _), do: trace_body(20)
+
+  # Flat manifests shaped like staging's after a day without retention.
+  defp seed_manifests(store) do
+    now = System.os_time(:nanosecond)
+
+    for {signal, count} <- [
+          {"logs", env_int("PULSO_LOAD_LOG_SEGMENTS", 44_000)},
+          {"metrics", env_int("PULSO_LOAD_METRIC_SEGMENTS", 25_000)},
+          {"traces", env_int("PULSO_LOAD_TRACE_SEGMENTS", 8_000)}
+        ] do
+      segments =
+        for i <- count..1//-1 do
+          max_ts = now - i * 1_000_000_000
+          seed_segment(signal, i, max_ts - 2_000_000_000, max_ts)
+        end
+
+      body = %S3.Manifest{version: 1, segments: segments} |> S3.Manifest.encode() |> IO.iodata_to_binary()
+      key = S3.Manifest.manifest_key("default", signal)
+      Agent.update(store, &put_in(&1.objects[key], {"\"seed-#{signal}\"", body}))
+    end
+  end
+
+  defp seed_segment(signal, i, min_ts, max_ts) do
+    key = S3.object_key("default", signal, min_ts, max_ts, Integer.to_string(i, 16), nil)
+    segment = Segment.build(key, min_ts, max_ts, 15 + rem(i, 40), 9000 + rem(i, 9000))
+
+    case signal do
+      "logs" ->
+        services = @staging_services |> Enum.take_random(2 + rem(i, 4)) |> Enum.sort()
+        %{segment | log_services: services, log_labels: %{"error_project" => [""], "error_source" => [""]}}
+
+      "metrics" ->
+        names = for n <- Enum.take_random(1..300, 1 + rem(i, 40)), do: "metric_#{n}"
+        %{segment | metric_names: Enum.sort(names), metric_labels: %{"job" => ["load"], "variant" => ["#{rem(i, 7)}"]}}
+
+      "traces" ->
+        segment
+    end
+  end
+
+  defp staging_report(results, ctx, elapsed) do
+    rows = :ets.tab2list(results)
+    s3 = :ets.tab2list(ctx.stats)
+
+    lines =
+      for signal <- [:loki_pb, :rw_steady, :traces] do
+        ok = for {^signal, :attempt, status, ms} <- rows, is_integer(status) and status < 300, do: ms
+        failed = Enum.count(rows, &match?({^signal, :attempt, status, _} when status not in 200..299, &1))
+        mean = if ok != [], do: round(Enum.sum(ok) / length(ok))
+
+        "  #{signal}: #{length(ok)} ok (#{Float.round(length(ok) / elapsed, 2)}/s) mean #{mean} ms " <>
+          "p50 #{pct(ok, 0.5)} ms p90 #{pct(ok, 0.9)} ms p99 #{pct(ok, 0.99)} ms failed #{failed}"
+      end
+
+    puts = for {:s3, "PUT", kind, bytes} <- s3, do: {kind, bytes}
+    manifest = for {:manifest, bytes} <- puts, do: bytes
+    segments = Enum.count(puts, &(elem(&1, 0) == :object))
+
+    stages =
+      for({:stage, signal, stage, duration} <- s3, do: {{signal, stage}, duration})
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Enum.sort()
+      |> Enum.map(fn {{signal, stage}, durations} ->
+        mean = System.convert_time_unit(div(Enum.sum(durations), length(durations)), :native, :microsecond)
+        "    #{signal}/#{stage}: n=#{length(durations)} mean #{Float.round(mean / 1000, 1)} ms"
+      end)
+
+    operations =
+      for({:op, operation, purpose, duration} <- s3, do: {{operation, purpose}, duration})
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Enum.sort()
+      |> Enum.map(fn {{operation, purpose}, durations} ->
+        mean = durations |> Enum.sum() |> div(length(durations)) |> System.convert_time_unit(:native, :millisecond)
+        "    #{operation}/#{purpose}: #{length(durations)} calls, mean #{mean} ms"
+      end)
+
+    {low, high} = ctx.latency
+
+    [
+      "",
+      "staging-shaped load: #{Float.round(elapsed, 1)} s, S3 #{low}..#{high} ms + " <>
+        "#{env_int("PULSO_LOAD_S3_MB_PER_S", 0)} MB/s, flush #{env_int("PULSO_LOAD_FLUSH_INTERVAL_MS", 50)} ms",
+      lines,
+      "  S3: #{segments} segment PUTs, #{length(manifest)} manifest PUTs " <>
+        "(mean #{div(Enum.sum(manifest), max(length(manifest), 1))} B, max #{Enum.max(manifest, fn -> 0 end)} B)",
+      "  object store operations:",
+      operations,
+      "  ingest stages:",
+      stages
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
   end
 
   test "a remote-write flood does not starve steady Loki and OTLP trace ingest", ctx do
@@ -228,6 +432,8 @@ defmodule PulsoWeb.IngestLoadTest do
     end
   end
 
+  defp target(:loki_pb), do: {"/loki/api/v1/push", [{"content-type", "application/x-protobuf"}]}
+  defp target(:rw_steady), do: {"/api/v1/write", remote_write_headers()}
   defp target(:loki), do: {"/loki/api/v1/push", [{"content-type", "application/json"}]}
   defp target(:traces), do: {"/v1/traces", [{"content-type", "application/json"}]}
   defp target(:steady_metrics), do: {"/api/v1/write", [{"x-scope-orgid", "steady"} | remote_write_headers()]}

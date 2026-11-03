@@ -24,7 +24,7 @@ defmodule Pulso.OTLP.Ingest do
   def ingest(:logs, tenant, key, decoded) do
     with {:ok, records, rejected} <- decoded,
          :ok <- keyed_records(key, rejected, :invalid_otlp),
-         {:ok, records} <- Logs.prepare(records, key),
+         {:ok, records} <- Pulso.Metrics.time_stage(:logs, :prepare, fn -> Logs.prepare(records, key) end),
          :ok <- append(:logs, tenant, records, rejected, key_opts(key)),
          do: {:ok, rejected, Rejections.message(%{})}
   end
@@ -45,16 +45,22 @@ defmodule Pulso.OTLP.Ingest do
     with {:ok, spans, rejected, rejections} <- decoded,
          :ok <- Rejections.record(:traces, tenant, rejections),
          :ok <- keyed_records(key, rejected, :invalid_keyed_batch),
-         {:ok, spans, rejected, rejections} <- retained_spans(opts, tenant, spans, rejected, rejections),
+         {:ok, spans, rejected, rejections} <-
+           Pulso.Metrics.time_stage(:traces, :prepare, fn ->
+             retained_spans(opts, tenant, spans, rejected, rejections)
+           end),
          :ok <- append(:traces, tenant, spans, rejected, opts),
          do: {:ok, rejected, Rejections.message(rejections)}
   end
 
   @doc "Decode one export for `signal`, keeping per-record rejection reasons where the decoder has them."
-  def decode(:traces, :json, input), do: Traces.decode_detailed(input)
-  def decode(:traces, :protobuf, input), do: Traces.decode_protobuf_detailed(input)
-  def decode(signal, :json, input), do: decoder(signal).decode(input)
-  def decode(signal, :protobuf, input), do: decoder(signal).decode_protobuf(input)
+  def decode(signal, format, input),
+    do: Pulso.Metrics.time_stage(signal, :decode, fn -> do_decode(signal, format, input) end)
+
+  defp do_decode(:traces, :json, input), do: Traces.decode_detailed(input)
+  defp do_decode(:traces, :protobuf, input), do: Traces.decode_protobuf_detailed(input)
+  defp do_decode(signal, :json, input), do: decoder(signal).decode(input)
+  defp do_decode(signal, :protobuf, input), do: decoder(signal).decode_protobuf(input)
 
   defp decoder(:logs), do: Logs
   defp decoder(:metrics), do: Metrics

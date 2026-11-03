@@ -227,7 +227,13 @@ Ownership is an *optimization*, not a correctness property. It determines which 
 Implemented ownership currently covers background metrics merge and cleanup.
 Optional unkeyed append buffers are node-local, not rendezvous-owned. They can
 coalesce concurrent requests within a configured 1–1000 ms window before encoding
-one segment. Keyed requests stay on the original direct path. Admission counters
+one segment. While the node's manifest coalescer is publishing for that tenant
+and signal, the window stretches (up to 2 s) so the batch's encode and PUT finish
+just before that publication ends: requests arriving during a publication would
+wait for it anyway, so they share one segment without a later acknowledgment.
+The coalescer's commit start and moving-average duration are a scheduling hint
+read from its registry value, never a correctness input. Keyed requests stay on
+the original direct path. Admission counters
 reserve at most 128 callers, 100,000 rows and 10 MiB of estimated input terms per
 buffer, including queued and executing work; overflow is processed unbuffered.
 Reservations are released by the buffer only after publication finishes, never by
@@ -1311,6 +1317,17 @@ false negatives. Legacy, malformed, and over-budget summaries always scan.
 The additive field needs no segment migration; older writers may erase it,
 which only loses the optimization. Other labels and regular expressions remain
 native decoder filters.
+
+Root manifests write log summaries through dictionaries: `si` lists IDs into a
+manifest `services` name dictionary and `ei` references a `log_labels` set
+dictionary, each with a 64 KiB budget; entries beyond it stay inline as `ls`/`el`,
+which remain readable. This cuts a staging-shaped flat log entry from about 300
+to 216 bytes. Readers before 1.26 ignore `si`/`ei`, so their view of these
+summaries is unknown: they scan instead of pruning, and an older writer that
+rewrites the root drops them. The owner keeps both dictionaries in its encode
+cache so IDs, and therefore cached entry encodings, stay stable across flushes;
+an inherited dictionary that overflows restarts and re-encodes every entry once.
+Paged leaves keep the inline `Segment.to_wire/1` form.
 
 - LogQL subset. Label filter + substring/regex match on message.
 - Sort row groups by `(service, ts)`.
