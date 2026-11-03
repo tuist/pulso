@@ -1,0 +1,302 @@
+{{/*
+One Pulso Deployment. Takes (dict "root" $ "pool" <name or ""> "values"
+<pool values>). The unnamed pool is the combined Deployment that runs every
+role and keeps the original name and selector; named pools add a component.
+*/}}
+{{- define "pulso.deployment" -}}
+{{- $root := .root }}
+{{- $pool := .pool }}
+{{- $values := .values }}
+{{- with $root }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pulso.poolName" (list $root $pool) }}
+  labels:
+    {{- include "pulso.labels" . | nindent 4 }}
+    {{- if $pool }}
+    app.kubernetes.io/component: {{ $pool }}
+    {{- end }}
+spec:
+  {{- if not $values.autoscaling.enabled }}
+  replicas: {{ include "pulso.boundedInteger" (list (printf "%s replicas" (default "combined" $pool)) $values.replicas 0 1000) }}
+  {{- end }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pulso.selectorLabels" . | nindent 6 }}
+      {{- if $pool }}
+      app.kubernetes.io/component: {{ $pool }}
+      {{- end }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.existingSecret }}
+        checksum/secret: {{ include "pulso.secretChecksum" . }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "pulso.labels" . | nindent 8 }}
+        {{- if $pool }}
+        app.kubernetes.io/component: {{ $pool }}
+        {{- end }}
+        {{- if include "pulso.clustered" (list $root $pool) }}
+        pulso.tuist.dev/cluster: "true"
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "pulso.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      terminationGracePeriodSeconds: {{ include "pulso.terminationGracePeriodSeconds" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pulso
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+            {{- if and .Values.otlpGrpc.enabled (ne $pool "query") (ne $pool "maintenance") }}
+            - name: otlp-grpc
+              containerPort: {{ .Values.otlpGrpc.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: PORT
+              value: "4000"
+            {{- with $pool }}
+            - name: PULSO_ROLES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if include "pulso.clustered" (list $root $pool) }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Erlang distribution for rendezvous ownership among these pods.
+            - name: RELEASE_DISTRIBUTION
+              value: name
+            - name: RELEASE_NODE
+              value: pulso@$(POD_IP)
+            - name: DNS_CLUSTER_QUERY
+              value: {{ printf "%s-cluster.%s.svc.cluster.local" (include "pulso.fullname" .) .Release.Namespace | quote }}
+            - name: RELEASE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulso.secretName" . }}
+                  key: RELEASE_COOKIE
+            {{- end }}
+            # The release writes temporary files under RELEASE_TMP; keep them
+            # on the writable scratch volume so the root filesystem can be
+            # read-only.
+            - name: RELEASE_TMP
+              value: /tmp
+            - name: ERL_CRASH_DUMP
+              value: /tmp/erl_crash.dump
+            - name: PULSO_S3_BUCKET
+              value: {{ .Values.storage.bucket | quote }}
+            - name: PULSO_S3_REGION
+              value: {{ .Values.storage.region | quote }}
+            {{- with .Values.storage.endpoint }}
+            - name: PULSO_S3_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: PULSO_S3_ALLOW_HTTP
+              value: {{ .Values.storage.allowHttp | quote }}
+            - name: PULSO_METRICS_COMPACTION_ENABLED
+              value: {{ .Values.metricsCompaction.enabled | quote }}
+            {{- if and .Values.otlpGrpc.enabled (ne $pool "query") (ne $pool "maintenance") }}
+            - name: PULSO_OTLP_GRPC_PORT
+              value: {{ .Values.otlpGrpc.port | int64 | quote }}
+            - name: PULSO_OTLP_GRPC_MAX_MESSAGE_BYTES
+              value: {{ .Values.otlpGrpc.maxMessageBytes | int64 | quote }}
+            - name: PULSO_OTLP_GRPC_MAX_IN_FLIGHT
+              value: {{ .Values.otlpGrpc.maxInFlight | int64 | quote }}
+            {{- end }}
+            - name: PULSO_TEMPO_SEARCH_ENABLED
+              value: {{ .Values.tempoSearch.enabled | quote }}
+            - name: PULSO_METRICS_FOOTER_PRUNING_ENABLED
+              value: {{ .Values.metricsFooterPruning.enabled | quote }}
+            - name: PULSO_TRACE_COMPACTION_ENABLED
+              value: {{ .Values.traceCompaction.enabled | quote }}
+            - name: PULSO_LOG_COMPACTION_ENABLED
+              value: {{ .Values.logCompaction.enabled | quote }}
+            - name: PULSO_SENTRY_PROJECTS_JSON
+              value: {{ .Values.sentry.projects | toJson | quote }}
+            - name: PULSO_ERROR_PROJECTION_ENABLED
+              value: {{ .Values.sentry.projectionEnabled | quote }}
+            - name: PULSO_ERROR_HISTORY_DAYS
+              value: {{ include "pulso.boundedInteger" (list "sentry.historyDays" .Values.sentry.historyDays 1 365) | quote }}
+            - name: PULSO_ERROR_PROJECTION_INTERVAL_MS
+              value: {{ include "pulso.boundedInteger" (list "sentry.projectionIntervalMs" .Values.sentry.projectionIntervalMs 1000 60000) | quote }}
+            - name: PULSO_RELIABILITY_ENABLED
+              value: {{ .Values.reliability.enabled | quote }}
+            - name: PULSO_RELIABILITY_TENANTS_JSON
+              value: {{ .Values.reliability.tenants | toJson | quote }}
+            - name: PULSO_RELIABILITY_PRICE_VALID_UNTIL
+              value: {{ .Values.reliability.priceValidUntil | quote }}
+            - name: PULSO_RELIABILITY_INPUT_NANO_USD_PER_TOKEN
+              value: {{ include "pulso.boundedInteger" (list "reliability.inputNanoUsdPerToken" .Values.reliability.inputNanoUsdPerToken 1 1000000) | quote }}
+            - name: PULSO_RELIABILITY_ASSESSMENT_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.assessmentBudgetUsd" .Values.reliability.assessmentBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_OBJECT_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.objectBudgetUsd" .Values.reliability.objectBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_INVESTIGATION_BUDGET_USD
+              value: {{ include "pulso.boundedInteger" (list "reliability.investigationBudgetUsd" .Values.reliability.investigationBudgetUsd 0 100000) | quote }}
+            - name: PULSO_RELIABILITY_INVESTIGATION_URL
+              value: {{ .Values.reliability.investigationUrl | quote }}
+            - name: PULSO_ALERTING_EVALUATION_ENABLED
+              value: {{ .Values.alerting.evaluationEnabled | quote }}
+            - name: PULSO_ALERTING_NOTIFICATIONS_ENABLED
+              value: {{ .Values.alerting.notificationsEnabled | quote }}
+            - name: PULSO_ALERTING_SOURCE_BINDINGS_JSON
+              value: {{ .Values.alerting.sourceBindings | toJson | quote }}
+            - name: PULSO_ALERTING_NOTIFICATION_TARGETS_JSON
+              value: {{ .Values.alerting.notificationTargets | toJson | quote }}
+            - name: PULSO_ALERTING_POLL_INTERVAL_MS
+              value: {{ .Values.alerting.pollIntervalMs | quote }}
+            - name: PULSO_ALERTING_PRINCIPALS_JSON
+              value: {{ .Values.alerting.principals | toJson | quote }}
+            - name: PULSO_WORKLOAD_IDENTITY_JSON
+              value: {{ .Values.workloadIdentity.trust | toJson | quote }}
+            {{- with .Values.tenantLimits }}
+            - name: PULSO_TENANT_LIMITS_JSON
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            - name: PULSO_INGEST_FLUSH_INTERVAL_MS
+              value: {{ .Values.ingestBatching.flushIntervalMs | quote }}
+            {{- if ne (toString .Values.ingestBatching.maxConcurrentRequests) "" }}
+            - name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS
+              value: {{ include "pulso.boundedInteger" (list "ingestBatching.maxConcurrentRequests" .Values.ingestBatching.maxConcurrentRequests 1 100000) | quote }}
+            {{- end }}
+            - name: PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL
+              value: {{ .Values.ingestBatching.reservedRequestsPerSignal | quote }}
+            - name: PULSO_INGEST_MAX_PENDING_BYTES
+              value: {{ .Values.ingestBatching.maxPendingBytes | int64 | quote }}
+            - name: PULSO_RETENTION_ENABLED
+              value: {{ .Values.retention.enabled | quote }}
+            - name: PULSO_LOGS_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.logsDays" .Values.retention.logsDays 0 3650) | quote }}
+            - name: PULSO_METRICS_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.metricsDays" .Values.retention.metricsDays 0 3650) | quote }}
+            - name: PULSO_TRACES_RETENTION_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.tracesDays" .Values.retention.tracesDays 0 3650) | quote }}
+            - name: PULSO_RETENTION_MODE
+              value: {{ .Values.retention.mode | quote }}
+            - name: PULSO_RETENTION_DELETE_GRACE_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.deleteGraceMs" .Values.retention.deleteGraceMs 60000 2592000000) | quote }}
+            - name: PULSO_RETENTION_INTERVAL_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.intervalMs" .Values.retention.intervalMs 1000 3600000) | quote }}
+            - name: PULSO_RETENTION_DELETE_LIMIT
+              value: {{ include "pulso.boundedInteger" (list "retention.deleteLimit" .Values.retention.deleteLimit 1 512) | quote }}
+            - name: PULSO_RETENTION_TIMEOUT_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.timeoutMs" .Values.retention.timeoutMs 1000 600000) | quote }}
+            - name: PULSO_RETENTION_MIGRATION_TIMEOUT_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.migrationTimeoutMs" .Values.retention.migrationTimeoutMs 30000 3600000) | quote }}
+            - name: PULSO_RETENTION_FUTURE_SKEW_MS
+              value: {{ include "pulso.boundedInteger" (list "retention.futureSkewMs" .Values.retention.futureSkewMs 0 86400000) | quote }}
+            {{- if ne (toString .Values.retention.sweepHorizonDays) "" }}
+            - name: PULSO_RETENTION_SWEEP_HORIZON_DAYS
+              value: {{ include "pulso.boundedInteger" (list "retention.sweepHorizonDays" .Values.retention.sweepHorizonDays 1 7302) | quote }}
+            {{- end }}
+            {{- with .Values.mcp.allowedOrigins }}
+            - name: PULSO_MCP_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- range $key, $value := .Values.ingestLimits }}
+            - name: {{ printf "PULSO_INGEST_%s" (upper $key) }}
+              value: {{ include "pulso.ingestLimitValue" (list $key $value) | quote }}
+            {{- end }}
+            {{- range $key := list "SECRET_KEY_BASE" "PULSO_TENANT_TOKENS" "PULSO_S3_ACCESS_KEY_ID" "PULSO_S3_SECRET_ACCESS_KEY" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulso.secretName" $root }}
+                  key: {{ $key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.preStopSleepSeconds }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.preStopSleepSeconds }}"]
+          {{- end }}
+          {{- with (default .Values.resources $values.resources) }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
+            - name: kubernetes-api
+              mountPath: /var/run/secrets/pulso/kubernetes-api
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
+        - name: kubernetes-api
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ include "pulso.boundedInteger" (list "workloadIdentity.kubernetesApiToken.expirationSeconds" .Values.workloadIdentity.kubernetesApiToken.expirationSeconds 600 86400) }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

@@ -14,7 +14,8 @@ defmodule Pulso.IngestAdmission do
 
   Slots are split by signal class (`:metrics`, `:logs`, `:traces`). Each class
   owns `:reserved_per_signal` slots (`PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL`,
-  default an eighth of the slots) that no other class can take; the rest form a
+  default an eighth of the slots, at least one with three or more slots) that
+  no other class can take; the rest form a
   shared pool any class may borrow from. A remote-write replay can therefore
   hold its reserve plus the whole shared pool, but never the reserves that keep
   logs and traces admitted. Every counter is updated atomically, so the global
@@ -72,9 +73,15 @@ defmodule Pulso.IngestAdmission do
   Take this process's slot for `signal` on behalf of `tenant`, or
   `{:error, :ingest_overloaded}` when neither the signal's reserve nor the
   shared pool has room, or when `tenant` is above its fair share of the signal.
+
+  `limited` names a tenant whose credentials have verified. When
+  `Pulso.TenantLimits` gives it an `ingest_max_concurrent` bound, the request
+  also takes one of that tenant's node-wide slots (across signals) or fails
+  with `:tenant_concurrency`; it is released with the slot, including at
+  `handoff/1`.
   """
-  @spec acquire(atom(), String.t()) :: :ok | {:error, :ingest_overloaded}
-  def acquire(signal \\ :metrics, tenant \\ "default") when signal in @signals and is_binary(tenant) do
+  @spec acquire(atom(), String.t(), String.t() | nil) :: :ok | {:error, :ingest_overloaded | :tenant_concurrency}
+  def acquire(signal \\ :metrics, tenant \\ "default", limited \\ nil) when signal in @signals and is_binary(tenant) do
     pid = self()
     table = table()
 
@@ -85,28 +92,22 @@ defmodule Pulso.IngestAdmission do
       held ->
         # A request that raised after handoff leaves its pending charge behind.
         if held != [], do: release(pid)
-        take(table, pid, signal, tenant)
+        take(table, pid, signal, tenant, limited)
     end
   rescue
     # Not started (some test runtimes and tools): never fail ingest.
     ArgumentError -> :ok
   end
 
-  defp take(table, pid, signal, tenant) do
+  defp take(table, pid, signal, tenant, limited) do
     limits = limits()
     now = System.monotonic_time(:millisecond)
     key = tenant_key(table, signal, tenant, now)
+    limit = tenant_limit(limited)
 
-    pool =
-      cond do
-        not within_share?(table, signal, key, limits, now) -> :tenant_limited
-        claim(table, {:reserved, signal}, limits.reserved) -> :reserved
-        claim(table, :shared, limits.shared) -> :shared
-        true -> nil
-      end
-
-    case pool do
+    case pool(table, signal, key, limits, limit, now) do
       pool when pool in [:reserved, :shared] ->
+        if limit, do: :ets.insert(table, {{:limited, pid}, limited})
         :ets.insert(table, {{:held, pid}, {:slot, signal, pool, key}})
         :ets.update_counter(table, {:in_flight, signal}, {2, 1}, {{:in_flight, signal}, 0})
         :ets.update_counter(table, key, {2, 1}, {key, 0, now})
@@ -114,12 +115,59 @@ defmodule Pulso.IngestAdmission do
         GenServer.cast(__MODULE__, {:monitor, pid})
         :ok
 
+      :tenant_concurrency ->
+        Pulso.SelfMetrics.admission_rejection(:ingest, :tenant_concurrency)
+        {:error, :tenant_concurrency}
+
       reason ->
         if reason == :tenant_limited, do: count(table, signal, :tenant_limited)
         count(table, signal, :rejected)
         {:error, :ingest_overloaded}
     end
   end
+
+  # The fair share comes first, then the configured tenant bound, then the
+  # signal's reserve and the shared pool; a refused pool undoes the tenant claim.
+  defp pool(table, signal, key, limits, limit, now) do
+    cond do
+      not within_share?(table, signal, key, limits, now) -> :tenant_limited
+      not claim_tenant(table, limit) -> :tenant_concurrency
+      claim(table, {:reserved, signal}, limits.reserved) -> :reserved
+      claim(table, :shared, limits.shared) -> :shared
+      true -> unclaim_tenant(table, limit)
+    end
+  end
+
+  # Configured bounds (`Pulso.TenantLimits`) count `{{:limit, tenant}, held}`
+  # across signals; rows of tenants holding nothing are deleted on release.
+  defp tenant_limit(nil), do: nil
+
+  defp tenant_limit(tenant) do
+    case Pulso.TenantLimits.get(tenant, :ingest_max_concurrent) do
+      nil -> nil
+      max -> {{:limit, tenant}, max}
+    end
+  end
+
+  defp claim_tenant(_table, nil), do: true
+
+  defp claim_tenant(table, {key, max}) do
+    # A refused claim leaves the counter as it was; a zero bound leaves a 0 row.
+    claim(table, key, max) || (drop_idle_limit(table, key) && false)
+  end
+
+  defp unclaim_tenant(_table, nil), do: nil
+
+  defp unclaim_tenant(table, {key, _max}) do
+    release_limit(table, key)
+    nil
+  end
+
+  defp release_limit(table, key) do
+    if :ets.update_counter(table, key, {2, -1}, {key, 1}) <= 0, do: drop_idle_limit(table, key)
+  end
+
+  defp drop_idle_limit(table, key), do: :ets.select_delete(table, [{{key, 0}, [], [true]}])
 
   # Rows are `{{:tenant, signal, tenant}, held_slots, last_demand_ms}`. A new
   # tenant takes a tracking credit; beyond the cap tenants share one bucket.
@@ -234,7 +282,7 @@ defmodule Pulso.IngestAdmission do
 
     case :ets.take(table, {:held, pid}) do
       [{_, {:slot, signal, pool, tenant}}] ->
-        release_slot(table, signal, pool, tenant)
+        release_slot(table, pid, signal, pool, tenant)
 
       [{_, {:pending, _signal, bytes}}] ->
         :ets.update_counter(table, :pending_bytes, {2, -bytes})
@@ -250,10 +298,15 @@ defmodule Pulso.IngestAdmission do
 
   defp free_slot(table, pid) do
     [{_, {:slot, signal, pool, tenant}}] = :ets.lookup(table, {:held, pid})
-    release_slot(table, signal, pool, tenant)
+    release_slot(table, pid, signal, pool, tenant)
   end
 
-  defp release_slot(table, signal, pool, tenant) do
+  defp release_slot(table, pid, signal, pool, tenant) do
+    case :ets.take(table, {:limited, pid}) do
+      [{_, limited}] -> release_limit(table, {:limit, limited})
+      [] -> :ok
+    end
+
     :ets.update_counter(table, pool_key(pool, signal), {2, -1})
     :ets.update_counter(table, {:in_flight, signal}, {2, -1})
     # Rows with held slots are never pruned; the default only guards races.
@@ -318,7 +371,7 @@ defmodule Pulso.IngestAdmission do
     config = Pulso.Runtime.get_env(:pulso, __MODULE__, [])
     max = Keyword.get(config, :max_concurrent, @default_max)
     # Reserves never exceed the bound: every class keeps at least its reserve.
-    reserved = config |> Keyword.get(:reserved_per_signal, div(max, 8)) |> min(div(max, length(@signals)))
+    reserved = config |> Keyword.get(:reserved_per_signal, max(1, div(max, 8))) |> min(div(max, length(@signals)))
     %{max: max, reserved: reserved, shared: max - reserved * length(@signals)}
   end
 
@@ -329,6 +382,8 @@ defmodule Pulso.IngestAdmission do
   @impl true
   def init(_opts) do
     :ets.new(table(), [:named_table, :public, :set, write_concurrency: true])
+    # Per-tenant ingest rate buckets (Pulso.TenantLimits), one row per tenant.
+    :ets.new(Pulso.Runtime.table(Pulso.TenantLimits.table()), [:named_table, :public, :set, write_concurrency: true])
     {:ok, MapSet.new()}
   end
 

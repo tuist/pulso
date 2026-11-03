@@ -40,7 +40,8 @@ defmodule Pulso.Application do
         Tail
       ] ++
         storage_children() ++
-        Pulso.Alerting.Supervisor.children() ++ JWKS.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
+        maintenance(Pulso.Alerting.Supervisor.children()) ++
+        JWKS.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
@@ -56,11 +57,14 @@ defmodule Pulso.Application do
     :ok
   end
 
+  # Background workers run only on instances with the maintenance role.
+  defp maintenance(children), do: if(Pulso.Roles.enabled?(:maintenance), do: children, else: [])
+
   # The OTLP/gRPC listener starts after the endpoint, only when configured.
   defp otlp_grpc_children do
     config = Application.get_env(:pulso, PulsoWeb.OTLPGRPC, [])
 
-    if Keyword.get(config, :enabled, false),
+    if Keyword.get(config, :enabled, false) and Pulso.Roles.enabled?(:ingest),
       do: [{PulsoWeb.OTLPGRPC, config |> Keyword.delete(:enabled) |> Keyword.put(:name, PulsoWeb.OTLPGRPC)}],
       else: []
   end
@@ -90,10 +94,12 @@ defmodule Pulso.Application do
         config = :pulso |> Application.fetch_env!(S3) |> Map.new()
 
         [ManifestSupervision, {StorageMonitor, config: config}] ++
-          CompactionWorker.children(config) ++
-          RetentionWorker.children(config) ++
-          Pulso.Errors.Supervisor.children() ++
-          Pulso.Reliability.Supervisor.children()
+          maintenance(
+            CompactionWorker.children(config) ++
+              RetentionWorker.children(config) ++
+              Pulso.Errors.Supervisor.children() ++
+              Pulso.Reliability.Supervisor.children()
+          )
 
       _ ->
         []

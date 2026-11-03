@@ -107,7 +107,7 @@ defmodule PulsoWeb.OTLPTracesControllerTest do
     assert conn.status == 429
     assert get_resp_header(conn, "retry-after") == ["1"]
     assert {:ok, []} = Storage.query(:traces, "default")
-    assert Pulso.SelfMetrics.render() =~ ~s(pulso_admission_rejections_total{layer="ingest",reason="node"} 1\n)
+    assert Pulso.SelfMetrics.render() =~ ~s(pulso_ingest_admission_total{signal="traces",outcome="rejected"} 1\n)
     metrics = Pulso.Metrics.render()
     assert metrics =~ "\npulso_ingest_inflight_requests 1\n"
     assert metrics =~ "\npulso_ingest_max_concurrent_requests 1\n"

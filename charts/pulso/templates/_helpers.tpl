@@ -234,3 +234,25 @@ created, and hashing a second random draw would differ from the stored one.
 {{- define "pulso.secretChecksum" -}}
 {{- dict "secretKeyBase" .Values.secretKeyBase "tenantTokens" .Values.tenantTokens "accessKeyId" .Values.storage.accessKeyId "secretAccessKey" .Values.storage.secretAccessKey | toJson | sha256sum }}
 {{- end }}
+
+{{/*
+Name of a pool's resources: the release fullname for the combined Deployment,
+or "<fullname>-<pool>". Takes (list $ pool).
+*/}}
+{{- define "pulso.poolName" -}}
+{{- $root := index . 0 }}
+{{- $pool := index . 1 }}
+{{- if $pool }}
+{{- printf "%s-%s" (include "pulso.fullname" $root) $pool | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- include "pulso.fullname" $root }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether pods join the Erlang cluster used for rendezvous ownership. Takes
+(list $ pool); every pool joins one cluster when clustering is enabled.
+*/}}
+{{- define "pulso.clustered" -}}
+{{- if (index . 0).Values.clustering.enabled }}true{{- end }}
+{{- end }}

@@ -1,9 +1,16 @@
+{{- define "pulso.service" -}}
+{{- $root := .root }}
+{{- $pool := .pool }}
+{{- with $root }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "pulso.fullname" . }}
+  name: {{ include "pulso.poolName" (list $root $pool) }}
   labels:
     {{- include "pulso.labels" . | nindent 4 }}
+    {{- if $pool }}
+    app.kubernetes.io/component: {{ $pool }}
+    {{- end }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -12,15 +19,48 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "pulso.selectorLabels" . | nindent 4 }}
+    {{- if $pool }}
+    app.kubernetes.io/component: {{ $pool }}
+    {{- end }}
   ports:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
-    {{- if .Values.otlpGrpc.enabled }}
+    {{- if and .Values.otlpGrpc.enabled (ne $pool "query") }}
     - name: otlp-grpc
       port: {{ .Values.otlpGrpc.port }}
       targetPort: otlp-grpc
       protocol: TCP
       appProtocol: grpc
     {{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.pools.enabled }}
+{{- range $pool := list "ingest" "query" }}
+---
+{{ include "pulso.service" (dict "root" $ "pool" $pool) }}
+{{- end }}
+{{- else }}
+{{ include "pulso.service" (dict "root" . "pool" "") }}
+{{- end }}
+{{- if .Values.clustering.enabled }}
+---
+# Headless Service for DNS-based Erlang cluster discovery only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulso.fullname" . }}-cluster
+  labels:
+    {{- include "pulso.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "pulso.selectorLabels" . | nindent 4 }}
+    pulso.tuist.dev/cluster: "true"
+  ports:
+    - name: epmd
+      port: 4369
+      targetPort: 4369
+{{- end }}

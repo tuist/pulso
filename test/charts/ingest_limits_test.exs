@@ -10,7 +10,10 @@ defmodule Pulso.Charts.IngestLimitsTest do
     assert {manifest, 0} = render("max_trace_nodes=123456,ingestLimits.max_otlp_nodes=234567")
     assert manifest =~ ~r/name: PULSO_INGEST_MAX_TRACE_NODES\s+value: "123456"/
     assert manifest =~ ~r/name: PULSO_INGEST_MAX_OTLP_NODES\s+value: "234567"/
-    assert manifest =~ ~r/name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS\s+value: "32"/
+    # Unset by default, so the instance derives it from its memory limit.
+    refute manifest =~ "PULSO_INGEST_MAX_CONCURRENT_REQUESTS"
+    assert {manifest, 0} = render("max_trace_nodes=123456,ingestBatching.maxConcurrentRequests=24")
+    assert manifest =~ ~r/name: PULSO_INGEST_MAX_CONCURRENT_REQUESTS\s+value: "24"/
     assert manifest =~ ~r/name: PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL\s+value: ""/
     assert manifest =~ ~r/name: PULSO_INGEST_MAX_PENDING_BYTES\s+value: "67108864"/
   end

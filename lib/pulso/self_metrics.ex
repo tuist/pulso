@@ -34,7 +34,7 @@ defmodule Pulso.SelfMetrics do
     {"pulso_admission_rejections_total", "counter",
      "Requests refused with a retryable overload error, by layer and bounded reason."}
   ]
-  @admission_reasons %{ingest: [:node, :tenant_concurrency, :tenant_rate], query: [:node, :tenant, :class]}
+  @admission_reasons %{ingest: [:tenant_concurrency, :tenant_rate], query: [:node, :tenant, :class]}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 

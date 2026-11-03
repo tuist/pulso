@@ -162,6 +162,18 @@ jobs:
             echo "rendering with an incomplete workload identity entry should fail" >&2
             exit 1
           fi
+          # Separate pools: ingest/query/maintenance Deployments, HPAs, the
+          # cluster Service, and receiver paths routed to the ingest pool.
+          helm template pulso charts/pulso "${args[@]}" --set pools.enabled=true --set clustering.enabled=true \
+            --set pools.ingest.autoscaling.enabled=true --set otlpGrpc.enabled=true \
+            --set ingress.enabled=true --set ingress.host=pulso.example.com \
+            | tee "$RUNNER_TEMP/pulso-pools.yaml" \
+            | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas
+          for pool in ingest query maintenance; do
+            grep -A1 'name: PULSO_ROLES' "$RUNNER_TEMP/pulso-pools.yaml" | grep -q "value: \"${pool}\""
+          done
+          grep -A6 'path: /loki/api/v1/push$' "$RUNNER_TEMP/pulso-pools.yaml" | grep -q 'name: pulso-ingest'
+          grep -A6 'path: /mcp$' "$RUNNER_TEMP/pulso-pools.yaml" | grep -q 'name: pulso-query'
           # Required values must fail at render time.
           if helm template pulso charts/pulso > /dev/null 2>&1; then
             echo "rendering without required values should fail" >&2

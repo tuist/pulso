@@ -53,8 +53,11 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `POST /mcp`, such as `https://agent.example.com`. Requests that carry no `Origin` header, which is the case for most agents and servers, are always accepted; any other origin receives `403`. |
 | `PULSO_MEMORY_BUDGET_MB` | container memory limit | Memory budget, `256..1048576` MiB, that sizes ingest and query slots when they are not set explicitly. Production releases read the container's cgroup limit when it is unset; without a limit the fixed defaults below apply. See [Node memory envelope](#node-memory-envelope). |
 | `PULSO_INGEST_MAX_CONCURRENT_REQUESTS` | derived, else `32` | Node-local bound on ingest requests processed at once over HTTP and gRPC, `1..100000`, shared between signals; derived from the memory budget when unset. Excess requests get a retryable `429` (gRPC `RESOURCE_EXHAUSTED`) with `Retry-After: 1`. See [Ingest admission](#ingest-admission). |
-| `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` | an eighth of the slots | Slots that metrics, logs and traces each keep for themselves, `0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3`. The rest are shared. See [Ingest admission](#ingest-admission). |
+| `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` | an eighth of the slots, at least 1 | Slots that metrics, logs and traces each keep for themselves, `0..PULSO_INGEST_MAX_CONCURRENT_REQUESTS/3`. The rest are shared. See [Ingest admission](#ingest-admission). |
 | `PULSO_INGEST_MAX_PENDING_BYTES` | `67108864` | Estimated memory of coalesced requests that have released their slot while they wait for durable publication, `0..17179869184`; `0` disables the handoff. See [Ingest admission](#ingest-admission). |
+| `PULSO_TENANT_LIMITS_JSON` | `{}` | Per-tenant ingest concurrency, ingest byte rate and query concurrency, per instance. See [per-tenant limits](scaling.md#per-tenant-limits). |
+| `PULSO_ROLES` | `ingest,query,maintenance` | Comma-separated work this instance takes on. Requests for a role it does not run get a retryable `503`; background workers (compaction, retention, alerting, error projection, reliability) run only with `maintenance`. See [scaling](scaling.md#separate-pools). |
+| `DNS_CLUSTER_QUERY` | none | DNS name whose A records list the other instances, to join one Erlang cluster for rendezvous ownership. Set `RELEASE_DISTRIBUTION=name`, `RELEASE_NODE=pulso@<pod IP>` and a shared `RELEASE_COOKIE` too; the chart does this with `clustering.enabled`. |
 | `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request source-record, attribute and request-node budgets for ingestion. OTLP distributions also cap expanded float samples at `PULSO_INGEST_MAX_RECORDS`; the separate fixed 16 MiB repeated-source metadata ceiling is unchanged. |
 | `PULSO_INGEST_MAX_OTLP_NODES` | `262144` | Request-wide log/metric JSON-shaped node ceiling, independent of per-set nodes. Applies to JSON/protobuf logs and metrics; see [OTLP logs](logs.md) and [OTLP metrics](metrics.md). |
@@ -361,7 +364,8 @@ under a container memory limit, Pulso derives the slots from that budget:
 
 `PULSO_INGEST_MAX_CONCURRENT_REQUESTS`, `PULSO_QUERY_MAX_CONCURRENT` and
 `PULSO_QUERY_MAX_HEAP_MB` override individual values. Requests beyond the slots
-get retryable overload errors, counted by `pulso_admission_rejections_total`,
+get retryable overload errors, counted by `pulso_ingest_admission_total` (ingest)
+and `pulso_admission_rejections_total` (queries and tenant limits),
 and the slot gauges show saturation for autoscaling; see [scaling](scaling.md).
 Flat manifests of tenants without retention still grow with history and are not
 covered by the reserve.
@@ -390,7 +394,8 @@ publication without a slot.
 Slots are shared fairly between three signal classes: metrics (remote write,
 OTLP metrics), logs (Loki push, OTLP logs, Sentry) and traces (OTLP traces).
 Each class keeps `PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL` slots (chart
-`ingestBatching.reservedRequestsPerSignal`, by default an eighth of the slots)
+`ingestBatching.reservedRequestsPerSignal`, by default an eighth of the slots
+and at least one when there are three or more)
 that the others cannot take. The remaining slots are a shared pool that any class
 can borrow from. A remote-write replay after an outage can therefore use its
 reserve plus the whole pool and receive `429`s beyond that, while Loki pushes and

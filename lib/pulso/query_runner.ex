@@ -26,7 +26,9 @@ defmodule Pulso.QueryRunner do
 
             scope = if class == :reliability_callback, do: {:reliability_callback, tenant}, else: tenant
 
-            with :ok <- acquire({scope}, config(:max_per_tenant, 2)),
+            per_tenant = Pulso.TenantLimits.get(tenant, :query_max_concurrent) || config(:max_per_tenant, 2)
+
+            with :ok <- acquire({scope}, per_tenant),
                  :ok <- acquire_interactive(class),
                  :ok <- acquire({:class, class}, class_limit(class)) do
               fun.(deadline)

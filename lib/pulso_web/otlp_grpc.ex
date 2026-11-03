@@ -159,9 +159,9 @@ defmodule PulsoWeb.OTLPGRPC do
 
     result =
       with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
-           :ok <- admit(signal, tenant),
            :ok <- S3.validate_tenant(tenant),
            :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
+           :ok <- admit(signal, tenant, byte_size(body)),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
         Ingest.ingest(signal, tenant, key, Ingest.decode(signal, :protobuf, body))
       end
@@ -173,10 +173,25 @@ defmodule PulsoWeb.OTLPGRPC do
   end
 
   # Each call runs in its own task, so its slot is released when it exits.
-  defp admit(signal, tenant) do
-    case Pulso.IngestAdmission.acquire(signal, tenant) do
-      :ok -> :ok
-      {:error, :ingest_overloaded} -> {:error, :owner_overloaded}
+  # Configured tenant limits apply to the verified tenant and the decompressed
+  # message size.
+  defp admit(signal, tenant, bytes) do
+    limited = if Pulso.TenantLimits.configured?(), do: tenant
+
+    with :ok <- tenant_rate(limited, bytes),
+         :ok <- Pulso.IngestAdmission.acquire(signal, tenant, limited) do
+      :ok
+    else
+      {:error, _} -> {:error, :owner_overloaded}
+    end
+  end
+
+  defp tenant_rate(nil, _bytes), do: :ok
+
+  defp tenant_rate(tenant, bytes) do
+    with {:error, _} = error <- Pulso.TenantLimits.take_ingest_bytes(tenant, bytes) do
+      Pulso.SelfMetrics.admission_rejection(:ingest, :tenant_rate)
+      error
     end
   end
 

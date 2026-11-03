@@ -34,6 +34,8 @@ defmodule PulsoWeb.Endpoint do
   end
 
   plug PulsoWeb.PathAliases
+  # After alias rewriting, so legacy push paths classify as ingest.
+  plug PulsoWeb.Roles
   plug Plug.RequestId
   plug PulsoWeb.BasicTenant
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]

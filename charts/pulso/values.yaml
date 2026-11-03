@@ -249,7 +249,7 @@ ingestBatching:
   maxConcurrentRequests: ""
   # Slots that metrics, logs and traces each keep for themselves, so one
   # signal's burst cannot starve the others; the rest are shared. Empty means
-  # an eighth of maxConcurrentRequests. At most maxConcurrentRequests / 3.
+  # an eighth of maxConcurrentRequests, at least 1. At most maxConcurrentRequests / 3.
   reservedRequestsPerSignal: ""
   # Estimated bytes of coalesced requests that released their slot while they
   # wait for durable publication (acknowledgment is unchanged). Budget this
@@ -442,6 +442,68 @@ prometheusRule:
   enabled: false
   labels: {}
 
+# Per-tenant admission limits, so one tenant cannot take a shared instance's
+# capacity from the others. Applied per instance, only to callers whose
+# credentials verify. See docs/scaling.md#per-tenant-limits. Example:
+#   default: {ingest_max_concurrent: 8, query_max_concurrent: 2}
+#   tenants: {acme: {ingest_bytes_per_second: 10485760}}
+tenantLimits: {}
+
+# Instances of the combined Deployment, which runs every role. Every instance
+# can ingest and query any tenant: the bucket is the only authority, so you can
+# change this at any time. See docs/scaling.md.
+replicaCount: 1
+
+# HorizontalPodAutoscaler for the combined Deployment (ignored with pools).
+# Scales on CPU; for slot saturation (docs/scaling.md) use a custom-metrics
+# adapter or KEDA and set `metrics` accordingly.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+  metrics: []
+
+# Separate ingest, query and maintenance Deployments on the same bucket, so
+# writes and reads scale independently and heavy queries cannot starve ingest.
+# Replaces the combined Deployment; the ingress routes receiver paths to the
+# ingest pool and everything else to the query pool. Maintenance (compaction,
+# retention, alerting, error projection, reliability) has no Service.
+pools:
+  enabled: false
+  ingest:
+    replicas: 2
+    resources: {}
+    autoscaling:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+      metrics: []
+  query:
+    replicas: 2
+    resources: {}
+    autoscaling:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+      metrics: []
+  maintenance:
+    replicas: 1
+    resources: {}
+    autoscaling:
+      enabled: false
+
+# Erlang distribution among Pulso pods, through a headless Service, so
+# rendezvous ownership spreads compaction, retention and alert evaluation
+# across instances instead of every instance attempting all of it. Correctness
+# never depends on it: conditional object writes arbitrate overlaps. Keep pods
+# inside one trusted network; the cookie is generated into the chart Secret
+# (or RELEASE_COOKIE in existingSecret).
+clustering:
+  enabled: false
+
 # Starting points, not measured capacity. Pulso sizes its ingest and query
 # slots from limits.memory (docs/configuration.md#node-memory-envelope), so
 # raising memory raises concurrency; overload beyond the slots is a retryable
@@ -454,9 +516,8 @@ resources:
   limits:
     memory: 2Gi
 
-# Pulso is supported as a single node today. Rolling updates briefly run two
-# nodes, which object-storage conditional writes keep safe for compatible
-# versions. When upgrading from a version that rejected stale/non-finite samples,
+# Rolling updates briefly run old and new instances together, which
+# object-storage conditional writes keep safe for compatible versions. When upgrading from a version that rejected stale/non-finite samples,
 # use type: Recreate and rollingUpdate: null so old readers never overlap new
 # writers. Existing buckets cannot be rolled back to the old reader after those
 # values are stored. See docs/deployment.md's stale-sample compatibility section.

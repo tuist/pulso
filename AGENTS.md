@@ -695,6 +695,17 @@ Early scaffolding. In place:
 
 Not yet built: full Grafana alert/notification compatibility, Mimir/Tempo clients, external sidecar indexes (bloom filters, posting lists, stats; bounded native metric footer postings now exist), bounded catalogs without finite retention, full query/discovery parity, full TraceQL and Tempo search/discovery/client parity, delta-to-cumulative metric conversion, OTLP-sourced metric metadata, TraceQL `compare()`, full protocol feature breadth (see `plans/protocol-breadth.md`), remediation surface, HITL wiring, ingest forwarding and ownership. Follow-up priority: external label posting indexes and representative capacity, expanded metric compatibility, then alert evaluation.
 
+Scaling: `Pulso.ResourceBudget` derives ingest/query slots from
+`PULSO_MEMORY_BUDGET_MB` or the prod cgroup limit; slot/saturation gauges and
+`pulso_admission_rejections_total` feed autoscaling. `Pulso.Roles`
+(`PULSO_ROLES`) splits ingest/query/maintenance; `PulsoWeb.Roles` answers
+other roles 503. `Pulso.TenantLimits` (`PULSO_TENANT_LIMITS_JSON`) adds
+per-instance tenant ingest concurrency/byte-rate and query concurrency, charged
+only after credentials verify. The chart supports replicas, HPAs, `pools.*` and
+`clustering.enabled` (headless DNSCluster). Not built: cluster-wide quotas,
+tenant metering/lifecycle, per-tenant retention, ingest forwarding. See
+`docs/scaling.md`.
+
 Keyed S3 appends for every signal use conditional creation and native streaming
 exact-byte verification before CAS registration. Different existing encodings,
 even logically equivalent ones, fail permanently with HTTP409 `keyed_content_mismatch`;

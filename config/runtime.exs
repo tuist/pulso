@@ -254,8 +254,6 @@ envelope =
     do: Pulso.ResourceBudget.derive(memory_budget_mb),
     else: %{budget_mb: nil, ingest_slots: 32, query_slots: 3, query_heap_mb: 128}
 
-config :pulso, Pulso.ResourceBudget, budget_mb: envelope.budget_mb
-
 # Node-local bound on concurrently processed ingest requests (HTTP and gRPC).
 # Excess requests receive a retryable 429 / RESOURCE_EXHAUSTED.
 ingest_max_concurrent =
@@ -265,11 +263,11 @@ ingest_max_concurrent =
   end
 
 # Slots each signal (metrics, logs, traces) keeps for itself; the rest are shared.
-# Empty means an eighth of the slots.
+# Empty means an eighth of the slots, at least one when there are three or more.
 ingest_reserved =
   case env_var.("PULSO_INGEST_RESERVED_REQUESTS_PER_SIGNAL", "") do
     "" ->
-      div(ingest_max_concurrent, 8)
+      min(max(1, div(ingest_max_concurrent, 8)), div(ingest_max_concurrent, 3))
 
     raw ->
       case Integer.parse(raw) do
@@ -367,15 +365,15 @@ query_budgets =
       env_var.(name, nil) not in [nil, ""],
       do: {key, parse_integer.(name, default, range)}
 
-config :pulso, Pulso.IngestAdmission,
-  max_concurrent: ingest_max_concurrent,
-  reserved_per_signal: ingest_reserved,
-  max_pending_bytes: ingest_max_pending_bytes
-
 # Wall-clock limit for one query, plus the node's query memory envelope:
 # interactive slots (alerting and reliability run one each outside them), each
 # with a process heap ceiling. Size slots * heap well below the memory limit.
 query_slots = parse_integer.("PULSO_QUERY_MAX_CONCURRENT", envelope.query_slots, 1..64)
+
+config :pulso, Pulso.IngestAdmission,
+  max_concurrent: ingest_max_concurrent,
+  reserved_per_signal: ingest_reserved,
+  max_pending_bytes: ingest_max_pending_bytes
 
 config :pulso, Pulso.IngestLimits, ingest_limits
 
@@ -386,6 +384,13 @@ config :pulso, Pulso.QueryRunner,
   max_global: query_slots + 2,
   max_heap_words: div(parse_integer.("PULSO_QUERY_MAX_HEAP_MB", envelope.query_heap_mb, 16..16_384) * 1_048_576, 8)
 
+config :pulso, Pulso.ResourceBudget, budget_mb: envelope.budget_mb
+
+# Which work this instance takes on; all roles by default. See docs/scaling.md.
+config :pulso, Pulso.Roles, roles: Pulso.Roles.parse!(env_var.("PULSO_ROLES", "ingest,query,maintenance"))
+
+# Per-tenant admission limits; see Pulso.TenantLimits and docs/scaling.md.
+config :pulso, Pulso.TenantLimits, limits: Pulso.TenantLimits.parse!(env_var.("PULSO_TENANT_LIMITS_JSON", "{}"))
 config :pulso, PulsoWeb.Endpoint, http: [port: String.to_integer(env_var.("PORT", "4000"))]
 
 # Browser origins allowed to call POST /mcp, comma-separated

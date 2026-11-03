@@ -2,7 +2,8 @@ defmodule PulsoWeb.IngestAdmission do
   @moduledoc """
   Admits ingest requests through `Pulso.IngestAdmission` before their bodies
   are read, answering 429 with `Retry-After` when the request's signal has no
-  reserved or shared slot left.
+  reserved or shared slot left, or when a verified tenant is over its
+  configured `Pulso.TenantLimits`.
   """
   @behaviour Plug
 
@@ -13,7 +14,7 @@ defmodule PulsoWeb.IngestAdmission do
 
   @impl true
   def call(%Plug.Conn{method: "POST"} = conn, _opts) do
-    case ingest(Enum.map(conn.path_info, &URI.decode/1)) do
+    case ingest_path(conn.path_info) do
       nil -> conn
       {format, signal} -> admit(conn, format, signal)
     end
@@ -22,22 +23,16 @@ defmodule PulsoWeb.IngestAdmission do
   def call(conn, _opts), do: conn
 
   defp admit(conn, format, signal) do
-    case Pulso.IngestAdmission.acquire(signal, tenant(conn)) do
-      :ok ->
-        register_before_send(conn, fn conn ->
-          Pulso.IngestAdmission.release()
-          conn
-        end)
+    limited = limited_tenant(conn, format)
 
-      {:error, :ingest_overloaded} ->
-        conn = put_resp_header(conn, "retry-after", "1")
-
-        conn =
-          if format == :otlp,
-            do: PulsoWeb.OTLPHTTP.error(conn, 429, "ingest capacity exhausted"),
-            else: conn |> put_resp_content_type("text/plain") |> send_resp(429, "ingest capacity exhausted")
-
-        halt(conn)
+    with :ok <- rate(conn, limited),
+         :ok <- Pulso.IngestAdmission.acquire(signal, tenant(conn), limited) do
+      register_before_send(conn, fn conn ->
+        Pulso.IngestAdmission.release()
+        conn
+      end)
+    else
+      {:error, reason} -> refuse(conn, format, reason)
     end
   end
 
@@ -53,6 +48,61 @@ defmodule PulsoWeb.IngestAdmission do
     end
   end
 
+  # Configured tenant limits charge only callers whose credentials verify for
+  # the tenant they name, so a spoofed header cannot spend another tenant's
+  # allowance. Others pass through to the controller, which rejects them.
+  # Sentry requests name their tenant through DSN project bindings and use
+  # only the fair share.
+  defp limited_tenant(_conn, :sentry), do: nil
+
+  defp limited_tenant(conn, _format) do
+    with true <- Pulso.TenantLimits.configured?(),
+         {:ok, tenant} <- PulsoWeb.OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
+         :ok <- Pulso.Auth.verify(conn, tenant, :ingest) do
+      tenant
+    else
+      _ -> nil
+    end
+  end
+
+  defp rate(_conn, nil), do: :ok
+
+  defp rate(conn, tenant) do
+    bytes =
+      with [value] <- get_req_header(conn, "content-length"),
+           {n, ""} <- Integer.parse(value) do
+        n
+      else
+        _ -> nil
+      end
+
+    with {:error, :tenant_rate} = error <- Pulso.TenantLimits.take_ingest_bytes(tenant, bytes) do
+      Pulso.SelfMetrics.admission_rejection(:ingest, :tenant_rate)
+      error
+    end
+  end
+
+  defp refuse(conn, format, reason) do
+    message =
+      case reason do
+        :ingest_overloaded -> "ingest capacity exhausted"
+        :tenant_concurrency -> "tenant ingest concurrency limit reached"
+        :tenant_rate -> "tenant ingest rate limit reached"
+      end
+
+    conn = put_resp_header(conn, "retry-after", "1")
+
+    conn =
+      if format == :otlp,
+        do: PulsoWeb.OTLPHTTP.error(conn, 429, message),
+        else: conn |> put_resp_content_type("text/plain") |> send_resp(429, message)
+
+    halt(conn)
+  end
+
+  @doc "The `{format, signal}` of an ingest path, or nil for any other path."
+  def ingest_path(path_info), do: path_info |> Enum.map(&URI.decode/1) |> ingest()
+
   # Each request is admitted under the signal class it stores; see
   # `Pulso.IngestAdmission` for the per-signal reserves.
   defp ingest(["v1", "traces"]), do: {:otlp, :traces}
@@ -60,7 +110,7 @@ defmodule PulsoWeb.IngestAdmission do
   defp ingest(["v1", "logs"]), do: {:otlp, :logs}
   defp ingest(["loki", "api", "v1", "push"]), do: {:text, :logs}
   defp ingest(["api", "v1", "write"]), do: {:text, :metrics}
-  defp ingest(["api", "store"]), do: {:text, :logs}
-  defp ingest(["api", _project, endpoint]) when endpoint in ["envelope", "store"], do: {:text, :logs}
+  defp ingest(["api", "store"]), do: {:sentry, :logs}
+  defp ingest(["api", _project, endpoint]) when endpoint in ["envelope", "store"], do: {:sentry, :logs}
   defp ingest(_path), do: nil
 end
