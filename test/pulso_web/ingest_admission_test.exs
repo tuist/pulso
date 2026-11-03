@@ -11,13 +11,13 @@ defmodule PulsoWeb.IngestAdmissionTest do
     :ok
   end
 
-  defp hold(signal) do
+  defp hold(signal, tenant \\ "default") do
     owner = self()
 
     pid =
       spawn(
         Pulso.Runtime.capture(fn ->
-          send(owner, {:held, self(), IngestAdmission.acquire(signal)})
+          send(owner, {:held, self(), IngestAdmission.acquire(signal, tenant)})
           receive do: (:stop -> :ok)
         end)
       )
@@ -76,6 +76,63 @@ defmodule PulsoWeb.IngestAdmissionTest do
     assert metrics =~ ~s(pulso_ingest_admission_total{signal="traces",outcome="rejected"} 0\n)
     assert metrics =~ ~s(pulso_ingest_admission_in_flight{signal="metrics"} 4\n)
     assert metrics =~ ~s(pulso_ingest_admission_in_flight{signal="logs"} 1\n)
+  end
+
+  defp stop(pid) do
+    ref = Process.monitor(pid)
+    send(pid, :stop)
+    assert_receive {:DOWN, ^ref, :process, _, _}
+    _ = :sys.get_state(Pulso.Runtime.whereis(IngestAdmission))
+  end
+
+  defp remote_write(tenant) do
+    build_conn()
+    |> put_req_header("x-scope-orgid", tenant)
+    |> put_req_header("content-type", "application/x-protobuf")
+    |> put_req_header("content-encoding", "snappy")
+    |> put_req_header("x-prometheus-remote-write-version", "0.1.0")
+    |> post("/api/v1/write", "")
+  end
+
+  test "a flooding tenant leaves a slot for another tenant of the same signal" do
+    # 12 slots: metrics may use its reserve of 2 plus a shared pool of 6. Active
+    # tenants are recomputed on every request instead of every 500 ms.
+    config = [max_concurrent: 12, reserved_per_signal: 2, tenant_refresh_ms: 0]
+    Pulso.Runtime.put_env(:pulso, IngestAdmission, config)
+
+    # Alone, tenant A may use all 8 metrics slots.
+    holders = for _ <- 1..8, do: elem(hold(:metrics, "a"), 0)
+    assert {_, {:error, :ingest_overloaded}} = hold(:metrics, "a")
+
+    # B finds no slot, but its request makes it an active tenant.
+    conn = remote_write("b")
+    assert conn.status == 429
+    assert get_resp_header(conn, "retry-after") == ["1"]
+
+    # A freed slot is not refilled by A, now above its share of 4...
+    stop(hd(holders))
+    assert {_, {:error, :ingest_overloaded}} = hold(:metrics, "a")
+    assert IngestAdmission.in_flight(:metrics) == 7
+
+    # ...so B's retry is admitted through the public path.
+    assert remote_write("b").status != 429
+    {b, :ok} = hold(:metrics, "b")
+    assert IngestAdmission.in_flight(:metrics) == 8
+
+    # Other signals keep their reserves regardless of tenants.
+    assert {_, :ok} = hold(:logs, "a")
+
+    metrics = Pulso.SelfMetrics.render()
+    assert metrics =~ ~s(pulso_ingest_admission_total{signal="metrics",outcome="tenant_limited"} 1\n)
+    assert metrics =~ ~s(pulso_ingest_admission_active_tenants{signal="metrics"} 2\n)
+
+    # B stays active for its demand window, so A keeps leaving it a slot...
+    stop(b)
+    assert {_, {:error, :ingest_overloaded}} = hold(:metrics, "a")
+
+    # ...and once B's demand expires, A may borrow the last slot again.
+    Pulso.Runtime.put_env(:pulso, IngestAdmission, Keyword.put(config, :tenant_window_ms, 0))
+    assert {_, :ok} = hold(:metrics, "a")
   end
 
   test "handoff frees the slot only within the pending budget and returns its bytes on release" do

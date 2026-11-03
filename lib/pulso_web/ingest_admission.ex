@@ -22,7 +22,7 @@ defmodule PulsoWeb.IngestAdmission do
   def call(conn, _opts), do: conn
 
   defp admit(conn, format, signal) do
-    case Pulso.IngestAdmission.acquire(signal) do
+    case Pulso.IngestAdmission.acquire(signal, tenant(conn)) do
       :ok ->
         register_before_send(conn, fn conn ->
           Pulso.IngestAdmission.release()
@@ -38,6 +38,18 @@ defmodule PulsoWeb.IngestAdmission do
             else: conn |> put_resp_content_type("text/plain") |> send_resp(429, "ingest capacity exhausted")
 
         halt(conn)
+    end
+  end
+
+  # Fairness key only, before authentication: `PulsoWeb.BasicTenant` has
+  # already turned a Basic username into this header. Sentry projects map to
+  # tenants later, so each project is its own key.
+  defp tenant(%Plug.Conn{path_info: ["api", project, _endpoint]}) when project != "v1", do: "sentry:" <> project
+
+  defp tenant(conn) do
+    case get_req_header(conn, "x-scope-orgid") do
+      [tenant | _] -> tenant
+      [] -> "default"
     end
   end
 

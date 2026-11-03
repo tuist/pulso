@@ -8,7 +8,8 @@ defmodule PulsoWeb.IngestLoadTest do
         mix test test/pulso_web/ingest_load_test.exs --include ingest_load
 
   A remote-write replay flood (many shards that retry after 429) runs alongside
-  steady open-loop Loki pushes and OTLP trace exports against the S3 adapter on
+  steady open-loop Loki pushes, OTLP trace exports and a second tenant's
+  remote writes against the S3 adapter on
   a fake S3 server that delays every request by a uniformly drawn latency.
   The test prints throughput, status counts, accepted latency and storage
   request counts, and asserts that Loki and traces are still admitted.
@@ -158,9 +159,17 @@ defmodule PulsoWeb.IngestLoadTest do
     traces =
       Task.async(fn -> open_loop(ctx, results, deadline, :traces, env_int("PULSO_LOAD_TRACE_RPS", 2), trace_body) end)
 
+    # A second remote-write tenant with steady traffic beside the flooding one.
+    steady_body = Enum.at(rw_bodies, 0)
+
+    steady =
+      Task.async(fn ->
+        open_loop(ctx, results, deadline, :steady_metrics, env_int("PULSO_LOAD_STEADY_RW_RPS", 2), steady_body)
+      end)
+
     trimmer = Task.async(fn -> trim_loop(ctx.trim, deadline) end)
     started = System.monotonic_time(:millisecond)
-    Task.await_many([loki, traces | flood], :infinity)
+    Task.await_many([loki, traces, steady | flood], :infinity)
     elapsed = (System.monotonic_time(:millisecond) - started) / 1000
     Task.await(trimmer, :infinity)
     peak = Task.await(memory, :infinity)
@@ -174,9 +183,10 @@ defmodule PulsoWeb.IngestLoadTest do
     assert report.accepted.traces > 0
     assert report.dropped.loki == 0, "Loki pushes dropped after retries: #{report.dropped.loki}"
     assert report.dropped.traces == 0, "trace exports dropped after retries: #{report.dropped.traces}"
+    assert report.dropped.steady_metrics == 0, "steady tenant writes dropped: #{report.dropped.steady_metrics}"
   end
 
-  # Alloy's remote-write shard: send, back off after a 429, repeat.
+  # Alloy's remote-write shard of the flooding "default" tenant: send, back off after a 429, repeat.
   defp flood(ctx, results, deadline, body) do
     if System.monotonic_time(:millisecond) < deadline do
       {status, ms} = post(ctx.api <> "/api/v1/write", body, remote_write_headers())
@@ -220,6 +230,7 @@ defmodule PulsoWeb.IngestLoadTest do
 
   defp target(:loki), do: {"/loki/api/v1/push", [{"content-type", "application/json"}]}
   defp target(:traces), do: {"/v1/traces", [{"content-type", "application/json"}]}
+  defp target(:steady_metrics), do: {"/api/v1/write", [{"x-scope-orgid", "steady"} | remote_write_headers()]}
 
   defp post(url, body, headers) do
     started = System.monotonic_time(:microsecond)
@@ -257,7 +268,7 @@ defmodule PulsoWeb.IngestLoadTest do
     s3 = :ets.tab2list(ctx.stats)
 
     per_signal =
-      for signal <- [:remote_write, :loki, :traces], into: %{} do
+      for signal <- [:remote_write, :steady_metrics, :loki, :traces], into: %{} do
         attempts = for {^signal, :attempt, status, ms} <- rows, do: {status, ms}
         ok = for {status, ms} <- attempts, is_integer(status) and status < 300, do: ms
         statuses = attempts |> Enum.frequencies_by(&elem(&1, 0)) |> Enum.sort()

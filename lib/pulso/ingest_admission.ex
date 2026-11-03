@@ -20,6 +20,19 @@ defmodule Pulso.IngestAdmission do
   logs and traces admitted. Every counter is updated atomically, so the global
   bound and every reserve are exact.
 
+  Within a signal, slots are shared between tenants (the `X-Scope-OrgID`
+  the request names, before authentication). A tenant is *active* for a
+  signal while it holds a slot or has asked for one in the last
+  `:tenant_window_ms` (5 s). Each active tenant may always fill its equal share
+  of the signal's usable slots (reserve plus shared pool). Above that share it
+  may only borrow while at least one usable slot stays free for every other
+  active tenant, so a flooding tenant cannot take the slot another tenant's
+  retry needs. A lone tenant can use the whole share. The active count is
+  recomputed at most every `:tenant_refresh_ms` (500 ms), so the per-request
+  cost does not grow with tenants. These per-tenant checks are best effort under
+  racing requests; the global bound and signal reserves stay exact. At most
+  1024 tenants per signal are tracked per node; the rest share one bucket.
+
   ## Pending publication handoff
 
   A slot bounds decoding memory. Once a request's records are queued in a
@@ -45,6 +58,9 @@ defmodule Pulso.IngestAdmission do
   @default_max 32
   @default_max_pending_bytes 64 * 1024 * 1024
   @signals [:metrics, :logs, :traces]
+  @max_tenants 1024
+  @default_tenant_window_ms 5_000
+  @default_tenant_refresh_ms 500
 
   def signals, do: @signals
 
@@ -53,47 +69,123 @@ defmodule Pulso.IngestAdmission do
   defp table, do: Pulso.Runtime.table(@table)
 
   @doc """
-  Take this process's slot for `signal`, or `{:error, :ingest_overloaded}`
-  when neither the signal's reserve nor the shared pool has room.
+  Take this process's slot for `signal` on behalf of `tenant`, or
+  `{:error, :ingest_overloaded}` when neither the signal's reserve nor the
+  shared pool has room, or when `tenant` is above its fair share of the signal.
   """
-  @spec acquire(atom()) :: :ok | {:error, :ingest_overloaded}
-  def acquire(signal \\ :metrics) when signal in @signals do
+  @spec acquire(atom(), String.t()) :: :ok | {:error, :ingest_overloaded}
+  def acquire(signal \\ :metrics, tenant \\ "default") when signal in @signals and is_binary(tenant) do
     pid = self()
     table = table()
 
     case :ets.lookup(table, {:held, pid}) do
-      [{_, {:slot, _signal, _pool}}] ->
+      [{_, {:slot, _signal, _pool, _tenant}}] ->
         :ok
 
       held ->
         # A request that raised after handoff leaves its pending charge behind.
         if held != [], do: release(pid)
-        take(table, pid, signal)
+        take(table, pid, signal, tenant)
     end
   rescue
     # Not started (some test runtimes and tools): never fail ingest.
     ArgumentError -> :ok
   end
 
-  defp take(table, pid, signal) do
-    %{reserved: reserved, shared: shared} = limits()
+  defp take(table, pid, signal, tenant) do
+    limits = limits()
+    now = System.monotonic_time(:millisecond)
+    key = tenant_key(table, signal, tenant, now)
 
     pool =
       cond do
-        claim(table, {:reserved, signal}, reserved) -> :reserved
-        claim(table, :shared, shared) -> :shared
+        not within_share?(table, signal, key, limits, now) -> :tenant_limited
+        claim(table, {:reserved, signal}, limits.reserved) -> :reserved
+        claim(table, :shared, limits.shared) -> :shared
         true -> nil
       end
 
-    if pool do
-      :ets.insert(table, {{:held, pid}, {:slot, signal, pool}})
-      :ets.update_counter(table, {:in_flight, signal}, {2, 1}, {{:in_flight, signal}, 0})
-      count(table, signal, :admitted)
-      GenServer.cast(__MODULE__, {:monitor, pid})
-      :ok
+    case pool do
+      pool when pool in [:reserved, :shared] ->
+        :ets.insert(table, {{:held, pid}, {:slot, signal, pool, key}})
+        :ets.update_counter(table, {:in_flight, signal}, {2, 1}, {{:in_flight, signal}, 0})
+        :ets.update_counter(table, key, {2, 1}, {key, 0, now})
+        count(table, signal, :admitted)
+        GenServer.cast(__MODULE__, {:monitor, pid})
+        :ok
+
+      reason ->
+        if reason == :tenant_limited, do: count(table, signal, :tenant_limited)
+        count(table, signal, :rejected)
+        {:error, :ingest_overloaded}
+    end
+  end
+
+  # Rows are `{{:tenant, signal, tenant}, held_slots, last_demand_ms}`. A new
+  # tenant takes a tracking credit; beyond the cap tenants share one bucket.
+  defp tenant_key(table, signal, tenant, now) do
+    key = {:tenant, signal, tenant}
+
+    cond do
+      :ets.update_element(table, key, {3, now}) ->
+        key
+
+      claim(table, {:tracked, signal}, @max_tenants) ->
+        if not :ets.insert_new(table, {key, 0, now}), do: :ets.update_counter(table, {:tracked, signal}, {2, -1})
+        key
+
+      true ->
+        overflow = {:tenant, signal, :overflow}
+        if not :ets.update_element(table, overflow, {3, now}), do: :ets.insert_new(table, {overflow, 0, now})
+        overflow
+    end
+  end
+
+  # Below its equal share a tenant is limited only by the pools. Above it, a
+  # tenant must leave one usable slot free for each other active tenant.
+  defp within_share?(table, signal, key, limits, now) do
+    active = active_tenants(table, signal, now)
+    usable = limits.reserved + limits.shared
+    held = counter(table, key)
+
+    if held < max(1, div(usable + active - 1, active)) do
+      true
     else
-      count(table, signal, :rejected)
-      {:error, :ingest_overloaded}
+      free =
+        max(0, limits.reserved - counter(table, {:reserved, signal})) + max(0, limits.shared - counter(table, :shared))
+
+      # With nothing free the pools refuse it anyway, as plain capacity;
+      # `tenant_limited` means free slots existed but were kept for others.
+      free == 0 or free >= active
+    end
+  end
+
+  # Recomputed by whichever request finds it stale; racing recomputations agree.
+  defp active_tenants(table, signal, now) do
+    config = Pulso.Runtime.get_env(:pulso, __MODULE__, [])
+    refresh = Keyword.get(config, :tenant_refresh_ms, @default_tenant_refresh_ms)
+
+    case :ets.lookup(table, {:active, signal}) do
+      [{_, active, at}] when now - at < refresh ->
+        active
+
+      _ ->
+        cutoff = now - Keyword.get(config, :tenant_window_ms, @default_tenant_window_ms)
+        # The untracked overflow bucket holds no tracking credit; keep it.
+        idle = [{{{:tenant, signal, :"$2"}, 0, :"$1"}, [{:<, :"$1", cutoff}, {:"=/=", :"$2", :overflow}], [true]}]
+        pruned = :ets.select_delete(table, idle)
+        if pruned > 0, do: :ets.update_counter(table, {:tracked, signal}, {2, -pruned}, {{:tracked, signal}, 0})
+
+        active =
+          max(
+            1,
+            :ets.select_count(table, [
+              {{{:tenant, signal, :_}, :"$1", :"$2"}, [{:orelse, {:>, :"$1", 0}, {:>, :"$2", cutoff}}], [true]}
+            ])
+          )
+
+        :ets.insert(table, {{:active, signal}, active, now})
+        active
     end
   end
 
@@ -115,7 +207,7 @@ defmodule Pulso.IngestAdmission do
     table = table()
     pid = self()
 
-    with [{_, {:slot, signal, _pool}}] <- :ets.lookup(table, {:held, pid}),
+    with [{_, {:slot, signal, _pool, _tenant}}] <- :ets.lookup(table, {:held, pid}),
          true <- claim_bytes(table, bytes) do
       free_slot(table, pid)
       :ets.insert(table, {{:held, pid}, {:pending, signal, bytes}})
@@ -141,9 +233,8 @@ defmodule Pulso.IngestAdmission do
     table = table()
 
     case :ets.take(table, {:held, pid}) do
-      [{_, {:slot, signal, pool}}] ->
-        :ets.update_counter(table, pool_key(pool, signal), {2, -1})
-        :ets.update_counter(table, {:in_flight, signal}, {2, -1})
+      [{_, {:slot, signal, pool, tenant}}] ->
+        release_slot(table, signal, pool, tenant)
 
       [{_, {:pending, _signal, bytes}}] ->
         :ets.update_counter(table, :pending_bytes, {2, -bytes})
@@ -158,9 +249,16 @@ defmodule Pulso.IngestAdmission do
   end
 
   defp free_slot(table, pid) do
-    [{_, {:slot, signal, pool}}] = :ets.lookup(table, {:held, pid})
+    [{_, {:slot, signal, pool, tenant}}] = :ets.lookup(table, {:held, pid})
+    release_slot(table, signal, pool, tenant)
+  end
+
+  defp release_slot(table, signal, pool, tenant) do
     :ets.update_counter(table, pool_key(pool, signal), {2, -1})
     :ets.update_counter(table, {:in_flight, signal}, {2, -1})
+    # Rows with held slots are never pruned; the default only guards races.
+    now = System.monotonic_time(:millisecond)
+    :ets.update_counter(table, tenant, {2, -1}, {tenant, 1, now})
   end
 
   defp pool_key(:reserved, signal), do: {:reserved, signal}
@@ -174,9 +272,12 @@ defmodule Pulso.IngestAdmission do
   @doc "Estimated record bytes of requests waiting for publication without a slot."
   def pending_bytes, do: counter(:pending_bytes)
 
-  defp counter(key) do
-    case :ets.lookup(table(), key) do
+  defp counter(key), do: counter(table(), key)
+
+  defp counter(table, key) do
+    case :ets.lookup(table, key) do
       [{_, value}] -> value
+      [{_, value, _}] -> value
       [] -> 0
     end
   rescue
@@ -191,9 +292,20 @@ defmodule Pulso.IngestAdmission do
          in_flight: in_flight(signal),
          admitted: counter({:outcome, signal, :admitted}),
          rejected: counter({:outcome, signal, :rejected}),
+         tenant_limited: counter({:outcome, signal, :tenant_limited}),
+         active_tenants: active_gauge(signal),
          handed_off: counter({:outcome, signal, :handed_off})
        }}
     end
+  end
+
+  defp active_gauge(signal) do
+    case :ets.lookup(table(), {:active, signal}) do
+      [{_, active, _at}] -> active
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
   end
 
   defp count(table, signal, outcome) do

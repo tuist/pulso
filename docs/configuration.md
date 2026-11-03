@@ -381,13 +381,27 @@ stays bounded by the slots plus the budget. This only changes how long a request
 holds a slot, not when it is acknowledged; see
 [Ingest coalescing](#ingest-coalescing).
 
+Within each signal, slots are also shared between tenants, identified by the
+`X-Scope-OrgID` header or the Basic auth username (each Sentry project counts
+separately). A tenant is active for a signal while it holds a slot or has
+requested one in the last 5 seconds. Each active tenant can always use its equal
+share of the signal's slots (reserve plus shared pool). A tenant above that share
+is admitted only while at least one slot stays free for every other active
+tenant. A tenant replaying a backlog therefore gets `429`s for the slots another
+tenant needs, and keeps the rest of the capacity when it is alone. The tenant is
+read before authentication, so a client can choose its key; requests still fail
+authentication afterwards, and each node tracks at most 1,024 tenants per signal,
+with any further tenants sharing one bucket. Tenant shares apply to admission
+slots, not to the pending budget.
+
 Watch `pulso_ingest_admission_total{signal,outcome}` (`admitted`, `rejected`,
-`handed_off`), `pulso_ingest_admission_in_flight{signal}` and
-`pulso_ingest_admission_pending_bytes`; see
-[self-monitoring](self-monitoring.md). A steady `rejected` rate for one signal
-means its exporters retry: add instances, raise the slots together with memory,
-or raise that signal's reserve. Fairness is per signal, not per tenant: one tenant
-can still use all of a signal's slots.
+`tenant_limited`, `handed_off`), `pulso_ingest_admission_in_flight{signal}`,
+`pulso_ingest_admission_active_tenants{signal}` and
+`pulso_ingest_admission_pending_bytes`; see [self-monitoring](self-monitoring.md).
+`rejected` counts every refusal; `tenant_limited` is the part refused while free
+slots were kept for other tenants. A steady `rejected` rate for one signal means
+its exporters retry: add instances, raise the slots together with memory, or
+raise that signal's reserve.
 
 Manifests are the other memory consumer that grows. With retention disabled,
 each signal's manifest is a flat list with one entry per append, kept forever.

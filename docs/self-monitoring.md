@@ -65,7 +65,8 @@ with count and sum only, without quantiles.
 | `pulso_compaction_segments_total` | Counter | None | Source segments merged by successful compactions |
 | `pulso_compaction_deleted_objects_total` | Counter | None | Retirement deletions confirmed by successful cleanup calls |
 | `pulso_manifest_queue_depth` | Gauge | None | Publication callers, including active flushes, plus manifest-owner mailbox messages |
-| `pulso_ingest_admission_total` | Counter | `signal` (`metrics`, `logs`, `traces`), `outcome` (`admitted`, `rejected`, `handed_off`) | Ingest requests given an admission slot, refused with `429`/`RESOURCE_EXHAUSTED`, or moved from their slot to the pending budget while they wait for publication. See [ingest admission](configuration.md#ingest-admission) |
+| `pulso_ingest_admission_total` | Counter | `signal` (`metrics`, `logs`, `traces`), `outcome` (`admitted`, `rejected`, `tenant_limited`, `handed_off`) | Ingest requests given an admission slot, refused with `429`/`RESOURCE_EXHAUSTED` (`tenant_limited` is the subset refused while free slots were kept for other tenants), or moved from their slot to the pending budget while they wait for publication. See [ingest admission](configuration.md#ingest-admission) |
+| `pulso_ingest_admission_active_tenants` | Gauge | `signal` | Tenants holding or recently requesting a slot on this node; no tenant labels |
 | `pulso_ingest_admission_in_flight` | Gauge | `signal` | Ingest requests holding an admission slot |
 | `pulso_ingest_admission_pending_bytes` | Gauge | None | Estimated memory of requests waiting for publication without a slot |
 | `pulso_alert_evaluation_skips_total` | Counter | `reason` | Native alert/recording ticks deferred without checkpointing; fixed reasons `authority_missing`, `freshness_unavailable`, `capacity`, `timeout`, `budget`, `overrun` |

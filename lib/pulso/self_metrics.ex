@@ -206,14 +206,20 @@ defmodule Pulso.SelfMetrics do
   # Node-local ingest admission by signal class; outcomes are a fixed enum.
   defp render_admission(stats) do
     [
-      "# HELP pulso_ingest_admission_total Ingest requests admitted to, rejected by (429), or handed off from a slot.\n",
+      "# HELP pulso_ingest_admission_total Ingest requests admitted, rejected (429; tenant_limited is the subset refused for exceeding a tenant share), or handed off from a slot.\n",
       "# TYPE pulso_ingest_admission_total counter\n",
-      for {signal, row} <- stats, outcome <- [:admitted, :rejected, :handed_off] do
+      for {signal, row} <- stats, outcome <- [:admitted, :rejected, :tenant_limited, :handed_off] do
         ~s(pulso_ingest_admission_total{signal="#{signal}",outcome="#{outcome}"} #{Map.fetch!(row, outcome)}\n)
       end,
       "# HELP pulso_ingest_admission_in_flight Ingest requests holding an admission slot.\n",
       "# TYPE pulso_ingest_admission_in_flight gauge\n",
       for({signal, row} <- stats, do: ~s(pulso_ingest_admission_in_flight{signal="#{signal}"} #{row.in_flight}\n)),
+      "# HELP pulso_ingest_admission_active_tenants Tenants holding or recently requesting a slot, per signal.\n",
+      "# TYPE pulso_ingest_admission_active_tenants gauge\n",
+      for(
+        {signal, row} <- stats,
+        do: ~s(pulso_ingest_admission_active_tenants{signal="#{signal}"} #{row.active_tenants}\n)
+      ),
       "# HELP pulso_ingest_admission_pending_bytes Estimated bytes of slot-free requests awaiting durable publication.\n",
       "# TYPE pulso_ingest_admission_pending_bytes gauge\n",
       "pulso_ingest_admission_pending_bytes #{Pulso.IngestAdmission.pending_bytes()}\n"

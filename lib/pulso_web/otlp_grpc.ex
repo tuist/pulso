@@ -158,8 +158,8 @@ defmodule PulsoWeb.OTLPGRPC do
     conn = PulsoWeb.BasicTenant.call(%Plug.Conn{req_headers: headers}, [])
 
     result =
-      with :ok <- admit(signal),
-           {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
+      with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
+           :ok <- admit(signal, tenant),
            :ok <- S3.validate_tenant(tenant),
            :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
@@ -173,8 +173,8 @@ defmodule PulsoWeb.OTLPGRPC do
   end
 
   # Each call runs in its own task, so its slot is released when it exits.
-  defp admit(signal) do
-    case Pulso.IngestAdmission.acquire(signal) do
+  defp admit(signal, tenant) do
+    case Pulso.IngestAdmission.acquire(signal, tenant) do
       :ok -> :ok
       {:error, :ingest_overloaded} -> {:error, :owner_overloaded}
     end

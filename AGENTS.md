@@ -19,7 +19,9 @@ rate-limited log. `ManifestCache` stores encoded manifest binaries in ETS and
 callers decode locally (ETS flattens decoded summary sharing ~50x); ingest and
 publication read only `ManifestCache.info/2`. `Pulso.IngestAdmission` bounds
 concurrent ingest per node (`PULSO_INGEST_MAX_CONCURRENT_REQUESTS`, retryable
-429) with exact per-signal reserves plus a shared pool, and lets coalesced
+429) with exact per-signal reserves plus a shared pool, equal per-tenant shares
+within each signal (above-share tenants keep one free slot per other active
+tenant; best effort, keyed by pre-auth `X-Scope-OrgID`), and lets coalesced
 requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
 16 per tenant/signal) so uploads overlap the serialized manifest CAS. Flat
