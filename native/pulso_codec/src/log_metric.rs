@@ -282,7 +282,7 @@ fn names(term: Term<'_>) -> Res<Vec<String>> {
 
 #[rustler::nif]
 fn log_metric_api_version() -> u32 {
-    17
+    18
 }
 
 /// `stages` is the pipeline after pushdown; `value` is `:count`, `:bytes` or
@@ -706,20 +706,23 @@ impl State {
     }
 
     fn observe(&mut self, ts: i64, line: &[u8], labels: &Labels) -> Res<bool> {
+        // Without an unwrap target there is no observation whose labels can
+        // carry an earlier pipeline error. Selected rows still spend work.
+        let unwrapped = if let Value::Unwrap(name) = &self.value {
+            let Some(value) = labels.get(name).filter(|v| !v.is_empty()) else {
+                return Ok(false);
+            };
+            Some(value)
+        } else {
+            None
+        };
         if labels.get("__error__").is_some_and(|e| !e.is_empty()) {
             return Err(Error::Pipeline);
         }
         let sample = match &self.value {
             Value::Count => Sample::Float(1.0),
             Value::Bytes => Sample::Int(i64::try_from(line.len()).map_err(|_| Error::Fallback)?),
-            Value::Unwrap(name) => {
-                // Selected rows still spend work, but absent/empty values do
-                // not create series or consume the retained sample budget.
-                let Some(value) = labels.get(name).filter(|v| !v.is_empty()) else {
-                    return Ok(false);
-                };
-                unwrap_value(Some(value))?
-            }
+            Value::Unwrap(_) => unwrap_value(unwrapped)?,
         };
         let key: Vec<(String, String)> = labels
             .iter()

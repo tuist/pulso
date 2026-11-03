@@ -23,7 +23,8 @@ defmodule Pulso.Traces.Metrics do
   Parenthesized pipelines compose with `+`, `-`, `*`, `/` and scalar constants.
   Scalar-right comparisons filter values; all branches share one storage scan
   and native series/point/work budgets. Arithmetic runs in the bounded query
-  worker after native aggregation.
+  worker after native aggregation. A single scalar filter may also precede
+  `topk`/`bottomk` on a pipeline; that filter runs natively before ranking.
 
   Spans are reduced natively per segment (`trace_metrics.rs`); see that
   module for the interval, labeling and quantile semantics.
@@ -46,7 +47,7 @@ defmodule Pulso.Traces.Metrics do
           quantiles: [float()],
           value: {String.t(), String.t()} | nil,
           by: [{String.t(), String.t(), String.t()}],
-          second: {String.t(), pos_integer()} | nil
+          second: {String.t(), pos_integer()} | {String.t(), pos_integer(), {String.t(), float()}} | nil
         }
 
   @doc """
@@ -146,10 +147,16 @@ defmodule Pulso.Traces.Metrics do
     aligned_start = if aligned_start > step, do: aligned_start - step, else: aligned_start
 
     # Tempo checks the requested range before alignment adds boundary intervals.
-    if div(finish - start, step) <= 10_000 and aligned_end <= 9_223_372_036_854_775_807 and
-         div(aligned_end - aligned_start, step) in 1..11_000,
-       do: {:ok, {aligned_start, aligned_end, step, false}},
-       else: {:error, :unsupported_parameters}
+    cond do
+      div(finish - start, step) > 10_000 ->
+        {:error, {:trace_metrics_step_too_small, step, div(finish - start, 10_000)}}
+
+      aligned_end <= 9_223_372_036_854_775_807 and div(aligned_end - aligned_start, step) in 1..11_000 ->
+        {:ok, {aligned_start, aligned_end, step, false}}
+
+      true ->
+        {:error, :unsupported_parameters}
+    end
   end
 
   def window(_window, _instant), do: {:error, :unsupported_parameters}

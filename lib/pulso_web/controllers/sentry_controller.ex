@@ -1,30 +1,68 @@
 defmodule PulsoWeb.SentryController do
   use PulsoWeb, :controller
 
+  alias Plug.Parsers.RequestTooLargeError
   alias Pulso.Errors
   alias Pulso.Sentry
   alias Pulso.Sentry.Envelope
+  alias PulsoWeb.CompressedBodyReader
+
+  # Relay's minimal 1×1 GIF response for pixel store ingestion.
+  @pixel Base.decode64!("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
 
   def envelope(conn, %{"project_id" => id}) do
+    ingest_envelope(conn, id)
+  end
+
+  defp ingest_envelope(conn, project_id) do
     with {:ok, headers, event, discarded} <- Envelope.decode(conn.private.sentry_body),
-         {:ok, project} <- Sentry.authorize(conn, id, headers) do
+         {:ok, id, project} <- Sentry.authorize(conn, project_id, headers) do
       ingest(conn, id, project, headers, event, discarded)
     else
       error -> failure(conn, error)
     end
   end
 
-  def store(conn, %{"project_id" => id}) do
-    with {:ok, project} <- Sentry.authorize(conn, id, %{}),
-         true <- byte_size(conn.private.sentry_body) <= 1_048_576,
-         {:ok, event} when is_map(event) <- Pulso.JSON.decode(conn.private.sentry_body) do
+  def store(conn, _params) do
+    case Sentry.authorize(conn, conn.path_params["project_id"], %{}) do
+      {:ok, id, project} ->
+        if conn.method == "POST" and get_req_header(conn, "content-type") == ["application/x-sentry-envelope"] do
+          ingest_envelope(conn, conn.path_params["project_id"])
+        else
+          store_event(conn, id, project)
+        end
+
+      error ->
+        failure(conn, error)
+    end
+  rescue
+    RequestTooLargeError -> failure(conn, {:error, :event_too_large})
+  end
+
+  defp store_event(conn, id, project) do
+    with {:ok, body} <- store_body(conn.private.sentry_body),
+         true <- byte_size(body) <= 1_048_576,
+         {:ok, event} when is_map(event) <- Pulso.JSON.decode(body) do
       ingest(conn, id, project, %{}, event, %{})
     else
       false -> failure(conn, {:error, :event_too_large})
-      {:error, :invalid_sentry_key} = error -> failure(conn, error)
       _ -> failure(conn, {:error, :invalid_event})
     end
   end
+
+  defp store_body(body) when is_binary(body) do
+    if String.starts_with?(String.trim_leading(body), "{") do
+      {:ok, body}
+    else
+      case Base.decode64(body) do
+        {:ok, <<"{", _::binary>> = decoded} -> {:ok, decoded}
+        {:ok, decoded} -> CompressedBodyReader.uncompress(decoded, 1_048_576)
+        error -> error
+      end
+    end
+  end
+
+  defp store_body(_), do: {:error, :invalid_event}
 
   defp ingest(conn, _id, _project, _headers, nil, discarded), do: success(conn, nil, discarded)
 
@@ -35,6 +73,10 @@ defmodule PulsoWeb.SentryController do
     else
       error -> failure(conn, error)
     end
+  end
+
+  defp success(%{method: "GET"} = conn, _id, _discarded) do
+    conn |> put_resp_content_type("image/gif", nil) |> send_resp(200, @pixel)
   end
 
   defp success(conn, id, discarded) do

@@ -30,6 +30,32 @@ defmodule Pulso.ErrorsTest do
     Pulso.JSON.decode!(text)
   end
 
+  @tag :sentry_legacy_store
+  test "offset-free Sentry timestamps mean UTC without repairing malformed or out-of-policy times" do
+    for {value, expected} <- [
+          {"2018-08-27T13:24:00", 1_535_376_240_000_000_000},
+          {"2018-08-27T13:24:00Z", 1_535_376_240_000_000_000},
+          {"2018-08-27T15:54:00+02:30", 1_535_376_240_000_000_000},
+          {"2018-08-27T13:24:00.123456", 1_535_376_240_123_456_000}
+        ] do
+      assert {:ok, %Log{timestamp_ns: ^expected, body: %{"timestamp" => ^value}}} =
+               Errors.record(%{"timestamp" => value}, %{}, "42", @project)
+    end
+
+    for value <- [
+          "2018-08-27",
+          "2018-02-30T13:24:00",
+          "2018-08-27T24:00:00",
+          "2018-08-27T13:24:00+00:0",
+          "2018-08-27T13:24:00Zjunk",
+          "1969-12-31T23:59:59",
+          "2099-01-01T00:00:00",
+          "2263-01-01T00:00:00"
+        ] do
+      assert {:error, :invalid_timestamp} = Errors.record(%{"timestamp" => value}, %{}, "42", @project)
+    end
+  end
+
   test "resource labels alone cannot turn malformed ordinary logs into errors" do
     valid = record(1, 10)
     assert Errors.error_record?(valid)
@@ -240,11 +266,23 @@ defmodule Pulso.ErrorsTest do
     project = Map.put(@project, "public_key_hashes", [String.duplicate("a", 64), String.duplicate("b", 64)])
     assert Pulso.Sentry.validate_projects!(%{"42" => project}) == %{"42" => project}
 
+    for domains <- [[], ["*"], [String.duplicate("a", 256)], List.duplicate("http://valid.com", 32)] do
+      config = %{"42" => Map.put(project, "allowed_domains", domains)}
+      assert Pulso.Sentry.validate_projects!(config) == config
+    end
+
     for config <- [
           [],
           %{"../bad" => project},
           %{"42" => Map.put(project, "tenant", "bad/name")},
-          %{"42" => Map.put(project, "public_key_hashes", [])}
+          %{"42" => Map.put(project, "public_key_hashes", [])},
+          %{"42" => Map.put(project, "allowed_domains", nil)},
+          %{"42" => Map.put(project, "allowed_domains", "*")},
+          %{"42" => Map.put(project, "allowed_domains", [1])},
+          %{"42" => Map.put(project, "allowed_domains", [""])},
+          %{"42" => Map.put(project, "allowed_domains", [<<255>>])},
+          %{"42" => Map.put(project, "allowed_domains", [String.duplicate("a", 257)])},
+          %{"42" => Map.put(project, "allowed_domains", List.duplicate("*", 33))}
         ] do
       assert_raise ArgumentError, fn -> Pulso.Sentry.validate_projects!(config) end
     end

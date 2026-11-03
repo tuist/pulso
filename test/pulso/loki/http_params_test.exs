@@ -88,6 +88,30 @@ defmodule Pulso.Loki.HTTPParamsTest do
     end
   end
 
+  @calendar_fixture Path.expand("../../fixtures/logs/loki-upstream/http-calendar-timestamps.json", __DIR__)
+  @external_resource @calendar_fixture
+  test "calendar timestamps replay pinned Go fractional and grammar oracles within int64 bounds" do
+    fixture = @calendar_fixture |> File.read!() |> JSON.decode!()
+    assert length(fixture["rows"]) == 105
+
+    for row <- fixture["rows"] do
+      expected = if row["expected_ns"], do: String.to_integer(row["expected_ns"])
+      result = HTTPParams.timestamp(row["input"])
+
+      if row["reject"] or expected < -9_223_372_036_854_775_808 or expected > 9_223_372_036_854_775_807 do
+        assert match?({:error, {:http_parameter_error, "time", _}}, result), row["id"]
+      else
+        assert result == {:ok, expected}, row["id"]
+      end
+    end
+
+    prefix = "2020-01-02T03:04:05."
+    at_limit = prefix <> String.duplicate("1", 107) <> "Z"
+    assert byte_size(at_limit) == 128
+    assert HTTPParams.timestamp(at_limit) == {:ok, 1_577_934_245_111_111_111}
+    assert {:error, _} = HTTPParams.timestamp(prefix <> String.duplicate("1", 108) <> "Z")
+  end
+
   defp replay(%{"table" => "TestHttp_defaultQueryRangeStep", "input" => input}) do
     HTTPParams.default_step(ns(input["start_ns"]), ns(input["end_ns"]))
   end

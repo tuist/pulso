@@ -82,7 +82,7 @@ defmodule Pulso.LogQL.Pipeline do
   @doc "Apply every compiled stage to one entry; stages are stateless."
   @spec apply([term()], Entry.t()) :: result()
   def apply(compiled, %Entry{} = entry),
-    do: run_stages(compiled, %{entry | base_labels: entry.base_labels || entry.labels})
+    do: run_stages(compiled, Entry.initialize_errors(%{entry | base_labels: entry.base_labels || entry.labels}))
 
   defp run_stages([], entry), do: {:keep, entry}
 
@@ -145,7 +145,16 @@ defmodule Pulso.LogQL.Pipeline do
 
   defp compile_stage(%AST.LineFormat{template: t}) do
     {:ok, template} = Template.compile(t)
-    {:line_format, template}
+    # Loki's single-field line formatter uses ordinary Get, unlike template
+    # execution's rendered map. Retain rendering/work/output checks here; only
+    # select the matching label view for the two independently owned names.
+    case Enum.reject(template, &(&1 == {:literal, ""})) do
+      [{:action, [[{:field, {:root}, [name]}]]}] when name in ["__error__", "__error_details__"] ->
+        {:line_format, template, :ordinary_error_label}
+
+      _ ->
+        {:line_format, template}
+    end
   end
 
   defp compile_stage(%AST.LabelFormat{entries: entries}) do
@@ -242,10 +251,7 @@ defmodule Pulso.LogQL.Pipeline do
         {:keep, extract_labels(e, fields)}
 
       {:error, details} ->
-        {:keep,
-         e
-         |> Entry.put_label("__error__", "JSONParserErr", :parsed)
-         |> Entry.put_label("__error_details__", details, :parsed)}
+        {:keep, Entry.set_error(e, "JSONParserErr", details)}
     end
   end
 
@@ -254,8 +260,7 @@ defmodule Pulso.LogQL.Pipeline do
   defp apply_stage({:json, fields}, %Entry{line: <<char, _::binary>>} = e) when char in [?{, ?[, ?"],
     do: {:keep, extract_json_fields(e, fields)}
 
-  defp apply_stage({:json, _fields}, %Entry{} = e),
-    do: {:keep, Entry.put_label(e, "__error__", "JSONParserErr", :parsed)}
+  defp apply_stage({:json, _fields}, %Entry{} = e), do: {:keep, Entry.set_error(e, "JSONParserErr")}
 
   defp apply_stage({:logfmt, fields, sources, keep_empty?, strict?}, %Entry{} = e) do
     mode = if map_size(fields) == 0, do: :all, else: :explicit
@@ -265,9 +270,7 @@ defmodule Pulso.LogQL.Pipeline do
 
     e =
       if error && not stopped? do
-        e
-        |> Entry.put_label("__error__", "LogfmtParserErr", :parsed)
-        |> Entry.put_label("__error_details__", error, :parsed)
+        Entry.set_error(e, "LogfmtParserErr", error)
       else
         e
       end
@@ -313,19 +316,14 @@ defmodule Pulso.LogQL.Pipeline do
         {:keep, e}
 
       {:error, details} ->
-        {:keep,
-         e
-         |> Entry.put_label("__error__", "JSONParserErr", :parsed)
-         |> Entry.put_label("__error_details__", details, :parsed)}
+        {:keep, Entry.set_error(e, "JSONParserErr", details)}
     end
   end
 
-  defp apply_stage({:line_format, tmpl}, %Entry{} = e) do
-    case Template.render(tmpl, e.labels, e.line, e.timestamp_ns) do
-      {:ok, line} -> {:keep, %{e | line: line}}
-      {:error, details} -> {:keep, template_error(e, details)}
-    end
-  end
+  defp apply_stage({:line_format, tmpl}, %Entry{} = e), do: format_line(e, tmpl, e.labels)
+
+  defp apply_stage({:line_format, tmpl, :ordinary_error_label}, %Entry{} = e),
+    do: format_line(e, tmpl, Entry.ordinary_labels(e))
 
   defp apply_stage({:label_format, entries}, %Entry{} = e) do
     {formatted, _snapshot} =
@@ -342,7 +340,7 @@ defmodule Pulso.LogQL.Pipeline do
           {formatted, snapshot}
 
         {name, {:rename, src}}, {acc, snapshot} ->
-          case Map.fetch(acc.labels, src) do
+          case Entry.fetch_label(acc, src) do
             {:ok, value} -> {acc |> Entry.put_label(name, value, :parsed) |> Entry.delete_label(src), snapshot}
             :error -> {acc, snapshot}
           end
@@ -354,8 +352,13 @@ defmodule Pulso.LogQL.Pipeline do
   defp apply_stage({:drop, entries}, %Entry{} = e) do
     dropped =
       Enum.reduce(entries, e, fn {name, match}, acc ->
-        if drop_matches?(match, Map.get(acc.labels, name)) do
-          Entry.delete_label(acc, name)
+        value =
+          if name in ["__error__", "__error_details__"],
+            do: Entry.error_value(acc, name),
+            else: Entry.label_value(acc, name)
+
+        if drop_matches?(match, value) do
+          Entry.drop_label(acc, name)
         else
           acc
         end
@@ -383,10 +386,13 @@ defmodule Pulso.LogQL.Pipeline do
     {:keep, e}
   end
 
-  defp template_error(entry, details) do
-    entry
-    |> Entry.put_label("__error__", "TemplateFormatErr", :parsed)
-    |> Entry.put_label("__error_details__", details, :parsed)
+  defp template_error(entry, details), do: Entry.set_error(entry, "TemplateFormatErr", details)
+
+  defp format_line(entry, template, labels) do
+    case Template.render(template, labels, entry.line, entry.timestamp_ns) do
+      {:ok, line} -> {:keep, %{entry | line: line}}
+      {:error, details} -> {:keep, template_error(entry, details)}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -426,17 +432,17 @@ defmodule Pulso.LogQL.Pipeline do
   defp eval_label_filter({:cmp, name, op, {:ip, matcher}}, entry) do
     result =
       cond do
-        Map.get(entry.labels, "__error__", "") != "" -> true
-        not Map.has_key?(entry.labels, name) -> false
-        op == :eq -> IP.matches?(matcher, entry.labels[name])
-        op == :neq -> not IP.matches?(matcher, entry.labels[name])
+        Entry.error_value(entry, "__error__") != "" -> true
+        is_nil(Entry.label_value(entry, name)) -> false
+        op == :eq -> IP.matches?(matcher, Entry.label_value(entry, name))
+        op == :neq -> not IP.matches?(matcher, Entry.label_value(entry, name))
       end
 
     {result, entry}
   end
 
   defp eval_label_filter({:cmp, name, op, {type, expected}}, entry) when type in [:number, :duration_ns, :bytes] do
-    actual = Map.get(entry.labels, name)
+    actual = Entry.label_value(entry, name)
 
     case {actual, parse_filter_value(type, actual)} do
       {nil, _} ->
@@ -456,7 +462,8 @@ defmodule Pulso.LogQL.Pipeline do
   end
 
   defp eval_label_filter({:cmp, name, op, value}, entry) do
-    {eval_cmp(op, Map.get(entry.labels, name, ""), value), entry}
+    actual = if name == "__error__", do: Entry.error_value(entry, name), else: Entry.label_value(entry, name) || ""
+    {eval_cmp(op, actual, value), entry}
   end
 
   defp eval_cmp(:eq, actual, {:string, v}), do: actual == v
@@ -635,12 +642,10 @@ defmodule Pulso.LogQL.Pipeline do
   # Conversion failures keep the line and the first error, allowing later
   # __error__ filters to decide its fate. Details come from the same converters
   # used by unwrap, retaining their original Go diagnostics.
-  defp label_conversion_error(%{labels: %{"__error__" => error}} = entry, _) when error != "", do: entry
-
   defp label_conversion_error(entry, details) do
-    entry
-    |> Entry.put_label("__error__", "LabelFilterErr", :parsed)
-    |> Entry.put_label("__error_details__", details, :parsed)
+    if Entry.error_value(entry, "__error__") == "",
+      do: Entry.set_error(entry, "LabelFilterErr", details),
+      else: entry
   end
 
   # Recognize Loki's decolorizer language without discarding unmatched input.

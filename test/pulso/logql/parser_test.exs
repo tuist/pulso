@@ -5,6 +5,38 @@ defmodule Pulso.LogQL.ParserTest do
   alias Pulso.LogQL.Parser
   alias Pulso.LogQL.QueryValidation
 
+  @tag :sort_grouping_batch
+  test "named sort grouping is statically rejected while empty grouping remains valid" do
+    originals = [
+      ~s/sort(sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )) by (app)/,
+      ~s/sort_desc(sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )) by (app)/
+    ]
+
+    for query <- originals ++ Enum.map(originals, &"sum(#{&1})") do
+      # Pulso separates grammar from bounded executable AST validation;
+      # Loki's ParseExpr performs both before returning to its caller.
+      assert {:ok, ast} = Parser.parse(query)
+      assert QueryValidation.validate(ast) == {:error, :sort_grouping_not_allowed}
+    end
+
+    for op <- ["sort", "sort_desc"], mode <- ["by", "without"] do
+      for query <- ["#{op} #{mode}(app)(vector(1))", "#{op}(vector(1)) #{mode}(app)"] do
+        assert {:ok, ast} = Parser.parse(query)
+        assert QueryValidation.validate(ast) == {:error, :sort_grouping_not_allowed}
+      end
+
+      for query <- ["#{op} #{mode}()(vector(1))", "#{op}(vector(1)) #{mode}()"] do
+        assert {:ok, ast} = Parser.parse(query)
+        assert QueryValidation.validate(ast) == :ok
+      end
+    end
+
+    for op <- ["sum", "avg", "min", "max", "count", "stddev", "stdvar"] do
+      assert {:ok, ast} = Parser.parse("#{op} by(app)(vector(1))")
+      assert QueryValidation.validate(ast) == :ok
+    end
+  end
+
   @tag :formatter_roundtrip_batch
   test "complete Loki formatter inputs and literal outputs retain query admission" do
     fixture = File.read!("test/fixtures/logs/loki-upstream/formatter-roundtrip.json") |> Pulso.JSON.decode!()
@@ -355,6 +387,32 @@ defmodule Pulso.LogQL.ParserTest do
     test "quantile_over_time carries a scalar param" do
       assert {:ok, %AST.RangeAgg{op: :quantile_over_time, param: 0.99}} =
                Parser.parse("quantile_over_time(0.99, {s=\"a\"} | json | unwrap x [5m])")
+    end
+
+    @tag :quantile_sign_upstream
+    test "quantile parameters are unsigned tokens but exponents and scalars retain signs" do
+      for token <- ["-0.1", "-0", "+0", "-1e-1", "+1e-1"] do
+        assert {:error, _} = Parser.parse(~s'quantile_over_time(#{token}, {app="a"} | logfmt | unwrap v [1m])')
+      end
+
+      for {token, expected} <- [
+            {"0", 0.0},
+            {"0.5", 0.5},
+            {"1.5", 1.5},
+            {"5e-1", 0.5},
+            {"5e+0", 5.0},
+            {"0x1p-1", 0.5},
+            {"0x1p+1", 2.0}
+          ] do
+        assert {:ok, %AST.RangeAgg{param: ^expected} = ast} =
+                 Parser.parse(~s'quantile_over_time(#{token}, {app="a"} | logfmt | unwrap v [1m])')
+
+        assert QueryValidation.validate(ast) == :ok
+      end
+
+      for {token, expected} <- [{"-2e-1", -0.2}, {"+2e+1", 20.0}, {"-0x1p-1", -0.5}, {"+0x1p+1", 2.0}] do
+        assert {:ok, %AST.NumberLit{value: ^expected}} = Parser.parse(token)
+      end
     end
 
     test "unwrap ends up inside the inner log query" do

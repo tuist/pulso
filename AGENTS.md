@@ -24,15 +24,25 @@ not ID-value discovery. All 25 reserve entries inside the existing global
 apps/native artifacts together; native tuples and storage/keyed bytes are
 unchanged. See `docs/traces.md#static-intrinsic-vocabulary`.
 
-Trace metrics capability **3** adds bounded scalar/vector arithmetic and
-value-preserving scalar filters. All unique leaves share one provider scan and
-native series/point/selector-work/group-byte budgets; native decode repeats per
+Trace metrics capability **5** adds a single finite scalar prefilter before
+native topk/bottomk on an unranked leaf, preserving stage order and charging
+every finalized slot to shared native work before filtering. Directional
+homogeneous string-group ties remain: topk favors earlier labels, bottomk later
+labels. All unique leaves share one
+provider scan and native series/point/selector-work/group-byte budgets; native decode repeats per
 leaf, and arithmetic runs in the bounded BEAM query worker. Match ordered typed
 group labels, broadcast only truly ungrouped series, omit NaNs and fail whole on
 storage/budget errors without resetting scan budgets. Upgrade all serving
 app/native pairs; trace/storage/keyed tuples are unchanged. See `docs/querying.md`.
 
-Current log codec tuple is `{1,1,17}`, superseding the log API snapshots below.
+Current log codec tuple is `{1,1,18}`, superseding the log API snapshots below.
+Missing/empty unwrap targets discard prior pipeline errors before observation
+validation on both native and Elixir paths; usable targets and count/bytes
+observations retain their error guards. Selected scan/pipeline work still charges.
+Unwrapped-free absent_over_time skips unused plain JSON extraction only for
+whole pipelines of plain JSON and line filters. Consumers/other parsers retain
+execution; metadata errors and selected scan/work charges remain. General hint
+parity is open. No native/storage/keyed-byte change; upgrade query apps.
 Dedicated nonempty log trace_id/span_id fields fill absent structured-metadata
 names for LogQL, never overwrite explicit attributes (including empty values)
 or become stream labels. Existing one-suffix stream/parser collision ownership
@@ -592,8 +602,34 @@ quantile repair uses the upstream strict tolerance, minimum-normal absolute
 floor and maximum-float-capped relative scale; large finite counts no longer
 fail arithmetic and subnormals normalize correctly. Six public HTTP controls
 and 10,030 actual pinned Go quantile/repair comparisons cover the extremes.
-Selected Mimir engine corpus is now 1733 evaluations/94 files/6302 memory/S3 HTTP
-requests. Complete absence-over-time and staleness blocks plus label-replace,
+Selected Mimir engine corpus is now 1798 evaluations/106 files/6538 memory/S3 HTTP
+requests. Two unchanged histogram-subquery evaluations retain twelve samples
+and one explicit reset hint. Subqueries clear only explicit reset/no-reset hints
+on resampled points, preserving gauges/floats and direct selectors; repeated or
+skipped source samples cannot repeat/suppress reset metadata. Existing shared
+work/materialization limits and native/storage bytes are unchanged; upgrade
+query-serving apps. Two unchanged empty-le histogram evaluations retain all fourteen
+samples; the test load producer now drops empty-valued labels like upstream
+TSDB storage. Runtime quantile behavior was already correct; expected labels
+remain untouched. Seven unchanged float-delta boundary evaluations retain 34 original
+samples; the test producer now expands `_xN` into N omitted positions, while
+numeric/histogram repeats retain N+1. Runtime delta behavior was already correct.
+Seven unchanged sort evaluations retain ten original series/fifty samples;
+range sort/sort_desc omit histogram points without reordering, preserving float
+points in mixed series. Label sorts still retain histograms; warnings and budgets
+are unchanged. Two unchanged label-replace evaluations preserve the complete three-sample
+setup, valid control and original bounded invalid-regex diagnostic before storage;
+HTTP 400/bad_data and destination precedence remain unchanged. Three unchanged
+timestamp/rate evaluations retain produced-float rate/increase possible-non-counter
+naming infos; suffix/empty-name exclusions,
+histogram-only/nil omissions and query/batch isolation remain. This is a naming
+heuristic, not counter-type validation. Eight unchanged aggregation-extrema
+evaluations preserve min/max
+histogram-ignored infos, including histogram-only groups with no sample.
+Eight unchanged range-extrema evaluations preserve mixed-window
+histogram info while histogram-only extrema remain empty without info.
+Nine unchanged range-dispersion evaluations extend that policy to stddev/stdvar.
+Complete absence-over-time and staleness blocks plus label-replace,
 absence, timestamp and rounding selections retain original oracles. Complete
 upstream selectors/collision and Mimir staleness/subqueries/collision files add
 62 commands, including seven repeated offset evaluations. Multi-metric

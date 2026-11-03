@@ -128,6 +128,193 @@ native/reference regression. The source-expression continuation adds one wrapper
 for 15 frozen unit-table rows and one local lookup/admission/budget control.
 These are not additional service suites.
 
+The compensated-sum continuation adds one wrapper for four unchanged evaluations
+from [`vector_aggregations.logqltest:246–277`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/vector_aggregations.logqltest#L246-L277).
+It preserves the six `app="k"` load rows (21 expanded observations), original
+queries, windows, steps and complete 10/7/17 oracles, including the absent final
+non-overlapping window. Unrelated apps from the shared upstream load are omitted
+because none can match these selectors; relative timestamps receive only the
+harness's epoch translation. Authenticated instant/range GET and form POST replay
+all four evaluations (eight reads) over 21 native Parquet/S3 seed writes.
+Before correction, the first grouped instant result returned 0/0 instead of
+7/10. Sum-over-time now uses the existing compensated sum; the frozen
+materializing reference receives the same documented shared-bug correction,
+not a new oracle. This selected cancellation regression is not full vector/range
+aggregation, distributed execution or capacity parity.
+
+The independent vector-sum continuation adds one `:vector_sum_precision_upstream`
+wrapper for the active
+[`TestVectorAggEvaluator_Precision/sum()` oracle at `evaluator_test.go:1033–1073`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/evaluator_test.go#L1033-L1073).
+It retains all **10,001 original numeric inputs** (`1e16` followed by 10,000
+ones) and the literal original result **10000000000010000**. This is a
+unit-to-distinct-series HTTP adaptation, not an unchanged upstream HTTP query:
+the original helper assigns every sample the same `{foo="bar"}` labels at one
+timestamp (`evaluator_test.go:729–744`); the replay uses distinct stream labels
+and one `v` log at relative 30s per stream so `max_over_time` preserves each
+input to the outer ungrouped sum. `sort_desc` explicitly restores the original
+large-first sequence for the instant regression.
+
+Eleven authenticated batched pushes (ten of 1,000 streams and one of one)
+publish eleven native Parquet segments to owned loopback S3. Six authenticated
+GET/form-POST reads cover sorted original-order instant sum, ordinary instant
+sum and ordinary range sum at 60s/120s; the later `(60s,120s]` window stays
+absent, not zero. The red public replay returned 10000000000000000 for the
+sorted instant sum. Vector sum now independently reuses compensated summation
+in production and the materializing reference, correcting their shared bug
+without changing the earlier sum-over-time correction or deriving expectations
+from either evaluator. Existing request/query/resource ceilings and native,
+storage/keyed-byte formats are unchanged. This selected unit-oracle adaptation
+does not establish complete numeric, distributed or provider-capacity parity.
+
+The missing-target error continuation adds three
+`:unwrap_missing_errors_upstream` wrappers. The source replay keeps the complete
+five-row load and all four evaluations from
+[`range_aggregations.logqltest:409–440`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L409-L440):
+three numeric JSON lines, a malformed line without `v`, and nonmatching noise.
+Original instant median `6`, range medians `5,6`, filtered median `6` and empty
+error-selected result remain literal expectations. Only source times receive
+the harness's epoch translation; the four original sharded-stack 2% tolerances
+are provenance, not Pulso sharding claims. All eight source GET/form-POST reads
+use authenticated HTTP, native Parquet and owned loopback S3.
+
+Two separately authored wrappers add eight successful native-eligible/JSON-
+fallback reads and 40 rejection controls. Missing/empty targets discard prior
+metadata errors without creating an observation; usable targets still propagate
+those errors, as do count/bytes observations even when `v` is missing/empty.
+The later empty range window remains absent. A direct accumulator replay of the
+actual published Parquet returns three selected rows and one retained sample
+under a one-sample cap, proving native success without fallback and unchanged
+retained-sample accounting. Five authenticated pushes across these three tests
+publish five Parquet segments; no server ceiling is raised.
+
+Before correction, both the original fallback query and the native-eligible
+missing/empty control returned HTTP 400 `pipeline_error`. Separate direct native
+probes returned `pipeline_error` for both missing and empty targets too. The
+Elixir evaluator, frozen materializing reference and native accumulator now
+discard these nonobservations before checking prior errors, matching the
+upstream extractor's early return at
+[`metrics_extraction.go:370–397`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/metrics_extraction.go#L370-L397).
+Count/bytes and present-target guards stay intact. Upgrade all query-serving
+application/native pairs together to log codec tuple **`{1,1,18}`**; storage and
+keyed bytes are unchanged. This selected nonobservation correction is not broad
+parser-hint, exact diagnostic, distributed or provider-capacity parity.
+
+The bounded absence/JSON continuation adds two
+`:absence_json_hints_upstream` wrappers. The source wrapper retains both
+original rows and all five literal evaluations from
+[`range_aggregations.logqltest:1727–1745`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L1727-L1745):
+the malformed `{` line, valid nonmatching noise, empty unfiltered/error-selected
+instant vectors, the error-selected `_ 1` range and error-excluding `1` / `1 1`
+results. Ten authenticated GET/form-POST reads replay the original oracles over
+native Parquet/owned loopback S3; only timestamps receive the harness epoch
+translation. Before correction, the unfiltered instant query returned HTTP 400
+`pipeline_error`, not the original empty vector.
+
+This implements only the no-required-label corner of the upstream contract:
+[`extractor.go:43–47`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/extractor.go#L43-L47),
+[`parser_hints.go:130–142`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser_hints.go#L130-L142)
+and [`parser.go:81–85`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser.go#L81-L85).
+Only unwrapped-free `absent_over_time` pipelines consisting entirely of plain
+extract-all JSON parsers and line filters omit JSON execution. Multiple plain
+JSON stages are covered. Full normal validation/compilation and the original
+pushdown split happen first, so post-parser filters do not become native head
+filters and selected scan/work charges remain. Metadata errors still reach
+normal observation validation; no error guard is relaxed. Any label/error,
+formatting, unwrap, explicit-extraction or other-parser stage disables omission
+for the whole pipeline. The materializing snapshot requests the same bounded
+pipeline hint as an explicitly documented shared-bug correction, not as an
+independent oracle.
+
+The authored wrapper adds 20 successful GET/form-POST reads, 28 prior-error/
+consumer rejection controls and two invalid-regex rejections before storage.
+Controls cover parsed label/template consumption, usable versus missing unwrap
+targets, prior metadata errors, both orders of JSON/logfmt and explicit JSON.
+Four direct streamed/reference checks read the published Parquet with literal
+presence expectations and selected-work assertions, including a post-JSON
+filter that drops its input. Two batched pushes publish two Parquet segments;
+existing resource ceilings remain unchanged. This is not general required-label
+planning, parser early-exit, mixed-parser hint or exact diagnostic parity.
+The original upstream Go suite was inspected, not executed for this increment.
+No native change or rebuild is required: absence already uses the Elixir path;
+the log tuple remains `{1,1,18}` and storage/keyed bytes are unchanged.
+
+The raw-log range-boundary continuation adds three
+`:raw_log_exclusive_end_upstream` wrappers. The source wrapper preserves the
+complete active load and literal oracle from
+[`log_selection.logqltest:28–36`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/log_selection.logqltest#L28-L36):
+`{app="foo"}` contains `"in range"` at 10s and `"at boundary"` at 20s;
+`eval select from 0 to 20s forward {app="foo"}` returns only the 10s line.
+Only timestamps receive the harness epoch translation. One authenticated batched
+push publishes both original rows in one native Parquet segment on owned
+loopback S3. Before correction, public GET/form-POST returned both rows.
+The original upstream Go test was inspected, not executed for this increment.
+
+Authored GET/form-POST controls cover forward/backward ordering, limit one,
+adjacent nanoseconds, inclusive starts and empty equal bounds at populated,
+minimum-int64 and maximum-int64 timestamps. Equal windows avoid all provider
+requests without bypassing authentication, required-label admission or invalid
+regex validation. A 1ms+1ns request under a 1ms length policy rejects using the
+original external bounds, before normalization. Instant raw-log reads, metric
+instant/range endpoint inclusion, label discovery and detected-field windows
+retain their existing inclusive behavior.
+
+Only external raw-log `/query_range` dispatch translates `[start,end)` to
+the existing inclusive reader before selection/top-k. Equal bounds validate the
+pipeline and return empty without subtraction or storage access. Validation
+still runs inside the normal `:logql` bounded query worker with the admitted
+timeout/deadline, heap and concurrency limits, and retains log-query operation
+accounting. A third authored wrapper occupies the owned runtime's only LogQL
+class slot: valid and invalid-regex empty queries both return HTTP 429 until
+release, then return empty/HTTP 400 respectively. All eight GET/form-POST
+attempts avoid provider requests; counters retain six errors and two successes.
+This deterministically catches caller-side validation/admission bypass, but is
+not a timed-expiration or heap-exhaustion stress test. The earlier
+controller module doc described all range endpoints as inclusive (dating to
+`df05259`); this correction does not alter the deliberate inclusive shared
+evaluator/storage contract. No intentional safety restriction was identified.
+There is no native, codec-tuple, storage, keyed-byte or resource-ceiling change.
+
+Earlier HTTP execution controls had authored inclusive-end assumptions, not
+different source oracles. The seven accepted range-parameter table replays now
+seed the included row at original parsed end minus 1ns and the excluded row at
+end; original HTTP inputs and request-struct fixtures remain unchanged. Calendar
+controls use each original spelling as both an inclusive start and an exclusive
+end, with neighboring nanosecond bounds. The decimal-rounding control excludes
+the row at its rounded end. The authored policy/top-k control translates both
+range bounds by 1ns, retaining its one-minute interval and both intended rows.
+Instant, discovery and metric expectations remain unchanged. These are scoped
+HTTP compatibility replays, not full client, distributed or provider-capacity
+acceptance.
+
+The lexical-sign continuation adds one `:quantile_sign_upstream` HTTP wrapper
+using the complete seven-row load from
+[`range_aggregations.logqltest:225–234`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L225-L234).
+The original negative-quantile rejection at
+[`273–274`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L272-L274)
+and complete median `3`/out-of-range `+Inf` oracles at
+[`243–244,270–271`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L243-L271)
+retain their queries and source times, with only the harness's epoch translation.
+The source expects `unexpected -`; replay asserts HTTP 400 and the parse-error
+category, not exact diagnostic text. Authored controls separately exercise
+`-0`/`+0`, leading signs on exponent spellings, unsigned zero, decimal/hexadecimal
+exponent signs, and signed scalar literals. The 56 authenticated GET/form-POST
+attempts include 20 instant/range rejections without additional provider access,
+28 successful instant/range quantile reads over native Parquet/owned S3 and eight
+successful instant scalar reads without additional provider access. Seven seed
+pushes preserve every original input, including the noise and later sample.
+
+Before the fix, this exact HTTP regression returned 200 with `{app="a"} -Inf`
+instead of rejecting the original `-0.1` query (seed631, one failing test).
+Range parameters now consume unsigned NUMBER tokens rather than signed scalar
+expressions, matching
+[`syntax.y:166–170`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/syntax.y#L166-L170).
+Signs inside exponents and signed scalar parsing remain unchanged; this is not a
+numeric `q >= 0` guard, and values above one still return `+Inf`. The complete
+parser file passes 108 tests (seed632), and the targeted HTTP wrapper passes
+(seed633), serially with `ERL_FLAGS='+S 2:2 +SDcpu 1'` and warnings-as-errors.
+No full suite, native/storage/keyed-byte, dependency or resource-limit change is
+claimed; this closes only the selected lexical-sign gap.
+
 The [reserved error-label comparison continuation](reserved-label-comparisons.md)
 adds the complete original `TestParseExpr_ShouldValidateLabelComparison`
 matrix: 68 queries, 56 rejections and 12 admissions. One HTTP/S3 wrapper replays
@@ -3711,6 +3898,15 @@ Separate authored controls cover both directions, pipeline ordering, fractional
 volume steps and fail-whole sample/work ceilings. Endpoint, scan, heap and metric
 point ceilings remain unchanged; uint32 parser success is not a quota bypass.
 
+The separate [calendar continuation](http-calendar-timestamps.md) adds all 16
+original Go long-fraction rows and 89 authored executed Go-helper controls,
+not additional Loki source rows. Component replay preserves signed-int64
+nanosecond admission, including five deliberate rejections of wider Go times.
+Public GET/form-POST replay covers six spellings through exact log bounds and
+metric evaluation times (36 successful reads), plus six malformed/range/length
+controls (36 rejections with no provider requests). Single-digit hours and Go's
+inclusive timezone bounds now work without losing fractional nanoseconds.
+
 This closes the selected tables, not full HTTP error/duplicate-scalar/RFC3339
 grammar, live-tail delay scheduling, full Loki engine/client admission or deployed
 provider/capacity acceptance. Query applications must upgrade together; no
@@ -3799,3 +3995,539 @@ The original files have these SHA-256 hashes:
 | Counter selection, exact lines 588–739 including final newline | `0d683bccd991c437cc4636ca7d55e54acf3d8a01432d1adcbc2b69a288e799b7` |
 | `pkg/logql/internal/logqltest/README.md` | `ed4c0b5b9c129c970e7e7031d5d092b7534b9559d53690ba17c7c5d5add76097` |
 | `LICENSE` | `0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0` |
+
+### Formatter error-detail ownership continuation
+
+The `formatter_error_ownership_batch` HTTP tests retain the complete active
+[`formatters.logqltest:85–105`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/formatters.logqltest#L85-L105)
+block at the same pinned Loki revision. All three original loads survive:
+`{app="a",pod="p1"}` / `{` / 40s / metadata `n="7"`;
+`{app="a",pod="p2"}` / `{"ok":1}` / 20s / `n="5"`; and
+noise `{app="noise",pod="p3"}` / `{"ok":1}` / 20s / `n="9"`.
+One authenticated batched push creates one native Parquet object in an owned
+S3 harness. Relative times translate to recent nanosecond timestamps; queries,
+line bytes, metadata and literal value/error-label oracles are unchanged.
+
+The four original observations are: rejecting a formatter destination
+`__error__`; selecting both matching lines with parsed
+`__error_details__="mine"`; and both orders of JSON parsing versus detail
+formatting in `first_over_time(... | __error__!="" | unwrap n [1m]) by
+(__error_details__)`. Both orders return exactly
+`{__error__="JSONParserErr",__error_details__="Malformed JSON error"} 7`.
+The rejection retains its category, not the upstream exact diagnostic spelling.
+Every original query replays through authenticated GET and form POST; the raw
+selection negotiates categorized labels so metadata/parsed ownership is tested.
+
+Additional **authored controls**, not additional upstream rows, distinguish
+ordinary labels from authoritative pipeline errors: hidden-value reveal after
+detail resets, independent error/detail resets, conditional drop, keep, ordinary
+renames versus rendered template snapshots, same-stage snapshots, real later
+logfmt/template/unwrap errors, grouped instant/range results and an absent later
+window. Work and 16 MiB template-output exhaustion remain fail-whole even when
+the destination is hidden by an existing error and the query selects errors.
+Existing incoming-metadata and first-error conversion guards are not relaxed.
+
+Ownership follows pinned `labels.go` (`SetErr`, ordinary `Get`/`Set`/`Del`,
+`IntoMap`, `appendErrorLabels`), `drop_labels.go`, `keep_labels.go` and
+`label_filter.go:482–487`. A single-field `line_format` is a significant
+exception: `fmt.go:232–253` optimizes it through ordinary `Get`; a general line
+template and every label-format template use the rendered map instead. Tests
+distinguish `{{.__error_details__}}` from `{{.__error_details__ | print}}`.
+
+The actual Go pipeline reference was rebuilt with `go build -mod=readonly`
+from a clean checkout of the exact pin, after expanding its sparse checkout;
+no upstream tracked files or module dependencies were changed. The resulting
+binary reports Go 1.27.3. Thirteen authored successful pipeline inputs were
+compared on line bytes, keep decision, flattened labels and all three label
+categories. This is actual pipeline execution, not execution of the original
+upstream engine suite. The disposable runner does not support rejected-line
+results, so no negative-filter execution claim is made.
+
+The frozen materializing model independently corrects ordinary-label lookup
+for unwrap and grouping after an error reset. New instant/range comparisons
+cover retained hidden details and their removal by an ordinary rename; this
+does not extend that model to preserved-error pipelines. An older authored
+post-unwrap details-filter assertion is corrected: absent ordinary details
+discard the sample, while explicitly formatting an ordinary detail makes the
+same filter match and still fails on the unpreserved genuine extraction error.
+This is an ownership correction, not permission to retain errors.
+
+Earlier authored duration/byte/number diagnostic queries also used direct
+details predicates against authoritative errors. Their literal diagnostic
+oracles and complete inputs are retained: raw-log queries now snapshot the
+rendered detail into an ordinary temporary label, filter it and drop that label.
+Post-unwrap queries explicitly test that an absent ordinary detail filters out
+the sample, then select by `__error__` and assert the same complete diagnostic
+labels. The authored absence JSON consumer control similarly captures a
+rendered detail; a separate assertion retains the ordinary-filter empty result.
+No unchanged upstream query oracle is rewritten by these authored adaptations.
+The four negative/absent error-label matcher rows also correct their public
+setup adaptation: upstream `label_filter_test.go:277` calls `SetErr`, so HTTP
+seeds that error as structured metadata rather than an ordinary stream label.
+All four original error values, predicates and keep/drop oracles are retained,
+now through both GET and form POST.
+
+Combined replay also corrects nine stale **authored HTTP adaptations**, not
+upstream source oracles. Seven label/correlation/formatter/OR consumers now use
+a one-nanosecond-wide raw-log range instead of an empty range (or extend its
+upper bound by one nanosecond to include the final seeded row). Instant,
+metric and discovery bounds are unchanged. The historical-partition control
+asserts exclusive ends and adjacent-nanosecond inclusion explicitly. The
+counter control now skips a missing unwrap target despite prior error metadata,
+through GET and form POST; its real malformed-counter failures remain asserted.
+These align older consumers with the preceding exclusive-end and missing-unwrap
+fixes, without weakening their line, label, category or numerical expectations.
+
+No native/storage format or capability change is involved: formatter pipelines
+already use the bounded Elixir evaluator. This selection does not claim full
+diagnostic, parser-hint, native reserved-label, distributed or client parity.
+
+| Source / rebuilt reference | SHA-256 |
+| --- | --- |
+| Complete pinned `formatters.logqltest` | `c95c60b63d489f2c19bc2f60db92c31e2ea6716a82c469c04c87310fce99a759` |
+| Pinned `pkg/logql/log/labels.go` | `2f37f986442f5535402d0bd1503135fb358027e006842eba5e5690c64880e0f8` |
+| Pinned `pkg/logql/log/fmt.go` | `0a1830ef146924bdeff22d371fcb2489b8ffb44e8eb08503ee17c6c0f0418132` |
+| Disposable Go runner source | `b77e08ecf0eaf4af1ce160c2ff36ce1f8233bcf11e5add0eeea6e08d86e19f9a` |
+| Rebuilt local arm64 reference binary | `a2d2b921a7408b2afeb5293e82f5c446923003dfc44f5ec78f8af53436258559` |
+
+### Binary matching indexed-side diagnostics
+
+The `binary_matching_diagnostics_batch` HTTP replay retains the complete active
+[`binary_operations.logqltest:888–929`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/binary_operations.logqltest#L888-L929)
+block at the same pinned revision. All 57 original entries survive: 19 `"x"`
+entries for `{app="foo",machine="fuzz"}` every 10 seconds from zero, 19 `"x"`
+entries for `{app="foo",machine="buzz"}` every 15 seconds, and 19 `"noise"`
+entries for `{app="noise"}` every 10 seconds. One authenticated batched push
+writes a native Parquet object in an owned S3 harness. Only the relative epoch
+translates to recent whole seconds; labels, line bytes and query expressions
+are unchanged.
+
+All ten evaluations replay through authenticated GET and form POST: instant
+at 60 seconds and range 60–180 seconds, step 30, for each of the five queries.
+The first pair retains the literal `expect fail msg:` substring
+`found duplicate series on the right hand-side`. The upstream runner requires
+this substring, not merely rejection (`runner.go:174–185`). Four successful
+pairs retain both original machine label sets and literal `1` or `10` values,
+including all five matrix timestamps. Both bare and empty-parenthesized
+`group_right` forms, `on`/`ignoring`, and non-bool original-left values remain
+covered. The complete 20-request block executes before diagnostic assertions,
+so the public red replay does not stop before the successful source controls.
+
+The shared matching index now retains its failing side: right normally, left
+after the `group_right` operand swap. Loki HTTP renders the pinned
+`evaluator.go:1127–1148` diagnostic, including its semicolon without a space.
+PromQL normalizes that context back to its existing `:many_to_many_matching`
+error at its public evaluator boundary, including batched queries. No matching
+algorithm, cardinality-check ordering or resource policy changes.
+
+Separate **authored controls**, not additional upstream evaluations, cover
+left-side `group_right`, right-side `group_left`, unchanged one-to-one and
+grouped-output collision errors, authentication before provider access, and
+fail-whole scan/work budgets on both endpoints/transports. The existing LogQL
+boundary test now expects structured side context, including the frozen
+materializing reference; no independent numerical reference is inferred from
+their shared binary operations. PromQL tests retain the old public atom.
+
+The original upstream engine suite was not executed for this selection; the
+authority is the pinned active case, its runner assertion and matching source.
+This closes these indexed-side diagnostic oracles, not general error-wire or
+matching-diagnostic parity. Native/storage formats and capability tuples are
+unchanged; no Go or native rebuild is required for normal replay.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `binary_operations.logqltest` | `590d52f764e989b1cad7eb98d2933231644cec28decd91ca6d4f631a827b6d81` |
+| Complete lines 888–929, including final newline | `9bda28f6d31cef759427a6cab4b9e62a3102cdd28468afb137aec5aa5b8ee0e9` |
+
+### Missing explicit binary matching group diagnostic
+
+The `binary_missing_group_batch` continuation retains the complete active
+[`binary_operations.logqltest:750–789`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/binary_operations.logqltest#L750-L789),
+frozen verbatim in [`binary-operations-group-left.logqltest`](binary-operations-group-left.logqltest).
+Its three loads are identical to the later group-right block above: all 57
+original entries, including noise, reuse the same batched producer. They are
+not 57 additional distinct source inputs. This selection adds ten original
+evaluations, not new parser rows or authored results.
+
+Authenticated GET/form POST replay all ten evaluations on the two public query
+endpoints: instant at 60 seconds and range 60–180 seconds with step 30. Only the
+epoch translates to recent whole seconds. The two original rejection oracles
+retain the literal substring `multiple matches for labels: many-to-one matching
+must be explicit (group_left/group_right)`; the runner checks that substring at
+`runner.go:175–185`. All eight successful evaluations preserve the original
+labels, zero-valued bool outputs, asymmetric non-bool counts (fuzz 6, buzz 4),
+and five range timestamps. Both bare and empty-parenthesized `group_left`
+forms and `ignoring(machine)` remain unchanged. The complete 20-request source
+block and all successful assertions execute before checking the diagnostic.
+
+Loki HTTP now renders the existing atom reason with the actionable message from
+`evaluator.go:1164–1172`, preserving HTTP 400 and Pulso's `evaluation_failed`
+envelope. Shared matching algorithms, error ordering, PromQL contracts,
+indexed-side tuple rendering and grouped-output collision policy are unchanged.
+The earlier authored one-to-one assertion honestly replaces its old atom-string
+expectation; the indexed-side and grouped-output assertions remain unchanged.
+
+Separate authored controls, not source evaluations, verify all 57 raw entries
+and exact line bytes through GET/form range reads. The shared safety test now
+checks both indexed-side and missing-group queries: authentication and owned
+concurrency admission reject without provider requests, while scan/work limits
+fail whole without partial data, on both endpoints/transports. All state belongs
+to the test Runtime and owned S3 harness; the source replay writes and reads
+native Parquet. No native/storage/capability or resource-ceiling change occurs.
+
+The pinned Go suite/server was not executed for this selection. Authority is
+the active original block, its runner and matching implementation, not an
+independent Go execution or exact upstream HTTP-envelope claim. The frozen
+block retains Grafana Loki's AGPL-3.0-only attribution and license above.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `binary_operations.logqltest` | `590d52f764e989b1cad7eb98d2933231644cec28decd91ca6d4f631a827b6d81` |
+| Complete lines 750–789 / frozen block, including final newline | `d9e81a45f4e23edae4b474092b3d6dcc630c2bc99053221019b3b3b5f3f15714` |
+
+### Named sort-grouping admission
+
+The `sort_grouping_batch` continuation retains the complete active
+[`Test_SampleExpr_Sort_Fail`, `ast_test.go:219–230`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/ast_test.go#L219-L230):
+both unchanged query strings and the literal `require.ErrorContains` oracle
+`sort and sort_desc doesn't allow grouping by`. The original constructor test
+has **no loads**. Its two parser rows are not part of the separately frozen
+`parser_test.go` syntax-admission table and do not become engine evaluations.
+
+Authenticated GET/form POST on both query endpoints first replay the original
+empty setup. A separately authored one-line producer then writes native Parquet
+to owned S3 and repeats the same rejection checks. Six authored cases exercise
+pre/post grouping, `without`, and invalid sorts nested under aggregation,
+binary operations and `label_replace`. All 64 rejected attempts leave the
+provider request list unchanged, not merely the Parquet-read list. A separate
+missing-token request rejects with 401.
+
+Pulso keeps grammar parsing separate from executable AST validation. The new
+rule therefore runs in existing bounded evaluator validation, before provider
+work, and HTTP renders its specific reason as 400 `parse_error` with the pinned
+substring. This preserves the original rejection and substring, **not** exact
+upstream HTTP-envelope or parse-position parity: no Loki HTTP oracle occurs in
+this constructor test, and the upstream Go test/server was not executed here.
+
+The precise source contract is
+[`parser.go:202–211,255–262`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/parser.go#L202-L262):
+only a nonempty group-name list rejects, recursively. Empty `by()` and
+`without()` remain admitted. Existing sorting, other aggregators, worker
+admission/deadlines and resource ceilings are unchanged. Native/storage formats
+and capability tuples are unchanged.
+
+Separate **authored success controls**, not upstream loads/results, batch four
+lines into one Parquet object: `a=one` has one retained `error` and one excluded
+`error timeout`; `a=two` has two retained `error` lines, with `job=mysql,app=api`
+on both streams. Original filter spelling and the ten-second range produce
+asymmetric `0.1`/`0.2` rates. Forty-eight reads cover both sorts, omitted/empty
+grouping, both placements, endpoints and transports, with later absent windows.
+Ungrouped/`by()` instant results assert ascending/descending order; `without()`
+asserts complete values without a global-order oracle. Pinned
+[`evaluator.go:553–583,695–721`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/evaluator.go#L553-L721)
+retains all labels for empty `without`, making these separate singleton groups
+emitted through a Go map. An initial authored assertion incorrectly demanded
+global descending order for that case; source inspection corrected that
+assertion, without changing either original rejection oracle or production
+sorting. Two further reads preserve ordinary named `sum by(a)` grouping.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/logql/syntax/ast_test.go` | `b058fddd8f947e159e62e694394819eb358557e040c8c27f4f69d47a16be95a6` |
+| Complete lines 219–230, including final newline | `182ba8fb9a9b0077bd465776e4fc2491acb8763d7416af0cb3f03e3d115473fe` |
+
+### Nested detector JSON and difficult keys
+
+The `detected_object_comma` continuation freezes the complete active
+[`TestNestedJSONFieldDetection`, `detected_fields_test.go:1471–1648`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/queryrange/detected_fields_test.go#L1471-L1648)
+in [`nested-json-field-detection.go.txt`](nested-json-field-detection.go.txt).
+Both subtests, all four original line binaries, labels, empty structured
+metadata and original assertions are retained. The preceding valid pair has
+seven literal type/path oracles; the difficult-key pair at lines 1564–1647 has
+ten existence/path oracles, **not** type, cardinality or HTTP-envelope oracles.
+The replay extracts the four strings directly from the hash-checked source.
+The difficult-key strings deliberately contain trailing object commas.
+
+HTTP adaptation: the source unit test calls `parseDetectedFields(20, streams)`
+without a query. The replay adds the exact source-label selector, `limit=20`
+and `line_limit=100`, translates each pair's `now` to a distinct past instant,
+and retains both same-timestamp entries and every original byte. One batched
+authenticated push writes the four originals and two separately authored
+repaired counterparts to one native Parquet object in owned S3. GET/form POST
+on `detected_fields` reproduce the source paths; raw `query_range` checks
+retain the exact lines using the separately established `[start,end)` HTTP
+adaptation. The repairs remove only explicitly named fixture commas and do not
+replace or rewrite the original loads. All twelve reads execute before the
+source-oracle assertions, including on the red replay. Originally the difficult
+pair returned HTTP 200 `{}` on both transports; the valid/repaired pairs worked.
+
+The source contract is detector
+[`detected_fields.go:407–419`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/queryrange/detected_fields.go#L407-L419)
+and plain parser
+[`parser.go:90–125`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser.go#L90-L125):
+JSON detection uses `jsonparser.ObjectEach`. Its pinned dependency
+[`grafana/jsonparser`, `5f438463be34`, `parser.go:1080–1190`](https://github.com/grafana/jsonparser/blob/5f438463be34cc3c149bb1d3eef729e9f1879593/parser.go#L1080-L1190)
+accepts a closing object brace after the final comma. Existing Pulso ordered
+JSON pipeline parsing is strict and does not retain detector paths; explicit
+path extraction is partial and cannot discover keys. Neither is a sound
+detector-discovery fallback.
+
+The correction is confined to detector JSON decoding **after newest-line
+selection**, inside its existing bounded query worker. Strict valid JSON keeps
+its existing path. On failure, a string/escape-aware traversal records only
+commas before `}` after a possible complete value; a second strict decode
+must prove the entire repaired structure. No regex normalization, field/value
+rewrites or array-terminal-comma acceptance occurs. Leading `{,}`, doubled
+`{"a":1,,}` and missing-value `{"a":,}` remain malformed and use the existing
+logfmt fallback. Whitespace lookahead visits each byte at most once in addition
+to traversal; offset/chunk storage grows only with candidate commas. Disjoint
+source slices assemble one smaller binary, without repeated prefix copying.
+The extra traversal, decoding and allocation are linear in selected line bytes,
+under the existing heap/deadline/scan bounds, not a new byte-work quota.
+
+Separate **authored controls** cover strings containing commas/braces, escaped
+quotes and backslashes in keys/values, nested objects/arrays, empty
+objects/arrays, all JSON whitespace, strict repaired strings,
+leading/doubled/missing-value commas,
+trailing array commas, malformed/unclosed values, multiple roots, trailing
+garbage and ordinary logfmt fallback. Sentinel scalar fields make malformed
+array/empty-object controls observable if an incorrect normalizer accepts them.
+Exact string values replay through the detected-value endpoint too.
+Newest-line sampling, authentication-before-read, fail-whole provider scan
+limits and worker admission remain covered on public HTTP; ordinary `| json`
+still attaches `JSONParserErr` to the same trailing-comma
+input on both transports. Raw detection does not initialize the metric
+evaluator's `max_work` budget; that unsupported control was corrected to test
+the actual existing scan/admission policies, without adding or relaxing a policy.
+
+The upstream Go test/server was not executed: authority is the pinned active
+source oracle and matching dependency source, with actual Pulso HTTP replay.
+This is not general malformed-JSON/parser-hint/duplicate-key parity. Ordinary
+LogQL JSON execution, transport/OTLP admission, native/storage bytes, capability
+tuple 18 and resource ceilings are unchanged.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/querier/queryrange/detected_fields_test.go` | `526ccfbba128e917dfb017426baa63ad124e4f91ba9ceee616710864d07f75df` |
+| Complete frozen function, lines 1471–1648 including final newline | `d90a731058af10163cdebda0c882ebafc7acb4f7c66c99ab75c50e34d6bfcbed` |
+| Complete difficult-key subtest, lines 1564–1647 including final newline | `732d9622e47872424863a7e6138a579a43540177751458dbf1c91de4377f4080` |
+| First original difficult-key line | `bb731464d070ca659f5c0120fbb9c4589bf3568790601d2d1415fc747a01a658` |
+| Second original difficult-key line | `290709d8556c3445b52d142b200fa285cc1911a90f5446646ede3c570de78558` |
+
+### Numeric boolean detected-label continuation
+
+The `detected_numeric_booleans` continuation freezes the complete active
+[`TestQuerier_DetectedLabels / allows boolean values, even if numeric`, `querier_test.go:1783–1821`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/querier_test.go#L1783-L1821)
+in [`detected-label-numeric-booleans.go.txt`](detected-label-numeric-booleans.go.txt).
+The replay extracts all five original label names and nine literal values from
+the hash-checked source: numeric `0`/`1`, lowercase and uppercase Boolean
+strings, the original UUID and numeric `6`/`7` controls. Both original assertions
+remain: three labels, containing exactly `boolean-ints`, `boolean-bools` and
+`boolean-bools-uppercase`, independent of response ordering. The exact-cardinality
+checks are separately authored, not upstream sketch-estimation oracles.
+
+**Mock-to-HTTP adaptation:** upstream supplies an ingester name/value mock and
+an empty store response, not log entries. Its inherited request has an empty
+query and equal `now` bounds. The public replay keeps the query omitted and
+uses one singleton-label stream for every original label/value pair, with
+explicitly authored carrier text and one common past timestamp. A positive
+two-second window contains those entries instead of relying on mocked equal
+bounds. One authenticated batched push writes all nine entries into one native
+Parquet object in owned S3. GET/form POST `/series` independently prove all
+nine original label maps survived; both `/detected_labels` transports run
+before checking the unchanged three-name oracle. Before the correction, both
+returned only the two string-Boolean labels, omitting `boolean-ints`.
+
+Pinned [`shouldRejectLabel`, `querier.go:966–1009`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/querier.go#L966-L1009)
+retains nonempty one/two-value collections consisting only of literal `0`
+and/or `1` before all-ID rejection. The correction applies that exception to
+the existing distinct-value sets, without changing static-label handling,
+numeric/UUID rejection, discovery, storage or integer-first detected-field
+typing. The extra check visits at most two values and allocates no new set.
+
+Separate **authored controls** distinguish singleton `0`, singleton `1` and
+the pair from `0`/`1`/`2`, signed zeros, decimal zero/one spellings, other
+integers and UUIDs. Mixed numeric/text values and numeric static `pod` labels
+remain visible. Public detected-field reads still classify both `0` and `1`
+as integers; absent windows produce no invented labels. Missing/wrong tokens
+and invalid bounds reject without provider work, worker admission rejects with
+429 before provider work, and existing provider scan limits return fail-whole
+422 responses without suggestions. Normal controls verify actual Parquet
+reads; a scan bound may reject from manifest/footer information before a
+payload GET, so rejection is not asserted to require a Parquet download.
+
+The upstream Go test/server was not executed. Authority is the complete pinned
+active source case and production rejection contract, replayed through actual
+Pulso authenticated HTTP/native Parquet/owned S3. This is not full detected-label
+or HLL-estimation parity. Resource ceilings, native/storage bytes, capability
+tuple 18, field typing and the separate trailing-object-comma correction are
+unchanged.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/querier/querier_test.go` | `630560c5f11c336bf7eb547e728b6eafebc7627a0483bc6bfa63177c9b9b3022` |
+| Complete frozen subtest, lines 1783–1821 including final newline | `0240f47cc9e9678602ff7701aa5b69866222c6570af45c4626124f5335aefff0` |
+| Complete pinned `pkg/querier/querier.go` | `61bd4bc33e6bf897daf06eae0e844b4080653d01f251b6e8906192caa4b10ad0` |
+
+### Detected JSON replacement-character value continuation
+
+The `detected_json_replacement` continuation reuses the existing complete
+`utf8 error rune` row in [`json-parser.json`](json-parser.json), from active
+[`Test_jsonParser_Parse`, `parser_test.go:137–152`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser_test.go#L137-L152).
+It is **not another imported source row**: the original 16-row parser table
+and its counts remain unchanged. The row retains the complete original JSON
+line, empty base labels/metadata, all three expected values and all three JSON
+paths. Its literal U+FFFD string value must extract as one U+0020 space.
+
+The pinned detector calls the same
+[`NewJSONParser(true)`, `detected_fields.go:407–419`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/queryrange/detected_fields.go#L407-L419).
+[`unescapeJSONString`, `parser.go:281–293`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser.go#L281-L293)
+maps decoded U+FFFD values to spaces. Ordinary Pulso `| json` already obeyed
+that contract; its independent detector JSON string conversion did not.
+
+**HTTP adaptation:** the source is a parser unit case, without a timestamp or
+HTTP request. The replay writes the exact original line with its empty stream
+labels, adds a past timestamp, an empty selector and positive two-nanosecond
+bounds. One authenticated push creates one native Parquet object in owned S3.
+GET/form POST check every original field value and JSON path, the matching
+ordinary JSON pipeline result, and exact raw line bytes. Both transports finish
+before the source value oracle is checked. On red, both detector reads returned
+U+FFFD instead of space while the other two values, all paths, ordinary JSON
+parsing and raw bytes already matched.
+
+A second test batches six separately **authored controls** into one object:
+embedded/repeated U+FFFD, escaped `\ufffd`, ordinary Unicode, literal backslash
+spelling `\\ufffd`, a U+FFFD-containing key with untouched structured metadata,
+and the existing terminal-object-comma fallback. Per-row GET/form reads retain
+all raw bytes and paths. Missing/wrong authentication and invalid bounds reject
+without provider work; admission returns 429 before provider work; existing scan
+bounds return fail-whole 422 without values. All 63 public HTTP attempts across
+the two tests precede their final value assertions, including on red.
+
+The correction only cleans decoded JSON string **values** after bounded newest
+line selection, using the ordinary JSON parser's existing U+FFFD-to-space rule.
+Keys/paths, metadata, literal backslash text, raw lines and transport decoding
+are unchanged. The check is linear in selected string bytes; the existing
+worker heap/deadline and scan bounds remain authoritative. No native/storage
+bytes, capability tuple, resource ceiling or grammar policy changes occur;
+the numeric-boolean and terminal-object-comma corrections remain intact.
+
+The upstream Go test/server was not executed for this continuation. Evidence
+is the existing hash-checked active source row and pinned detector/parser
+contract, replayed through actual authenticated Pulso HTTP/native Parquet/owned
+S3. This does not establish general detector JSON or malformed-input parity.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/logql/log/parser_test.go` | `346b91ced2d38e51d8cf7fd8acb3335ea5796e9286fd901b45dd625c0b3634ff` |
+| Existing complete source row, lines 137–152 including final newline | `96a487acc7f5b19984a56930f414bd3ffb1eeac186754d0dcd5a7e5aae0d2d7f` |
+| Complete pinned `pkg/logql/log/parser.go` | `e844f4036afcb11d8e84235a77b837a82f21d6c3819a05d3c150eb7812786bfd` |
+| Complete pinned `pkg/querier/queryrange/detected_fields.go` | `391608fcc1aa68902f097a8cac47c94b68fce187161f52f112b313c1f561d06f` |
+
+### Detected logfmt first-extraction ownership continuation
+
+The `detected_logfmt_duplicates` continuation reuses the complete existing
+`duplicate from line property` row in [`logfmt.json`](logfmt.json), from active
+[`TestLogfmtParser_parse`, `parser_test.go:1301–1311`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser_test.go#L1301-L1311).
+It is **not another imported source row**: all 19 original parse rows and
+fixture counts remain unchanged. The test hashes the exact row from the
+fixture's frozen source selection. The original line is
+`foobar="foo bar" foobar=10ms`, the base labels are `foo="bar"`, and metadata
+is empty. Its complete oracle retains `foo="bar", foobar="foo bar"`.
+The [strict runner inherits that same oracle when `wantStrict` is empty](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser_test.go#L1448-L1467).
+
+The pinned detector calls
+[`NewLogfmtParser(false, false)` after JSON parsing fails](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/querier/queryrange/detected_fields.go#L407-L429).
+That parser [sanitizes and applies the stream suffix before checking prior extraction ownership, skipping empty values before claiming a destination](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/log/parser.go#L415-L445).
+The first retained extraction owns the final destination, not the last pair.
+
+**HTTP adaptation:** this parser unit row has no timestamp or HTTP request.
+The replay preserves its exact line, stream labels, empty metadata and complete
+ordinary/strict label oracles, adding only a past timestamp and positive
+two-nanosecond bounds. One authenticated push writes one native Parquet object
+in owned S3. GET/form POST check unchanged raw bytes and ordinary non-strict
+and strict parsing, then detected values, type and cardinality both without a
+pipeline and with `| logfmt`. On red, bare detection returned `10ms` as a
+duration; pipeline detection returned both `10ms` and `foo bar`, cardinality 2.
+Both must instead retain only `foo bar`, type string, cardinality 1.
+
+A second test batches five **authored controls**, not additional source rows:
+a nonduplicated value, empty-first duplicates, normalized aliases, duplicate
+values colliding with a stream label, and an already-suffixed key colliding
+with a later suffixed destination. Every row retains exact raw bytes and
+untouched `tag="�"` structured metadata. Missing/wrong authentication and
+invalid bounds reject without provider work; owned admission returns 429
+without provider work; scan ceilings return fail-whole 422 without values.
+All 65 public HTTP attempts across the two tests finish before their final
+detector value assertions, including on red.
+
+The correction is detector-local, after bounded newest-line selection. It
+retains the decoder's empty-value semantics and the existing sanitization and
+single-suffix rules, but records only the first value for each final destination.
+Traversal remains linear in decoded pairs, with no new input copies or retained
+duplicate-value lists. Ordinary pipelines, metadata, JSON detection, raw lines,
+transport admission, native/storage bytes, capability tuple 18 and resource
+ceilings are unchanged, including the earlier numeric-boolean, terminal-object-
+comma and JSON replacement-character corrections.
+
+The upstream Go test/server was not executed. Evidence is the hash-checked
+complete active source row and pinned detector/parser contract, replayed through
+actual authenticated Pulso HTTP/native Parquet/owned S3. This is not a claim of
+general detector or malformed-input parity.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/logql/log/parser_test.go` | `346b91ced2d38e51d8cf7fd8acb3335ea5796e9286fd901b45dd625c0b3634ff` |
+| Existing complete source row, lines 1301–1311 including final newline | `907c9c52ee3423bf82f5b9c32259e25d5bf66952d702a5c465e8a9f6d564c289` |
+| Complete pinned `pkg/logql/log/parser.go` | `e844f4036afcb11d8e84235a77b837a82f21d6c3819a05d3c150eb7812786bfd` |
+| Complete pinned `pkg/querier/queryrange/detected_fields.go` | `391608fcc1aa68902f097a8cac47c94b68fce187161f52f112b313c1f561d06f` |
+
+### Topk parameter diagnostic continuation
+
+[`vector-aggregations-topk.logqltest`](vector-aggregations-topk.logqltest)
+freezes the complete active
+[`vector_aggregations.logqltest:898–939`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/vector_aggregations.logqltest#L898-L939)
+block verbatim, under the existing upstream license attribution. Its eight
+load schedules produce all **378 original entries**, including noise, across
+four streams. All **nine evaluations** remain: seven successful instant/range
+ranking and grouping oracles, plus fractional and missing rank rejections
+requiring the literal substrings `invalid parameter` and `parameter required`.
+The pinned [AST constructor distinguishes missing parameters from invalid integer spelling](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/syntax/ast.go#L1959-L1965).
+
+**HTTP adaptation:** the `topk_parameter_batch` tests translate only the relative
+epoch into past nanosecond timestamps. They batch every original line through
+one authenticated push/native Parquet object in owned S3 per test. Every
+original evaluation replays over GET and form POST; the original range keeps
+20/40/60-second steps. Additional range placements of the two rejection queries
+are authored controls, not extra upstream evaluations. Raw-log queries retain
+every original byte, including noise. Successful metric assertions compare
+complete labels, timestamps and values, not transport series ordering.
+
+Before correction, both original rejection queries returned HTTP 400 with
+`error="evaluation_failed"` and `message=":invalid_aggregation_parameter"`.
+Static validation now distinguishes missing `topk` parameters; the controller
+renders `parameter required for operation topk` and `invalid parameter` while
+retaining HTTP 400 and the existing envelope. The latter rendering applies to
+the existing shared LogQL `invalid_aggregation_parameter` reason, including
+other invalid vector-aggregation parameters; its internal atom is unchanged.
+This is substring compatibility, not exact upstream parse-error wire parity.
+No ranking, grouping, zero-rank, native/storage or resource policy changes.
+
+Authored controls cover nested missing/fractional ranks, zero top/bottom ranks,
+unchanged unrelated range/vector grouping errors, wrong authentication and
+owned admission without provider reads, scan/work exhaustion without partial
+data, and no provider reads for invalid queries on both endpoints/transports.
+All state belongs to the existing test-local Runtime and S3 harness. The two
+focused tests fail on the old diagnostics and pass with the correction.
+
+The pinned Go test/server was not executed. Evidence is the hash-checked
+complete active source block and constructor, replayed through actual Pulso
+HTTP/native Parquet/owned S3. The neighboring zero-rank acceptance is retained
+deliberately even though the pinned constructor rejects nonpositive ranks.
+These tests do not establish general parser diagnostics or Loki wire parity.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/logql/internal/logqltest/testdata/vector_aggregations.logqltest` | `215a8a4297575f6d2bbc2befe0765e10d008b576ecc14e386744438221142369` |
+| Frozen complete lines 898–939 including final newline | `ccefc4098de08103c8bd55f3938912de4233e862a22e09f44fc179be0563e14d` |
+| Complete pinned `pkg/logql/syntax/ast.go` | `87eb6811c68654e2b2f7d629d799d215dc79fb549e0f9d71a805a46bd51e1e69` |

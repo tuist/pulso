@@ -24,6 +24,10 @@ defmodule Pulso.LogQL.Entry do
     * `label_categories` — optional current name-to-origin map for negotiated
       categorized HTTP output. Mutations update it alongside `labels`, even
       when the new value equals the old one. Never inferred from final values.
+    * `error_labels` — authoritative pipeline error and details, independent
+      of ordinary labels with those names. `labels` overlays these for output
+      and templates. `ordinary_error_labels` retains only the two shadowed
+      ordinary values/categories, including values revealed by error resets.
   """
 
   alias Pulso.Record.Log
@@ -35,6 +39,8 @@ defmodule Pulso.LogQL.Entry do
     :labels,
     :base_labels,
     :label_categories,
+    :error_labels,
+    ordinary_error_labels: %{},
     metadata_labels: %{},
     extracted_labels: %{}
   ]
@@ -46,6 +52,8 @@ defmodule Pulso.LogQL.Entry do
           labels: %{optional(String.t()) => String.t()},
           base_labels: map() | nil,
           label_categories: %{optional(String.t()) => category()} | nil,
+          error_labels: map() | nil,
+          ordinary_error_labels: map(),
           metadata_labels: map(),
           extracted_labels: %{optional(String.t()) => true}
         }
@@ -98,8 +106,117 @@ defmodule Pulso.LogQL.Entry do
       labels: labels,
       base_labels: base_labels,
       metadata_labels: metadata,
-      label_categories: categories
+      label_categories: categories,
+      error_labels: Map.take(metadata, ["__error__", "__error_details__"]),
+      ordinary_error_labels:
+        base_labels
+        |> Map.take(["__error__", "__error_details__"])
+        |> Map.new(fn {name, value} -> {name, {stringify(value), :stream}} end)
     }
+  end
+
+  # `labels` remains the rendered bag for output/template consumers. Only the
+  # two reserved names need a shadow: Loki's ordinary Set/Get/Del are separate
+  # from SetErr/ResetError. No second full label map is retained or copied.
+  @error_names ["__error__", "__error_details__"]
+
+  @doc false
+  def initialize_errors(%{error_labels: nil} = entry) do
+    # As with base-label provenance, manually constructed entries start with
+    # ordinary stream labels. Only from_record metadata and set_error establish
+    # authoritative errors; a same-named base label is not a SetErr call.
+    ordinary =
+      Map.new(Map.take(entry.labels, @error_names), fn {name, value} ->
+        {name, {value, Map.get(entry.label_categories || %{}, name, :stream)}}
+      end)
+
+    %{entry | error_labels: %{}, ordinary_error_labels: ordinary}
+  end
+
+  def initialize_errors(entry), do: entry
+
+  @doc false
+  def error_value(entry, name), do: Map.get(entry.error_labels || %{}, name, "")
+
+  @doc false
+  def fetch_label(%{error_labels: nil} = entry, name) when name in @error_names,
+    do: fetch_label(initialize_errors(entry), name)
+
+  def fetch_label(entry, name) when name in @error_names do
+    case Map.fetch(entry.ordinary_error_labels, name) do
+      {:ok, {value, _category}} -> {:ok, value}
+      :error -> :error
+    end
+  end
+
+  def fetch_label(entry, name), do: Map.fetch(entry.labels, name)
+
+  @doc false
+  def label_value(entry, name) do
+    case fetch_label(entry, name) do
+      {:ok, value} -> value
+      :error -> nil
+    end
+  end
+
+  @doc false
+  def set_error(entry, error, details \\ nil) do
+    entry = initialize_errors(entry)
+    errors = %{"__error__" => error}
+    errors = if details in [nil, ""], do: errors, else: Map.put(errors, "__error_details__", details)
+    refresh_errors(%{entry | error_labels: errors})
+  end
+
+  @doc false
+  def drop_label(entry, name) when name in @error_names do
+    entry = initialize_errors(entry)
+    refresh_errors(%{entry | error_labels: Map.delete(entry.error_labels, name)})
+  end
+
+  def drop_label(entry, name), do: delete_label(entry, name)
+
+  @doc false
+  def ordinary_labels(%{error_labels: errors} = entry) when is_nil(errors) or errors == %{}, do: entry.labels
+
+  def ordinary_labels(entry) do
+    Enum.reduce(@error_names, entry.labels, fn name, labels ->
+      case fetch_label(entry, name) do
+        {:ok, value} -> Map.put(labels, name, value)
+        :error -> Map.delete(labels, name)
+      end
+    end)
+  end
+
+  @doc false
+  def preserve_error_labels(entry, labels) do
+    if error_value(entry, "__error__") == "" do
+      labels
+    else
+      labels
+      |> Map.drop(@error_names)
+      |> Map.merge(Map.reject(entry.error_labels, fn {_name, value} -> value == "" end))
+    end
+  end
+
+  defp refresh_errors(entry) do
+    Enum.reduce(@error_names, entry, fn name, acc ->
+      {value, category} =
+        case error_value(acc, name) do
+          "" -> Map.get(acc.ordinary_error_labels, name, {nil, nil})
+          value -> {value, :parsed}
+        end
+
+      labels = if is_nil(value), do: Map.delete(acc.labels, name), else: Map.put(acc.labels, name, value)
+
+      categories =
+        case acc.label_categories do
+          nil -> nil
+          categories when is_nil(category) -> Map.delete(categories, name)
+          categories -> Map.put(categories, name, category)
+        end
+
+      %{acc | labels: labels, label_categories: categories}
+    end)
   end
 
   @doc false
@@ -113,6 +230,15 @@ defmodule Pulso.LogQL.Entry do
   def extracted?(entry, name), do: Map.has_key?(entry.extracted_labels, name)
 
   @doc false
+  def put_label(entry, name, value, category) when name in @error_names do
+    entry = initialize_errors(entry)
+    entry = %{entry | ordinary_error_labels: Map.put(entry.ordinary_error_labels, name, {value, category})}
+    # Ordinary parser ownership still records an extraction, even when hidden
+    # by the authoritative pipeline error.
+    extracted = if category == :parsed, do: Map.put(entry.extracted_labels, name, true), else: entry.extracted_labels
+    refresh_errors(%{entry | extracted_labels: extracted})
+  end
+
   def put_label(entry, name, value, category) do
     categories = if entry.label_categories, do: Map.put(entry.label_categories, name, category)
 
@@ -133,6 +259,18 @@ defmodule Pulso.LogQL.Entry do
   end
 
   @doc false
+  def delete_label(entry, name) when name in @error_names do
+    entry = initialize_errors(entry)
+    base = if entry.base_labels, do: Map.delete(entry.base_labels, name)
+
+    refresh_errors(%{
+      entry
+      | ordinary_error_labels: Map.delete(entry.ordinary_error_labels, name),
+        base_labels: base,
+        metadata_labels: Map.delete(entry.metadata_labels, name)
+    })
+  end
+
   def delete_label(entry, name) do
     categories = if entry.label_categories, do: Map.delete(entry.label_categories, name)
     base = if entry.base_labels, do: Map.delete(entry.base_labels, name)
@@ -148,6 +286,8 @@ defmodule Pulso.LogQL.Entry do
 
   @doc false
   def keep_labels(entry, labels) do
+    # Keep never deletes either reserved name, including hidden ordinary values.
+    labels = Map.merge(labels, Map.take(entry.labels, @error_names))
     names = Map.keys(labels)
     categories = if entry.label_categories, do: Map.take(entry.label_categories, names)
     base = if entry.base_labels, do: Map.take(entry.base_labels, names)

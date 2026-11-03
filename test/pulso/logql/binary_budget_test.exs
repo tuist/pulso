@@ -8,6 +8,7 @@ defmodule Pulso.LogQL.BinaryBudgetTest do
   alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.Memory
+  alias Pulso.Test.MetricEvalReference
 
   setup do
     Memory.reset()
@@ -57,8 +58,21 @@ defmodule Pulso.LogQL.BinaryBudgetTest do
   end
 
   test "empty-label aggregation is a vector and ambiguous matching rejects, never overwrites" do
-    assert {:error, :many_to_many_matching} =
-             run(~s'sum(count_over_time({service="api"}[1m])) + on () count_over_time({service="api"}[1m])')
+    # LogQL now retains the indexed side for HTTP diagnostics. The frozen
+    # reference shares matching, not error formatting, and must retain it too.
+    one = ~s'sum(count_over_time({service="api"}[1m]))'
+    many = ~s'count_over_time({service="api"}[1m])'
+
+    for {query, side} <- [
+          {one <> " + on () " <> many, :right},
+          {many <> " + on () group_right " <> one, :left}
+        ] do
+      assert {:error, {:many_to_many_matching, ^side}} = run(query)
+      assert {:ok, ast} = Parser.parse(query)
+
+      assert {:error, {:many_to_many_matching, ^side}} =
+               MetricEvalReference.evaluate(ast, "acme", %{end_ts_ns: 10})
+    end
   end
 
   test "empty matrix windows are missing, not zero samples" do

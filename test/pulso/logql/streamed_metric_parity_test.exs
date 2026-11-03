@@ -81,6 +81,37 @@ defmodule Pulso.LogQL.StreamedMetricParityTest do
   defp approx(v) when is_float(v), do: Float.round(v, 9)
   defp approx(v), do: v
 
+  test "reset errors retain distinct ordinary details through materialized grouping" do
+    tenant = "error-ownership-model"
+
+    assert :ok =
+             Storage.append(:logs, tenant, [
+               %Log{timestamp_ns: 10 * @second, body: "{", resource: %{"app" => "a"}, attributes: %{"n" => "7"}}
+             ])
+
+    for stages <- [
+          ~s/| json | label_format __error_details__="mine" | drop __error__/,
+          ~s/| json | label_format __error_details__="mine" | drop __error__,__error_details__/,
+          ~s/| json | label_format __error_details__="mine" | label_format saved=__error_details__ | drop __error__,__error_details__/
+        ] do
+      {:ok, ast} = Parser.parse(~s/first_over_time({app="a"} #{stages} | unwrap n [1m]) by (__error_details__)/)
+      expected_details = if stages =~ "saved=", do: %{}, else: %{"__error_details__" => "mine"}
+      at = 30 * @second
+
+      for module <- [MetricEval, MetricEvalReference] do
+        assert {:ok, {:vector, [{^expected_details, {^at, 7.0}}]}} =
+                 evaluate(module, ast, tenant, %{end_ts_ns: 30 * @second})
+
+        assert {:ok, {:matrix, [{^expected_details, [{^at, 7.0}]}]}} =
+                 evaluate(module, ast, tenant, %{
+                   start_ts_ns: 30 * @second,
+                   end_ts_ns: 120 * @second,
+                   step_ns: 90 * @second
+                 })
+      end
+    end
+  end
+
   test "the materializing model independently validates every selected first/last value, not fetched gaps" do
     tenant = "window-model"
 

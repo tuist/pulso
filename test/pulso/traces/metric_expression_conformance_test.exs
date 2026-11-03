@@ -21,6 +21,38 @@ defmodule Pulso.Traces.MetricExpressionConformanceTest do
     for row <- @fixture["grammar"]["negative"], do: assert({:error, _} = Metrics.parse(row["query"]), row["query"])
   end
 
+  test "TestMetricsSecondStage prefilter parser rows preserve filter-before-ranking order" do
+    # Original parser acceptance oracle, not original numeric engine results.
+    for {query, ranking, filter} <- [
+          {"{ } | rate() > 10 | topk(5)", {"topk", 5}, {">", 10.0}},
+          {"{ } | rate() by(name) >= 5.5 | bottomk(3)", {"bottomk", 3}, {">=", 5.5}},
+          {"{ } | count_over_time() != 0 | topk(10)", {"topk", 10}, {"!=", 0.0}}
+        ] do
+      assert {:ok, %{second: {op, k, ^filter}}} = Metrics.parse(query)
+      assert {op, k} == ranking
+      assert {:ok, %{leaves: [leaf]}} = Metrics.parse("(#{query}) + 0")
+      assert leaf.second == {op, k, filter}
+      assert {:ok, %{second: {^op, ^k, ^filter}}} = Metrics.parse(query <> " with(sample=0.5)")
+    end
+
+    assert {:ok, %{expression: {:filter, ">=", {:leaf, leaf}, 5.5}}} =
+             Metrics.parse("{} | rate() by(name) | bottomk(3) >= 5.5")
+
+    assert leaf.second == {"bottomk", 3}
+
+    # Additional ordered chains, ranking whole expressions and nonfinite
+    # thresholds stay outside this narrow single-leaf/single-prefilter slice.
+    for query <- [
+          "{} | rate() > 1e999 | topk(1)",
+          "{} | rate() >= 0 < 10 | topk(1)",
+          "{} | rate() | bottomk(2) >= 0 | topk(1)",
+          "{} | rate() > 0 | topk(1) | bottomk(1)",
+          "({} | rate()) > 0 | topk(1)"
+        ] do
+      assert {:error, _} = Metrics.parse(query), query
+    end
+  end
+
   test "complete scalar engine oracle replays through the memory/native scan" do
     scalar = @fixture["scalar"]
     tenant = "tempo-scalar-#{System.unique_integer([:positive])}"

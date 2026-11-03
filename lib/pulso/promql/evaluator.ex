@@ -182,6 +182,9 @@ defmodule Pulso.PromQL.Evaluator do
   rescue
     ArithmeticError -> {:error, :nonfinite_result}
   catch
+    # LogQL retains the failing indexed side for its diagnostic; PromQL's
+    # public evaluator keeps its established undifferentiated error contract.
+    {:promql_error, {:many_to_many_matching, side}} when side in [:left, :right] -> {:error, :many_to_many_matching}
     {:promql_error, reason} -> {:error, reason}
   end
 
@@ -415,6 +418,16 @@ defmodule Pulso.PromQL.Evaluator do
         Process.put(:promql_warnings, MapSet.put(Process.get(:promql_warnings), message))
       end
 
+      drop_histograms? = Process.get(:promql_range_query) and name in ["sort", "sort_desc"]
+      range_series = if drop_histograms?, do: vector, else: []
+
+      range_series =
+        for {labels, samples} <- range_series,
+            floats = Enum.reject(samples, &is_struct(elem(&1, 1), Histogram)),
+            floats != [],
+            do: {labels, floats}
+
+      vector = if drop_histograms?, do: range_series, else: vector
       result = if Process.get(:promql_range_query), do: vector, else: Operations.call(name, values, steps)
       {:ok, result, warnings}
     end
@@ -498,13 +511,20 @@ defmodule Pulso.PromQL.Evaluator do
 
       groups =
         Enum.map(series, fn {labels, points} ->
-          {labels, Enum.map(points, fn {ts, value} -> %{timestamp_ns: ts, value: value} end)}
+          {labels, Enum.map(points, &subquery_point/1)}
         end)
 
       with {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits()),
            do: {:ok, result, warnings}
     end
   end
+
+  # Resampling can skip or repeat the source sample a reset hint describes.
+  # Re-detect resets across the subquery's own points, preserving gauge hints.
+  defp subquery_point({ts, %Histogram{counter_reset_hint: hint} = h}) when hint in [:yes, :no],
+    do: %{timestamp_ns: ts, value: %{h | counter_reset_hint: :unknown}}
+
+  defp subquery_point({ts, value}), do: %{timestamp_ns: ts, value: value}
 
   defp evaluate_args(args, tenant, steps) do
     Enum.reduce_while(args, {:ok, [], []}, fn arg, {:ok, acc, warnings} ->
@@ -722,9 +742,21 @@ defmodule Pulso.PromQL.Evaluator do
     samples = Enum.reject(:queue.to_list(bucket), &(&1.value == :stale))
     note_mixed_histograms(op, samples, metric_name)
 
-    if op in [:rate, :increase] and Enum.all?(samples, &histogram?/1),
-      do: NativeRange.value(op, samples, start, finish, &note_histogram_counter(&1, metric_name)),
-      else: value(op, samples, start, finish)
+    result =
+      if op in [:rate, :increase] and Enum.all?(samples, &histogram?/1),
+        do: NativeRange.value(op, samples, start, finish, &note_histogram_counter(&1, metric_name)),
+        else: value(op, samples, start, finish)
+
+    if op in [:rate, :increase] and
+         (is_number(result) or result in [:nan, :infinity, :negative_infinity]) and
+         metric_name != "" and not String.ends_with?(metric_name, ["_total", "_sum", "_count", "_bucket"]) do
+      info(
+        "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: " <>
+          Pulso.JSON.encode!(metric_name)
+      )
+    end
+
+    result
   end
 
   # Both storage adapters use unanchored matching; Prometheus selectors anchor
@@ -931,7 +963,16 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp note_mixed_histograms(op, samples, metric_name) do
     annotate? =
-      op in [:deriv, :mad_over_time, :ts_of_min_over_time, :ts_of_max_over_time] or
+      op in [
+        :deriv,
+        :mad_over_time,
+        :min_over_time,
+        :max_over_time,
+        :stddev_over_time,
+        :stdvar_over_time,
+        :ts_of_min_over_time,
+        :ts_of_max_over_time
+      ] or
         match?({name, _, _} when name in [:predict_linear, :quantile_over_time, :double_exponential_smoothing], op)
 
     if annotate? and Enum.any?(samples, &histogram?/1) and Enum.any?(samples, &(not histogram?(&1))) do
@@ -1168,7 +1209,7 @@ defmodule Pulso.PromQL.Evaluator do
     {histograms, floats} = Enum.split_with(values, &match?({%Histogram{}, _}, &1))
     floats = Enum.map(floats, &elem(&1, 0))
 
-    if histograms != [] and op in [:stddev, :stdvar],
+    if histograms != [] and op in [:stddev, :stdvar, :min, :max],
       do: info("PromQL info: ignored histogram in #{op} aggregation")
 
     cond do

@@ -15,11 +15,15 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
   alias Pulso.Auth
   alias Pulso.Auth.SharedSecret
+  alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST.RangeAgg
+  alias Pulso.LogQL.MetricEval
   alias Pulso.LogQL.Parser
+  alias Pulso.Loki.FieldType
   alias Pulso.Loki.PushProto
   alias Pulso.Loki.Tail
   alias Pulso.PromQL.Evaluator
+  alias Pulso.PromQL.QuerySlots
   alias Pulso.Runtime
   alias Pulso.Storage
   alias Pulso.Storage.S3
@@ -29,6 +33,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
   alias Pulso.Test.LokiLabelBuilderFixture
   alias Pulso.Test.LokiPipelineFixture
   alias Pulso.Test.LokiSampleExtractorFixture
+  alias Pulso.Test.MetricEvalReference
   alias Pulso.Test.RuntimePlug
   alias Pulso.Test.WebSocketClient
 
@@ -115,6 +120,348 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       now: System.system_time(:nanosecond) - 10 * @second,
       store: store
     }
+  end
+
+  @tag :sort_grouping_batch
+  test "complete Loki named-sort rejection table rejects before provider work", ctx do
+    # Original Test_SampleExpr_Sort_Fail has no loads. Keep both original
+    # queries and the literal rejection-substring oracle unchanged.
+    originals = [
+      ~s/sort(sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )) by (app)/,
+      ~s/sort_desc(sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )) by (app)/
+    ]
+
+    # Authored placements exercise recursive admission, not additional
+    # upstream rows. An outer valid expression must not hide an invalid sort.
+    authored = [
+      ~s/sort by(app)(rate({job="mysql"}[10s]))/,
+      ~s/sort_desc without(app)(rate({job="mysql"}[10s]))/,
+      ~s/sort(rate({job="mysql"}[10s])) without(app)/,
+      ~s/sum(#{hd(originals)})/,
+      ~s/vector(1) + (#{List.last(originals)})/,
+      ~s/label_replace(#{hd(originals)}, "copied", "$1", "a", "(.*)")/
+    ]
+
+    for seeded? <- [false, true] do
+      if seeded? do
+        # Separately authored producer: preserve the original empty setup
+        # first, then prove rejection does not depend on absent storage.
+        push(ctx, "error", ctx.now - @second, %{"job" => "mysql", "a" => "one", "app" => "api"})
+        assert_parquet(ctx, 1)
+      end
+
+      before = Agent.get(ctx.store, & &1.requests)
+
+      for query <- originals ++ authored,
+          path <- ["/query", "/query_range"],
+          method <- [&request/4, &request_form/4] do
+        response =
+          method.(
+            ctx,
+            path,
+            [query: query, time: to_string(ctx.now), start: to_string(ctx.now), end: to_string(ctx.now), step: "1"],
+            400
+          )
+
+        assert response["status"] == "error"
+        assert response["error"] == "parse_error"
+        assert response["message"] =~ "sort and sort_desc doesn't allow grouping by"
+      end
+
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    response =
+      Req.get!(ctx.url <> "/loki/api/v1/query",
+        headers: [{"x-scope-orgid", ctx.tenant}],
+        params: [query: hd(originals), time: to_string(ctx.now)],
+        retry: false
+      )
+
+    assert response.status == 401
+    refute_parquet_read(ctx)
+  end
+
+  @tag :sort_grouping_batch
+  test "authored sort controls retain empty grouping, asymmetric order and ordinary grouping", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second}
+
+    push_streams(ctx, [
+      %{
+        "stream" => %{"job" => "mysql", "a" => "one", "app" => "api"},
+        "values" => [
+          [to_string(ctx.now - @second), "error"],
+          [to_string(ctx.now - 2 * @second), "error timeout"]
+        ]
+      },
+      %{
+        "stream" => %{"job" => "mysql", "a" => "two", "app" => "api"},
+        "values" => [
+          [to_string(ctx.now - @second), "error"],
+          [to_string(ctx.now - 2 * @second), "error"]
+        ]
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+    inner = ~s/sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )/
+    timestamp = div(ctx.now, @second) * 1.0
+
+    for op <- ["sort", "sort_desc"],
+        grouping <- ["", "by ()", "without ()"],
+        placement <- [:before, :after],
+        method <- [&request/4, &request_form/4] do
+      query =
+        case placement do
+          :before -> "#{op} #{grouping}(#{inner})"
+          :after -> "#{op}(#{inner}) #{grouping}"
+        end
+
+      response = method.(ctx, "/query", [query: query, time: to_string(ctx.now)], 200)
+
+      ascending = [
+        %{"metric" => %{"a" => "one"}, "value" => [timestamp, "0.1"]},
+        %{"metric" => %{"a" => "two"}, "value" => [timestamp, "0.2"]}
+      ]
+
+      assert response["data"]["resultType"] == "vector"
+
+      if grouping == "without ()" do
+        # Pinned VectorAggEvaluator hashes all retained labels for without().
+        # These singleton groups have no global directional-order guarantee.
+        assert Enum.sort_by(response["data"]["result"], & &1["metric"]["a"]) == ascending
+      else
+        assert response["data"]["result"] == if(op == "sort", do: ascending, else: Enum.reverse(ascending))
+      end
+
+      response =
+        method.(
+          ctx,
+          "/query_range",
+          [query: query, start: to_string(ctx.now), end: to_string(ctx.now + 20 * @second), step: "10"],
+          200
+        )
+
+      assert response["data"]["resultType"] == "matrix"
+
+      assert Enum.sort_by(response["data"]["result"], & &1["metric"]["a"]) == [
+               %{"metric" => %{"a" => "one"}, "values" => [[timestamp, "0.1"]]},
+               %{"metric" => %{"a" => "two"}, "values" => [[timestamp, "0.2"]]}
+             ]
+    end
+
+    for method <- [&request/4, &request_form/4] do
+      response = method.(ctx, "/query", [query: inner, time: to_string(ctx.now)], 200)
+      assert values(response) == %{%{"a" => "one"} => "0.1", %{"a" => "two"} => "0.2"}
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :formatter_error_ownership_batch
+  test "complete Loki formatter error block retains all loads and four original oracles", ctx do
+    ctx = %{ctx | now: ctx.now - 120 * @second}
+    push_formatter_error_rows(ctx)
+
+    for method <- [&request/4, &request_form/4] do
+      failed =
+        method.(
+          ctx,
+          "/query",
+          [
+            query: ~s/count_over_time({app="a"} | label_format __error__="mine" [1m])/,
+            time: to_string(ctx.now + 60 * @second)
+          ],
+          400
+        )
+
+      assert failed["status"] == "error"
+      assert failed["message"] =~ "error_label_cannot_be_formatted"
+
+      response =
+        method.(
+          categorize(ctx),
+          "/query_range",
+          [
+            query: ~s/{app="a"} | label_format __error_details__="mine"/,
+            start: to_string(ctx.now),
+            end: to_string(ctx.now + 60 * @second),
+            direction: "forward"
+          ],
+          200
+        )
+
+      assert Enum.sort_by(response["data"]["result"], & &1["stream"]["pod"]) == [
+               %{
+                 "stream" => %{"app" => "a", "pod" => "p1"},
+                 "values" => [
+                   [
+                     to_string(ctx.now + 40 * @second),
+                     "{",
+                     %{"structuredMetadata" => %{"n" => "7"}, "parsed" => %{"__error_details__" => "mine"}}
+                   ]
+                 ]
+               },
+               %{
+                 "stream" => %{"app" => "a", "pod" => "p2"},
+                 "values" => [
+                   [
+                     to_string(ctx.now + 20 * @second),
+                     ~s/{"ok":1}/,
+                     %{"structuredMetadata" => %{"n" => "5"}, "parsed" => %{"__error_details__" => "mine"}}
+                   ]
+                 ]
+               }
+             ]
+
+      for stages <- [
+            ~s/| label_format __error_details__="mine" | json/,
+            ~s/| json | label_format __error_details__="mine"/
+          ] do
+        query = ~s/first_over_time({app="a"} #{stages} | __error__!="" | unwrap n [1m]) by (__error_details__)/
+        response = method.(ctx, "/query", [query: query, time: to_string(ctx.now + 60 * @second)], 200)
+
+        assert response["data"]["result"] == [
+                 %{
+                   "metric" => %{"__error__" => "JSONParserErr", "__error_details__" => "Malformed JSON error"},
+                   "value" => [(ctx.now + 60 * @second) / @second, "7"]
+                 }
+               ]
+      end
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :formatter_error_ownership_batch
+  test "authored formatter ownership controls distinguish hidden labels and authoritative errors", ctx do
+    ctx = %{ctx | now: ctx.now - 120 * @second}
+    push_formatter_error_rows(ctx)
+    error = %{"__error__" => "JSONParserErr", "__error_details__" => "Malformed JSON error"}
+    prefix = ~s/{app="a",pod="p1"} | json | label_format __error_details__="mine"/
+
+    controls = [
+      {prefix, error},
+      {prefix <> " | drop __error_details__", %{error | "__error_details__" => "mine"}},
+      {prefix <> " | drop __error__", Map.delete(error, "__error__")},
+      {prefix <> " | drop __error__,__error_details__", %{"__error_details__" => "mine"}},
+      {prefix <> " | label_format saved=__error_details__", Map.put(error, "saved", "mine")},
+      {prefix <> ~s/ | label_format saved="{{.__error_details__}}"/, Map.put(error, "saved", "Malformed JSON error")},
+      {prefix <> ~s/ | drop __error_details__="mine"/, error},
+      {prefix <> ~s/ | drop __error_details__="Malformed JSON error"/, %{error | "__error_details__" => "mine"}},
+      {prefix <> " | keep app | drop __error_details__", %{error | "__error_details__" => "mine"}},
+      {prefix <> ~s/ | __error_details__="mine"/, error},
+      {prefix <> ~s/ | line_format "{{.__error_details__}}"/, error},
+      {~s/{app="a",pod="p1"} | json | label_format __error_details__="mine",saved="{{.__error_details__}}" | drop __error_details__/,
+       %{"__error__" => "JSONParserErr", "__error_details__" => "mine", "saved" => "Malformed JSON error"}},
+      {prefix <> ~S/ | line_format "broken=\"" | logfmt --strict | drop __error_details__/,
+       %{"__error__" => "LogfmtParserErr", "__error_details__" => "mine"}}
+    ]
+
+    for {query, expected} <- controls, method <- [&request/4, &request_form/4] do
+      response =
+        method.(
+          categorize(ctx),
+          "/query_range",
+          [query: query, start: to_string(ctx.now), end: to_string(ctx.now + 60 * @second)],
+          200
+        )
+
+      assert [%{"values" => [[_, _, categories]]}] = response["data"]["result"], query
+      assert categories["parsed"] == expected, query
+    end
+
+    for {template, expected} <- [
+          {"{{.__error_details__}}", "mine"},
+          {"{{.__error_details__ | print}}", "Malformed JSON error"}
+        ],
+        method <- [&request/4, &request_form/4] do
+      query = prefix <> " | line_format " <> Pulso.JSON.encode!(template)
+
+      response =
+        method.(
+          categorize(ctx),
+          "/query_range",
+          [query: query, start: to_string(ctx.now), end: to_string(ctx.now + 60 * @second)],
+          200
+        )
+
+      assert [%{"values" => [[_, ^expected, _]]}] = response["data"]["result"]
+    end
+
+    for method <- [&request/4, &request_form/4] do
+      query = prefix <> ~s/ | line_format "{{div 1 0}}"/
+
+      response =
+        method.(
+          categorize(ctx),
+          "/query_range",
+          [query: query, start: to_string(ctx.now), end: to_string(ctx.now + 60 * @second)],
+          200
+        )
+
+      assert [%{"values" => [[_, "{", %{"parsed" => parsed}]]}] = response["data"]["result"]
+      assert parsed["__error__"] == "TemplateFormatErr"
+      assert parsed["__error_details__"] =~ "divide by zero"
+    end
+
+    for {suffix, expected} <- [
+          {" | drop __error_details__", %{"__error__" => "JSONParserErr"}},
+          {" | drop __error__", %{"__error_details__" => "mine"}},
+          {" | drop __error__,__error_details__", %{"__error_details__" => "mine"}}
+        ] do
+      query = ~s/first_over_time(#{prefix} | __error__!="" #{suffix} | unwrap n [1m]) by (__error_details__)/
+      assert_metric(ctx, query, 60, %{expected => [{60, "7"}]})
+      assert_metric(ctx, query, {60, 120, 60}, %{expected => [{60, "7"}]})
+    end
+
+    query =
+      ~s/first_over_time(#{prefix} | label_format v="oops" | unwrap v | __error__!="" [1m]) by (__error_details__)/
+
+    assert_metric(ctx, query, 60, %{
+      %{
+        "__error__" => "SampleExtractionErr",
+        "__error_details__" => ~s/strconv.ParseFloat: parsing "oops": invalid syntax/
+      } => [{60, "0"}]
+    })
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :formatter_error_ownership_batch
+  test "error-detail ownership never suppresses template output or work exhaustion", ctx do
+    ctx = %{ctx | now: ctx.now - 120 * @second}
+    push_formatter_error_rows(ctx)
+    prefix = ~s/{app="a",pod="p1"} | json | label_format __error_details__=/
+
+    for template <- [~s/{{repeat 16777217 "x"}}/, "{{range 100}}x{{end}}"],
+        method <- [&request/4, &request_form/4] do
+      if template =~ "range", do: Runtime.put_env(:pulso, Evaluator, max_work: 5)
+      query = ~s/count_over_time(#{prefix}#{Pulso.JSON.encode!(template)} | __error__!="" [1m])/
+      response = method.(ctx, "/query", [query: query, time: to_string(ctx.now + 60 * @second)], 422)
+      assert response["error"] == "query_limit"
+      refute Map.has_key?(response, "data")
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  defp push_formatter_error_rows(ctx) do
+    push_streams(
+      ctx,
+      for {app, pod, line, second, n} <- [
+            {"a", "p1", "{", 40, "7"},
+            {"a", "p2", ~s/{"ok":1}/, 20, "5"},
+            {"noise", "p3", ~s/{"ok":1}/, 20, "9"}
+          ] do
+        %{
+          "stream" => %{"app" => app, "pod" => pod},
+          "values" => [[to_string(ctx.now + second * @second), line, %{"n" => n}]]
+        }
+      end
+    )
+
+    assert_parquet(ctx, 1)
   end
 
   @tag :http_errors_batch
@@ -233,6 +580,69 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
   end
 
+  @tag :http_calendar_batch
+  test "Go calendar timestamp spellings retain exact HTTP bounds and native evaluation times", ctx do
+    # Go 1.27.3 time.Parse(RFC3339Nano) oracles, not Elixir ISO conversions.
+    cases = [
+      {"2020-01-02T3:04:05Z", 1_577_934_245_000_000_000},
+      {"2020-01-02T03:04:05+24:00", 1_577_847_845_000_000_000},
+      {"2020-01-02T03:04:05+00:60", 1_577_930_645_000_000_000},
+      {"2020-01-02T03:04:05-24:60", 1_578_024_245_000_000_000},
+      {"2020-01-02T03:04:05,123456789Z", 1_577_934_245_123_456_789},
+      {"2020-01-02T03:04:05.1234567899Z", 1_577_934_245_123_456_789}
+    ]
+
+    push_streams(
+      ctx,
+      for {{_input, ns}, index} <- Enum.with_index(cases) do
+        %{
+          "stream" => %{"job" => "calendar", "case" => to_string(index)},
+          "values" => [[to_string(ns - 1), "before"], [to_string(ns), "on"], [to_string(ns + 1), "after"]]
+        }
+      end
+    )
+
+    for {{input, ns}, index} <- Enum.with_index(cases), method <- [&request/4, &request_form/4] do
+      selector = ~s({job="calendar",case="#{index}"})
+
+      # Instant remains inclusive. Range checks exercise the same calendar
+      # spelling once as the inclusive start and once as the exclusive end.
+      for {path, bounds, expected} <- [
+            {"/query", [time: input, start: input, end: input], [[to_string(ns), "on"]]},
+            {"/query_range", [start: input, end: to_string(ns + 1)], [[to_string(ns), "on"]]},
+            {"/query_range", [start: to_string(ns - 1), end: input], [[to_string(ns - 1), "before"]]}
+          ] do
+        response = method.(ctx, path, [query: selector] ++ bounds, 200)
+        assert [stream] = response["data"]["result"]
+        assert stream["values"] == expected
+      end
+
+      response = method.(ctx, "/query", [query: "count_over_time(#{selector}[1s])", time: input], 200)
+      assert [%{"value" => [time, "2"]}] = response["data"]["result"]
+      assert time == ns / @second
+    end
+
+    for input <- [
+          "2020-01-02T03:04:05+25:00",
+          "2020-01-02T03:04:05+00:61",
+          "2020-01-02t03:04:05z",
+          "2262-04-11T23:47:16.854775808Z",
+          "1677-09-21T00:12:43.145224191Z",
+          "2020-01-02T03:04:05." <> String.duplicate("1", 108) <> "Z"
+        ],
+        method <- [&request/4, &request_form/4],
+        {path, field} <- [{"/query", :time}, {"/query_range", :start}, {"/query_range", :end}] do
+      params = Keyword.put([query: ~s({job="calendar"}), start: "0", end: "0"], field, input)
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(ctx, path, params, 400)
+      assert response["error"] == "invalid_parameter"
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
   @tag :http_parameter_controls
   test "Loki HTTP interval samples globally before the limit in either direction", ctx do
     base = div(ctx.now, @second) * @second
@@ -323,8 +733,10 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       params = [query: ~s({job="decimal"}), start: "1571332130.0004", end: "1571332130.0016", direction: "forward"]
       response = method.(ctx, "/query_range", params, 200)
 
+      # Decimal parameter rounding is unchanged: the admitted end rounds to
+      # base+2ms, which is now correctly excluded from raw range results.
       assert Enum.flat_map(response["data"]["result"], & &1["values"]) ==
-               for(n <- [0, 1, 2], do: [to_string(base + n * 1_000_000), "abc"])
+               for(n <- [0, 1], do: [to_string(base + n * 1_000_000), "abc"])
 
       assert method.(ctx, "/labels", [end: to_string(base + @second), since: "1s"], 200)["data"] == ["job"]
       assert method.(ctx, "/labels", [end: to_string(base + 2 * @second), since: "1s"], 200)["data"] == []
@@ -344,6 +756,192 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     assert Enum.sum_by(samples, fn [_, value] -> String.to_integer(value) end) == 12
   end
 
+  @tag :index_stats_range_admission
+  test "index stats admits range parameters before manifest reads without using them to truncate statistics", ctx do
+    push(ctx, "first", ctx.now, %{"job" => "stats"})
+    push(ctx, "second", ctx.now, %{"job" => "stats"})
+    assert_parquet(ctx, 2)
+
+    params = [query: ~s({job="stats"}), start: to_string(ctx.now - @second), end: to_string(ctx.now + @second)]
+
+    for method <- [&request/4, &request_form/4] do
+      expected = method.(ctx, "/index/stats", params, 200)
+      assert %{"streams" => 0, "chunks" => 2, "entries" => 2, "bytes" => bytes} = expected
+      assert bytes > 0
+
+      for invalid <- [
+            [step: "0"],
+            [step: "-1"],
+            [step: "invalid"],
+            [step: "NaN"],
+            [step: "+Inf"],
+            [step: "1ns"],
+            [limit: "0"],
+            [limit: "-1"],
+            [limit: "4294967296"],
+            [limit: "invalid"],
+            [direction: "sideways"],
+            [interval: "-1"],
+            [interval: "invalid"],
+            [start: "invalid"],
+            [start: to_string(ctx.now + 2 * @second)],
+            [start: to_string(ctx.now - 11_001 * @second), end: to_string(ctx.now), step: "1"]
+          ] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, "/index/stats", Keyword.merge(params, invalid), 400)
+        refute Map.has_key?(response, "entries")
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+
+      for valid <- [
+            [limit: "1", direction: "forward", step: "0.5", interval: "1h"],
+            [limit: "4294967295", direction: "BACKWARD", interval: "0"],
+            [limit: "", direction: "", step: "", interval: ""],
+            [start: to_string(ctx.now), end: to_string(ctx.now)],
+            [start: to_string(ctx.now - 11_000 * @second - 999_999_999), end: to_string(ctx.now), step: "1"]
+          ] do
+        assert method.(ctx, "/index/stats", Keyword.merge(params, valid), 200) == expected
+      end
+    end
+
+    refute_parquet_read(ctx)
+  end
+
+  @tag :discovery_scalar_precedence
+  test "discovery takes the first scalar value, with form values before URL values", ctx do
+    a = %{"job" => "a", "only_a" => "yes"}
+    b = %{"job" => "b", "only_b" => "yes"}
+    push(ctx, "recent", ctx.now, a)
+    push(ctx, "older", ctx.now - 120 * @second, b)
+    assert_parquet(ctx, 2)
+
+    start = to_string(ctx.now - 180 * @second)
+    finish = to_string(ctx.now + @second)
+    recent = to_string(ctx.now - @second)
+    bounds = [{"start", start}, {"end", finish}]
+
+    routes = [
+      {"/labels", ["job", "only_a"], ["job", "only_a", "only_b"]},
+      {"/label/job/values", ["a"], ["a", "b"]},
+      {"/series", [a], [a, b]}
+    ]
+
+    for {path, one, both} <- routes, method <- [&request/4, &request_form/4] do
+      for {params, expected} <- [
+            {[{"start", start}, {"start", recent}, {"end", finish}], both},
+            {[{"start", recent}, {"start", "invalid"}, {"end", finish}], one},
+            {[{"start", start}, {"end", finish}, {"end", to_string(ctx.now - 60 * @second)}], both},
+            {[{"start", start}, {"end", finish}, {"end", "invalid"}], both},
+            {[{"end", finish}, {"since", "180s"}, {"since", "1s"}], both},
+            {[{"end", finish}, {"since", "1s"}, {"since", "invalid"}], one},
+            {[{"start", ""}, {"start", "invalid"}, {"end", finish}, {"since", "1s"}], one},
+            {[{"start", start}, {"end", ""}, {"end", "invalid"}], both},
+            {[{"end", finish}, {"since", ""}, {"since", "invalid"}], both}
+          ] do
+        assert method.(ctx, path, params, 200)["data"] == expected
+      end
+
+      for {name, valid} <- [{"start", start}, {"end", finish}, {"since", "1s"}] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, [{name, "invalid"}, {name, valid}], 400)
+        refute Map.has_key?(response, "data")
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+    end
+
+    for {path, one, both} <- Enum.take(routes, 2), method <- [&request/4, &request_form/4] do
+      assert method.(ctx, path, [{"query", ~s({job="a"})}, {"query", ~s({job="b"})} | bounds], 200)["data"] == one
+      assert method.(ctx, path, [{"query", ""}, {"query", ~s({job="a"})} | bounds], 200)["data"] == both
+
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(ctx, path, [{"query", "invalid"}, {"query", ~s({job="a"})} | bounds], 400)
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    for {path, one, _both} <- routes do
+      url = path <> "?" <> URI.encode_query(start: "invalid", end: "invalid", since: "invalid")
+      assert request_form(ctx, url, [{"start", ""}, {"end", finish}, {"since", "1s"}])["data"] == one
+
+      before = Agent.get(ctx.store, & &1.requests)
+      url = path <> "?" <> URI.encode_query(bounds)
+      response = request_form(ctx, url, [{"start", "invalid"}], 400)
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    for {path, _one, both} <- Enum.take(routes, 2) do
+      url = path <> "?" <> URI.encode_query([{"query", "invalid"} | bounds])
+      assert request_form(ctx, url, [{"query", ""}])["data"] == both
+
+      before = Agent.get(ctx.store, & &1.requests)
+      url = path <> "?" <> URI.encode_query([{"query", ~s({job="a"})} | bounds])
+      response = request_form(ctx, url, [{"query", "invalid"}], 400)
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    # Repeated selectors are a union, never scalar first-value selection.
+    for method <- [&request/4, &request_form/4] do
+      response = method.(ctx, "/series", [{"match", ~s({job="a"})}, {"match[]", ~s({job="b"})} | bounds], 200)
+      assert Enum.sort(response["data"]) == Enum.sort([a, b])
+    end
+
+    url = "/series?" <> URI.encode_query([{"match", ~s({job="a"})} | bounds])
+    assert request_form(ctx, url, [{"match[]", ~s({job="b"})}])["data"] |> Enum.sort() == Enum.sort([a, b])
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :discovery_literal_scalars
+  test "discovery ignores bracketed names instead of expanding them into scalar parameters", ctx do
+    a = %{"job" => "a", "only_a" => "yes"}
+    b = %{"job" => "b", "only_b" => "yes"}
+    push(ctx, "recent", ctx.now, a)
+    push(ctx, "older", ctx.now - 120 * @second, b)
+
+    bounds = [
+      {"start", to_string(ctx.now - 180 * @second)},
+      {"end", to_string(ctx.now + @second)},
+      {"since", "180s"}
+    ]
+
+    routes = [
+      {"/labels", ["job", "only_a", "only_b"]},
+      {"/label/job/values", ["a", "b"]},
+      {"/series", [a, b]}
+    ]
+
+    for {path, expected} <- routes, method <- [&request/4, &request_form/4] do
+      for name <- ["start", "end", "since"], suffix <- ["[]", "[ignored]"] do
+        params = Enum.reject(bounds, fn {key, _} -> key == name end) ++ [{name <> suffix, "invalid"}]
+        assert method.(ctx, path, params, 200)["data"] == expected
+      end
+
+      for {name, value} <- bounds do
+        params = List.keyreplace(bounds, name, 0, {name, "invalid"}) ++ [{name <> "[]", value}]
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, params, 400)
+        refute Map.has_key?(response, "data")
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+    end
+
+    for {path, expected} <- Enum.take(routes, 2), method <- [&request/4, &request_form/4] do
+      for suffix <- ["[]", "[ignored]"] do
+        assert method.(ctx, path, [{"query" <> suffix, ~s({job="a"})} | bounds], 200)["data"] == expected
+      end
+
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(ctx, path, [{"query", "invalid"}, {"query[]", ~s({job="a"})} | bounds], 400)
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    assert_parquet(ctx, 2)
+    assert_parquet_read(ctx)
+  end
+
   for row <- @http_parameter_rows,
       row["table"] in ["TestParseRangeQuery", "TestParseInstantQuery", "TestHttp_ParseRangeQuery_Step"] do
     @tag :http_parameters_batch
@@ -352,13 +950,18 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       params = http_parameter_params(row)
       path = if row["table"] == "TestParseInstantQuery", do: "/query", else: "/query_range"
 
-      if !row["error"]["reject"] do
-        fields = row["expected"]["fields"]
-        finish = String.to_integer(fields["End_ns"] || fields["Ts_ns"])
-        # Full-window/time rejection must differ from successful empty results.
-        push(ctx, "included", finish, %{"foo" => "bar"})
-        push(ctx, "future", finish + 1, %{"foo" => "bar"})
-      end
+      included_ts =
+        if !row["error"]["reject"] do
+          fields = row["expected"]["fields"]
+          finish = String.to_integer(fields["End_ns"] || fields["Ts_ns"])
+          # These are authored execution seeds, not source table inputs.
+          # Keep the original HTTP parameters/struct oracles unchanged: range
+          # inclusion is 1ns before its exclusive end, instant inclusion at time.
+          included = if path == "/query_range", do: finish - 1, else: finish
+          push(ctx, "included", included, %{"foo" => "bar"})
+          push(ctx, "excluded", included + 1, %{"foo" => "bar"})
+          included
+        end
 
       for method <- [&request/4, &request_form/4] do
         before = Agent.get(ctx.store, & &1.requests)
@@ -368,7 +971,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
           assert Agent.get(ctx.store, & &1.requests) == before
         else
           assert Enum.flat_map(response["data"]["result"], & &1["values"]) ==
-                   [[row["expected"]["fields"]["End_ns"] || row["expected"]["fields"]["Ts_ns"], "included"]]
+                   [[to_string(included_ts), "included"]]
 
           assert_parquet_read(ctx)
         end
@@ -559,6 +1162,10 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     for categorized? <- [false, true], path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
       params = [query: ~s'{app="correlation"}', start: to_string(ctx.now), end: to_string(ctx.now + 4 * @second)]
+
+      params =
+        if path == "/query_range", do: Keyword.put(params, :end, to_string(ctx.now + 4 * @second + 1)), else: params
+
       response = method.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
 
       actual =
@@ -687,6 +1294,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
         method <- [&request/4, &request_form/4] do
       timestamp = to_string(at.now)
       params = [query: row.query, start: timestamp, end: timestamp, time: timestamp]
+      params = if path == "/query_range", do: Keyword.put(params, :end, to_string(at.now + 1)), else: params
       response = method.(if(categorized?, do: categorize(at), else: at), path, params, 200)
       assert [%{"stream" => stream, "values" => [value]}] = response["data"]["result"]
       assert Enum.take(value, 2) == [timestamp, "label-builder"]
@@ -748,6 +1356,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     for categorized? <- [false, true], path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
       params = [query: "{}", start: timestamp, end: timestamp, time: timestamp]
+      params = if path == "/query_range", do: Keyword.put(params, :end, to_string(ctx.now + 1)), else: params
       response = method.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
       value = if categorized?, do: [timestamp, "label-builder", %{}], else: [timestamp, "label-builder"]
 
@@ -796,6 +1405,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
         send_request <- [&request/4, &request_form/4] do
       query = LokiPipelineFixture.query(row["table"], row["source_index"])
       params = %{query: query, start: timestamp, end: timestamp, time: timestamp}
+      params = if path == "/query_range", do: %{params | end: to_string(String.to_integer(timestamp) + 1)}, else: params
       response = send_request.(if(categorized?, do: categorize(ctx), else: ctx), path, params, 200)
 
       expected =
@@ -979,6 +1589,11 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
           {"step", "1"}
         ]
 
+        params =
+          if path == "/query_range" and row["source_index"] in [1, 2],
+            do: List.keyreplace(params, "end", 0, {"end", to_string(ctx.now + 1)}),
+            else: params
+
         response = method.(ctx, path, params, 200)
 
         case row["source_index"] do
@@ -1075,6 +1690,11 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
         ]
 
         for path <- ["/query", "/query_range"], method <- [&request/4, &request_form/4] do
+          params =
+            if path == "/query_range",
+              do: List.keyreplace(params, "end", 0, {"end", to_string(ctx.now + 1)}),
+              else: params
+
           assert_streams(method.(ctx, path, params, 200), expected)
         end
       end
@@ -5713,19 +6333,23 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
       labels = %{"job" => job, "foo" => input, "__error__" => "LabelFilterErr", "__error_details__" => details}
       expected = [{labels, ["sample"]}]
-      assert_streams(query(ctx, filter <> error_filter), expected)
-      assert_streams(request_form(ctx, "/query_range", [query: filter <> error_filter] ++ range(ctx)), expected)
+      assert_streams(query(ctx, filter <> error_filter), [])
+      selected = filter <> rendered_error_details_filter(details)
+      assert_streams(query(ctx, selected), expected)
+      assert_streams(request_form(ctx, "/query_range", [query: selected] ++ range(ctx)), expected)
       assert_streams(query(ctx, filter <> ~s/ | __error__=""/), [])
 
       labels = %{"job" => job, "__error__" => "SampleExtractionErr", "__error_details__" => details}
       expression = ~s/sum_over_time(#{selector} | unwrap duration(foo) | __error__!=""#{error_filter} [1m])/
+      assert_metric(ctx, expression, {1, 2, 1}, %{})
+      expression = ~s/sum_over_time(#{selector} | unwrap duration(foo) | __error__!="" [1m])/
       assert_metric(ctx, expression, {1, 2, 1}, %{labels => [{1, "0"}, {2, "0"}]})
     end
 
     # The first duration-filter error survives a later failing byte filter.
     selector = ~s/{job="duration-diagnostic-0"}/
     details = ~s/time: missing unit in duration "1s2"/
-    expression = selector <> " | foo>0ns and foo>0B | __error_details__=" <> Pulso.JSON.encode!(details)
+    expression = selector <> " | foo>0ns and foo>0B" <> rendered_error_details_filter(details)
 
     assert_streams(query(ctx, expression), [
       {%{
@@ -5765,7 +6389,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       job = "byte-diagnostic-#{index}"
       selector = ~s/{job="#{job}"}/
       error_filter = " | __error_details__=" <> Pulso.JSON.encode!(details)
-      filter = selector <> " | foo>0B" <> error_filter
+      filter = selector <> " | foo>0B" <> rendered_error_details_filter(details)
       labels = %{"job" => job, "foo" => input, "__error__" => "LabelFilterErr", "__error_details__" => details}
       expected = [{labels, ["sample"]}]
       assert_streams(query(ctx, filter), expected)
@@ -5774,6 +6398,8 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
       labels = %{"job" => job, "__error__" => "SampleExtractionErr", "__error_details__" => details}
       expression = ~s/sum_over_time(#{selector} | unwrap bytes(foo) | __error__!=""#{error_filter} [1m])/
+      assert_metric(ctx, expression, {1, 2, 1}, %{})
+      expression = ~s/sum_over_time(#{selector} | unwrap bytes(foo) | __error__!="" [1m])/
       assert_metric(ctx, expression, {1, 2, 1}, %{labels => [{1, "0"}, {2, "0"}]})
     end
 
@@ -5792,7 +6418,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     selector = ~s/{job="byte-diagnostic-0"}/
     details = ~s/strconv.ParseFloat: parsing "": invalid syntax/
-    error_filter = " | __error_details__=" <> Pulso.JSON.encode!(details)
+    error_filter = rendered_error_details_filter(details)
     expression = selector <> " | foo>0B and foo>0ns" <> error_filter
 
     assert_streams(query(ctx, expression), [
@@ -5804,7 +6430,9 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
        }, ["sample"]}
     ])
 
-    expression = "sum_over_time(#{selector} | unwrap bytes(foo)#{error_filter} [1m])"
+    expression =
+      ~s/sum_over_time(#{selector} | label_format __error_details__="ordinary" | unwrap bytes(foo) | __error_details__="ordinary" [1m])/
+
     response = request(ctx, "/query", [query: expression, time: to_string(ctx.now + @second)], 400)
     assert response["message"] =~ "sample_extraction_error"
 
@@ -5941,7 +6569,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     for {[input, details], index} <- Enum.with_index(cases) do
       job = "number-diagnostic-#{index}"
       selector = ~s/{job="#{job}"}/
-      error_filter = " | __error_details__=" <> Pulso.JSON.encode!(details)
+      error_filter = rendered_error_details_filter(details)
       filter = selector <> " | foo>0" <> error_filter
       labels = %{"job" => job, "foo" => input, "__error__" => "LabelFilterErr", "__error_details__" => details}
       expected = [{labels, ["sample"]}]
@@ -5952,7 +6580,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     selector = ~s/{job="number-diagnostic-10"}/
     details = ~s/strconv.ParseFloat: parsing "1e10000": value out of range/
-    error_filter = " | __error_details__=" <> Pulso.JSON.encode!(details)
+    error_filter = rendered_error_details_filter(details)
     expression = selector <> " | foo>0 and foo>0ns" <> error_filter
 
     assert_streams(query(ctx, expression), [
@@ -6007,6 +6635,8 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
         error_filter = " | __error_details__=" <> Pulso.JSON.encode!(details)
         expression = "sum_over_time(#{unwrap} | __error__!=\"\"#{error_filter} [1m])"
+        assert_metric(ctx, expression, {1, 2, 1}, %{})
+        expression = "sum_over_time(#{unwrap} | __error__!=\"\" [1m])"
         assert_metric(ctx, expression, {1, 2, 1}, %{labels => [{1, "0"}, {2, "0"}]})
       end
     end
@@ -7082,7 +7712,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     for {row, i} <- Enum.with_index(cases) do
       stamp = to_string(ctx.now + i * 2 * @second)
-      params = [query: row["query"], start: stamp, end: stamp]
+      params = [query: row["query"], start: stamp, end: to_string(ctx.now + i * 2 * @second + 1)]
       lines = for check <- row["checks"], check["match"], do: check["line"]
 
       # Upstream asserts individual keep/drop decisions, not equal-time order.
@@ -7519,10 +8149,13 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     for {{filter, error, keep?}, index} <- Enum.with_index(cases) do
       labels = %{"job" => "error-filter-#{index}", "status" => "200", "method" => "POST"}
       labels = if error == "", do: labels, else: Map.put(labels, "__error__", error)
-      push(ctx, "sample log line", ctx.now, labels)
+      # Upstream label_filter_test.go:277 uses SetErr, not a base label.
+      # Incoming metadata errors exercise that authoritative owner publicly.
+      push(ctx, "sample log line", ctx.now, Map.delete(labels, "__error__"), Map.take(labels, ["__error__"]))
       expression = ~s/{job="error-filter-#{index}"} | / <> filter
       expected = if keep?, do: [{labels, ["sample log line"]}], else: []
       assert_streams(query(ctx, expression), expected)
+      assert_streams(request_form(ctx, "/query_range", [query: expression] ++ range(ctx)), expected)
     end
 
     assert_parquet(ctx, 4)
@@ -7574,6 +8207,374 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     assert Agent.get(ctx.store, & &1.objects) == objects
     assert_parquet_read(ctx)
+  end
+
+  # Complete vector_aggregations.logqltest:898-939: eight original schedules,
+  # all 378 entries and nine evaluations. Only the relative epoch translates.
+  @tag :topk_parameter_batch
+  test "complete Loki topk block retains ranking results and parameter diagnostics", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    streams = push_topk_parameter_fixture(ctx)
+    inner = ~s/count_over_time({app=~"foo|bar"} |~".+bar" [1m])/
+    foo_a = %{"app" => "foo", "pod" => "a"}
+    foo_b = %{"app" => "foo", "pod" => "b"}
+    bar_a = %{"app" => "bar", "pod" => "a"}
+    bar_b = %{"app" => "bar", "pod" => "b"}
+
+    cases = [
+      {"topk(2, #{inner})", 60, %{bar_b => ["30"], bar_a => ["15"]}},
+      {"topk(2, #{inner})", {20, 60, 20}, %{bar_b => ["10", "20", "30"], bar_a => ["5", "10", "15"]}},
+      {"topk(1, #{inner})", 60, %{bar_b => ["30"]}},
+      {"topk(1, #{inner}) by (app)", 60, %{foo_b => ["12"], bar_b => ["30"]}},
+      {"topk(1, #{inner}) without (app)", 60, %{bar_a => ["15"], bar_b => ["30"]}},
+      {"topk(1, #{inner}) without (app, pod)", 60, %{bar_b => ["30"]}},
+      {"topk(1, #{inner}) without ()", 60, %{foo_a => ["6"], foo_b => ["12"], bar_a => ["15"], bar_b => ["30"]}}
+    ]
+
+    for {query, times, expected} <- cases do
+      assert_metric(
+        ctx,
+        query,
+        times,
+        Map.new(expected, fn {labels, values} ->
+          times = if is_tuple(times), do: [20, 40, 60], else: [times]
+          {labels, Enum.zip(times, values)}
+        end)
+      )
+    end
+
+    # Collect both original instant failures and authored range placements
+    # before asserting substrings, so the red replay retains the whole block.
+    responses =
+      for {query, expected} <- [
+            {"topk(1.5, #{inner})", "invalid parameter"},
+            {"topk(#{inner})", "parameter required"}
+          ],
+          {path, bounds} <- [
+            {"/query", [time: to_string(ctx.now + 60 * @second)]},
+            {"/query_range",
+             [start: to_string(ctx.now + 20 * @second), end: to_string(ctx.now + 60 * @second), step: "20"]}
+          ],
+          method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, [query: query] ++ bounds, 400)
+        assert Agent.get(ctx.store, & &1.requests) == before
+        {query, expected, response}
+      end
+
+    # Authored raw-byte control keeps every original schedule, including noise.
+    for method <- [&request/4, &request_form/4] do
+      response =
+        method.(
+          ctx,
+          "/query_range",
+          [
+            query: ~s/{app=~"foo|bar"}/,
+            start: to_string(ctx.now),
+            end: to_string(ctx.now + 186 * @second),
+            direction: "forward",
+            limit: "500"
+          ],
+          200
+        )
+
+      assert Map.new(response["data"]["result"], &{&1["stream"], &1["values"]}) ==
+               Map.new(streams, &{&1["stream"], &1["values"]})
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+
+    for {query, expected, response} <- responses do
+      assert response["error"] == "evaluation_failed"
+      assert response["message"] =~ expected, query <> ": " <> inspect(response)
+    end
+  end
+
+  @tag :topk_parameter_batch
+  test "topk diagnostics preserve bounded admission and neighboring error contracts", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_topk_parameter_fixture(ctx)
+    inner = ~s/count_over_time({app=~"foo|bar"} |~".+bar" [1m])/
+
+    endpoints = [
+      {"/query", [time: to_string(ctx.now + 60 * @second)]},
+      {"/query_range", [start: to_string(ctx.now + 20 * @second), end: to_string(ctx.now + 60 * @second), step: "20"]}
+    ]
+
+    for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(%{ctx | token: "wrong-token"}, path, [query: "topk(#{inner})"] ++ bounds, 401)
+      assert response["error"] == "invalid_token"
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    for {module, config, status, error} <- [
+          {Pulso.QueryRunner, [max_per_tenant: 0], 429, "query_overloaded"},
+          {Pulso.QueryRunner, [max_scan_rows: 1], 422, "query_limit"},
+          {Evaluator, [max_work: 1], 422, "query_limit"}
+        ] do
+      original = Runtime.get_env(:pulso, module, [])
+      Runtime.put_env(:pulso, module, Keyword.merge(original, config))
+
+      for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, [query: "topk(2, #{inner})"] ++ bounds, status)
+        assert response["error"] == error
+        refute Map.has_key?(response, "data")
+        if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      end
+
+      Runtime.put_env(:pulso, module, original)
+    end
+
+    # Authored controls, not more upstream rows: retain zero-rank behavior,
+    # recursive validation and unrelated range/grouping reasons.
+    assert_metric(ctx, "topk(0, #{inner})", 60, %{})
+    assert_metric(ctx, "bottomk(0, #{inner})", 60, %{})
+
+    for {query, expected} <- [
+          {"sum(topk(#{inner}))", "parameter required"},
+          {"vector(1) + topk(1.5, #{inner})", "invalid parameter"},
+          {"count_over_time({app=\"foo\"}[1m]) by (app)", ":unsupported_range_grouping"},
+          {"approx_topk(1, #{inner}) by (app)", ":unsupported_vector_grouping"}
+        ],
+        method <- [&request/4, &request_form/4] do
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(ctx, "/query", [query: query, time: to_string(ctx.now + 60 * @second)], 400)
+      assert response["message"] =~ expected
+      assert response["error"] == "evaluation_failed"
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+  end
+
+  # Complete binary_operations.logqltest:750-789. The three original loads
+  # match the later group-right block exactly; retain all 57 entries once.
+  @tag :binary_missing_group_batch
+  test "complete Loki group-left block retains explicit-group diagnostic and original values", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_binary_matching_fixture(ctx)
+    left = ~s/sum by (app,machine) (count_over_time({app="foo"}[1m]))/
+    right = ~s/sum by (app) (count_over_time({app="foo"}[1m]))/
+    expected_error = "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"
+
+    cases = [
+      {"> bool ignoring (machine)", {:error, expected_error}},
+      {"> bool on () group_left", %{"fuzz" => "0", "buzz" => "0"}},
+      {"> bool on () group_left ()", %{"fuzz" => "0", "buzz" => "0"}},
+      {"> bool ignoring (machine) group_left", %{"fuzz" => "0", "buzz" => "0"}},
+      {"< on () group_left", %{"fuzz" => "6", "buzz" => "4"}}
+    ]
+
+    # Collect the complete block before asserting the error substring, so the
+    # public red replay also executes every unchanged successful oracle.
+    responses =
+      for {operator, expected} <- cases,
+          {path, bounds} <- [
+            {"/query", [time: to_string(ctx.now + 60 * @second)]},
+            {"/query_range",
+             [start: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 180 * @second), step: "30"]}
+          ],
+          method <- [&request/4, &request_form/4] do
+        query = left <> " " <> operator <> " " <> right
+        status = if is_tuple(expected), do: 400, else: 200
+        {path, query, expected, method.(ctx, path, [query: query] ++ bounds, status)}
+      end
+
+    assert length(responses) == 20
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+
+    for {path, query, expected, response} <- responses, is_map(expected) do
+      assert length(response["data"]["result"]) == 2
+
+      actual =
+        Map.new(response["data"]["result"], fn series ->
+          {series["metric"], series[if(path == "/query", do: "value", else: "values")]}
+        end)
+
+      expected =
+        Map.new(expected, fn {machine, value} ->
+          points = for time <- [60, 90, 120, 150, 180], do: [div(ctx.now, @second) + time, value]
+          {%{"app" => "foo", "machine" => machine}, if(path == "/query", do: hd(points), else: points)}
+        end)
+
+      assert actual == expected, query
+    end
+
+    # Authored raw-byte control over the unchanged source loads, including noise.
+    for method <- [&request/4, &request_form/4] do
+      response =
+        method.(
+          ctx,
+          "/query_range",
+          [
+            query: ~s/{app=~"foo|noise"}/,
+            start: to_string(ctx.now),
+            end: to_string(ctx.now + 271 * @second),
+            direction: "forward",
+            limit: "100"
+          ],
+          200
+        )
+
+      expected =
+        Map.new(
+          [
+            {%{"app" => "foo", "machine" => "fuzz"}, "x", 10},
+            {%{"app" => "foo", "machine" => "buzz"}, "x", 15},
+            {%{"app" => "noise"}, "noise", 10}
+          ],
+          fn {labels, line, seconds} ->
+            {labels, for(index <- 0..18, do: [to_string(ctx.now + index * seconds * @second), line])}
+          end
+        )
+
+      assert Map.new(response["data"]["result"], &{&1["stream"], &1["values"]}) == expected
+    end
+
+    for {_path, query, {:error, message}, response} <- responses do
+      assert response["error"] == "evaluation_failed"
+      assert response["message"] =~ message, query <> ": " <> inspect(response)
+    end
+  end
+
+  # Complete binary_operations.logqltest:888-929: all three original loads,
+  # including noise, and all ten original evaluations. Only the epoch shifts.
+  @tag :binary_matching_diagnostics_batch
+  test "complete Loki group-right block retains matching diagnostics and original values", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_binary_matching_fixture(ctx)
+    left = ~s/sum by (app) (count_over_time({app="foo"}[1m]))/
+    right = ~s/sum by (app,machine) (count_over_time({app="foo"}[1m]))/
+    expected_error = "found duplicate series on the right hand-side"
+
+    cases = [
+      {">= bool ignoring (machine)", {:error, expected_error}},
+      {">= bool on () group_right", "1"},
+      {">= bool on () group_right ()", "1"},
+      {">= bool ignoring (machine) group_right", "1"},
+      {"> on () group_right", "10"}
+    ]
+
+    # Collect every evaluation before checking diagnostics, so a red run still
+    # executes the complete source block and both HTTP transports.
+    responses =
+      for {operator, expected} <- cases,
+          {path, bounds} <- [
+            {"/query", [time: to_string(ctx.now + 60 * @second)]},
+            {"/query_range",
+             [start: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 180 * @second), step: "30"]}
+          ],
+          method <- [&request/4, &request_form/4] do
+        query = left <> " " <> operator <> " " <> right
+        status = if is_tuple(expected), do: 400, else: 200
+        {path, query, expected, method.(ctx, path, [query: query] ++ bounds, status)}
+      end
+
+    assert length(responses) == 20
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+
+    for {path, query, expected, response} <- responses do
+      case expected do
+        {:error, message} ->
+          assert response["error"] == "evaluation_failed"
+          assert response["message"] =~ message, query <> ": " <> inspect(response)
+
+        value ->
+          labels = for machine <- ["fuzz", "buzz"], do: %{"app" => "foo", "machine" => machine}
+          assert length(response["data"]["result"]) == 2
+
+          if path == "/query" do
+            assert values(response) == Map.new(labels, &{&1, value}), query
+
+            assert Enum.all?(response["data"]["result"], fn series ->
+                     hd(series["value"]) == div(ctx.now, @second) + 60
+                   end)
+          else
+            assert response["data"]["resultType"] == "matrix"
+            points = for time <- [60, 90, 120, 150, 180], do: [div(ctx.now, @second) + time, value]
+            actual = Map.new(response["data"]["result"], &{&1["metric"], &1["values"]})
+            assert actual == Map.new(labels, &{&1, points}), query
+          end
+      end
+    end
+  end
+
+  @tag :binary_matching_diagnostics_batch
+  @tag :binary_missing_group_batch
+  test "authored matching controls retain side context without relabeling unrelated failures", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_binary_matching_fixture(ctx)
+    many = ~s/sum by (app,machine) (count_over_time({app="foo"}[1m]))/
+    one = ~s/sum by (app) (count_over_time({app="foo"}[1m]))/
+    suffix = ";many-to-many matching not allowed: matching labels must be unique on one side"
+
+    # Authored queries over the unchanged source loads, not extra upstream rows.
+    cases = [
+      {many <> " >= bool on (app) group_right " <> one, "found duplicate series on the left hand-side" <> suffix},
+      {one <> " >= bool on (app) group_left " <> many, "found duplicate series on the right hand-side" <> suffix},
+      {many <> " >= bool on (app) " <> one,
+       "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"},
+      {many <> " > bool on (app) group_left (machine) " <> one, ":multiple_matches_for_labels"}
+    ]
+
+    for {query, expected} <- cases,
+        {path, bounds} <- [
+          {"/query", [time: to_string(ctx.now + 60 * @second)]},
+          {"/query_range",
+           [start: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 180 * @second), step: "30"]}
+        ],
+        method <- [&request/4, &request_form/4] do
+      response = method.(ctx, path, [query: query] ++ bounds, 400)
+      assert response == %{"status" => "error", "error" => "evaluation_failed", "message" => expected}, query
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
+  @tag :binary_matching_diagnostics_batch
+  @tag :binary_missing_group_batch
+  test "matching diagnostics cannot bypass authentication or existing admission, scan and work budgets", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_binary_matching_fixture(ctx)
+    many = ~s/sum by (app,machine) (count_over_time({app="foo"}[1m]))/
+    one = ~s/sum by (app) (count_over_time({app="foo"}[1m]))/
+
+    endpoints = [
+      {"/query", [time: to_string(ctx.now + 60 * @second)]},
+      {"/query_range", [start: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 180 * @second), step: "30"]}
+    ]
+
+    for query <- [one <> " >= bool ignoring (machine) " <> many, many <> " > bool ignoring (machine) " <> one] do
+      for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        unauthorized = method.(%{ctx | token: "wrong-token"}, path, [query: query] ++ bounds, 401)
+        assert unauthorized["error"] == "invalid_token"
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+
+      for {module, config, status, error} <- [
+            {Pulso.QueryRunner, [max_per_tenant: 0], 429, "query_overloaded"},
+            {Pulso.QueryRunner, [max_scan_rows: 1], 422, "query_limit"},
+            {Evaluator, [max_work: 1], 422, "query_limit"}
+          ] do
+        original = Runtime.get_env(:pulso, module, [])
+        Runtime.put_env(:pulso, module, Keyword.merge(original, config))
+
+        for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+          before = Agent.get(ctx.store, & &1.requests)
+          response = method.(ctx, path, [query: query] ++ bounds, status)
+          assert response["error"] == error
+          refute Map.has_key?(response, "data")
+          if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+        end
+
+        Runtime.put_env(:pulso, module, original)
+      end
+    end
   end
 
   # Complete scalar sections of binary_operations.logqltest:1-87. Expected
@@ -7740,7 +8741,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
   end
 
-  test "Pulso control: historical partitions retain inclusive source-time boundaries", ctx do
+  test "Pulso control: historical raw-log partitions retain exclusive upper boundaries", ctx do
     for {line, timestamp} <- [
           {"lineA", ctx.now - 72 * 60 * @minute},
           {"lineB", ctx.now - 48 * 60 * @minute},
@@ -7751,9 +8752,11 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
 
     for {start, finish, expected} <- [
-          {ctx.now - 72 * 60 * @minute, ctx.now - 48 * 60 * @minute, ["lineA", "lineB"]},
+          {ctx.now - 72 * 60 * @minute, ctx.now - 48 * 60 * @minute, ["lineA"]},
+          {ctx.now - 72 * 60 * @minute, ctx.now - 48 * 60 * @minute + 1, ["lineA", "lineB"]},
           {ctx.now - 72 * 60 * @minute + 1, ctx.now - 48 * 60 * @minute - 1, []},
-          {ctx.now - 48 * 60 * @minute + 1, ctx.now, ["lineC", "lineD"]}
+          {ctx.now - 48 * 60 * @minute + 1, ctx.now, []},
+          {ctx.now - 48 * 60 * @minute + 1, ctx.now + 1, ["lineC", "lineD"]}
         ],
         direction <- ["forward", "backward"] do
       params = [query: ~s({job="fake"}), start: to_string(start), end: to_string(finish), direction: direction]
@@ -8084,6 +9087,570 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
   # These are executable upstream LogQL fixtures, not additional microservice
   # integration tests. Preserve every selected query and its complete result.
+  @tag :compensated_sum_upstream
+  test "vector_aggregations.logqltest sum_over_time retains cancellation residuals", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Original app=k load rows and all four evaluations from the pinned
+    # vector_aggregations.logqltest:246-251,268-277. Other apps cannot match.
+    for {c, count, finish} <- [{"ten", 10, 16}, {"seven", 7, 13}] do
+      labels = %{"app" => "k", "c" => c}
+      push(ctx, "v=10000000000000000", ctx.now + 5 * @second, labels)
+
+      for index <- 0..(count - 1) do
+        push(ctx, "v=1", ctx.now + (6 + index) * @second, labels)
+      end
+
+      push(ctx, "v=-10000000000000000", ctx.now + finish * @second, labels)
+    end
+
+    assert_parquet(ctx, 21)
+
+    assert_metric(ctx, ~s'sum by (c) (sum_over_time({app="k"} | logfmt | unwrap v [1m]))', 60, %{
+      %{"c" => "ten"} => [{60, "10"}],
+      %{"c" => "seven"} => [{60, "7"}]
+    })
+
+    assert_metric(ctx, ~s'sum(sum_over_time({app="k"} | logfmt | unwrap v [1m]))', 60, %{
+      %{} => [{60, "17"}]
+    })
+
+    assert_metric(ctx, ~s'sum by (c) (sum_over_time({app="k"} | logfmt | unwrap v [1m]))', {20, 60, 20}, %{
+      %{"c" => "ten"} => [{20, "10"}, {40, "10"}, {60, "10"}],
+      %{"c" => "seven"} => [{20, "7"}, {40, "7"}, {60, "7"}]
+    })
+
+    assert_metric(ctx, ~s'sum(sum_over_time({app="k"} | logfmt | unwrap v [20s]))', {20, 60, 40}, %{
+      %{} => [{20, "17"}]
+    })
+  end
+
+  @tag :vector_sum_precision_upstream
+  test "upstream vector sum retains all 10000 small contributions", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # TestVectorAggEvaluator_Precision/sum(), evaluator_test.go:1064-1073:
+    # preserve every original value and the literal large+10000 oracle.
+    # Unit-to-HTTP adaptation: unique stream labels keep the 10001 samples
+    # distinct through max_over_time; sort_desc restores the unit input order.
+    streams =
+      for index <- 0..10_000 do
+        value = if index == 0, do: "10000000000000000", else: "1"
+
+        %{
+          "stream" => %{"app" => "vector-sum-precision", "series" => Integer.to_string(index)},
+          "values" => [[to_string(ctx.now + 30 * @second), "v=" <> value]]
+        }
+      end
+
+    assert length(streams) == 10_001
+    streams |> Enum.chunk_every(1000) |> Enum.each(&push_streams(ctx, &1))
+    assert_parquet(ctx, 11)
+
+    inner = ~s'max_over_time({app="vector-sum-precision"} | logfmt | unwrap v [1m])'
+    expected = %{%{} => [{60, "10000000000010000"}]}
+
+    assert_metric(ctx, "sum(sort_desc(#{inner}))", 60, expected)
+    assert_metric(ctx, "sum(#{inner})", 60, expected)
+    # The second window (60s,120s] is empty, not a zero-valued sample.
+    assert_metric(ctx, "sum(#{inner})", {60, 120, 60}, expected)
+  end
+
+  @tag :raw_log_exclusive_end_upstream
+  test "original log-selection upper boundary is exclusive before ordering and top-k", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Complete active log_selection.logqltest:28-36; only the epoch changes.
+    push_streams(ctx, [
+      %{
+        "stream" => %{"app" => "foo"},
+        "values" => [
+          [to_string(ctx.now + 10 * @second), "in range"],
+          [to_string(ctx.now + 20 * @second), "at boundary"]
+        ]
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+
+    # First row is the unchanged original oracle. The remaining rows are
+    # authored direction/top-k/adjacent-nanosecond/start-inclusive controls.
+    for {start, finish, direction, limit, values} <- [
+          {0, 20 * @second, "forward", "100", [{10 * @second, "in range"}]},
+          {0, 20 * @second, "backward", "100", [{10 * @second, "in range"}]},
+          {0, 20 * @second, "forward", "1", [{10 * @second, "in range"}]},
+          {0, 20 * @second, "backward", "1", [{10 * @second, "in range"}]},
+          {0, 20 * @second - 1, "forward", "100", [{10 * @second, "in range"}]},
+          {0, 20 * @second + 1, "forward", "100", [{10 * @second, "in range"}, {20 * @second, "at boundary"}]},
+          {20 * @second, 20 * @second + 1, "forward", "100", [{20 * @second, "at boundary"}]},
+          {20 * @second - 1, 20 * @second, "backward", "1", []}
+        ] do
+      params = [
+        query: ~s/{app="foo"}/,
+        start: to_string(ctx.now + start),
+        end: to_string(ctx.now + finish),
+        direction: direction,
+        limit: limit
+      ]
+
+      expected =
+        if values == [],
+          do: [],
+          else: [
+            %{
+              "stream" => %{"app" => "foo"},
+              "values" => Enum.map(values, fn {time, line} -> [to_string(ctx.now + time), line] end)
+            }
+          ]
+
+      for method <- [&request/4, &request_form/4] do
+        assert method.(ctx, "/query_range", params, 200)["data"]["result"] == expected
+      end
+    end
+
+    # These APIs retain their existing inclusive endpoint contracts.
+    for method <- [&request/4, &request_form/4] do
+      response =
+        method.(
+          ctx,
+          "/query",
+          [
+            query: ~s/{app="foo"}/,
+            start: to_string(ctx.now),
+            time: to_string(ctx.now + 20 * @second),
+            direction: "forward"
+          ],
+          200
+        )
+
+      assert [%{"values" => [[_, "in range"], [_, "at boundary"]]}] = response["data"]["result"]
+
+      assert method.(
+               ctx,
+               "/labels",
+               [start: to_string(ctx.now + 20 * @second), end: to_string(ctx.now + 20 * @second)],
+               200
+             )["data"] == ["app"]
+
+      fields =
+        method.(
+          ctx,
+          "/detected_fields",
+          [
+            query: ~s/{app="foo"} | line_format "value=present"/,
+            start: to_string(ctx.now + 20 * @second),
+            end: to_string(ctx.now + 20 * @second)
+          ],
+          200
+        )
+
+      assert [%{"label" => "value", "cardinality" => 1}] = fields["fields"]
+    end
+
+    assert_metric(ctx, ~s/count_over_time({app="foo"}[1m])/, 20, %{%{"app" => "foo"} => [{20, "2"}]})
+    assert_metric(ctx, ~s/count_over_time({app="foo"}[1m])/, {20, 20, 1}, %{%{"app" => "foo"} => [{20, "2"}]})
+    assert_parquet_read(ctx)
+
+    # Equal bounds are empty even when a row exists at that exact timestamp.
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+    for method <- [&request/4, &request_form/4] do
+      assert method.(
+               ctx,
+               "/query_range",
+               [
+                 query: ~s/{app="foo"}/,
+                 start: to_string(ctx.now + 20 * @second),
+                 end: to_string(ctx.now + 20 * @second)
+               ],
+               200
+             )["data"]["result"] == []
+    end
+
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+  end
+
+  @tag :raw_log_exclusive_end_upstream
+  test "empty raw-log ranges avoid providers without bypassing admission or validation", ctx do
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+    for time <- [ctx.now, -9_223_372_036_854_775_808, 9_223_372_036_854_775_807],
+        method <- [&request/4, &request_form/4] do
+      params = [query: ~s/{app="foo"}/, start: to_string(time), end: to_string(time)]
+
+      assert method.(ctx, "/query_range", params, 200)["data"] == %{
+               "resultType" => "streams",
+               "result" => [],
+               "stats" => %{}
+             }
+
+      method.(ctx, "/query_range", Keyword.put(params, :query, ~s/{app="foo"} |~ "("/), 400)
+      method.(query_limits(ctx, ~s({"requiredLabels":["missing"]})), "/query_range", params, 400)
+    end
+
+    # 1ms + 1ns must reject against the ORIGINAL interval, not its normalized
+    # inclusive storage bound (whose numerical difference would be 1ms).
+    for method <- [&request/4, &request_form/4] do
+      method.(
+        query_limits(ctx, ~s({"maxQueryLength":"1ms"})),
+        "/query_range",
+        [query: ~s/{app="foo"}/, start: to_string(ctx.now), end: to_string(ctx.now + 1_000_001)],
+        400
+      )
+
+      method.(
+        %{ctx | token: "wrong-token"},
+        "/query_range",
+        [query: ~s/{app="foo"}/, start: to_string(ctx.now), end: to_string(ctx.now)],
+        401
+      )
+    end
+
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+  end
+
+  @tag :raw_log_exclusive_end_upstream
+  test "empty raw-log validation uses bounded logql admission and query accounting", ctx do
+    Runtime.put_env(:pulso, Pulso.QueryRunner, class_limits: %{logql: 1})
+    slots = QuerySlots
+    key = {:class, :logql, 0}
+    assert {:ok, _} = Runtime.Registry.register(slots, key, nil)
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+    params = [query: ~s/{app="foo"}/, start: to_string(ctx.now), end: to_string(ctx.now)]
+    invalid = Keyword.put(params, :query, ~s/{app="foo"} |~ "("/)
+    limited = query_limits(ctx, ~s({"maxQueryTime":"200ms"}))
+
+    # The slot belongs to this test's private runtime. Even static validation
+    # must acquire the same logql class as nonempty reads, not run on the caller.
+    for method <- [&request/4, &request_form/4], query <- [params, invalid] do
+      assert method.(limited, "/query_range", query, 429)["error"] == "query_overloaded"
+    end
+
+    Runtime.Registry.unregister(slots, key)
+
+    for method <- [&request/4, &request_form/4] do
+      assert method.(limited, "/query_range", params, 200)["data"]["result"] == []
+      method.(limited, "/query_range", invalid, 400)
+    end
+
+    metrics = Pulso.SelfMetrics.render()
+    assert metrics =~ ~s(pulso_operations_total{layer="query",operation="logql_log",outcome="error"} 6\n)
+    assert metrics =~ ~s(pulso_operations_total{layer="query",operation="logql_log",outcome="success"} 2\n)
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+  end
+
+  @tag :absence_json_hints_upstream
+  test "upstream absence skips unneeded JSON but explicit error consumers still parse", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Complete active range_aggregations.logqltest:1727-1745: two original
+    # inputs, five literal oracles. Only the source epoch is translated.
+    push_streams(ctx, [
+      %{"stream" => %{"app" => "a"}, "values" => [[to_string(ctx.now + 40 * @second), "{"]]},
+      %{"stream" => %{"app" => "noise"}, "values" => [[to_string(ctx.now + 40 * @second), ~s({"ok":1})]]}
+    ])
+
+    assert_parquet(ctx, 1)
+    assert_metric(ctx, ~s/absent_over_time({app="a"} | json [1m])/, 60, %{})
+    assert_metric(ctx, ~s/absent_over_time({app="a"} | json | __error__!="" [1m])/, 60, %{})
+
+    assert_metric(ctx, ~s/absent_over_time({app="a"} | json | __error__!="" [1m])/, {60, 120, 60}, %{
+      %{"app" => "a"} => [{120, "1"}]
+    })
+
+    assert_metric(ctx, ~s/absent_over_time({app="a"} | json | __error__="" [1m])/, 60, %{
+      %{"app" => "a"} => [{60, "1"}]
+    })
+
+    assert_metric(ctx, ~s/absent_over_time({app="a"} | json | __error__="" [1m])/, {60, 120, 60}, %{
+      %{"app" => "a"} => [{60, "1"}, {120, "1"}]
+    })
+  end
+
+  @tag :absence_json_hints_upstream
+  test "authored absence JSON hints preserve consumers, prior errors and validation", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    push_streams(ctx, [
+      %{"stream" => %{"app" => "bad"}, "values" => [[to_string(ctx.now + 40 * @second), "{"]]},
+      %{"stream" => %{"app" => "good"}, "values" => [[to_string(ctx.now + 40 * @second), ~s({"v":5})]]},
+      %{"stream" => %{"app" => "explicit"}, "values" => [[to_string(ctx.now + 40 * @second), "not-json"]]},
+      %{
+        "stream" => %{"app" => "prior"},
+        "values" => [[to_string(ctx.now + 40 * @second), "{", %{"__error__" => "prior", "v" => "5"}]]
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+
+    # Multiple plain parsers and line-only stages need no extracted labels.
+    # A post-parser line filter must not move into native head pushdown.
+    for pipeline <- [~s/| json | json/, ~s/|= "{" | json | json != "absent"/, ~s/| json |= "absent"/] do
+      expected =
+        if String.ends_with?(pipeline, ~s/|= "absent"/),
+          do: %{%{"app" => "bad"} => [{60, "1"}, {120, "1"}]},
+          else: %{%{"app" => "bad"} => [{120, "1"}]}
+
+      assert_metric(ctx, ~s/absent_over_time({app="bad"} #{pipeline} [1m])/, {60, 120, 60}, expected)
+    end
+
+    # Real label consumers must still see parsed fields and errors. An absent
+    # target differs from a usable unwrap target after malformed JSON.
+    for pipeline <- [
+          ~s/| json | v="5"/,
+          ~s/| json | line_format "{{.v}}" |= "5"/,
+          ~s/| json | label_format out="{{.v}}" | out="5"/,
+          ~s/| json | unwrap v/
+        ] do
+      assert_metric(ctx, ~s/absent_over_time({app="good"} #{pipeline} [1m])/, 60, %{})
+    end
+
+    for pipeline <- [~s/| json | v="missing"/, ~s/| json | line_format "{{.missing}}" |= "5"/] do
+      assert_metric(ctx, ~s/absent_over_time({app="good"} #{pipeline} [1m])/, {60, 120, 60}, %{
+        %{"app" => "good"} => [{60, "1"}, {120, "1"}]
+      })
+    end
+
+    assert_metric(ctx, ~s/absent_over_time({app="bad"} | json | unwrap v [1m])/, 60, %{
+      %{"app" => "bad"} => [{60, "1"}]
+    })
+
+    # An ordinary details filter sees no ordinary label. To consume the real
+    # error details, capture the rendered template snapshot explicitly.
+    assert_metric(ctx, ~s/absent_over_time({app="bad"} | json | __error_details__!="" [1m])/, 60, %{
+      %{"app" => "bad"} => [{60, "1"}]
+    })
+
+    for {app, pipeline} <- [
+          {"prior", "| json | json"},
+          {"prior", "| json | unwrap v"},
+          {"bad", ~s/| json | label_format diagnostic_details="{{.__error_details__}}" | diagnostic_details!=""/},
+          {"bad", ~s/| json | line_format "{{.v}}"/},
+          {"bad", "| json | logfmt"},
+          {"bad", "| logfmt | json"},
+          {"explicit", ~s/| json v="v"/}
+        ],
+        method <- [&request/4, &request_form/4],
+        {path, times} <- [
+          {"/query", [time: to_string(ctx.now + 60 * @second)]},
+          {"/query_range",
+           [start: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 120 * @second), step: "60"]}
+        ] do
+      response = method.(ctx, path, [query: ~s/absent_over_time({app="#{app}"} #{pipeline} [1m])/] ++ times, 400)
+      assert response["message"] == ":pipeline_error"
+    end
+
+    before = Agent.get(ctx.store, & &1.reads)
+
+    for method <- [&request/4, &request_form/4] do
+      method.(
+        ctx,
+        "/query",
+        [query: ~s/absent_over_time({app="bad"} | json |~ "(" [1m])/, time: to_string(ctx.now + 60 * @second)],
+        400
+      )
+    end
+
+    assert Agent.get(ctx.store, & &1.reads) == before
+
+    # Both evaluators consume the same published Parquet, but assertions are
+    # literal. Inspect streamed work after a post-JSON filter drops the row:
+    # omission must not move that filter into provider/native head pushdown.
+    for {pipeline, expected} <- [
+          {"| json | json", []},
+          {~s/| json |= "absent"/, [{%{"app" => "bad"}, {ctx.now + 60 * @second, 1.0}}]}
+        ],
+        module <- [MetricEval, MetricEvalReference] do
+      {:ok, ast} = Parser.parse(~s/absent_over_time({app="bad"} #{pipeline} [1m])/)
+
+      {result, budget} =
+        Task.async(
+          Runtime.capture(fn ->
+            result = module.evaluate(ast, ctx.tenant, %{end_ts_ns: ctx.now + 60 * @second})
+            {result, Process.get(:promql_budget)}
+          end)
+        )
+        |> Task.await()
+
+      assert result == {:ok, {:vector, expected}}
+      assert budget.work >= 2
+    end
+  end
+
+  @tag :unwrap_missing_errors_upstream
+  test "upstream quantiles discard malformed JSON lines without an unwrap target", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Complete original setup and four evaluations: pinned
+    # range_aggregations.logqltest:409-440, including the nonmatching noise.
+    streams =
+      for {time, app, pod, line} <- [
+            {10, "a", "p1", ~s({"v":4})},
+            {20, "a", "p1", ~s({"v":6})},
+            {30, "a", "p1", ~s({"v":8})},
+            {40, "a", "p1", "{"},
+            {20, "noise", "p2", ~s({"v":1})}
+          ] do
+        %{"stream" => %{"app" => app, "pod" => pod}, "values" => [[to_string(ctx.now + time * @second), line]]}
+      end
+
+    push_streams(ctx, streams)
+    assert_parquet(ctx, 1)
+
+    query = ~s'quantile_over_time(0.5, {app="a"} | json | unwrap v [1m]) by (pod)'
+    assert_metric(ctx, query, 60, %{%{"pod" => "p1"} => [{60, "6"}]})
+    assert_metric(ctx, query, {20, 60, 40}, %{%{"pod" => "p1"} => [{20, "5"}, {60, "6"}]})
+
+    assert_metric(ctx, ~s'quantile_over_time(0.5, {app="a"} | json | __error__="" | unwrap v [1m]) by (pod)', 60, %{
+      %{"pod" => "p1"} => [{60, "6"}]
+    })
+
+    assert_metric(ctx, ~s'quantile_over_time(0.5, {app="a"} | json | __error__!="" | unwrap v [1m]) by (pod)', 60, %{})
+  end
+
+  @tag :unwrap_missing_errors_upstream
+  test "missing and empty unwrap targets discard prior errors on native and fallback scans", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Authored controls: the same inputs run natively without stages and fall
+    # back to Elixir with JSON. Only the usable, error-free value is retained.
+    streams =
+      for {kind, metadata} <- [
+            {"missing", %{"__error__" => "prior"}},
+            {"empty", %{"__error__" => "prior", "v" => ""}},
+            {"good", %{"v" => "5"}}
+          ] do
+        %{
+          "stream" => %{"job" => "unwrap-skip-errors", "case" => kind},
+          "values" => [[to_string(ctx.now + 30 * @second), "{}", metadata]]
+        }
+      end
+
+    push_streams(ctx, streams)
+    assert_parquet(ctx, 1)
+
+    for stage <- ["", " | json"] do
+      query = ~s'sum(sum_over_time({job="unwrap-skip-errors"}#{stage} | unwrap v [1m]))'
+      assert_metric(ctx, query, 60, %{%{} => [{60, "5"}]})
+      assert_metric(ctx, query, {60, 120, 60}, %{%{} => [{60, "5"}]})
+    end
+
+    # Replay the actual published Parquet directly too: a successful native
+    # response proves no fallback, and a one-sample cap proves skipped rows
+    # do not spend the retained-sample budget. All three still count as work.
+    [{_key, {_etag, bytes}}] =
+      ctx.store |> Agent.get(& &1.objects) |> Enum.filter(fn {key, _} -> String.ends_with?(key, ".parquet") end)
+
+    assert {:ok, scan} = NIF.log_metric_scan_new([], {:unwrap, "v"}, "v", nil, 1)
+
+    assert {:ok, {3, 1}} =
+             NIF.log_metric_scan_add(scan, bytes, ctx.now, ctx.now + 60 * @second, nil, [], [])
+
+    assert {:ok, [_]} = NIF.log_metric_scan_finish(scan)
+  end
+
+  @tag :unwrap_missing_errors_upstream
+  test "present unwrap targets and count or bytes observations retain prior errors", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    for {kind, metadata} <- [
+          {"missing", %{"__error__" => "prior"}},
+          {"empty", %{"__error__" => "prior", "v" => ""}},
+          {"present", %{"__error__" => "prior", "v" => "7"}}
+        ] do
+      push(ctx, "{}", ctx.now + 30 * @second, %{"job" => "unwrap-keep-errors", "case" => kind}, metadata)
+    end
+
+    assert_parquet(ctx, 3)
+
+    # Authored negative controls; neither native eligibility nor JSON fallback
+    # may hide an error on a line that actually supplies an observation.
+    for stage <- ["", " | json"],
+        {op, kind, unwrap} <- [
+          {"sum_over_time", "present", " | unwrap v"},
+          {"count_over_time", "missing", ""},
+          {"count_over_time", "empty", ""},
+          {"bytes_over_time", "missing", ""},
+          {"bytes_over_time", "empty", ""}
+        ],
+        {path, extra} <- [{"/query", []}, {"/query_range", [start: to_string(ctx.now + 60 * @second), step: "60"]}],
+        method <- [&request/4, &request_form/4] do
+      query = ~s'#{op}({job="unwrap-keep-errors",case="#{kind}"}#{stage}#{unwrap} [1m])'
+      params = [query: query, time: to_string(ctx.now + 60 * @second), end: to_string(ctx.now + 60 * @second)] ++ extra
+
+      assert method.(ctx, path, params, 400) == %{
+               "status" => "error",
+               "error" => "evaluation_failed",
+               "message" => ":pipeline_error"
+             }
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :quantile_sign_upstream
+  test "range_aggregations.logqltest rejects signed quantile tokens before storage", ctx do
+    ctx = %{ctx | now: div(ctx.now, @second) * @second - 180 * @second}
+
+    # Complete original load at range_aggregations.logqltest:228-234 and
+    # rejection at 273-274. Only relative times receive an epoch translation.
+    for {time, line} <- [{10, "v=1"}, {20, "v=2"}, {30, "v=3"}, {40, "v=4"}, {50, "v=5"}, {110, "v=6"}, {25, "noise"}] do
+      push(ctx, line, ctx.now + time * @second, %{"app" => "a"})
+    end
+
+    assert_parquet(ctx, 7)
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+    # -0.1 is the original oracle; the remaining signs are authored controls.
+    for token <- ["-0.1", "-0", "+0", "-1e-1", "+1e-1"],
+        path <- ["/query", "/query_range"],
+        method <- [&request/4, &request_form/4] do
+      query = ~s'quantile_over_time(#{token}, {app="a"} | logfmt | unwrap v [1m])'
+
+      params = [
+        query: query,
+        time: to_string(ctx.now + 60 * @second),
+        start: to_string(ctx.now + 60 * @second),
+        end: to_string(ctx.now + 60 * @second),
+        step: "1s"
+      ]
+
+      response = method.(ctx, path, params, 400)
+      assert response["status"] == "error"
+      assert response["error"] == "parse_error"
+      refute Map.has_key?(response, "data")
+      assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+    end
+
+    # Original median/+Inf oracles at 243-244,270-271; exponent spellings
+    # are authored controls, not additional upstream evaluations.
+    for {token, expected} <- [
+          {"0.5", "3"},
+          {"1.5", "+Inf"},
+          {"5e-1", "3"},
+          {"5e+0", "+Inf"},
+          {"0x1p-1", "3"},
+          {"0x1p+1", "+Inf"},
+          {"0", "1"}
+        ] do
+      query = ~s'quantile_over_time(#{token}, {app="a"} | logfmt | unwrap v [1m])'
+      assert_metric(ctx, query, 60, %{%{"app" => "a"} => [{60, expected}]})
+      assert_metric(ctx, query, {60, 60, 1}, %{%{"app" => "a"} => [{60, expected}]})
+    end
+
+    before = Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests})
+
+    for {query, expected} <- [{"-2e-1", "-0.2"}, {"+2e+1", "20"}, {"-0x1p-1", "-0.5"}, {"+0x1p+1", "2"}],
+        method <- [&request/4, &request_form/4] do
+      params = [query: query, time: to_string(ctx.now + 60 * @second)]
+      response = method.(ctx, "/query", params, 200)
+      assert response["data"]["resultType"] == "scalar"
+      assert response["data"]["result"] == [(ctx.now + 60 * @second) / @second, expected]
+    end
+
+    assert Agent.get(ctx.store, &{&1.reads, &1.lists, &1.requests}) == before
+  end
+
   describe "range_aggregations.logqltest missing unwrap fields" do
     setup ctx do
       %{now: div(ctx.now, @second) * @second - 180 * @second}
@@ -8455,8 +10022,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
       assert_counter(ctx, ~s'rate_counter({app="a"} | logfmt | unwrap c [10s])', {10, 30, 20}, [{10, "0"}, {30, "0"}])
 
       push(ctx, "noise", ctx.now + 31 * @second, %{"app" => "a"}, %{"__error__" => "bad"})
-      params = [query: ~s'rate_counter({app="a"} | unwrap c [1ms])', time: to_string(ctx.now + 31 * @second)]
-      assert request(ctx, "/query", params, 400)["message"] =~ "pipeline_error"
+      assert_counter(ctx, ~s'rate_counter({app="a"} | unwrap c [1ms])', 31, [])
     end
 
     @tag :rate_counter_control
@@ -9024,13 +10590,18 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     limited = query_limits(ctx, ~s({"maxQueryLength":"1m","maxQueryInterval":"1m","maxEntriesLimitPerQuery":1}))
 
     for path <- ["/query", "/query_range"], direction <- ["forward", "backward"] do
+      # This authored policy control needs both rows inside a one-minute
+      # window. Translate the range window by 1ns rather than claiming that
+      # its exclusive end includes the newest row; instant bounds stay intact.
+      shift = if path == "/query_range", do: 1, else: 0
+
       params = [
         {"query", ~s({job="fake"})},
         {"time", to_string(ctx.now)},
         {"direction", direction},
         {"limit", "1"},
-        {"start", to_string(ctx.now - @minute)},
-        {"end", to_string(ctx.now)}
+        {"start", to_string(ctx.now - @minute + shift)},
+        {"end", to_string(ctx.now + shift)}
       ]
 
       response = request(limited, path, params)
@@ -9499,6 +11070,704 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     end
   end
 
+  @tag :detected_logfmt_duplicates
+  test "detected logfmt fields reuse the complete frozen first-duplicate oracle", ctx do
+    fixture = "test/fixtures/logs/loki-upstream/logfmt.json" |> File.read!() |> Pulso.JSON.decode!()
+    row = Enum.find(fixture["parse_cases"], &(&1["name"] == "duplicate from line property"))
+    selection = hd(hd(fixture["provenance"]["sources"])["selections"])
+
+    raw =
+      selection["raw"]
+      |> String.split("\n")
+      |> Enum.slice(row["source_start"] - selection["source_start"], row["source_end"] - row["source_start"] + 1)
+      |> Enum.map_join("", &(&1 <> "\n"))
+
+    assert Base.encode16(:crypto.hash(:sha256, raw), case: :lower) ==
+             "907c9c52ee3423bf82f5b9c32259e25d5bf66952d702a5c465e8a9f6d564c289"
+
+    assert fixture["counts"]["parse_rows"] == 19
+    assert row["base_labels"] == %{"foo" => "bar"}
+    assert row["structured_metadata"] == %{}
+    assert row["want"] == %{"foo" => "bar", "foobar" => "foo bar"}
+    assert row["effective_strict_want"] == row["want"]
+
+    # This parser unit row has no HTTP request or timestamp. Preserve its
+    # complete line/labels/oracles and add only a past time and positive bounds.
+    line = row["line"]
+    push_streams(ctx, [%{"stream" => row["base_labels"], "values" => [[to_string(ctx.now), line]]}])
+    assert_parquet(ctx, 1)
+    params = [query: ~s/{foo="bar"}/, start: to_string(ctx.now - 1), end: to_string(ctx.now + 1)]
+
+    observations =
+      for method <- [&request/4, &request_form/4] do
+        raw = method.(ctx, "/query_range", params, 200)
+        assert [%{"stream" => %{"foo" => "bar"}, "values" => [[_, ^line]]}] = raw["data"]["result"]
+
+        for suffix <- [" | logfmt", " | logfmt --strict"] do
+          parsed = method.(ctx, "/query_range", Keyword.update!(params, :query, &(&1 <> suffix)), 200)
+          assert [%{"stream" => labels, "values" => [[_, ^line]]}] = parsed["data"]["result"]
+          assert labels == row["want"]
+        end
+
+        for suffix <- ["", " | logfmt"] do
+          params = Keyword.update!(params, :query, &(&1 <> suffix))
+          values = method.(ctx, "/detected_field/foobar/values", params, 200)
+          fields = method.(ctx, "/detected_fields", params, 200)
+          {values["values"], fields["fields"]}
+        end
+      end
+
+    assert_parquet_read(ctx)
+    expected = {["foo bar"], [%{"label" => "foobar", "type" => "string", "cardinality" => 1, "parsers" => ["logfmt"]}]}
+    assert observations == List.duplicate(List.duplicate(expected, 2), 2)
+  end
+
+  @tag :detected_logfmt_duplicates
+  test "authored detected logfmt ownership preserves normalized destinations metadata and safety", ctx do
+    # Authored controls, not new source rows. Empty values never claim a
+    # destination; retained values claim it after sanitization and one suffix.
+    rows = [
+      {~s/foobar="foo bar"/, %{}, "foobar", "foo bar"},
+      {~s/foobar= foobar="foo bar" foobar=10ms/, %{}, "foobar", "foo bar"},
+      {"a.b=first a_b=second", %{}, "a_b", "first"},
+      {~s/foobar="foo bar" foobar=10ms/, %{"foobar" => "stream"}, "foobar_extracted", "foo bar"},
+      {"foobar_extracted=first foobar=second", %{"foobar" => "stream"}, "foobar_extracted", "first"}
+    ]
+
+    push_streams(
+      ctx,
+      for {{line, labels, _name, _value}, index} <- Enum.with_index(rows) do
+        %{
+          "stream" => Map.put(labels, "case", "c#{index}"),
+          "values" => [[to_string(ctx.now), line, %{"tag" => "�"}]]
+        }
+      end
+    )
+
+    assert_parquet(ctx, 1)
+
+    observations =
+      for {{line, labels, name, expected}, index} <- Enum.with_index(rows), method <- [&request/4, &request_form/4] do
+        params = [query: ~s/{case="c#{index}"}/, start: to_string(ctx.now - 1), end: to_string(ctx.now + 1)]
+        values = method.(ctx, "/detected_field/#{name}/values", params, 200)
+        fields = method.(ctx, "/detected_fields", params, 200)["fields"]
+        assert method.(ctx, "/detected_field/tag/values", params, 200)["values"] == ["�"]
+        raw = method.(ctx, "/query_range", params, 200)
+        assert [%{"stream" => stream, "values" => [[_, ^line]]}] = raw["data"]["result"]
+        assert stream == labels |> Map.put("case", "c#{index}") |> Map.put("tag", "�")
+        {values["values"], Enum.find(fields, &(&1["label"] == name)), expected}
+      end
+
+    assert_parquet_read(ctx)
+    params = [query: ~s/{case="c1"}/, start: to_string(ctx.now - 1), end: to_string(ctx.now + 1)]
+    before = Agent.get(ctx.store, & &1.requests)
+
+    denied =
+      Req.get!(ctx.url <> "/loki/api/v1/detected_field/foobar/values",
+        headers: [{"x-scope-orgid", ctx.tenant}],
+        params: params,
+        retry: false
+      )
+
+    assert denied.status == 401
+
+    for method <- [&request/4, &request_form/4] do
+      assert method.(%{ctx | token: "wrong-token"}, "/detected_field/foobar/values", params, 401)["error"] ==
+               "invalid_token"
+
+      assert method.(ctx, "/detected_field/foobar/values", Keyword.put(params, :end, to_string(ctx.now - 2)), 400)[
+               "error"
+             ] ==
+               "invalid_parameter"
+    end
+
+    assert Agent.get(ctx.store, & &1.requests) == before
+
+    for {limits, status, error} <- [
+          {[max_per_tenant: 0], 429, "query_overloaded"},
+          {[max_scan_rows: 1], 422, "query_limit"}
+        ] do
+      Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
+
+      for method <- [&request/4, &request_form/4] do
+        response = method.(ctx, "/detected_field/foobar/values", params, status)
+        assert response["error"] == error
+        refute Map.has_key?(response, "values")
+      end
+
+      if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+    end
+
+    for {values, field, expected} <- observations do
+      assert values == [expected]
+      assert field["type"] == "string"
+      assert field["cardinality"] == 1
+      assert field["parsers"] == ["logfmt"]
+    end
+  end
+
+  @tag :detected_json_replacement
+  test "detected JSON values replay the complete frozen replacement-rune parser case", ctx do
+    fixture = "test/fixtures/logs/loki-upstream/json-parser.json" |> File.read!() |> Pulso.JSON.decode!()
+    row = Enum.find(fixture["parse_cases"], &(&1["name"] == "utf8 error rune"))
+    assert fixture["counts"]["table_rows"] == 16
+
+    assert Base.encode16(:crypto.hash(:sha256, row["raw"]), case: :lower) ==
+             "96a487acc7f5b19984a56930f414bd3ffb1eeac186754d0dcd5a7e5aae0d2d7f"
+
+    assert row["base_labels"] == %{}
+    assert row["structured_metadata"] == %{}
+    assert row["want"]["foo"] == " "
+
+    # Reuse the existing complete source row, not another imported row. Only
+    # timestamp and positive HTTP bounds adapt its empty-label unit setup.
+    line = row["line"]
+    push_streams(ctx, [%{"stream" => row["base_labels"], "values" => [[to_string(ctx.now), line]]}])
+    assert_parquet(ctx, 1)
+    params = [query: "{}", start: to_string(ctx.now - 1), end: to_string(ctx.now + 1)]
+
+    responses =
+      for method <- [&request/4, &request_form/4] do
+        values =
+          Map.new(row["want"], fn {key, _} ->
+            {key, method.(ctx, "/detected_field/#{key}/values", params, 200)["values"]}
+          end)
+
+        fields = method.(ctx, "/detected_fields", params, 200)["fields"]
+        assert Map.new(fields, &{&1["label"], &1["jsonPath"]}) == row["want_json_path"]
+        raw = method.(ctx, "/query_range", params, 200)
+        assert [%{"stream" => %{}, "values" => [[_, ^line]]}] = raw["data"]["result"]
+
+        # The ordinary JSON pipeline already implements this exact oracle;
+        # detection must agree without changing the persisted/raw line.
+        parsed = method.(ctx, "/query_range", Keyword.put(params, :query, "{} | json"), 200)
+        assert [%{"stream" => labels, "values" => [[_, ^line]]}] = parsed["data"]["result"]
+        assert labels == row["want"]
+        values
+      end
+
+    assert_parquet_read(ctx)
+    expected = Map.new(row["want"], fn {key, value} -> {key, [value]} end)
+    assert responses == [expected, expected]
+  end
+
+  @tag :detected_json_replacement
+  test "authored detected JSON cleanup preserves key metadata raw and safety boundaries", ctx do
+    # These are authored controls, not additional source rows. Cleanup applies
+    # to decoded JSON string values, never key/path bytes or metadata values.
+    rows = [
+      {~s/{"foo":"a��b"}/, %{}, %{"foo" => ["a  b"]}},
+      {~S/{"foo":"\ufffd"}/, %{}, %{"foo" => [" "]}},
+      {~s/{"foo":"é🙂"}/, %{}, %{"foo" => ["é🙂"]}},
+      {~S/{"foo":"\\ufffd"}/, %{}, %{"foo" => [~S/\ufffd/]}},
+      {~s/{"�foo":"ok","foo":"clean"}/, %{"tag" => "�"}, %{"_foo" => ["ok"], "foo" => ["clean"], "tag" => ["�"]}},
+      {~s/{"foo":"�",}/, %{}, %{"foo" => [" "]}}
+    ]
+
+    push_streams(ctx, [
+      %{
+        "stream" => %{},
+        "values" =>
+          for {{line, metadata, _}, index} <- Enum.with_index(rows) do
+            [to_string(ctx.now - index * 100), line, metadata]
+          end
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+
+    observations =
+      for {{line, _metadata, expected}, index} <- Enum.with_index(rows), method <- [&request/4, &request_form/4] do
+        at = ctx.now - index * 100
+        params = [query: "{}", start: to_string(at - 1), end: to_string(at + 1)]
+
+        values =
+          Map.new(expected, fn {key, _} ->
+            {key, method.(ctx, "/detected_field/#{key}/values", params, 200)["values"]}
+          end)
+
+        fields = method.(ctx, "/detected_fields", params, 200)["fields"]
+        paths = Map.new(fields, &{&1["label"], &1["jsonPath"]})
+
+        assert paths ==
+                 if(index == 4,
+                   do: %{"_foo" => ["�foo"], "foo" => ["foo"], "tag" => nil},
+                   else: %{"foo" => ["foo"]}
+                 )
+
+        raw = method.(ctx, "/query_range", params, 200)
+        assert [%{"values" => [[_, ^line]]}] = raw["data"]["result"]
+        {values, expected}
+      end
+
+    assert_parquet_read(ctx)
+    params = [query: "{}", start: to_string(ctx.now - 1), end: to_string(ctx.now + 1)]
+    before = Agent.get(ctx.store, & &1.requests)
+
+    denied =
+      Req.get!(ctx.url <> "/loki/api/v1/detected_field/foo/values",
+        headers: [{"x-scope-orgid", ctx.tenant}],
+        params: params,
+        retry: false
+      )
+
+    assert denied.status == 401
+
+    for method <- [&request/4, &request_form/4] do
+      assert method.(%{ctx | token: "wrong-token"}, "/detected_field/foo/values", params, 401)["error"] ==
+               "invalid_token"
+
+      assert method.(
+               ctx,
+               "/detected_field/foo/values",
+               Keyword.put(params, :end, to_string(ctx.now - 2)),
+               400
+             )["error"] == "invalid_parameter"
+    end
+
+    assert Agent.get(ctx.store, & &1.requests) == before
+
+    for {limits, status, error} <- [
+          {[max_per_tenant: 0], 429, "query_overloaded"},
+          {[max_scan_rows: 1], 422, "query_limit"}
+        ] do
+      Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
+
+      for method <- [&request/4, &request_form/4] do
+        response = method.(ctx, "/detected_field/foo/values", params, status)
+        assert response["error"] == error
+        refute Map.has_key?(response, "values")
+      end
+
+      if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+    end
+
+    for {values, expected} <- observations, do: assert(values == expected)
+  end
+
+  @tag :detected_numeric_booleans
+  test "complete detected-label source subtest retains numeric boolean suggestions", ctx do
+    source = File.read!("test/fixtures/logs/loki-upstream/detected-label-numeric-booleans.go.txt")
+
+    assert Base.encode16(:crypto.hash(:sha256, source), case: :lower) ==
+             "0240f47cc9e9678602ff7701aa5b69866222c6570af45c4626124f5335aefff0"
+
+    original =
+      Map.new(Regex.scan(~r/"([^"]+)":\s*\{Values: \[\]string\{([^}]+)\}\}/, source), fn [_, label, values] ->
+        {label, Enum.map(Regex.scan(~r/"([^"]*)"/, values), fn [_, value] -> value end)}
+      end)
+
+    assert map_size(original) == 5
+    assert Enum.sum(Enum.map(original, fn {_, values} -> length(values) end)) == 9
+    assert source =~ "assert.Len(t, detectedLabels, 3)"
+
+    [_, oracle] = Regex.run(~r/assert.ElementsMatch\(t, \[\]string\{([^}]+)\}, foundLabels\)/, source)
+    expected = Enum.sort(Enum.map(Regex.scan(~r/"([^"]+)"/, oracle), fn [_, label] -> label end))
+    assert expected == ["boolean-bools", "boolean-bools-uppercase", "boolean-ints"]
+
+    # Original input is an ingester mock's five name/value collections, not
+    # log lines. Give every original value its own singleton-label stream;
+    # carrier text and a positive window replace the mock's equal bounds.
+    streams =
+      for {label, values} <- original, value <- values do
+        %{"stream" => %{label => value}, "values" => [[to_string(ctx.now), "authored mock-to-HTTP carrier"]]}
+      end
+
+    push_streams(ctx, streams)
+    assert_parquet(ctx, 1)
+    params = [start: to_string(ctx.now - @second), end: to_string(ctx.now + @second)]
+
+    responses =
+      for method <- [&request/4, &request_form/4] do
+        response = method.(ctx, "/detected_labels", params, 200)
+        series = method.(ctx, "/series", params, 200)
+        assert MapSet.new(series["data"]) == MapSet.new(Enum.map(streams, & &1["stream"]))
+        response["detectedLabels"]
+      end
+
+    assert_parquet_read(ctx)
+
+    # Execute both transports before asserting the unchanged source oracle.
+    for labels <- responses do
+      assert length(labels) == 3
+      assert Enum.sort(Enum.map(labels, & &1["label"])) == expected
+      # Authored exact-cardinality control, not an upstream sketch oracle.
+      assert Enum.all?(labels, &(&1["cardinality"] == 2))
+    end
+  end
+
+  @tag :detected_numeric_booleans
+  test "authored detected-label boundaries keep only literal numeric booleans", ctx do
+    authored = %{
+      "zero-only" => ["0"],
+      "one-only" => ["1"],
+      "zero-one" => ["0", "1"],
+      "zero-one-two" => ["0", "1", "2"],
+      "signed-zero" => ["-0", "+0"],
+      "decimal-bools" => ["0.0", "1.0"],
+      "mixed" => ["0", "unknown"],
+      "pod" => ["2", "3"],
+      "numeric" => ["6", "7"],
+      "uuid" => ["751e8ee6-b377-4b2e-b7b5-5508fbe980ef"]
+    }
+
+    push_streams(
+      ctx,
+      for {label, values} <- authored, value <- values do
+        %{"stream" => %{label => value}, "values" => [[to_string(ctx.now), "authored boundary carrier"]]}
+      end
+    )
+
+    assert_parquet(ctx, 1)
+    params = [start: to_string(ctx.now - @second), end: to_string(ctx.now + @second)]
+
+    responses =
+      for method <- [&request/4, &request_form/4] do
+        method.(ctx, "/detected_labels", params, 200)
+      end
+
+    for response <- responses do
+      assert response == %{
+               "detectedLabels" => [
+                 %{"label" => "mixed", "cardinality" => 2},
+                 %{"label" => "one-only", "cardinality" => 1},
+                 %{"label" => "pod", "cardinality" => 2},
+                 %{"label" => "zero-one", "cardinality" => 2},
+                 %{"label" => "zero-only", "cardinality" => 1}
+               ]
+             }
+    end
+
+    # The label-suggestion exception must not change field typing: numeric
+    # booleans remain integers, while ordinary Boolean strings remain Boolean.
+    for method <- [&request/4, &request_form/4], value <- ["0", "1"] do
+      response =
+        method.(ctx, "/detected_fields", Keyword.put(params, :query, ~s/{pod="2"} | line_format "v=#{value}"/), 200)
+
+      assert [%{"label" => "v", "type" => "int"}] =
+               Enum.map(response["fields"], &Map.take(&1, ["label", "type"]))
+    end
+
+    assert FieldType.detect("1") == "int"
+    assert FieldType.detect("true") == "boolean"
+    assert_parquet_read(ctx)
+  end
+
+  @tag :detected_numeric_booleans
+  test "numeric boolean suggestions preserve auth bounds admission and fail-whole scans", ctx do
+    push_streams(
+      ctx,
+      for value <- ["0", "1"] do
+        %{"stream" => %{"boolean" => value}, "values" => [[to_string(ctx.now), "authored policy carrier"]]}
+      end
+    )
+
+    assert_parquet(ctx, 1)
+    params = [start: to_string(ctx.now - @second), end: to_string(ctx.now + @second)]
+
+    # Establish actual native Parquet reads before tightening admission. A
+    # footer/manifest row bound can reject without downloading the payload.
+    for method <- [&request/4, &request_form/4] do
+      assert is_list(method.(ctx, "/detected_labels", params, 200)["detectedLabels"])
+
+      assert method.(
+               ctx,
+               "/detected_labels",
+               [start: to_string(ctx.now - 3 * @second), end: to_string(ctx.now - 2 * @second)],
+               200
+             ) == %{"detectedLabels" => []}
+    end
+
+    assert_parquet_read(ctx)
+    before = Agent.get(ctx.store, & &1.requests)
+
+    denied =
+      Req.get!(ctx.url <> "/loki/api/v1/detected_labels",
+        params: params,
+        headers: [{"x-scope-orgid", ctx.tenant}],
+        retry: false
+      )
+
+    assert denied.status == 401
+    assert denied.body["error"] == "missing_token"
+
+    for method <- [&request/4, &request_form/4] do
+      assert method.(%{ctx | token: "wrong-token"}, "/detected_labels", params, 401)["error"] == "invalid_token"
+
+      assert method.(
+               ctx,
+               "/detected_labels",
+               [start: to_string(ctx.now + @second), end: to_string(ctx.now - @second)],
+               400
+             )["error"] == "invalid_parameter"
+    end
+
+    assert Agent.get(ctx.store, & &1.requests) == before
+
+    for {limits, status, error} <- [
+          {[max_scan_rows: 1], 422, "query_limit"},
+          {[max_per_tenant: 0], 429, "query_overloaded"}
+        ] do
+      Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
+
+      for method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, "/detected_labels", params, status)
+        assert response["error"] == error
+        refute Map.has_key?(response, "detectedLabels")
+        if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      end
+
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :detected_object_comma
+  test "complete nested JSON detection source pairs retain original difficult-key paths", ctx do
+    source = File.read!("test/fixtures/logs/loki-upstream/nested-json-field-detection.go.txt")
+
+    assert Base.encode16(:crypto.hash(:sha256, source), case: :lower) ==
+             "d90a731058af10163cdebda0c882ebafc7acb4f7c66c99ab75c50e34d6bfcbed"
+
+    [valid_a, valid_b, difficult_a, difficult_b] =
+      for [_, line] <- Regex.scan(~r/Line: `([^`]+)`/s, source), do: line
+
+    common = %{
+      "user_id" => ["user", "id"],
+      "user_name" => ["user", "name"],
+      "user_settings_theme" => ["user", "settings", "theme"],
+      "user_settings_notifications" => ["user", "settings", "notifications"]
+    }
+
+    valid_paths =
+      Map.merge(common, %{
+        "app_version" => ["app", "version"],
+        "app_metrics_cpu" => ["app", "metrics", "cpu"],
+        "app_metrics_memory" => ["app", "metrics", "memory"]
+      })
+
+    difficult_paths =
+      Map.merge(common, %{
+        "app_id" => ["app-id"],
+        "app_name" => ["app_name"],
+        "app_terrible_key_name" => ["app", "terrible/key/name"],
+        "other_bad_key_name" => ["other.bad.key.name"],
+        "key_with_spaces" => ["key with spaces"],
+        "nested_key_with_spaces_nest" => ["nested key with spaces", "nest"]
+      })
+
+    labels = %{"cluster" => "test-cluster", "job" => "json-test"}
+
+    # Separately authored repairs remove only these known terminal commas from
+    # the two fixtures. These are controls, never replacements for source loads.
+    repaired_a =
+      difficult_a
+      |> String.replace("\"notifications\":true,", "\"notifications\":true")
+      |> String.replace(~s("terrible/key/name": "four",), ~s("terrible/key/name": "four"))
+      |> String.replace(~s("nest": "thermostat",), ~s("nest": "thermostat"))
+
+    repaired_b =
+      difficult_b
+      |> String.replace("},\n        }", "}\n        }")
+      |> String.replace(~s("terrible/key/name": "four",), ~s("terrible/key/name": "four"))
+      |> String.replace(~s("nest": "protect",), ~s("nest": "protect"))
+
+    assert {:ok, _} = Pulso.JSON.decode(repaired_a)
+    assert {:ok, _} = Pulso.JSON.decode(repaired_b)
+
+    pairs = [
+      {ctx.now - @second, [valid_a, valid_b], valid_paths},
+      {ctx.now, [difficult_a, difficult_b], difficult_paths},
+      {ctx.now + 1, [repaired_a, repaired_b], difficult_paths}
+    ]
+
+    # HTTP adaptation: translate each original now to a separate instant,
+    # retaining both same-timestamp entries, exact line bytes and empty metadata.
+    push_streams(ctx, [
+      %{
+        "stream" => labels,
+        "values" => for({time, lines, _paths} <- pairs, line <- lines, do: [to_string(time), line, %{}])
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+
+    # Execute both transports for both complete original setups before checking
+    # their oracles, so a red assertion cannot hide the other response.
+    observations =
+      for {time, lines, paths} <- pairs, method <- [&request/4, &request_form/4] do
+        params = [
+          query: ~s/{cluster="test-cluster", job="json-test"}/,
+          start: to_string(time),
+          end: to_string(time),
+          line_limit: "100",
+          limit: "20"
+        ]
+
+        raw = method.(ctx, "/query_range", Keyword.replace!(params, :end, to_string(time + 1)), 200)
+        assert Enum.sort(lines(raw)) == Enum.sort(lines)
+        {paths, method.(ctx, "/detected_fields", params, 200)}
+      end
+
+    for {paths, response} <- observations do
+      assert Map.new(response["fields"] || [], &{&1["label"], &1["jsonPath"]}) == paths,
+             inspect(response)
+
+      if paths == valid_paths do
+        # The preceding original subtest also asserts these seven types.
+        assert Map.new(response["fields"], &{&1["label"], &1["type"]}) == %{
+                 "user_id" => "int",
+                 "user_name" => "string",
+                 "user_settings_theme" => "string",
+                 "user_settings_notifications" => "boolean",
+                 "app_version" => "float",
+                 "app_metrics_cpu" => "float",
+                 "app_metrics_memory" => "bytes"
+               }
+      end
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :detected_object_comma
+  test "authored object-comma controls preserve strings and reject unrelated malformed JSON", ctx do
+    # These are authored producers/results, not more upstream table rows.
+    string = "commas,} and braces {,} and quote \" and backslash \\"
+    escaped = Pulso.JSON.encode!(string)
+    escaped_key = Pulso.JSON.encode!("key,}\"\\end")
+
+    cases = [
+      {~s/{"text":#{escaped},"nested":{"leaf":true,},}/, %{"text" => ["text"], "nested_leaf" => ["nested", "leaf"]}},
+      {~s/{"a":1,"b":false,"c":null,"d":[],"e":{}, \r\n\t}/, %{"a" => ["a"], "b" => ["b"]}},
+      {~s/{"a":[{"b":2,}],"sentinel":1,}/, %{"sentinel" => ["sentinel"]}},
+      {~s/{"a":{"b":2,},"c":3,}/, %{"a_b" => ["a", "b"], "c" => ["c"]}},
+      # Repaired strict counterpart remains an independent control.
+      {~s/{"text":#{escaped},"nested":{"leaf":true}}/, %{"text" => ["text"], "nested_leaf" => ["nested", "leaf"]}},
+      {~s/{#{escaped_key}:{"leaf":1,},}/, %{"key____end_leaf" => ["key,}\"\\end", "leaf"]}},
+      {~s/{,}/, :invalid},
+      # Sentinel fields distinguish rejection from accidentally accepting an
+      # otherwise invisible empty object or skipped array/null value.
+      {~s/{,"sentinel":1}/, :invalid},
+      {~s/{"a":1,,}/, :invalid},
+      {~s/{"a":1, ,}/, :invalid},
+      {~s/{"a":,}/, :invalid},
+      {~s/{"sentinel":1,"a":,}/, :invalid},
+      {~s/{"sentinel":1,"a":[1,],}/, :invalid},
+      {~s/{"sentinel":1,"a":[,],}/, :invalid},
+      {~s/{"a":1,/, :invalid},
+      {~s/{"a":true false,}/, :invalid},
+      {~s/{"a":1} garbage,}/, :invalid},
+      {~s/{"a":"unterminated,}/, :invalid},
+      {~s/{"a":{"b":,},}/, :invalid},
+      {~s/{"a":1,} {"b":2,}/, :invalid},
+      {"plain=logfmt", :logfmt}
+    ]
+
+    push_streams(ctx, [
+      %{
+        "stream" => %{"job" => "comma-controls"},
+        "values" => for({{line, _expected}, i} <- Enum.with_index(cases), do: [to_string(ctx.now - i), line])
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+
+    for {{line, expected}, i} <- Enum.with_index(cases), method <- [&request/4, &request_form/4] do
+      params = [query: ~s/{job="comma-controls"}/, start: to_string(ctx.now - i), end: to_string(ctx.now - i)]
+      response = method.(ctx, "/detected_fields", params, 200)
+      fields = response["fields"] || []
+
+      case expected do
+        :invalid ->
+          refute Enum.any?(fields, &("json" in (&1["parsers"] || []))), inspect({line, response})
+
+        :logfmt ->
+          assert fields == [%{"label" => "plain", "type" => "string", "cardinality" => 1, "parsers" => ["logfmt"]}]
+
+        paths ->
+          assert Map.new(fields, &{&1["label"], &1["jsonPath"]}) == paths, inspect({line, response})
+          assert Enum.all?(fields, &(&1["parsers"] == ["json"]))
+      end
+
+      if i in [0, 4] do
+        assert method.(ctx, "/detected_field/text/values", params, 200)["values"] == [string]
+      end
+    end
+
+    assert_parquet_read(ctx)
+  end
+
+  @tag :detected_object_comma
+  test "detector fallback retains newest-line selection authentication and fail-whole budgets", ctx do
+    push_streams(ctx, [
+      %{
+        "stream" => %{"job" => "comma-policy"},
+        "values" => [
+          [to_string(ctx.now - 1), ~s/{"old":1,}/],
+          [to_string(ctx.now), "new=ok"]
+        ]
+      }
+    ])
+
+    assert_parquet(ctx, 1)
+    params = [query: ~s/{job="comma-policy"}/, start: to_string(ctx.now - 1), end: to_string(ctx.now), line_limit: "1"]
+
+    for method <- [&request/4, &request_form/4] do
+      assert Enum.map(method.(ctx, "/detected_fields", params, 200)["fields"], & &1["label"]) == ["new"]
+
+      # The detector's fallback must not broaden ordinary | json execution.
+      raw =
+        method.(
+          ctx,
+          "/query_range",
+          [query: ~s/{job="comma-policy"} | json/, start: to_string(ctx.now - 1), end: to_string(ctx.now)],
+          200
+        )
+
+      assert [%{"stream" => %{"__error__" => "JSONParserErr"}, "values" => [[_, ~s/{"old":1,}/]]}] =
+               raw["data"]["result"]
+    end
+
+    before = Agent.get(ctx.store, & &1.requests)
+
+    denied =
+      Req.get!(ctx.url <> "/loki/api/v1/detected_fields",
+        params: params,
+        headers: [{"x-scope-orgid", ctx.tenant}],
+        retry: false
+      )
+
+    assert denied.status == 401
+    assert Agent.get(ctx.store, & &1.requests) == before
+
+    # Raw detector sampling has provider scan bounds and worker admission, not
+    # the metric evaluator's request-local max_work budget. Test those existing
+    # boundaries rather than inventing a new detector byte/work policy.
+    for {limits, status, error} <- [
+          {[max_scan_rows: 1], 422, "query_limit"},
+          {[max_per_tenant: 0], 429, "query_overloaded"}
+        ] do
+      Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
+
+      for method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, "/detected_fields", Keyword.put(params, :line_limit, "100"), status)
+        assert response["error"] == error
+        refute Map.has_key?(response, "fields")
+        if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      end
+
+      Runtime.put_env(:pulso, Pulso.QueryRunner, [])
+    end
+
+    assert_parquet_read(ctx)
+  end
+
   describe "Test_ExploreLogsApis/detected_fields public results" do
     setup ctx do
       for {line, timestamp} <- [
@@ -9547,6 +11816,115 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
                  %{"label" => "foo", "type" => "string", "cardinality" => 1},
                  %{"label" => "color", "type" => "string", "cardinality" => 3}
                ])
+
+      assert_parquet_read(ctx)
+    end
+
+    @tag :detected_limit_fallback
+    test "empty limit falls back to field_limit without hiding invalid limits", ctx do
+      bounds = [
+        {"query", ~s({job="fake"})},
+        {"start", to_string(ctx.now - @minute)},
+        {"end", to_string(ctx.now + @minute)}
+      ]
+
+      # Authored controls for pinned pkg/loghttp/params.go detectedFieldsLimit.
+      for {limits, expected} <- [
+            {[], 1000},
+            {[{"field_limit", "1"}], 1},
+            {[{"limit", ""}, {"field_limit", "1"}], 1},
+            {[{"limit", ""}, {"field_limit", ""}], 1000},
+            {[{"limit", "2"}, {"field_limit", "0"}], 2},
+            {[{"limit", "1"}, {"field_limit", "5001"}], 1}
+          ],
+          method <- [&request/4, &request_form/4] do
+        fields = method.(ctx, "/detected_fields", bounds ++ limits, 200)
+        assert fields["limit"] == expected
+        assert length(fields["fields"]) == min(expected, 2)
+
+        values = method.(ctx, "/detected_field/color/values", bounds ++ limits, 200)
+        assert values["limit"] == expected
+        assert length(values["values"]) == min(expected, 3)
+        assert Enum.all?(values["values"], &(&1 in ["green", "purple", "red"]))
+      end
+
+      for limits <- [
+            [{"limit", ""}, {"field_limit", "0"}],
+            [{"limit", ""}, {"field_limit", "-1"}],
+            [{"limit", ""}, {"field_limit", "invalid"}],
+            [{"limit", ""}, {"field_limit", "5001"}],
+            [{"limit", "0"}, {"field_limit", "1"}],
+            [{"limit", "invalid"}, {"field_limit", "1"}]
+          ],
+          path <- ["/detected_fields", "/detected_field/color/values"],
+          method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, bounds ++ limits, 400)
+        assert response["error"] == "invalid_parameter"
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+
+      assert_parquet_read(ctx)
+    end
+
+    @tag :detected_step_admission
+    test "detected fields validate millisecond steps and the original interval ceiling", ctx do
+      bounds = [
+        {"query", ~s({job="fake"})},
+        {"start", to_string(ctx.now - div(@second, 2))},
+        {"end", to_string(ctx.now + div(@second, 2))}
+      ]
+
+      # Pinned ParseDetectedFieldsQuery validates step.Milliseconds() and
+      # integer (end-start)/step before dispatch; it does not ignore step.
+      for step <- ["0", "-1", "invalid", "NaN", "Inf", "0.000999999", "999999ns", String.duplicate("1", 129)],
+          path <- ["/detected_fields", "/detected_field/color/values"],
+          method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, [{"step", step} | bounds], 400)
+        assert response["error"] == "invalid_parameter"
+        assert Agent.get(ctx.store, & &1.requests) == before
+      end
+
+      for step <- [nil, "", "0.001", "1ms", "0.001000999", "1s"],
+          method <- [&request/4, &request_form/4] do
+        params = if is_nil(step), do: bounds, else: [{"step", step} | bounds]
+        fields = method.(ctx, "/detected_fields", params, 200)
+        assert Map.new(fields["fields"], &{&1["label"], &1["cardinality"]}) == %{"foo" => 1, "color" => 2}
+        values = method.(ctx, "/detected_field/color/values", params, 200)
+        assert values["values"] == ["green", "red"]
+      end
+
+      for {step, width, status} <- [
+            {"1ms", 11 * @second, 200},
+            {"1ms", 11_001_000_000 - 1, 200},
+            {"1ms", 11_001_000_000, 400},
+            {"0.0015", 16_500_000_000, 200},
+            {"0.0015", 16_501_500_000, 400}
+          ],
+          path <- ["/detected_fields", "/detected_field/color/values"],
+          method <- [&request/4, &request_form/4] do
+        params = [
+          {"query", ~s({job="fake"})},
+          {"start", to_string(ctx.now - width)},
+          {"end", to_string(ctx.now)},
+          {"step", step}
+        ]
+
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, params, status)
+
+        if status == 400 do
+          assert response["error"] == "invalid_parameter"
+          assert Agent.get(ctx.store, & &1.requests) == before
+        else
+          if path == "/detected_fields" do
+            assert Map.new(response["fields"], &{&1["label"], &1["cardinality"]}) == %{"foo" => 1, "color" => 3}
+          else
+            assert response["values"] == ["green", "purple", "red"]
+          end
+        end
+      end
 
       assert_parquet_read(ctx)
     end
@@ -9733,6 +12111,55 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     rows
   end
 
+  defp push_topk_parameter_fixture(ctx) do
+    streams =
+      for {app, pod, line, start, step, count} <- [
+            {"foo", "a", "xbar", 10, 10, 18},
+            {"foo", "a", "noise", 15, 10, 18},
+            {"foo", "b", "xbar", 5, 5, 36},
+            {"foo", "b", "noise", 7, 5, 36},
+            {"bar", "a", "xbar", 4, 4, 45},
+            {"bar", "a", "noise", 2, 4, 45},
+            {"bar", "b", "xbar", 2, 2, 90},
+            {"bar", "b", "noise", 1, 2, 90}
+          ] do
+        %{
+          "stream" => %{"app" => app, "pod" => pod},
+          "values" => for(index <- 0..(count - 1), do: [to_string(ctx.now + (start + index * step) * @second), line])
+        }
+      end
+
+    assert Enum.sum(Enum.map(streams, &length(&1["values"]))) == 378
+
+    streams =
+      streams
+      |> Enum.group_by(& &1["stream"])
+      |> Enum.map(fn {labels, schedules} ->
+        values = schedules |> Enum.flat_map(& &1["values"]) |> Enum.sort_by(fn [time, _] -> String.to_integer(time) end)
+        %{"stream" => labels, "values" => values}
+      end)
+
+    push_streams(ctx, streams)
+    streams
+  end
+
+  defp push_binary_matching_fixture(ctx) do
+    streams =
+      for {labels, line, seconds} <- [
+            {%{"app" => "foo", "machine" => "fuzz"}, "x", 10},
+            {%{"app" => "foo", "machine" => "buzz"}, "x", 15},
+            {%{"app" => "noise"}, "noise", 10}
+          ] do
+        %{
+          "stream" => labels,
+          "values" => for(index <- 0..18, do: [to_string(ctx.now + index * seconds * @second), line])
+        }
+      end
+
+    assert Enum.sum(Enum.map(streams, &length(&1["values"]))) == 57
+    push_streams(ctx, streams)
+  end
+
   defp push_streams(ctx, streams) do
     response = Req.post!(ctx.url <> "/loki/api/v1/push", headers: headers(ctx), json: %{"streams" => streams})
     assert response.status == 204, inspect(response.body)
@@ -9766,6 +12193,13 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     assert response.status == status, response.body
     response
+  end
+
+  # Authored diagnostic-selection queries must capture the rendered details:
+  # direct __error_details__ predicates read the independent ordinary label.
+  defp rendered_error_details_filter(details) do
+    ~s/ | label_format diagnostic_details="{{.__error_details__}}" | diagnostic_details=/ <>
+      Pulso.JSON.encode!(details) <> " | drop diagnostic_details"
   end
 
   defp quantity_errors(kind) do

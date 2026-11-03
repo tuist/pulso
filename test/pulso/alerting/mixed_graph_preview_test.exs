@@ -179,7 +179,8 @@ defmodule Pulso.Alerting.MixedGraphPreviewTest do
                  timestamp_ns: @now,
                  service: "api",
                  body: "x=3500",
-                 resource: %{"pod" => "one", "__error__" => "JSONParserErr"}
+                 resource: %{"pod" => "one"},
+                 attributes: %{"__error__" => "JSONParserErr"}
                }
              ])
 

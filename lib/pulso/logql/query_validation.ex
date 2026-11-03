@@ -41,6 +41,9 @@ defmodule Pulso.LogQL.QueryValidation do
   def validate(%AST.VectorAgg{op: :approx_topk, grouping: grouping}) when not is_nil(grouping),
     do: {:error, :unsupported_vector_grouping}
 
+  def validate(%AST.VectorAgg{op: op, grouping: %AST.Grouping{labels: [_ | _]}}) when op in [:sort, :sort_desc],
+    do: {:error, :sort_grouping_not_allowed}
+
   def validate(%AST.VectorAgg{inner: inner, op: op, param: param}) do
     with :ok <- validate_vector_parameter(op, param), do: validate(inner)
   end
@@ -97,6 +100,7 @@ defmodule Pulso.LogQL.QueryValidation do
        when is_integer(param) and param > 0 and param <= 9_223_372_036_854_775_807, do: :ok
 
   defp validate_vector_parameter(:approx_topk, _), do: {:error, :invalid_aggregation_parameter}
+  defp validate_vector_parameter(:topk, nil), do: {:error, :missing_topk_parameter}
   defp validate_vector_parameter(op, param) when op in [:topk, :bottomk] and is_integer(param), do: :ok
   defp validate_vector_parameter(op, _) when op in [:topk, :bottomk], do: {:error, :invalid_aggregation_parameter}
   defp validate_vector_parameter(_, nil), do: :ok

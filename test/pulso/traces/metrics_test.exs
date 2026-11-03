@@ -1,6 +1,7 @@
 defmodule Pulso.Traces.MetricsTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.Codec.NIF
   alias Pulso.OTLP.Traces
   alias Pulso.Storage
   alias Pulso.Traces.Metrics
@@ -122,8 +123,16 @@ defmodule Pulso.Traces.MetricsTest do
     assert length(series) == 5000
     assert Enum.all?(series, &(abs(&1["value"] - 1.1) < 1.0e-12))
 
+    filtered =
+      "({} | count_over_time() by (span:id) > 10000 | topk(1)) + " <>
+        "({} | sum_over_time(duration) by (span:id) > 10000 | bottomk(1))"
+
+    assert {:ok, json} = Metrics.query(tenant, filtered, window, true)
+    assert Pulso.JSON.decode!(json) == %{"series" => []}
+
     assert :ok = Storage.append(:traces, tenant, [%{span | span_id: "0000000000001389"}])
     assert {:error, :trace_group_limit} = Metrics.query(tenant, query, window, true)
+    assert {:error, :trace_group_limit} = Metrics.query(tenant, filtered, window, true)
   end
 
   test "negative, noninteger and overflowing windows reject before native decoding" do
@@ -186,7 +195,16 @@ defmodule Pulso.Traces.MetricsTest do
       assert List.last(samples) == %{"timestampMs" => to_string(last_ms), "value" => 0}
     end
 
-    assert {:error, :unsupported_parameters} = Metrics.query(tenant, query, {start, finish + step, step}, false)
+    assert {:error, {:trace_metrics_step_too_small, ^step, 1_000_100}} =
+             Metrics.query(tenant, query, {start, finish + step, step}, false)
+
+    # Preserve upstream integer division, not a ceil or an alignment-derived minimum.
+    assert {:error, {:trace_metrics_step_too_small, 1000, 1001}} =
+             Metrics.query(tenant, query, {start, start + 10_010_999, 1000}, false)
+
+    assert {:error, :unsupported_parameters} =
+             Metrics.query(tenant, query, {9_223_372_036_854_775_800, 9_223_372_036_854_775_807, 10}, false)
+
     assert {:ok, json} = Metrics.query(tenant, query, {start, finish + step, step}, true)
     assert [%{"value" => 0}] = Pulso.JSON.decode!(json)["series"]
   end
@@ -239,6 +257,73 @@ defmodule Pulso.Traces.MetricsTest do
 
     assert {:ok, %{second: {"bottomk", 2}}} = Metrics.parse("{} | rate() by (name) | bottomk(2) with(sample=true)")
     assert {:error, _} = Metrics.parse("{} | rate() | topk(0)")
+  end
+
+  test "native prefilter ranking agrees with BEAM scalar filters and per-interval selection" do
+    source = "{} | count_over_time() by (resource.service.name)"
+
+    for filter <- ["= 0", "!= 0", "< 1", "<= 1", "> 1", ">= 1"],
+        rank <- ["topk", "bottomk"],
+        k <- [1, 2, 3] do
+      # The existing bounded BEAM scalar-filter path is the reference for
+      # retained slots; this authored reduction independently selects winners.
+      filtered = range(ctx(), source <> " " <> filter)
+
+      expected =
+        for ts <- 1000..1060//10,
+            {labels, value} <-
+              filtered
+              |> Enum.flat_map(fn {labels, points} ->
+                if Map.has_key?(points, ts), do: [{labels, points[ts]}], else: []
+              end)
+              |> Enum.sort(fn {a, av}, {b, bv} ->
+                cond do
+                  av == bv -> if(rank == "topk", do: a <= b, else: a >= b)
+                  rank == "topk" -> av > bv
+                  true -> av < bv
+                end
+              end)
+              |> Enum.take(k),
+            reduce: %{} do
+          result -> Map.update(result, labels, %{ts => value}, &Map.put(&1, ts, value))
+        end
+
+      query = source <> " " <> filter <> " | #{rank}(#{k})"
+      assert range(ctx(), query) == expected, query
+      assert range(ctx(), "(#{query}) + 0") == expected, query
+    end
+
+    # Numeric aggregations have absent intervals, unlike count's zero slots.
+    query = "{} | min_over_time(duration) by (resource.service.name) > 0 | bottomk(1)"
+
+    assert range(ctx(), query) == %{
+             %{"resource.service.name" => "api"} => %{1010 => 0.1},
+             %{"resource.service.name" => "web"} => %{1020 => 2}
+           }
+  end
+
+  test "native ranking independently rejects malformed prefilter schemas" do
+    for second <- [
+          {"bottomk", 1, {"unknown", 1.0}},
+          {"bottomk", 0, {">", 1.0}},
+          {"unknown", 1, {">", 1.0}},
+          {"bottomk", 1, {">", "1"}},
+          {"bottomk", 1, [{">", 1.0}]},
+          {"bottomk", 1, {">", 1.0}, :extra},
+          :malformed
+        ] do
+      assert :fallback =
+               NIF.trace_metrics_new(
+                 nil,
+                 false,
+                 "count_over_time",
+                 [],
+                 nil,
+                 [],
+                 {0, @s, @s, false},
+                 second
+               )
+    end
   end
 
   test "instant queries return one value per series over the closed window" do

@@ -183,13 +183,27 @@ defmodule Pulso.PromQL.SemanticsTest do
     assert {:error, :many_to_many_matching} = query("a / on(job) b")
     append("b", %{"job" => "api", "region" => "us"}, [{30, 4.0}])
     assert {:error, :many_to_many_matching} = query("a / on(job) group_left b")
+    assert {:error, :many_to_many_matching} = query("a / on(job) group_right b")
+
+    # Both indexed-side contexts stay private to matching: PromQL's ordinary
+    # and batched public evaluators retain the same historical atom.
+    for expression <- ["a / on(job) group_left b", "a / on(job) group_right b"] do
+      assert {:error, :many_to_many_matching} =
+               Evaluator.query_batch(
+                 [{"ambiguous", expression, %{end_ts_ns: 30_000_000_000}}],
+                 "semantics",
+                 fn results, _deadline -> {:ok, results} end
+               )
+    end
   end
 
-  test "cardinality checks follow Prometheus even when filters drop matches" do
+  test "cardinality checks follow pinned Mimir before comparison filtering" do
     append("a", %{"job" => "api", "instance" => "one"}, [{30, 6.0}])
     append("a", %{"job" => "api", "instance" => "two"}, [{30, 8.0}])
-    assert entries("a > ignoring(job,instance) sum(a)") == []
-    assert numbers("a < ignoring(job,instance) max(a)") == ["6"]
+    # Prometheus 3.5.0 accepted zero/one surviving matches; PR 17668 fixed this
+    # before the Prometheus fork revision used by the pinned Mimir corpus.
+    assert {:error, :many_to_many_matching} = query("a > ignoring(job,instance) sum(a)")
+    assert {:error, :many_to_many_matching} = query("a < ignoring(job,instance) max(a)")
     assert {:error, :many_to_many_matching} = query("a < ignoring(job,instance) sum(a)")
     append("b", %{"job" => "web"}, [{30, 2.0}])
     assert {:error, :many_to_many_matching} = query("b + on(job) a")

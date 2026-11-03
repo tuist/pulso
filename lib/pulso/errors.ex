@@ -18,10 +18,23 @@ defmodule Pulso.Errors do
     with :ok <- Pulso.IngestLimits.validate(:sentry, event),
          {:ok, id} <- event_id(headers["event_id"] || event["event_id"]),
          {:ok, timestamp} <- timestamp(event["timestamp"]),
-         :ok <- validate_fingerprint(event["fingerprint"]) do
+         {:ok, fingerprint} <- fingerprint(event["fingerprint"]) do
       event = event |> scrub() |> Map.put("event_id", id)
-      issue = issue_id(event, project_id)
-      level = text(event["level"], "error")
+      issue = issue_id(event, project_id, scrub(fingerprint))
+
+      level =
+        %{
+          "log" => "info",
+          "critical" => "fatal",
+          10 => "debug",
+          20 => "info",
+          30 => "warning",
+          40 => "error",
+          50 => "fatal"
+        }
+        |> Map.get(event["level"], event["level"])
+        |> text("error")
+
       trace = object(object(event["contexts"])["trace"])
 
       {:ok,
@@ -40,8 +53,8 @@ defmodule Pulso.Errors do
            "error_project" => project_id,
            "error_issue_id" => issue,
            "error_event_id" => id,
-           "environment" => text(event["environment"], ""),
-           "release" => text(event["release"], "")
+           "environment" => environment(event),
+           "release" => text(lenient_string(event["release"]), "")
          }
        }}
     end
@@ -244,9 +257,9 @@ defmodule Pulso.Errors do
 
   # JSON framing preserves component boundaries (unlike joining with a delimiter).
   # v1 is part of the identity so future grouping algorithms can coexist.
-  defp issue_id(event, project) do
+  defp issue_id(event, project, fingerprint) do
     exception = exception(event)
-    frames = object(exception["stacktrace"])["frames"]
+    frames = object(Map.get(exception, "stacktrace", exception["sentry.interfaces.Stacktrace"]))["frames"]
     frames = if is_list(frames), do: Enum.filter(frames, &is_map/1), else: []
     in_app = Enum.filter(frames, &(&1["in_app"] == true))
     frame = List.last(if in_app == [], do: frames, else: in_app) || %{}
@@ -259,7 +272,7 @@ defmodule Pulso.Errors do
         [text(exception["type"], ""), location]
       end
 
-    fingerprint = if event["fingerprint"] in [nil, []], do: ["{{default}}"], else: event["fingerprint"]
+    fingerprint = if fingerprint == [], do: ["{{default}}"], else: fingerprint
 
     components =
       Enum.map(fingerprint, fn value ->
@@ -277,27 +290,83 @@ defmodule Pulso.Errors do
   @doc false
   def title(event) do
     ex = exception(event)
-    logentry = object(event["logentry"])
-    message = text(event["message"], text(object(event["message"])["formatted"], "Error"))
-    message = text(ex["value"], text(logentry["formatted"], text(logentry["message"], message)))
+    logentry_value = Map.get(event, "logentry", event["sentry.interfaces.Message"])
+    message = text(logentry_text(logentry_value), text(logentry_text(event["message"]), "Error"))
+
+    value =
+      case ex["value"] do
+        nil -> nil
+        value when is_binary(value) -> value
+        value -> Canonical.encode(value)
+      end
+
+    message = text(value, message)
     type = text(ex["type"], "")
     String.slice(if(type == "", do: message, else: type <> ": " <> message), 0, 500)
   end
 
+  defp logentry_text(value) when value in [nil, false], do: nil
+  defp logentry_text(value) when is_binary(value), do: value
+  defp logentry_text(value) when is_map(value), do: text(value["formatted"], value["message"])
+  defp logentry_text(value), do: Canonical.encode(value)
+
   defp exception(event) do
-    case object(event["exception"])["values"] do
+    values =
+      case Map.get(event, "exception", event["sentry.interfaces.Exception"]) do
+        %{"values" => values} -> values
+        %{} = value -> [value]
+        values -> values
+      end
+
+    case values do
       values when is_list(values) -> values |> Enum.filter(&is_map/1) |> List.last() || %{}
       _ -> %{}
     end
   end
 
-  defp validate_fingerprint(nil), do: :ok
+  defp fingerprint(nil), do: {:ok, []}
 
-  defp validate_fingerprint(values) when is_list(values) and length(values) <= 32 do
-    if Enum.all?(values, &(is_binary(&1) and byte_size(&1) <= 256)), do: :ok, else: {:error, :invalid_fingerprint}
+  defp fingerprint(values) when is_list(values) and length(values) <= 32 do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, components} ->
+      case lenient_string(value) do
+        nil -> {:cont, {:ok, components}}
+        value when is_binary(value) and byte_size(value) <= 256 -> {:cont, {:ok, components ++ [value]}}
+        _ -> {:halt, {:error, :invalid_fingerprint}}
+      end
+    end)
   end
 
-  defp validate_fingerprint(_), do: {:error, :invalid_fingerprint}
+  defp fingerprint(_), do: {:error, :invalid_fingerprint}
+
+  defp environment(%{"environment" => value}) when is_binary(value) and value != "", do: value
+
+  defp environment(event) do
+    value =
+      case event["tags"] do
+        %{} = tags -> tags["environment"]
+        tags when is_list(tags) -> tags |> Enum.find(&match?(["environment", _], &1)) |> List.wrap() |> List.last()
+        _ -> nil
+      end
+
+    value |> lenient_string() |> text("") |> String.trim()
+  end
+
+  defp lenient_string(nil), do: nil
+  defp lenient_string(value) when is_binary(value), do: value
+  defp lenient_string(true), do: "True"
+  defp lenient_string(false), do: "False"
+
+  defp lenient_string(value) when is_integer(value) and value in -9_223_372_036_854_775_808..18_446_744_073_709_551_615,
+    do: Integer.to_string(value)
+
+  # Relay's LenientString accepts floats strictly inside the JSON-precision
+  # boundary, truncating toward zero while retaining a negative zero spelling.
+  defp lenient_string(value) when is_float(value) and abs(value) < 9_007_199_254_740_992 do
+    integer = trunc(value)
+    if integer == 0 and String.starts_with?(Float.to_string(value), "-"), do: "-0", else: Integer.to_string(integer)
+  end
+
+  defp lenient_string(_), do: :invalid
 
   defp event_id(nil), do: {:ok, Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)}
 
@@ -315,12 +384,14 @@ defmodule Pulso.Errors do
   defp timestamp(nil), do: {:ok, System.system_time(:nanosecond)}
 
   defp timestamp(value) when is_number(value) and value >= 0 and value <= 9_223_372_036 do
-    validate_timestamp(round(value * 1_000_000_000))
+    seconds = floor(value)
+    validate_timestamp(seconds * 1_000_000_000 + round((value - seconds) * 1_000_000) * 1000)
   end
 
   defp timestamp(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, dt, _} -> validate_timestamp(DateTime.to_unix(dt, :nanosecond))
+      {:error, :missing_offset} -> timestamp(value <> "Z")
       _ -> {:error, :invalid_timestamp}
     end
   end
@@ -341,7 +412,7 @@ defmodule Pulso.Errors do
       value =
         cond do
           normalized in @sensitive -> "[Filtered]"
-          normalized in ~w(user request) -> "[Filtered]"
+          normalized in ~w(user request sentry.interfaces.user sentry.interfaces.http) -> "[Filtered]"
           normalized == "headers" -> "[Filtered]"
           true -> scrub(value)
         end
@@ -361,6 +432,13 @@ defmodule Pulso.Errors do
   defp text(_, default), do: default
   defp object(value) when is_map(value), do: value
   defp object(_), do: %{}
+
+  defp hex_id(value, 32) when is_binary(value) and byte_size(value) == 36 do
+    case event_id(value) do
+      {:ok, id} -> id
+      _ -> nil
+    end
+  end
 
   defp hex_id(value, size) when is_binary(value) and byte_size(value) == size do
     case Base.decode16(value, case: :mixed) do

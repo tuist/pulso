@@ -1,6 +1,7 @@
 defmodule PulsoWeb.PrometheusMathConformanceTest do
   use PulsoWeb.ConnCase, async: true
 
+  alias Pulso.Auth.SharedSecret
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.MetricSample
   alias Pulso.Record.NativeHistogram
@@ -16,42 +17,44 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
   setup %{adapter: adapter} do
     Runtime.put_env(:pulso, Storage, adapter: adapter)
 
-    if adapter == S3 do
-      store =
-        start_supervised!(
-          {Agent,
-           fn ->
-             %{
-               objects: %{},
-               reads: [],
-               version: 0,
-               hook: nil,
-               faults: %{},
-               barriers: %{},
-               lists: 0,
-               deletes: [],
-               requests: []
-             }
-           end}
-        )
+    store =
+      if adapter == S3 do
+        store =
+          start_supervised!(
+            {Agent,
+             fn ->
+               %{
+                 objects: %{},
+                 reads: [],
+                 version: 0,
+                 hook: nil,
+                 faults: %{},
+                 barriers: %{},
+                 lists: 0,
+                 deletes: [],
+                 requests: []
+               }
+             end}
+          )
 
-      server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
-      {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+        server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
+        {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
-      Runtime.put_env(:pulso, S3, %{
-        bucket: "pulso",
-        endpoint: "http://127.0.0.1:#{port}",
-        region: "us-east-1",
-        access_key_id: "test-#{System.unique_integer([:positive])}",
-        secret_access_key: "test",
-        allow_http: true,
-        refresh_stale_ms: 0
-      })
+        Runtime.put_env(:pulso, S3, %{
+          bucket: "pulso",
+          endpoint: "http://127.0.0.1:#{port}",
+          region: "us-east-1",
+          access_key_id: "test-#{System.unique_integer([:positive])}",
+          secret_access_key: "test",
+          allow_http: true,
+          refresh_stale_ms: 0
+        })
 
-      start_supervised!(ManifestSupervision)
-    end
+        start_supervised!(ManifestSupervision)
+        store
+      end
 
-    :ok
+    {:ok, store: store}
   end
 
   for adapter <- [Memory, S3],
@@ -61,6 +64,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"upstream-timestamp.test", 7},
         {"upstream-absence-over-time.test", 27},
         {"upstream-label-replace.test", 11},
+        {"mimir-label-replace-regex-error.test", 2},
         {"upstream-staleness.test", 17},
         {"upstream-selectors.test", 31},
         {"upstream-collision.test", 2},
@@ -81,6 +85,8 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"mimir-transitions.test", 1},
         {"upstream-regression.test", 11},
         {"mimir-regression.test", 1},
+        {"mimir-rate-name-annotations.test", 3},
+        {"mimir-prefilter-cardinality.test", 2},
         {"upstream-mad.test", 7},
         {"mimir-mad.test", 8},
         {"upstream-extremum-timestamps.test", 2},
@@ -108,9 +114,15 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"upstream-atan2.test", 4},
         {"mimir-atan2.test", 32},
         {"upstream-sort-warnings.test", 5},
+        {"mimir-sort-histograms.test", 7},
         {"upstream-query-context.test", 33},
+        {"upstream-scalar.test", 3},
         {"upstream-scalar-extrema.test", 14},
         {"mimir-scalar-extrema.test", 4},
+        {"upstream-ranking-histogram-annotations.test", 12},
+        {"upstream-range-extrema.test", 8},
+        {"upstream-range-dispersion.test", 9},
+        {"upstream-aggregation-extrema.test", 8},
         {"upstream-dispersion.test", 36},
         {"upstream-value-count.test", 10},
         {"mimir-value-count.test", 4},
@@ -136,6 +148,8 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"upstream-idelta.test", 10},
         {"upstream-irate.test", 11},
         {"upstream-delta.test", 4},
+        {"upstream-float-delta-boundaries.test", 7},
+        {"upstream-subquery-reset-hints.test", 2},
         {"upstream-custom-histogram-arithmetic.test", 17},
         {"upstream-histogram-range-aggregation.test", 20},
         {"upstream-histogram-group-aggregation.test", 3},
@@ -149,11 +163,35 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"upstream-histogram-interpolation.test", 150},
         {"mimir-histogram-binary.test", 25},
         {"upstream-classic-histograms.test", 183},
+        {"mimir-empty-load-labels.test", 2},
         {"mimir-histogram-quantiles.test", 5}
       ] do
     @tag adapter: adapter
+    @tag subquery_reset_hints: file == "upstream-subquery-reset-hints.test"
+    @tag subquery_reset_affected:
+           file in ~w(upstream-histogram-counter-annotations.test upstream-histogram-extrapolation.test upstream-time-subquery.test mimir-subqueries.test)
+    @tag empty_load_labels: file == "mimir-empty-load-labels.test"
+    @tag empty_load_labels_affected:
+           file in ~w(upstream-classic-histograms.test mimir-histogram-quantiles.test upstream-absence.test upstream-absence-over-time.test upstream-selectors.test)
     @tag time_modifiers: String.starts_with?(file, "upstream-time-")
     @tag sampling: String.ends_with?(file, "-limit.test")
+    @tag scalar_batch: file == "upstream-scalar.test"
+    @tag ranking_histogram_annotations: file == "upstream-ranking-histogram-annotations.test"
+    @tag range_extrema: file == "upstream-range-extrema.test"
+    @tag range_dispersion: file == "upstream-range-dispersion.test"
+    @tag aggregation_extrema: file == "upstream-aggregation-extrema.test"
+    @tag rate_name_annotations: file == "mimir-rate-name-annotations.test"
+    @tag prefilter_cardinality: file == "mimir-prefilter-cardinality.test"
+    @tag range_sort_histograms: file == "mimir-sort-histograms.test"
+    @tag range_sort_affected: file in ~w(upstream-sort-warnings.test upstream-label-sort.test mimir-label-sort.test)
+    @tag omitted_repetitions: file == "upstream-float-delta-boundaries.test"
+    @tag omitted_repetitions_affected:
+           file in ~w(upstream-delta.test upstream-idelta.test upstream-irate.test upstream-regression.test mimir-rate-name-annotations.test upstream-histogram-counter-annotations.test upstream-histogram-extrapolation.test)
+    @tag label_replace_regex_error: file == "mimir-label-replace-regex-error.test"
+    @tag label_replace_regex_affected: file in ~w(upstream-label-replace.test mimir-label-replace-regex-error.test)
+    @tag prefilter_cardinality_affected: file in ~w(upstream-atan2.test mimir-atan2.test mimir-histogram-binary.test)
+    @tag rate_name_affected:
+           file in ~w(upstream-regression.test upstream-histogram-counter-annotations.test upstream-histogram-extrapolation.test upstream-histogram-range-aggregation.test upstream-custom-histogram-arithmetic.test upstream-irate.test)
     @tag duration_expressions: file == "upstream-duration-expressions.test"
     @tag grammar_batch: String.starts_with?(file, "upstream-default-subquery")
     @tag result_types_batch: String.ends_with?(file, "-results.test")
@@ -215,6 +253,710 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         end)
 
       assert count == unquote(count)
+    end
+  end
+
+  for adapter <- [Memory, S3] do
+    @tag adapter: adapter, subquery_reset_hints: true
+    test "subqueries clear only counter hints and preserve direct inputs through authenticated #{inspect(adapter)}", %{
+      store: store
+    } do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{"subquery-hints" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "hint-token"), case: :lower)}
+      )
+
+      source = [
+        "yes {{count:10}} {{count:12 counter_reset_hint:reset}} {{count:14 counter_reset_hint:not_reset}}",
+        "no {{count:10}} {{count:4 counter_reset_hint:not_reset}} {{count:6 counter_reset_hint:not_reset}}",
+        "unknown {{count:10}} {{count:4}} {{count:6}}",
+        "gauge {{count:10 counter_reset_hint:gauge}} {{count:4 counter_reset_hint:gauge}} {{count:6 counter_reset_hint:gauge}}",
+        "floats 0 1 2"
+      ]
+
+      assert :ok = Storage.append(:metrics, "subquery-hints", Enum.flat_map(source, &records(&1, 1_000_000_000)))
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      for path <- ["/api/v1/query", "/api/v1/query_range"] do
+        denied = build_conn() |> put_req_header("x-scope-orgid", "subquery-hints") |> get(path, query: "vector(1)")
+        assert denied.status == 401
+      end
+
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+
+      for {query, expected} <- [
+            {"vector(1)", ["{} 1", "expect no_warn"]},
+            {"resets(yes[3s])", ["{} 1", "expect no_warn"]},
+            {"resets(yes[3s:500ms])", ["{} 0", "expect no_warn"]},
+            {"resets(no[3s])", ["{} 0", "expect no_warn"]},
+            {"resets(no[3s:1s])", ["{} 1", "expect no_warn"]},
+            {"resets(unknown[3s:500ms])", ["{} 1", "expect no_warn"]},
+            {"histogram_count(rate(gauge[3s:1s]))",
+             ["{} 3", ~s(expect warn msg: PromQL warning: this native histogram metric is not a counter: "gauge")]},
+            {"sum_over_time(floats[3s:1s])", ["{} 3", "expect no_warn"]}
+          ],
+          {path, params} <- [
+            {"/api/v1/query", %{time: "2"}},
+            {"/api/v1/query_range", %{start: "2", end: "2", step: "1s"}}
+          ] do
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "subquery-hints")
+          |> put_req_header("authorization", "Bearer hint-token")
+          |> get(path, Map.put(params, :query, query))
+
+        assert_success(conn, expected ++ ["expect no_info"], path, query, 2, 1)
+      end
+    end
+
+    @tag adapter: adapter, subquery_reset_hints: true
+    test "subquery counter hint normalization keeps query-local state and shared budgets through #{inspect(adapter)}" do
+      source = "yes {{count:10}} {{count:12 counter_reset_hint:reset}} {{count:14}}"
+      assert :ok = Storage.append(:metrics, "subquery-budget", records(source, 1_000_000_000))
+      opts = %{end_ts_ns: 2_000_000_000}
+      direct = {"direct", "resets(yes[3s])", opts}
+      subquery = {"subquery", "resets(yes[3s:500ms])", opts}
+
+      for batch <- [[direct, subquery], [subquery, direct]] do
+        assert {:ok, results} = Evaluator.query_batch(batch, "subquery-budget", fn result, _ -> {:ok, result} end)
+        assert [%{"value" => [2.0, "1"]}] = results["direct"]["data"]["result"]
+        assert [%{"value" => [2.0, "0"]}] = results["subquery"]["data"]["result"]
+      end
+
+      # Five inner points fit once, but two sources share the materialization cap.
+      Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 5)
+      assert {:ok, _} = Evaluator.query_batch([subquery], "subquery-budget", fn result, _ -> {:ok, result} end)
+
+      assert {:error, :query_intermediate_limit} =
+               Evaluator.query_batch([subquery, put_elem(subquery, 0, "second")], "subquery-budget", fn _, _ ->
+                 flunk("partial over-budget subquery batch")
+               end)
+
+      Runtime.put_env(:pulso, Evaluator, max_work: 1)
+      assert {:error, :query_work_limit} = Evaluator.query(elem(subquery, 1), "subquery-budget", opts)
+    end
+  end
+
+  for adapter <- [Memory, S3], path <- ["/api/v1/query", "/api/v1/query_range"] do
+    @tag adapter: adapter, empty_load_labels: true
+    test "load labels normalize only empty values through authenticated #{path} and #{inspect(adapter)}", %{
+      store: store
+    } do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{
+          "load-labels" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "load-token"), case: :lower)
+        }
+      )
+
+      source = [
+        ~s(producer_labels{empty="",kept="value","κλειδί"="雪"} 7),
+        ~s(producer_empty{first="",second=""} 8)
+      ]
+
+      assert :ok = Storage.append(:metrics, "load-labels", Enum.flat_map(source, &records(&1, 1_000_000_000)))
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      denied =
+        build_conn()
+        |> put_req_header("x-scope-orgid", "load-labels")
+        |> get(unquote(path), query: "producer_labels")
+
+      assert denied.status == 401
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+
+      for {query, expected} <- [
+            {"vector(1)", ["{} 1"]},
+            {"producer_labels", [~s(producer_labels{kept="value","κλειδί"="雪"} 7)]},
+            {"producer_empty", ["producer_empty 8"]}
+          ] do
+        params =
+          if unquote(path) == "/api/v1/query",
+            do: %{query: query, time: "0"},
+            else: %{query: query, start: "0", end: "0", step: "1s"}
+
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "load-labels")
+          |> put_req_header("authorization", "Bearer load-token")
+          |> get(unquote(path), params)
+
+        response = json_response(conn, 200)
+        assert Map.get(response, "warnings", []) == []
+        assert Map.get(response, "infos", []) == []
+        assert_query_data(response["data"], expected, unquote(path), query, 0, 1)
+      end
+    end
+  end
+
+  for adapter <- [Memory, S3] do
+    @tag adapter: adapter, omitted_repetitions: true
+    test "omitted and value repetition boundaries through authenticated HTTP and #{inspect(adapter)}", %{
+      store: store
+    } do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{
+          "repeat-boundaries" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "repeat-token"), case: :lower)
+        }
+      )
+
+      source = [
+        ~s(repeat_boundary{kind="omitted-zero"} _x0 7),
+        ~s(repeat_boundary{kind="omitted-one"} _x1 7),
+        ~s(repeat_boundary{kind="float-zero"} 7x0),
+        ~s(repeat_boundary{kind="float-one"} 7x1),
+        ~s(repeat_boundary{kind="histogram-zero"} {{count:2 sum:3}}x0),
+        ~s(repeat_boundary{kind="histogram-one"} {{count:2 sum:3}}x1)
+      ]
+
+      assert :ok = Storage.append(:metrics, "repeat-boundaries", Enum.flat_map(source, &records(&1, 1_000_000_000)))
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      for path <- ["/api/v1/query", "/api/v1/query_range"] do
+        denied = build_conn() |> put_req_header("x-scope-orgid", "repeat-boundaries") |> get(path, query: "vector(1)")
+        assert denied.status == 401
+      end
+
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+
+      for {query, range_expected, instant_expected} <- [
+            {"count_over_time(repeat_boundary[3s])",
+             [
+               ~s({kind="omitted-zero"} 1 1 1),
+               ~s({kind="omitted-one"} _ 1 1),
+               ~s({kind="float-zero"} 1 1 1),
+               ~s({kind="float-one"} 1 2 2),
+               ~s({kind="histogram-zero"} 1 1 1),
+               ~s({kind="histogram-one"} 1 2 2)
+             ],
+             [
+               ~s({kind="omitted-zero"} 1),
+               ~s({kind="omitted-one"} 1),
+               ~s({kind="float-zero"} 1),
+               ~s({kind="float-one"} 2),
+               ~s({kind="histogram-zero"} 1),
+               ~s({kind="histogram-one"} 2)
+             ]},
+            {"sum_over_time(repeat_boundary[3s])",
+             [
+               ~s({kind="omitted-zero"} 7 7 7),
+               ~s({kind="omitted-one"} _ 7 7),
+               ~s({kind="float-zero"} 7 7 7),
+               ~s({kind="float-one"} 7 14 14),
+               ~s({kind="histogram-zero"} {{count:2 sum:3}}x2),
+               ~s({kind="histogram-one"} {{count:2 sum:3}} {{count:4 sum:6}}x1)
+             ],
+             [
+               ~s({kind="omitted-zero"} 7),
+               ~s({kind="omitted-one"} 7),
+               ~s({kind="float-zero"} 7),
+               ~s({kind="float-one"} 14),
+               ~s({kind="histogram-zero"} {{count:2 sum:3}}),
+               ~s({kind="histogram-one"} {{count:4 sum:6}})
+             ]}
+          ],
+          {path, params, expected, first} <- [
+            {"/api/v1/query_range", %{start: "0", end: "2", step: "1s"}, range_expected, 0},
+            {"/api/v1/query", %{time: "1"}, instant_expected, 1}
+          ] do
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "repeat-boundaries")
+          |> put_req_header("authorization", "Bearer repeat-token")
+          |> get(path, Map.put(params, :query, query))
+
+        response = json_response(conn, 200)
+        assert Map.get(response, "warnings", []) == []
+        assert Map.get(response, "infos", []) == []
+        assert_query_data(response["data"], expected, path, query, first, 1)
+      end
+    end
+  end
+
+  for adapter <- [Memory, S3] do
+    @tag adapter: adapter, range_sort_histograms: true
+    test "range sorting omits only value-sort histograms through authenticated HTTP and #{inspect(adapter)}", %{
+      store: store
+    } do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{"range-sort" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "sort-token"), case: :lower)}
+      )
+
+      source = [
+        ~s(typed{kind="mixed"} 1 {{count:2 sum:3}} -0 NaN +Inf -Inf),
+        ~s(typed{kind="hist"} {{count:2 sum:3}}x5),
+        ~s(typed{kind="float"} 6 5 4 3 2 1)
+      ]
+
+      assert :ok = Storage.append(:metrics, "range-sort", Enum.flat_map(source, &records(&1, 1_000_000_000)))
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      for path <- ["/api/v1/query", "/api/v1/query_range"] do
+        denied = build_conn() |> put_req_header("x-scope-orgid", "range-sort") |> get(path, query: "sort(typed)")
+        assert denied.status == 401
+      end
+
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+
+      for {query, label_sort?} <- [
+            {"sort(typed)", false},
+            {"sort_desc(typed)", false},
+            {~s|sort_by_label(typed, "kind")|, true},
+            {~s|sort_by_label_desc(typed, "kind")|, true}
+          ],
+          {path, params, first, step, range?} <- [
+            {"/api/v1/query_range", %{start: "0", end: "5", step: "1s"}, 0, 1, true},
+            {"/api/v1/query_range", %{start: "1", end: "1", step: "1s"}, 1, 1, false},
+            {"/api/v1/query", %{time: "1"}, 1, 1, false}
+          ] do
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "range-sort")
+          |> put_req_header("authorization", "Bearer sort-token")
+          |> get(path, Map.put(params, :query, query))
+
+        response = json_response(conn, 200)
+
+        expected =
+          case {label_sort?, range?} do
+            {true, true} ->
+              source
+
+            {false, true} ->
+              [~s(typed{kind="mixed"} 1 _ -0 NaN +Inf -Inf), ~s(typed{kind="float"} 6 5 4 3 2 1)]
+
+            {true, false} ->
+              [
+                ~s(typed{kind="mixed"} {{count:2 sum:3}}),
+                ~s(typed{kind="hist"} {{count:2 sum:3}}),
+                ~s(typed{kind="float"} 5)
+              ]
+
+            {false, false} ->
+              [~s(typed{kind="float"} 5)]
+          end
+
+        assert_query_data(response["data"], expected, path, query, first, step)
+        assert Map.get(response, "infos", []) == []
+
+        warnings =
+          if range?,
+            do: ["PromQL warning: sort is ineffective for range queries since results are always ordered by labels"],
+            else: []
+
+        assert Map.get(response, "warnings", []) == warnings
+
+        if range? do
+          mixed = Enum.find(response["data"]["result"], &(&1["metric"]["kind"] == "mixed"))
+          assert [2.0, "-0"] in mixed["values"]
+        end
+      end
+    end
+
+    @tag adapter: adapter, range_sort_histograms: true
+    test "range sort batches isolate filtering and warnings and preserve budgets through #{inspect(adapter)}" do
+      samples =
+        Enum.flat_map(
+          [~s(typed{kind="mixed"} 1 {{count:2 sum:3}} 2), ~s(typed{kind="hist"} {{count:2 sum:3}}x2)],
+          &records(&1, 1_000_000_000)
+        )
+
+      assert :ok = Storage.append(:metrics, "sort-batch", samples)
+      range = %{start_ts_ns: 0, end_ts_ns: 2_000_000_000, step_ns: 1_000_000_000}
+
+      queries = [
+        {"value", "sort(typed)", range},
+        {"label", ~s|sort_by_label(typed, "kind")|, range},
+        {"instant", "sort_desc(typed)", %{end_ts_ns: 1_000_000_000}},
+        {"raw", "typed", range}
+      ]
+
+      for batch <- [queries, Enum.reverse(queries)] do
+        assert {:ok, results} = Evaluator.query_batch(batch, "sort-batch", fn result, _ -> {:ok, result} end)
+
+        assert [%{"metric" => %{"__name__" => "typed", "kind" => "mixed"}, "values" => [[+0.0, "1"], [2.0, "2"]]}] =
+                 results["value"]["data"]["result"]
+
+        assert results["label"]["data"] == results["raw"]["data"]
+        assert length(results["label"]["data"]["result"]) == 2
+        assert results["instant"]["data"]["result"] == []
+        assert length(results["value"]["warnings"]) == 1
+        assert results["label"]["warnings"] == results["value"]["warnings"]
+        refute Map.has_key?(results["instant"], "warnings")
+        refute Map.has_key?(results["raw"], "warnings")
+      end
+
+      for {limits, reason} <- [
+            {[max_samples: 1], :query_sample_limit},
+            {[max_work: 1], :query_work_limit},
+            {[max_result_points: 1], :query_result_limit}
+          ] do
+        Runtime.put_env(:pulso, Evaluator, limits)
+        assert {:error, ^reason} = Evaluator.query("sort(typed)", "sort-batch", range)
+
+        assert {:error, ^reason} =
+                 Evaluator.query_batch(queries, "sort-batch", fn _, _ -> flunk("partial over-budget sort batch") end)
+      end
+
+      # Even an empty projected result pays for every selected histogram.
+      Runtime.put_env(:pulso, Evaluator, max_samples: 2)
+
+      assert {:error, :query_sample_limit} =
+               Evaluator.query(~s|sort(typed{kind="hist"})|, "sort-batch", range)
+    end
+
+    @tag adapter: adapter, label_replace_regex_error: true
+    test "label_replace regex diagnostics preserve admission and bounded reflection through #{inspect(adapter)}", %{
+      store: store
+    } do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{
+          "regex-errors" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "owned-regex-token"), case: :lower)
+        }
+      )
+
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      for {path, params} <- [
+            {"/api/v1/query", %{time: "0"}},
+            {"/api/v1/query_range", %{start: "0", end: "0", step: "1s"}}
+          ] do
+        query = ~s|label_replace(series, "export", "$1", "label", "[.*")|
+
+        conn =
+          build_conn() |> put_req_header("x-scope-orgid", "regex-errors") |> get(path, Map.put(params, :query, query))
+
+        assert json_response(conn, 401) == %{
+                 "status" => "error",
+                 "errorType" => "unauthorized",
+                 "error" => "unauthorized"
+               }
+
+        for {destination, regex, message} <- [
+              {"export", "[.*", "invalid regular expression in label_replace(): [.*"},
+              {"export", "(.*", "invalid regular expression in label_replace(): (.*"},
+              {"export", "é[", "invalid regular expression in label_replace(): é["},
+              {"export", String.duplicate("a", 1023) <> "[",
+               "invalid regular expression in label_replace(): " <> String.duplicate("a", 1023) <> "["},
+              {"", "[.*", "Invalid or unsupported query parameters."},
+              {"", "(.*)", "Invalid or unsupported query parameters."},
+              {"export", String.duplicate("a", 1024) <> "[", "Invalid or unsupported query parameters."},
+              {"export", String.duplicate("é", 512) <> "[", "Invalid or unsupported query parameters."}
+            ] do
+          query = "label_replace(series, #{JSON.encode!(destination)}, \"$1\", \"label\", #{JSON.encode!(regex)})"
+
+          conn =
+            build_conn()
+            |> put_req_header("x-scope-orgid", "regex-errors")
+            |> put_req_header("authorization", "Bearer owned-regex-token")
+            |> get(path, Map.put(params, :query, query))
+
+          assert json_response(conn, 400) == %{"status" => "error", "errorType" => "bad_data", "error" => message}
+        end
+      end
+
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+    end
+
+    @tag adapter: adapter
+    @tag :ranking_histogram_annotations
+    test "Pulso ranking notices describe only executed histogram filters through #{inspect(adapter)}" do
+      samples =
+        Enum.flat_map(
+          [
+            ~s(ranking{kind="histogram"} {{schema:0 sum:4 count:4}}x2),
+            ~s(ranking{kind="other_histogram"} {{schema:0 sum:2 count:2}}x2),
+            ~s(ranking{kind="float"} 3 3),
+            ~s(ranking_switch {{schema:0 sum:4 count:4}} 3)
+          ],
+          &records(&1, 60_000_000_000)
+        )
+
+      assert :ok = Storage.append(:metrics, "ranking-notices", samples)
+
+      for op <- ~w(topk bottomk) do
+        # Instant upstream ranking stops before filtering for nonpositive k.
+        # Pulso also keeps this no-notice policy for range steps with zero k.
+        for k <- ["0", "-1", "0.9"] do
+          check("eval instant at 0 #{op}(#{k}, ranking)", ["expect no_info"], "ranking-notices")
+          check("eval range from 0 to 1m step 1m #{op}(#{k}, ranking)", ["expect no_info"], "ranking-notices")
+        end
+
+        notice = "expect info msg: PromQL info: ignored histogram in #{op} aggregation"
+
+        check(
+          "eval range from 0 to 1m step 1m #{op}(1, ranking)",
+          [notice, ~s(ranking{kind="float"} 3 3)],
+          "ranking-notices"
+        )
+
+        check(
+          "eval instant at 0 #{op}(1, ranking{kind=\"float\"})",
+          ["expect no_info", ~s(ranking{kind="float"} 3)],
+          "ranking-notices"
+        )
+
+        check("eval instant at 0 #{op}(1, ranking_missing)", ["expect no_info"], "ranking-notices")
+
+        check(
+          "eval range from 0 to 1m step 1m #{op}(time()/60, ranking_switch)",
+          ["expect no_info", ~s(ranking_switch _ 3)],
+          "ranking-notices"
+        )
+      end
+    end
+  end
+
+  for adapter <- [Memory, S3] do
+    @tag adapter: adapter
+    @tag :prefilter_cardinality
+    test "Pulso checks matched input cardinality before filtering through #{inspect(adapter)}" do
+      # Authored adaptations of pinned ours/binary_operators.test:1706-1744.
+      # The first setup is unchanged; the second retains the original disjoint
+      # lifetimes. Instant adaptations also replay through the range endpoint.
+      samples =
+        Enum.flat_map(
+          [
+            ~s(left{pod="a"} 1 2 3 4),
+            ~s(left{pod="b"} 5 6 7 8),
+            ~s(right 2 2 7 7),
+            ~s(left_side_a{env="test", pod="a"} 1 2 _ _),
+            ~s(left_side_b{env="test", pod="a"} _ _ 7 8),
+            ~s(right_side{env="test", pod="a"} 2 2 7 7)
+          ],
+          &records(&1, 360_000_000_000)
+        )
+
+      assert :ok = Storage.append(:metrics, "prefilter-cardinality", samples)
+
+      # No survivor at 0/18m; only a survives at 6m and only b at 12m. Neither
+      # the predicate nor source order may hide the two simultaneous inputs.
+      for at <- ~w(0 6m 12m 18m),
+          query <- [
+            "left == ignoring(pod) right",
+            "left == ignoring(pod) group_right right",
+            "right == ignoring(pod) left"
+          ] do
+        check("eval_fail instant at #{at} " <> query, [], "prefilter-cardinality")
+      end
+
+      # A populated counterpart with a different signature must not turn
+      # unmatched duplicate left signatures into a matching-cardinality error.
+      check(
+        ~s|eval range from 0 to 18m step 6m left == ignoring(pod) label_replace(right, "env", "absent", "", "")|,
+        ["expect no_warn", "expect no_info"],
+        "prefilter-cardinality"
+      )
+
+      check(
+        "eval instant at 6m left == ignoring(pod) absent_right",
+        [],
+        "prefilter-cardinality"
+      )
+
+      # Valid one-to-one input and explicit many-to-one grouping still succeed.
+      check(
+        ~s|eval instant at 6m left{pod="a"} == ignoring(pod) right|,
+        ["left 2"],
+        "prefilter-cardinality"
+      )
+
+      check(
+        ~s|eval instant at 12m left{pod="b"} == ignoring(pod) right|,
+        ["left 7"],
+        "prefilter-cardinality"
+      )
+
+      check(
+        "eval range from 0 to 18m step 6m left == ignoring(pod) group_left right",
+        [~s(left{pod="a"} _ 2 _ _), ~s(left{pod="b"} _ _ 7 _)],
+        "prefilter-cardinality"
+      )
+
+      # Including a missing one-side label drops pod. Grouped uniqueness is
+      # still about retained output labels, not unfiltered many-side inputs.
+      check(
+        "eval range from 0 to 18m step 6m left == ignoring(pod) group_left(pod) right",
+        ["left _ 2 7 _"],
+        "prefilter-cardinality"
+      )
+
+      check(
+        "eval instant at 6m left != ignoring(pod) group_left(pod) right",
+        ["left 6"],
+        "prefilter-cardinality"
+      )
+
+      check(
+        "eval_fail instant at 0 left != ignoring(pod) group_left(pod) right",
+        ["expected_fail_message multiple matches for labels: grouping labels must ensure unique matches"],
+        "prefilter-cardinality"
+      )
+
+      # Source-backed nonoverlap controls: never accumulate matching signatures
+      # across evaluation steps, including steps whose comparison is false.
+      for {query, expected} <- [
+            {~s|{__name__=~"left_side.*"} == ignoring(env) right_side|,
+             [~s(left_side_a{pod="a"} _ 2 _ _), ~s(left_side_b{pod="a"} _ _ 7 _)]},
+            {~s|{__name__=~"left_side.*"} == bool ignoring(env) right_side|, [~s({pod="a"} 0 1 1 0)]},
+            {~s|{__name__=~"left_side.*"} == on(pod) right_side|, [~s({pod="a"} _ 2 7 _)]}
+          ] do
+        check("eval range from 0 to 18m step 6m " <> query, expected, "prefilter-cardinality")
+      end
+
+      for {at, expected} <- [
+            {"0", []},
+            {"6m", [~s(left_side_a{pod="a"} 2)]},
+            {"12m", [~s(left_side_b{pod="a"} 7)]},
+            {"18m", []}
+          ] do
+        check(
+          ~s|eval instant at #{at} {__name__=~"left_side.*"} == ignoring(env) right_side|,
+          expected,
+          "prefilter-cardinality"
+        )
+      end
+    end
+  end
+
+  for adapter <- [Memory, S3] do
+    @tag adapter: adapter
+    @tag :rate_name_annotations
+    test "Pulso counter-name infos follow produced float results through #{inspect(adapter)}" do
+      # Pinned engine_test.go TestRateIncreaseAnnotations and rateSeriesValidator:
+      # validate output floats, not input presence; suffixes and empty names skip.
+      # These authored controls are separate from the three unchanged DSL cases.
+      samples =
+        Enum.flat_map(
+          [
+            ~s(unsuffixed{id="a"} 0 60 120),
+            ~s(unsuffixed{id="b"} 0 60 120),
+            ~s(other_bad{id="c"} 0 60 120),
+            ~s(valid_total{id="suffix"} 0 60 120),
+            ~s(valid_sum{id="suffix"} 0 60 120),
+            ~s(valid_count{id="suffix"} 0 60 120),
+            ~s(valid_bucket{id="suffix"} 0 60 120),
+            ~s(short_bad _ 1),
+            ~s(hist_bad {{count:0 sum:0}} {{count:1 sum:1}} {{count:2 sum:2}}),
+            ~s(mixed_bad 0 {{count:1 sum:1}} 2),
+            ~s(switch_bad 0 60 {{count:2 sum:2}}),
+            ~s(nan_bad NaN NaN),
+            ~s(infinite_bad 0 Inf),
+            ~s(negative_bad 0 -Inf)
+          ],
+          &records(&1, 60_000_000_000)
+        )
+
+      assert :ok = Storage.append(:metrics, "counter-name-infos", samples)
+
+      for op <- ~w(rate increase) do
+        notice =
+          ~s(PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "unsuffixed")
+
+        for suffix <- ~w(total sum count bucket) do
+          check(
+            "eval instant at 1m timestamp(#{op}(valid_#{suffix}[61s]))",
+            ["expect no_info", "expect no_warn", ~s({id="suffix"} 60)],
+            "counter-name-infos"
+          )
+        end
+
+        # Arithmetic removes the name before the subquery reaches rate/increase.
+        check(
+          "eval instant at 1m timestamp(#{op}((valid_total + 0)[61s:1m]))",
+          ["expect no_info", "expect no_warn", ~s({id="suffix"} 60)],
+          "counter-name-infos"
+        )
+
+        for {selector, at} <- [{"unsuffixed", "0"}, {"short_bad", "1m"}, {"absent_bad", "1m"}] do
+          check(
+            "eval instant at #{at} #{op}(#{selector}[61s])",
+            ["expect no_info", "expect no_warn"],
+            "counter-name-infos"
+          )
+        end
+
+        check(
+          "eval instant at 1m timestamp(#{op}(hist_bad[61s]))",
+          ["expect no_info", "expect no_warn", "{} 60"],
+          "counter-name-infos"
+        )
+
+        check(
+          "eval instant at 1m #{op}(mixed_bad[61s])",
+          [
+            "expect no_info",
+            ~s(expect warn msg: PromQL warning: encountered a mix of histograms and floats for metric name "mixed_bad")
+          ],
+          "counter-name-infos"
+        )
+
+        check(
+          "eval range from 0 to 2m step 1m timestamp(#{op}(unsuffixed[61s]))",
+          ["expect info msg: " <> notice, "expect no_warn", ~s({id="a"} _ 60 120), ~s({id="b"} _ 60 120)],
+          "counter-name-infos"
+        )
+
+        check(
+          "eval range from 0 to 2m step 1m timestamp(#{op}(switch_bad[61s]))",
+          [
+            ~s(expect info msg: PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "switch_bad"),
+            ~s(expect warn msg: PromQL warning: encountered a mix of histograms and floats for metric name "switch_bad"),
+            "{} _ 60 _"
+          ],
+          "counter-name-infos"
+        )
+
+        for {name, result} <- [{"nan_bad", "NaN"}, {"infinite_bad", "+Inf"}, {"negative_bad", "-Inf"}] do
+          check(
+            "eval instant at 1m #{op}(#{name}[61s])",
+            [
+              ~s(expect info msg: PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "#{name}"),
+              "expect no_warn",
+              "{} " <> result
+            ],
+            "counter-name-infos"
+          )
+        end
+
+        dirty = "timestamp(#{op}(unsuffixed[61s]))"
+        clean = "timestamp(#{op}(valid_total[61s]))"
+        other = "timestamp(#{op}(other_bad[61s]))"
+
+        # Every HTTP request has a fresh annotation context, even on this worker.
+        for _ <- 1..2 do
+          check(
+            "eval instant at 1m " <> dirty,
+            ["expect info msg: " <> notice, ~s({id="a"} 60), ~s({id="b"} 60)],
+            "counter-name-infos"
+          )
+
+          check(
+            "eval instant at 1m " <> clean,
+            ["expect no_info", ~s({id="suffix"} 60)],
+            "counter-name-infos"
+          )
+        end
+
+        batch = [
+          {"dirty", dirty, %{end_ts_ns: 60_000_000_000}},
+          {"clean", clean, %{end_ts_ns: 60_000_000_000}},
+          {"other", other, %{end_ts_ns: 60_000_000_000}}
+        ]
+
+        for batch <- [batch, Enum.reverse(batch)] do
+          assert {:ok, results} = Evaluator.query_batch(batch, "counter-name-infos", fn result, _ -> {:ok, result} end)
+          assert results["dirty"]["infos"] == [notice]
+          refute Map.has_key?(results["clean"], "infos")
+
+          assert results["other"]["infos"] == [
+                   ~s(PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "other_bad")
+                 ]
+        end
+      end
     end
   end
 
@@ -5748,6 +6490,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
   defp repeat(token) do
     case Regex.run(~r/^(.+)x(\d+)$/, token) do
+      [_, "_", count] -> List.duplicate(:absent, String.to_integer(count))
       [_, sample, count] -> List.duplicate(value(sample), String.to_integer(count) + 1)
       nil -> [value(token)]
     end
@@ -5821,6 +6564,9 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
   defp records(line, interval) do
     {labels, values} = series(line)
+    # The pinned TSDB load path calls labels.WithoutEmpty before storing.
+    # Keep expected output labels untouched in series/1.
+    labels = Map.reject(labels, fn {_, value} -> value == "" end)
 
     for {value, index} <- Enum.with_index(values), value != :absent do
       sample = %MetricSample{labels: labels, timestamp_ns: index * interval}
@@ -5957,41 +6703,70 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         ~s|label_replace(testmetric, "dst", "value-$1", "src", "(.*")|,
         ~S|label_replace(testmetric, "\xff", "", "src", "(.*)")|
       ] ->
-        # These two original failures are admission errors, not duplicate-series
-        # execution errors. Upstream specifies failure without diagnostic text.
         assert expected == ["expect fail"]
+
+        message =
+          Map.fetch!(
+            %{
+              ~s|label_replace(testmetric, "dst", "value-$1", "src", "(.*")| =>
+                "invalid regular expression in label_replace(): (.*",
+              ~S|label_replace(testmetric, "\xff", "", "src", "(.*)")| => "Invalid or unsupported query parameters."
+            },
+            params.query
+          )
 
         assert %{
                  "status" => "error",
                  "errorType" => "bad_data",
-                 "error" => "Invalid or unsupported query parameters."
+                 "error" => message
                } == json_response(conn, 400)
 
       Enum.any?(expected, &String.starts_with?(&1, "expected_fail_message invalid ")) ->
         assert ["expected_fail_message " <> message] = expected
 
-        assert message in [
-                 "invalid smoothing factor. Expected: 0 < sf < 1, got: 0.000000",
-                 "invalid trend factor. Expected: 0 < tf < 1, got: 0.000000"
-               ]
+        {status, type} =
+          Map.fetch!(
+            %{
+              "invalid smoothing factor. Expected: 0 < sf < 1, got: 0.000000" => {422, "execution"},
+              "invalid trend factor. Expected: 0 < tf < 1, got: 0.000000" => {422, "execution"},
+              "invalid regular expression in label_replace(): [.*" => {400, "bad_data"}
+            },
+            message
+          )
 
-        assert %{"status" => "error", "errorType" => "execution", "error" => message} == json_response(conn, 422)
+        assert %{"status" => "error", "errorType" => type, "error" => message} == json_response(conn, status)
 
       String.starts_with?(command, "eval_fail") or
-          expected in [["expect fail"], ["expect fail msg:vector cannot contain metrics with the same labelset"]] ->
-        assert expected in [
-                 [],
-                 ["expect fail"],
-                 ["expected_fail_message vector cannot contain metrics with the same labelset"],
-                 ["expect fail msg:vector cannot contain metrics with the same labelset"]
-               ]
+          expected in [
+            ["expect fail"],
+            ["expect fail msg:vector cannot contain metrics with the same labelset"],
+            ["expected_fail_message multiple matches for labels: grouping labels must ensure unique matches"]
+          ] ->
+        matching_error = "Vector matching produced ambiguous or duplicate series."
+
+        messages = %{
+          [] => matching_error,
+          ["expect fail"] => matching_error,
+          ["expected_fail_message vector cannot contain metrics with the same labelset"] => matching_error,
+          ["expect fail msg:vector cannot contain metrics with the same labelset"] => matching_error,
+          [
+            ~S"expected_fail_regexp (multiple matches for labels: many-to-one matching must be explicit|found duplicate series for the match group .* on the left (hand-)?side of the operation)"
+          ] => matching_error,
+          [
+            ~S"expected_fail_regexp found duplicate series for the match group .* on the left (hand-)?side of the operation"
+          ] => matching_error,
+          ["expected_fail_message multiple matches for labels: grouping labels must ensure unique matches"] =>
+            "multiple matches for labels: grouping labels must ensure unique matches"
+        }
+
+        assert Map.has_key?(messages, expected)
 
         # Pulso's HTTP diagnostic differs; assert its corresponding error exactly,
         # not just any 422 (which could conceal budgets or unrelated failures).
         assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Vector matching produced ambiguous or duplicate series."
+                 "error" => Map.fetch!(messages, expected)
                } == json_response(conn, 422)
 
       true ->

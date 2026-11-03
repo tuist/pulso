@@ -41,6 +41,9 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, {:invalid_parameter, message}} ->
         error(conn, :bad_request, "bad_data", message)
 
+      {:error, {:invalid_label_replace_regex, regex}} when is_binary(regex) and byte_size(regex) <= 1024 ->
+        error(conn, :bad_request, "bad_data", "invalid regular expression in label_replace(): " <> regex)
+
       {:error, :range_result_for_range_query} ->
         error(
           conn,

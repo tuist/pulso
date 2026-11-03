@@ -43,8 +43,125 @@ ceilings and metric inclusive-point ceilings remain authoritative. Explicit
 timestamps must fit signed int64 nanoseconds; nonfinite/nonportable float
 conversions reject. Instant raw-log queries and their optional start/end extension
 remain Pulso behavior, not proof of Loki engine admission parity. General exact
-HTTP error bodies/status mapping, duplicate scalar precedence, exhaustive RFC3339
-grammar and deployed/provider capacity remain outside this selection.
+HTTP error bodies/status mapping, scalar precedence outside stream discovery,
+exhaustive RFC3339 grammar and deployed/provider capacity remain outside this selection.
+
+### Index-statistics range admission
+
+At the pinned revision, [`ParseIndexStatsQuery` (`query.go:555–559`)](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/loghttp/query.go#L555-L559)
+delegates directly to `ParseRangeQuery` (`query.go:485–553`). Both query-range
+codec paths call it for `IndexStatsOp` (`pkg/querier/queryrange/codec.go:424–425`
+and `619–620`). The range/component expectations already frozen above therefore
+apply to stats admission too, even though the backend receives only bounds and
+matchers. This is inspected pinned-source evidence, not a new executed Loki test.
+
+The authored `index_stats_range_admission` regression exercises 44 GET/form-POST
+attempts against two native Parquet segments in owned loopback S3: 12 successful
+metadata estimates and 32 rejections without provider requests. It covers zero,
+negative, malformed, nonfinite and too-small steps; uint32 limits; direction;
+interval; invalid/reversed bounds; empty defaults; equal bounds; and the integer
+11,000-interval boundary. Accepted limit/direction/step/interval values do not
+truncate or sample the two-entry estimate, and no stats request reads Parquet.
+Before the fix, `step=0` returned 200; the unchanged request now rejects with 400.
+These are supplementary source-derived controls, not additional frozen rows,
+Loki chunk-estimate parity or complete error-body/precedence equivalence.
+
+### Stream-discovery scalar precedence
+
+The `discovery_scalar_precedence` HTTP control follows the pinned `query` and
+`bounds` helpers (`pkg/loghttp/params.go:76–98`), called by `ParseLabelQuery`
+and `ParseSeriesQuery`. They use `r.Form.Get`, not a last-value map lookup.
+Go 1.27.3's `net/url.Values.Get` returns the first associated value, including
+empty strings; `net/http.Request.ParseForm` places form-body values before URL
+values. The Pulso fix is local to names, values and series discovery, using the
+already bounded raw query/form pairs. It does not change shared Plug parsing,
+Prometheus duplicate rejection or repeated `match`/`match[]` unions.
+
+Ninety-seven authored GET/form-POST attempts exercise authenticated HTTP with
+native Parquet/owned-loopback S3: 70 successful nonempty dictionaries and 27
+rejections without provider requests. Two asymmetric streams/timestamps detect
+wrong selector and window precedence. Controls cover repeated valid values,
+valid/invalid ordering, first-empty defaults, mixed body/URL precedence and
+selector unions within and across the URL/body. The unchanged controller
+silently omitted the older stream when the last `start` narrowed the window;
+the same request returns both retained streams after the fix. These are
+source-derived controls, not additional original table rows or actual-Loki
+runtime executions. Other endpoints' scalar precedence remains open.
+
+The `discovery_literal_scalars` continuation covers the same helpers' exact
+parameter-name lookups. Go's form maps retain `start[]`, `query[ignored]` and
+other bracketed names literally; they do not populate `start` or `query`.
+Pulso now discards Plug's bracket-expanded scalar entries and replaces them
+only with exact names from the already bounded raw query/form pairs. Path
+parameters, repeated selector unions, first-value precedence and budgets stay
+unchanged. No shared Plug/Prometheus parameter semantics change.
+
+Sixty-six authored native-Parquet/owned-loopback-S3 HTTP attempts cover arrays
+and nested-map spellings through names, values and series discovery:
+44 successes retain both asymmetric streams, and 22 rejections prove malformed
+literal parameters cannot be repaired by bracketed values or cause provider work.
+The same `start[]=invalid` request returned HTTP 400 before the fix and the
+expected retained dictionary afterward. An independent standard-library-only
+Go 1.27.3 probe executed 28 `Request.ParseForm`/`Values.Get` controls across all
+four scalar names, GET/form POST, duplicate values and empty/body/URL precedence.
+It did not execute Loki HTTP or its query engine. The temporary probe was removed;
+ordinary replay requires only Elixir/Rust. These are authored controls, not
+additional frozen upstream table rows or full request-parser/diagnostic parity.
+
+### Detected-field legacy limit fallback
+
+The `detected_limit_fallback` HTTP control follows the pinned
+[`detectedFieldsLimit` helper (`params.go:55–74`)](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/loghttp/params.go#L55-L74):
+missing **or empty** `limit` selects `field_limit`, then numeric admission/defaults
+apply. Nonempty `limit` wins even if invalid; an unused invalid `field_limit`
+cannot poison a valid primary value. These are 12 authored parameter combinations,
+not additional original table rows. Both detected-fields and detected-field-values
+run GET/form POST against native Parquet/owned-loopback S3: 24 successful reads
+and 24 rejections, each rejection proving no provider request. Nonempty fields
+and three distinct values distinguish a real limit from a response-only echo.
+The same scenario fails before the fix (`1000` instead of `1`) and passes after.
+
+An independent Go 1.27.3 probe executed the exact selected helper and `parseInt`
+function bodies from the hash-guarded source below, with its original default
+1000 and standard-library `errors.New` replacing the imported pkg/errors.New
+(only values/error text were observed, not stack/wrapping behavior). All 12
+combinations agreed on selected values/errors, except the deliberate Pulso
+endpoint ceiling: Go's uint32 helper accepts 5001, but Pulso still rejects it.
+The temporary probe was removed; normal regression replay uses only Elixir/Rust.
+No general duplicate-scalar, diagnostic-text, client or deployed-capacity claim.
+
+### Detected-field step admission
+
+The `detected_step_admission` HTTP control follows the pinned
+[`ParseDetectedFieldsQuery` (`query.go:677–719`)](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/loghttp/query.go#L677-L719).
+Both public detected-field paths use it through the query-range codec's
+`DetectedFieldsOp` branches (`codec.go:483–497`, `673–682`). The parser requires
+at least one whole millisecond and rejects an integer interval count above
+11,000, using the original step duration, not its truncated millisecond representation.
+Whole-file SHA-256 for `query.go` is
+`8440255787eb4765f3b9d3c47ccda02cb9e05c3088b1d2e09c439814e39c2d81`;
+for `pkg/querier/queryrange/codec.go` it is
+`4e1702388215c7e1505f21ce0b49763e59b202ec6116f368b1bd631d158225ae`.
+
+Nineteen authored controls cover malformed/zero/negative/nonfinite steps,
+the 128-byte ceiling, just below/at 1 ms, omitted/empty defaults, both sides
+of the integer interval ceiling and 1.5 ms precision before truncation.
+There are 76 HTTP attempts across both endpoints and GET/form POST:
+36 successful nonempty sampled results and 40 rejections without provider
+requests, using native Parquet/owned-loopback S3. The unchanged controller
+returned 200/data for `step=0`; the same scenario rejects after the fix.
+Existing newest-line sampling and budgets are unchanged. These are source-derived
+controls, not additional original table rows or actual-Loki runtime executions;
+exact diagnostic text/precedence, backend sampling and client parity remain open.
+
+### Calendar helper continuation
+
+The separate [calendar helper continuation](http-calendar-timestamps.md) now
+replays all 16 Go long-fraction rows and 89 authored actual-Go grammar/boundary
+controls. Its public HTTP test exercises 36 successful reads and 36 rejection
+attempts through GET/form POST, including single-digit hours and Go's unusual
+timezone bounds. These are supplementary oracles, not more rows in the 87-row
+Loki selection; int64 and 128-byte timestamp ceilings remain deliberate policies.
 
 ```sh
 ERL_FLAGS='+S 4:4' PULSO_NIF_FORCE_BUILD=1 mise exec -- mix test \

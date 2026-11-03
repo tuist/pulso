@@ -43,9 +43,12 @@ defmodule PulsoWeb.Router do
   end
 
   # SDKs may omit Accept/Content-Type or use text/plain to avoid preflight.
-  scope "/api/:project_id", PulsoWeb do
-    post "/envelope", SentryController, :envelope
+  scope "/api", PulsoWeb do
+    get "/store", SentryController, :store
     post "/store", SentryController, :store
+    post "/:project_id/envelope", SentryController, :envelope
+    get "/:project_id/store", SentryController, :store
+    post "/:project_id/store", SentryController, :store
   end
 
   scope "/", PulsoWeb do

@@ -33,8 +33,8 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {1, 1, 17} do
-      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership, preserve scalar class complements or expose correlation IDs as LogQL metadata; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
+    if version != {1, 1, 18} do
+      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values before prior pipeline errors, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership, preserve scalar class complements or expose correlation IDs as LogQL metadata; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
     end
 
     :ok
@@ -95,10 +95,10 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {{2, 1, 3, 5, 12}, 3},
+    if version != {{2, 1, 3, 5, 12}, 5},
       do:
         raise(
-          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with shared expression budgets; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+          "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with shared expression budgets, directional string-group ranking ties and scalar prefilters before ranking; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
         )
 
     :ok

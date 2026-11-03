@@ -178,20 +178,33 @@ defmodule Pulso.Loki.HTTPParams do
   end
 
   defp calendar(value) do
-    with true <- Regex.match?(~r/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})\z/, value),
-         {:ok, dt, _} <- DateTime.from_iso8601(value) do
-      extra =
-        case Regex.run(~r/[.,](\d+)(?:Z|[+-]\d{2}:\d{2})$/, value) do
-          [_, fraction] ->
-            fraction |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer() |> rem(1000)
-
-          _ ->
-            0
-        end
-
-      bounded(DateTime.to_unix(dt, :nanosecond) + extra)
+    with [_, date, hour, minute, second, fraction, zone] <-
+           Regex.run(
+             ~r/\A(\d{4}-\d{2}-\d{2})T(\d{1,2}):(\d{2}):(\d{2})(?:[.,](\d+))?(Z|[+-]\d{2}:\d{2})\z/,
+             value
+           ),
+         {:ok, date} <- Date.from_iso8601(date),
+         {:ok, time} <- Time.new(String.to_integer(hour), String.to_integer(minute), String.to_integer(second)),
+         {:ok, dt} <- DateTime.new(date, time),
+         {:ok, offset} <- calendar_offset(zone) do
+      nanos = fraction |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
+      bounded(DateTime.to_unix(dt, :nanosecond) + nanos - offset * @second)
     else
       _ -> :error
+    end
+  end
+
+  defp calendar_offset("Z"), do: {:ok, 0}
+
+  defp calendar_offset(<<sign, hour::binary-size(2), ?:, minute::binary-size(2)>>) do
+    hour = String.to_integer(hour)
+    minute = String.to_integer(minute)
+
+    # Go's RFC3339 parser accepts these inclusive bounds, unlike ISO8601.
+    if hour <= 24 and minute <= 60 do
+      {:ok, (hour * 3600 + minute * 60) * if(sign == ?-, do: -1, else: 1)}
+    else
+      :error
     end
   end
 

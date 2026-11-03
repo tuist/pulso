@@ -17,7 +17,7 @@ defmodule Pulso.Loki.Detected do
   Detected labels are the stream labels complete discovery returns for the
   selector, with their exact cardinality, omitting labels whose values are
   all numbers or UUIDs unless they are `cluster`, `namespace`, `instance` or
-  `pod`.
+  `pod`, or their nonempty value set consists only of literal `0` and/or `1`.
   """
 
   alias Pulso.LogQL.AST
@@ -82,7 +82,9 @@ defmodule Pulso.Loki.Detected do
       |> IO.iodata_to_binary()
       |> Pulso.JSON.decode!()
       |> Enum.reduce(%{}, &add_series/2)
-      |> Enum.filter(fn {name, values} -> name in @static_labels or not Enum.all?(values, &id_like?/1) end)
+      |> Enum.filter(fn {name, values} ->
+        name in @static_labels or numeric_booleans?(values) or not Enum.all?(values, &id_like?/1)
+      end)
       |> Enum.map(fn {name, values} -> %{label: name, cardinality: MapSet.size(values)} end)
       |> Enum.sort_by(& &1.label)
       |> then(&{:ok, &1})
@@ -94,6 +96,10 @@ defmodule Pulso.Loki.Detected do
       Enum.reduce(series, acc, fn {name, value}, acc ->
         Map.update(acc, name, MapSet.new([value]), &MapSet.put(&1, value))
       end)
+
+  # Label suggestions exempt literal numeric booleans, not every numeric
+  # spelling of zero/one. FieldType's integer-first classification is separate.
+  defp numeric_booleans?(values), do: MapSet.size(values) in 1..2 and Enum.all?(values, &(&1 in ["0", "1"]))
 
   # -- sampling ---------------------------------------------------------------
 
@@ -148,7 +154,7 @@ defmodule Pulso.Loki.Detected do
   end
 
   defp json_fields(line, stream) do
-    case Pulso.JSON.decode(line) do
+    case decode_detected_json(line) do
       {:ok, %{} = object} ->
         {fields, paths} = flatten(object, [], stream, {%{}, %{}})
         {:ok, Map.new(fields, fn {name, value} -> {name, [value]} end), paths}
@@ -158,6 +164,70 @@ defmodule Pulso.Loki.Detected do
     end
   rescue
     _ -> :error
+  end
+
+  # Loki's detector uses jsonparser.ObjectEach, which accepts a comma after
+  # the final object value. Keep this compatibility local to sampled lines:
+  # ordinary JSON transport and pipeline parsers must remain unchanged.
+  defp decode_detected_json(line) do
+    case Pulso.JSON.decode(line) do
+      {:ok, _} = result -> result
+      _ -> decode_object_commas(line, object_commas(line, nil, [], byte_size(line)))
+    end
+  end
+
+  # Only record candidate commas outside complete strings. A preceding value
+  # must end in a quote, container close, digit, true/false's e or null's l.
+  # Strict decoding AFTER deletion still proves the entire object structure
+  # and every value. Leading/doubled/missing-value commas cannot disappear;
+  # array-terminal commas never qualify. No other bytes change.
+  defp object_commas(<<>>, _previous, offsets, _size), do: Enum.reverse(offsets)
+
+  defp object_commas(<<?", rest::binary>>, _previous, offsets, size) do
+    case after_json_string(rest) do
+      {:ok, rest} -> object_commas(rest, ?", offsets, size)
+      :error -> []
+    end
+  end
+
+  defp object_commas(<<?,, rest::binary>> = source, previous, offsets, size) do
+    candidate? = previous in [?", ?}, ?], ?e, ?l] or previous in ?0..?9
+
+    offsets =
+      if candidate? and match?(<<?}, _::binary>>, json_space(rest)),
+        do: [size - byte_size(source) | offsets],
+        else: offsets
+
+    object_commas(rest, ?,, offsets, size)
+  end
+
+  defp object_commas(<<char, rest::binary>>, previous, offsets, size) when char in [32, 9, 10, 13],
+    do: object_commas(rest, previous, offsets, size)
+
+  defp object_commas(<<char, rest::binary>>, _previous, offsets, size), do: object_commas(rest, char, offsets, size)
+
+  defp after_json_string(<<?\\, _escaped, rest::binary>>), do: after_json_string(rest)
+  defp after_json_string(<<?", rest::binary>>), do: {:ok, rest}
+  defp after_json_string(<<_char, rest::binary>>), do: after_json_string(rest)
+  defp after_json_string(<<>>), do: :error
+
+  defp json_space(<<char, rest::binary>>) when char in [32, 9, 10, 13], do: json_space(rest)
+  defp json_space(source), do: source
+
+  defp decode_object_commas(_line, []), do: :error
+
+  # Traversal and lookahead visit each byte at most twice. Offsets/chunks grow
+  # only with removed commas; disjoint original slices are copied once into a
+  # binary strictly smaller than the selected line. Never copy growing prefixes.
+  defp decode_object_commas(line, offsets) do
+    {chunks, start} =
+      Enum.reduce(offsets, {[], 0}, fn offset, {chunks, start} ->
+        {[binary_part(line, start, offset - start) | chunks], offset + 1}
+      end)
+
+    tail = binary_part(line, start, byte_size(line) - start)
+    repaired = [tail | chunks] |> Enum.reverse() |> IO.iodata_to_binary()
+    Pulso.JSON.decode(repaired)
   end
 
   # Strings, numbers and booleans become fields; objects nest with `_`;
@@ -181,7 +251,7 @@ defmodule Pulso.Loki.Detected do
     {Map.put(fields, name, value), Map.put(paths, name, key_path)}
   end
 
-  defp json_text(v) when is_binary(v), do: v
+  defp json_text(v) when is_binary(v), do: String.replace(v, "�", " ")
   defp json_text(true), do: "true"
   defp json_text(false), do: "false"
   defp json_text(v) when is_integer(v), do: Integer.to_string(v)
@@ -192,7 +262,12 @@ defmodule Pulso.Loki.Detected do
     |> Logfmt.parse(false)
     |> Enum.map(fn {key, value} -> {sanitize(key, true), value} end)
     |> Enum.reject(&(elem(&1, 0) == ""))
-    |> Map.new(fn {name, value} -> {if(Map.has_key?(stream, name), do: name <> "_extracted", else: name), [value]} end)
+    |> Enum.reduce(%{}, fn {name, value}, fields ->
+      name = if Map.has_key?(stream, name), do: name <> "_extracted", else: name
+      # The decoder already skipped empty values. First retained extraction
+      # owns the final destination, including normalized and suffix collisions.
+      Map.put_new(fields, name, [value])
+    end)
   end
 
   # Loki's sanitizeLabelKey.

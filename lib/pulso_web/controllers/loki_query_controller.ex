@@ -17,9 +17,10 @@ defmodule PulsoWeb.LokiQueryController do
 
   Endpoints:
 
-    * `GET|POST /loki/api/v1/query_range` — range query over `[start,
-      end]` at `step`. Returns `streams` for log queries and `matrix`
-      for metric queries.
+    * `GET|POST /loki/api/v1/query_range` — log selection over `[start,
+      end)` returning `streams`; metric evaluation over `[start, end]` at
+      `step` returning `matrix`. Only external raw-log range bounds are
+      normalized; shared evaluator/storage bounds remain inclusive.
     * `GET|POST /loki/api/v1/query` — instant query at `time`. Returns
       `streams` for log queries and `vector` for metric queries.
     * `GET /loki/api/v1/labels` — list of every label name seen across
@@ -72,11 +73,40 @@ defmodule PulsoWeb.LokiQueryController do
          :ok <- validate_query_length(limits, query_window_start(ast, opts), opts.end_ts_ns),
          :ok <- query_expression_limits(ast, opts, limits),
          :ok <- query_matcher_limits(ast, limits) do
-      dispatch_eval(conn, ast, tenant, query_timeout(opts, limits))
+      dispatch_eval(conn, ast, tenant, query_timeout(opts, limits), mode)
     else
       err -> render_error(conn, err)
     end
   end
+
+  # Admission above uses the original external bounds. Normalize only raw-log
+  # range dispatch, before selection/top-k, to the shared inclusive reader.
+  # Equal bounds are empty, including int64 minimum: never subtract from that
+  # endpoint or consult storage, but keep ordinary static stage validation.
+  defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts, :range) when opts.start_ts_ns == opts.end_ts_ns do
+    result =
+      Pulso.SelfMetrics.track(:query, :logql_log, fn ->
+        QueryRunner.run(
+          tenant,
+          :logql,
+          fn deadline ->
+            Process.put(:query_deadline_ms, deadline)
+            QueryValidation.validate(ast)
+          end,
+          opts
+        )
+      end)
+
+    case result do
+      :ok -> json(conn, Envelope.streams([], response_encoding_flags(conn)))
+      {:error, reason} -> render_query_error(conn, reason)
+    end
+  end
+
+  defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts, :range),
+    do: dispatch_eval(conn, ast, tenant, %{opts | end_ts_ns: opts.end_ts_ns - 1})
+
+  defp dispatch_eval(conn, ast, tenant, opts, _mode), do: dispatch_eval(conn, ast, tenant, opts)
 
   defp dispatch_eval(conn, %AST.LogQuery{} = ast, tenant, opts) do
     flags = response_encoding_flags(conn)
@@ -144,6 +174,21 @@ defmodule PulsoWeb.LokiQueryController do
   defp discover(conn, params, mode, key, selector_param) do
     tenant = tenant_from(conn)
 
+    # Loki's Form.Get takes the first value, with the POST body before the URL.
+    # The discovery gate has already bounded both raw inputs; keep selector
+    # unions and path parameters separate from these four scalar parameters.
+    scalars =
+      for raw <- [Map.get(conn.assigns, :prometheus_discovery_form, ""), conn.query_string],
+          {name, value} <- URI.query_decoder(raw),
+          name in ["query", "start", "end", "since"],
+          reduce: %{} do
+        acc -> Map.put_new(acc, name, value)
+      end
+
+    # Go keeps bracketed names literal; Plug expands them into lists/maps.
+    # Only exact raw scalar names may supply these values.
+    params = params |> Map.drop(["query", "start", "end", "since"]) |> Map.merge(scalars)
+
     with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, selectors} <- discovery_selectors(params, selector_param),
          {:ok, times} <- discovery_times(params),
@@ -209,7 +254,8 @@ defmodule PulsoWeb.LokiQueryController do
 
     with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, selectors} <- discovery_selectors(params, "query"),
-         {:ok, times} <- discovery_times(params),
+         {:ok, opts} <- HTTPParams.query(params, :range),
+         times = %{start_ns: opts.start_ts_ns, end_ns: opts.end_ts_ns},
          {:ok, times} <- query_window_limits(conn, times),
          {:ok, stats} <- index_stats(tenant, selectors, times) do
       json(conn, %{"streams" => 0, "chunks" => stats.segments, "entries" => stats.entries, "bytes" => stats.bytes})
@@ -417,6 +463,7 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp detected_request(conn, params) do
     tenant = tenant_from(conn)
+    limit = if params["limit"] in [nil, ""], do: params["field_limit"], else: params["limit"]
 
     with :ok <- Auth.verify(conn, tenant, :read),
          {:ok, query_str} <- require_query(params),
@@ -426,7 +473,9 @@ defmodule PulsoWeb.LokiQueryController do
          {:ok, limits} <- request_query_limits(conn),
          :ok <- validate_query_length(limits, window.start_ns, window.end_ns),
          {:ok, line_limit} <- detected_limit(params["line_limit"], 100, "line_limit"),
-         {:ok, limit} <- detected_limit(params["limit"] || params["field_limit"], 1000, "limit"),
+         {:ok, limit} <- detected_limit(limit, 1000, "limit"),
+         {:ok, step} <- HTTPParams.step(params["step"], window.start_ns, window.end_ns),
+         :ok <- if(step >= 1_000_000, do: :ok, else: {:error, {:invalid_query_parameter, "step"}}),
          :ok <- query_expression_limits(ast, %{limit: line_limit}, limits),
          :ok <- query_matcher_limits(ast, limits) do
       {:ok, tenant, ast, query_timeout(window, limits), line_limit, limit}
@@ -890,6 +939,33 @@ defmodule PulsoWeb.LokiQueryController do
 
   defp render_query_error(conn, reason) when reason in [:object_store_unavailable, :storage_unavailable],
     do: error_json(conn, :service_unavailable, "storage_unavailable", "Storage is unavailable.")
+
+  defp render_query_error(conn, :sort_grouping_not_allowed),
+    do: error_json(conn, :bad_request, "parse_error", "sort and sort_desc doesn't allow grouping by")
+
+  defp render_query_error(conn, :missing_topk_parameter),
+    do: error_json(conn, :bad_request, "evaluation_failed", "parameter required for operation topk")
+
+  defp render_query_error(conn, :invalid_aggregation_parameter),
+    do: error_json(conn, :bad_request, "evaluation_failed", "invalid parameter")
+
+  defp render_query_error(conn, :many_to_many_matching) do
+    error_json(
+      conn,
+      :bad_request,
+      "evaluation_failed",
+      "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"
+    )
+  end
+
+  defp render_query_error(conn, {:many_to_many_matching, side}) when side in [:left, :right] do
+    error_json(
+      conn,
+      :bad_request,
+      "evaluation_failed",
+      "found duplicate series on the #{side} hand-side;many-to-many matching not allowed: matching labels must be unique on one side"
+    )
+  end
 
   defp render_query_error(conn, reason), do: error_json(conn, :bad_request, "evaluation_failed", inspect(reason))
 

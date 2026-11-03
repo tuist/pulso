@@ -291,6 +291,29 @@ same optional `limit` and `spss`. HTTP endpoints become exact nanosecond
 boundaries: `end=40` includes a start at `40.000000000`, not `40.500000000`.
 This is the tested upstream contract, not an implicit full-final-second window.
 
+HTTP search-limit rejections identify zero as `invalid limit: must be a positive
+number`. Malformed or uint32-overflowing values within the existing ten-byte
+input bound return `invalid limit: strconv.ParseUint: parsing ...` with syntax
+or range details. Values above the operator cap of 1000, and longer inputs,
+retain the generic policy error. Existing numeric admission, authentication and
+window-validation precedence are unchanged. Upgrade query-serving applications;
+no native or storage-format change is required.
+
+Malformed or uint32-overflowing HTTP `spss` values within the same ten-byte bound
+also identify their parameter: `invalid spss: strconv.ParseUint: parsing ...`.
+Parsed zero, values above the sampling cap of 100, and longer inputs retain
+generic policy errors. The default remains 3 and sampling still follows full
+trace matching; accepted numeric grammar and auth/window/limit precedence do
+not change. This is a diagnostic change, not expanded sampling admission.
+
+Paired HTTP search bounds also identify malformed or uint32-overflowing
+`start`/`end` values within the ten-byte input bound. Start parses before end,
+with messages such as `invalid start: strconv.ParseUint: parsing ...`.
+Partial bounds, mixed zero/positive bounds, reversed windows, plus-prefixed
+numeric bounds and longer inputs still receive generic policy errors. Numeric
+acceptance, retained-context selection and window-before-limit precedence are
+unchanged; no native or storage-format upgrade is required.
+
 ```bash
 curl -G -H 'Authorization: Bearer <token>' -H 'X-Scope-OrgID: <tenant>' \
   --data-urlencode 'q={ resource.service.name = "worker" } with (most_recent=true)' \
@@ -445,6 +468,17 @@ URL-decoded once, so a literal `%20` in a key must travel as `%2520`. Invalid
 quotes/escapes and keys beyond 256 decoded UTF-8 bytes reject with `400` rather
 than returning an empty dictionary. This identifier support does not expand
 the separate supported filter grammar.
+
+Targets also accept dot-separated quoted and ordinary portions, such as
+`span."bar z".foo` for the single attribute key `bar z.foo`, or
+`.foo."bar baz"` for unscoped `foo.bar baz`. Mixed quoted portions decode
+only escaped quote/backslash; fully quoted keys retain their existing
+JSON-compatible escapes. Quoted dots are literal key bytes, not nested-object
+traversal. Normalization inputs cap at 2048 bytes and decoded keys at 256 UTF-8
+bytes. Adjacent quotes, suffix text after a quoted portion and malformed mixed
+escapes reject. Upgrade query-serving applications consistently; no native or
+storage-format change is required. Search, metric and filter grammars do not
+gain this identifier syntax.
 
 Supported explicit scopes are **resource, span, instrumentation, event and link**.
 Each searches only original attributes of that owner: instrumentation does not
@@ -1144,8 +1178,9 @@ hints. Only `mode=all` (default) and `allowPartialTrace=false` (default) are
 accepted. Ingesters/backends-only modes, block UUID selectors, error-truncated output
 and unknown query parameters reject rather than approximate another backend.
 Exact `Accept: application/protobuf` selects protobuf; JSON/no Accept/`*/*`
-selects JSON. Unsupported media types return 406; protobuf quality/list variants
-are not yet negotiated like a general-purpose HTTP server.
+or a single explicitly empty `Accept` value selects JSON. Unsupported media
+types return 406; protobuf quality/list variants are not yet negotiated like a
+general-purpose HTTP server.
 
 V2 additionally accepts an explicit same-span `q` filter using the documented
 [bounded expression grammar](trace-query-expressions.md): original resource/span

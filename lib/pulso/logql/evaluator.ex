@@ -179,7 +179,7 @@ defmodule Pulso.LogQL.Evaluator do
         Evaluator.charge(:work, length(records))
       end
 
-      compiled = Pipeline.compile(remaining_stages)
+      compiled = compile_metric_pipeline(query, remaining_stages, opts)
 
       entries =
         records
@@ -205,7 +205,7 @@ defmodule Pulso.LogQL.Evaluator do
   def fold_log(%AST.LogQuery{} = query, tenant, opts, acc, fun, stop \\ nil) when is_binary(tenant) do
     with :ok <- QueryValidation.validate(query),
          {storage_opts, remaining_stages} <- push_down(query, opts) do
-      compiled = Pipeline.compile(remaining_stages)
+      compiled = compile_metric_pipeline(query, remaining_stages, opts)
 
       storage_opts = if stop, do: Keyword.put(storage_opts, :log_fold_stop, stop), else: storage_opts
       categorize_labels? = Map.get(opts, :categorize_labels, false)
@@ -216,6 +216,27 @@ defmodule Pulso.LogQL.Evaluator do
     end
   catch
     {:logql_error, reason} -> {:error, reason}
+  end
+
+  # A deliberately narrow part of Loki's no-required-label parser hints:
+  # unwrapped-free absence with only plain JSON parsers and line filters.
+  # Inspect the ENTIRE pipeline, not just stages left after pushdown. Any
+  # label/error/format/unwrap consumer or different parser keeps normal execution.
+  # Validate and compile normally first; remove only execution of unused JSON,
+  # after the original pushdown split so selected-row/work charges cannot shrink.
+  # Existing metadata errors still reach the aggregate's ordinary error guard.
+  defp compile_metric_pipeline(%AST.LogQuery{stages: stages}, remaining, opts) do
+    compiled = Pipeline.compile(remaining)
+
+    unused? =
+      Map.get(opts, :omit_unused_plain_json, false) and
+        Enum.all?(stages, fn
+          %AST.JsonParser{fields: []} -> true
+          %AST.LineFilter{} -> true
+          _ -> false
+        end)
+
+    if unused?, do: Enum.reject(compiled, &(&1 == {:json, []})), else: compiled
   end
 
   defp fold_records(records, acc, compiled, fun, categorize_labels?) do

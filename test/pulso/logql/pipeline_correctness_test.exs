@@ -12,6 +12,51 @@ defmodule Pulso.LogQL.PipelineCorrectnessTest do
   alias Pulso.Test.LokiSampleExtractorFixture
   alias Pulso.Test.NativeQueryStorage
 
+  test "ordinary error-detail ownership is distinct from rendering, resets and parser errors" do
+    manual = %Entry{timestamp_ns: 10, line: "", labels: %{"__error_details__" => "base"}}
+    assert Entry.label_value(manual, "__error_details__") == "base"
+    assert Entry.error_value(manual, "__error_details__") == ""
+
+    assert manual
+           |> Entry.set_error("JSONParserErr", "details")
+           |> Entry.drop_label("__error_details__")
+           |> Map.fetch!(:labels) == %{"__error__" => "JSONParserErr", "__error_details__" => "base"}
+
+    entry = Entry.from_record(%Log{timestamp_ns: 10, body: "{", resource: %{"app" => "a"}}, true)
+    assert Entry.ordinary_labels(entry) === entry.labels
+    assert {:keep, parsed} = apply_pipeline(~s/| json | label_format __error_details__="mine"/, entry)
+    assert parsed.labels["__error_details__"] == "Malformed JSON error"
+    assert Entry.label_value(parsed, "__error_details__") == "mine"
+    assert {:keep, renamed} = apply_pipeline("| label_format saved=__error_details__", parsed)
+    assert renamed.labels["saved"] == "mine"
+    assert renamed.labels["__error_details__"] == "Malformed JSON error"
+    assert Entry.label_value(renamed, "__error_details__") == nil
+    assert {:keep, rendered} = apply_pipeline(~s/| line_format "{{.__error_details__}}"/, parsed)
+    # Loki's single-field line-format optimization uses ordinary Get; full
+    # templates (and all label-format templates) use the rendered snapshot.
+    assert rendered.line == "mine"
+    assert {:keep, rendered} = apply_pipeline(~s/| line_format "{{.__error_details__ | print}}"/, parsed)
+    assert rendered.line == "Malformed JSON error"
+    assert {:keep, reset} = apply_pipeline("| drop __error_details__", parsed)
+    assert reset.labels["__error_details__"] == "mine"
+    # A genuine later error with no details clears the old authoritative
+    # details, but does not erase the independent ordinary label.
+    assert {:keep, replacement} = apply_pipeline(~s/| line_format "plain" | json x="x"/, parsed)
+    assert replacement.labels["__error__"] == "JSONParserErr"
+    assert replacement.labels["__error_details__"] == "mine"
+    assert Entry.error_value(replacement, "__error_details__") == ""
+
+    assert Entry.preserve_error_labels(replacement, replacement.labels) == %{
+             "app" => "a",
+             "__error__" => "JSONParserErr"
+           }
+
+    assert elem(Entry.categorized_labels(reset), 1)["parsed"] == %{
+             "__error__" => "JSONParserErr",
+             "__error_details__" => "mine"
+           }
+  end
+
   @tag :sample_extractors_batch
   test "complete sample-extractor observations retain asserted metric values and labels" do
     fixture = LokiSampleExtractorFixture.load()
@@ -561,9 +606,18 @@ defmodule Pulso.LogQL.PipelineCorrectnessTest do
         assert {:ok, {:vector, []}} =
                  evaluate(~s/absent_over_time({app="a"} | logfmt | unwrap v | __error__!="" [1m])/, tenant)
 
-        # Reading details does not authorize retaining errors.
-        assert {:error, :sample_extraction_error} =
+        # Details filters read ordinary labels, not authoritative error details.
+        # No ordinary details exist here, so the post-filter discards the sample.
+        assert {:ok, {:vector, []}} =
                  evaluate(~s/min_over_time({app="a"} | logfmt | unwrap v | __error_details__!="" [1m])/, tenant)
+
+        # An ordinary detail makes that same filter match, but does not grant
+        # error preservation. The genuine extraction failure must still fail.
+        assert {:error, :sample_extraction_error} =
+                 evaluate(
+                   ~s/min_over_time({app="a"} | logfmt | label_format __error_details__="ordinary" | unwrap v | __error_details__!="" [1m])/,
+                   tenant
+                 )
       end
 
       @tag :error_filter_batch

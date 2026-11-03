@@ -7,9 +7,22 @@ defmodule Pulso.Test.MetricEvalReference do
   shared bug, not an oracle. Literal regression tests pin the corrected contract.
   Missing/empty unwrap fields are independently removed before grouping or
   testing window presence, matching the upstream extractor rather than the
-  snapshot's historical extraction error.
+  snapshot's historical extraction error. They also bypass prior pipeline
+  errors because no observation reaches the aggregate; the pinned malformed
+  JSON quantile HTTP replay retains its original 6 / 5,6 / 6 / empty oracles.
   Failed unwrap conversion replaces earlier pipeline errors before validation,
   as Loki's streamLabelSampleExtractor.Process/LabelsBuilder.SetErr specify.
+  Sum-over-time uses compensated summation: the snapshot's plain fold lost
+  cancellation residuals. The pinned vector_aggregations.logqltest HTTP replay
+  independently retains the original 10/7/17 expectations for this correction.
+  Vector sum independently uses compensated summation too: its plain fold
+  discarded small contributions across series even after sum-over-time was
+  corrected. The pinned TestVectorAggEvaluator_Precision HTTP adaptation keeps
+  all 10001 original values and the literal 10000000000010000 oracle.
+  Unwrapped-free absence requests the bounded unused-JSON pipeline hint too:
+  the historical snapshot unnecessarily parsed malformed lines even when no
+  stage needed labels. This is a shared-bug correction, not a reference oracle;
+  the five original upstream absence evaluations remain literal HTTP expectations.
 
   Metric-query evaluator.
 
@@ -105,6 +118,7 @@ defmodule Pulso.Test.MetricEvalReference do
     times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
     offset = agg.offset_ns || 0
     {first, last} = Enum.min_max(times)
+    opts = Map.put(opts, :omit_unused_plain_json, is_nil(extract_unwrap(agg.inner)))
 
     with {:ok, entries} <-
            query_window(remove_unwrap(agg.inner), tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
@@ -268,15 +282,17 @@ defmodule Pulso.Test.MetricEvalReference do
   end
 
   defp observations(entries, %AST.Unwrap{label: label, conversion: conversion}) do
+    entries = Enum.reject(entries, &(Entry.label_value(&1, label) in [nil, ""]))
+
     Enum.each(entries, fn entry ->
-      value = Map.get(entry.labels, label)
+      value = Entry.label_value(entry, label)
       # Invalid present values replace earlier errors with extraction errors,
-      # which remain deferred until a window reads that observation. Keep the
-      # existing strict pipeline guard for absent/empty unwrap targets.
-      if value in [nil, ""] or parse_unwrap(conversion, value) != nil, do: check_pipeline_error(entry)
+      # which remain deferred until a window reads that observation. Missing
+      # targets were already discarded, independently of prior pipeline errors.
+      if parse_unwrap(conversion, value) != nil, do: check_pipeline_error(entry)
     end)
 
-    Enum.reject(entries, &(Map.get(&1.labels, label) in [nil, ""]))
+    entries
   end
 
   defp filter_by_bucket(entries, start_ts, end_ts) do
@@ -287,7 +303,10 @@ defmodule Pulso.Test.MetricEvalReference do
     end)
   end
 
-  defp entry_label_key(%Entry{labels: labels}, unwrap, grouping) do
+  # Independent correction to the frozen model: grouping reads ordinary
+  # labels, not the rendered authoritative details left after ResetError.
+  defp entry_label_key(entry, unwrap, grouping) do
+    labels = if is_nil(grouping), do: entry.labels, else: Entry.ordinary_labels(entry)
     labels = if unwrap, do: Map.delete(labels, unwrap.label), else: labels
 
     case grouping do
@@ -369,7 +388,7 @@ defmodule Pulso.Test.MetricEvalReference do
 
   defp unwrap_values(entries, unwrap), do: for(e <- entries, v = unwrap_value(e, unwrap, nil), v != nil, do: v)
 
-  defp over_time(:sum_over_time, values), do: Enum.reduce(values, 0.0, &Number.add/2)
+  defp over_time(:sum_over_time, values), do: Number.sum(values)
   defp over_time(:avg_over_time, []), do: :nan
   defp over_time(:avg_over_time, values), do: Number.average(values)
   defp over_time(:max_over_time, values), do: Enum.reduce(values, :nan, &Number.max/2)
@@ -381,8 +400,8 @@ defmodule Pulso.Test.MetricEvalReference do
 
   defp unwrap_value(nil, _unwrap, default), do: default
 
-  defp unwrap_value(%Entry{labels: labels}, %AST.Unwrap{label: name, conversion: conv}, _default) do
-    with value when is_binary(value) <- Map.get(labels, name),
+  defp unwrap_value(entry, %AST.Unwrap{label: name, conversion: conv}, _default) do
+    with value when is_binary(value) <- Entry.label_value(entry, name),
          number when not is_nil(number) <- parse_unwrap(conv, value) do
       number
     else
@@ -505,7 +524,7 @@ defmodule Pulso.Test.MetricEvalReference do
   defp ordered?(left, right, :asc), do: not Number.less?(right, left)
   defp ordered?(left, right, :desc), do: not Number.less?(left, right)
 
-  defp aggregator(:sum, values), do: Enum.reduce(values, 0.0, &Number.add/2)
+  defp aggregator(:sum, values), do: Number.sum(values)
   defp aggregator(:count, values), do: length(values) * 1.0
   defp aggregator(:avg, values), do: over_time(:avg_over_time, values)
   defp aggregator(:min, values), do: over_time(:min_over_time, values)

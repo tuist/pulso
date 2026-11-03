@@ -960,7 +960,11 @@ defmodule Pulso.PromQL.Parser do
   end
 
   defp validate_call({:call, "label_replace", [_, {:string, dst}, _, _, {:string, regex}]} = expr) do
-    if label_name?(dst) and valid_regex?(regex), do: {:ok, expr}, else: {:error, :invalid_label_replace}
+    cond do
+      not label_name?(dst) or byte_size(regex) > 1024 -> {:error, :invalid_label_replace}
+      valid_regex?(regex) -> {:ok, expr}
+      true -> {:error, {:invalid_label_replace_regex, regex}}
+    end
   end
 
   defp validate_call({:call, "label_join", [_, {:string, dst}, _ | sources]} = expr) do

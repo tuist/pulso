@@ -170,7 +170,7 @@ defmodule Pulso.PromQL.Operations do
       grouping: grouping,
       right_many?: right_many?,
       boolean: "bool" in modifiers,
-      index: unique_index(one, modifiers)
+      index: unique_index(one, modifiers, if(right_many?, do: :left, else: :right))
     }
 
     {pairs, _seen} = Enum.map_reduce(many, MapSet.new(), &matched_output(&1, &2, context))
@@ -193,27 +193,38 @@ defmodule Pulso.PromQL.Operations do
     end
   end
 
-  defp unique_index(one, modifiers) do
+  defp unique_index(one, modifiers, side) do
     index = Enum.group_by(one, fn {labels, _} -> signature(labels, modifiers) end)
-    if Enum.any?(index, fn {_, samples} -> length(samples) > 1 end), do: throw({:promql_error, :many_to_many_matching})
+
+    if Enum.any?(index, fn {_, samples} -> length(samples) > 1 end),
+      do: throw({:promql_error, {:many_to_many_matching, side}})
+
     index
   end
 
   defp matched_output({labels, _} = sample, seen, context) do
-    output = vector_pair(sample, context)
     key = signature(labels, context.modifiers)
-    # Group modifiers may remove/overwrite a many-side label. Uniqueness is
-    # then per matching group AND final output labels, after filtering; it is
-    # distinct from an ambiguous one-side index or unrelated duplicate outputs.
-    key = if is_nil(context.grouping), do: key, else: {key, Enum.map(output, &elem(&1, 0))}
 
-    if output != [] and MapSet.member?(seen, key) do
-      reason = if is_nil(context.grouping), do: :many_to_many_matching, else: :multiple_matches_for_labels
-      throw({:promql_error, reason})
+    if is_nil(context.grouping) do
+      # One-to-one cardinality belongs to matched inputs, before a comparison
+      # can filter either sample out. Unmatched signatures do not participate.
+      matched? = Map.has_key?(context.index, key)
+      if matched? and MapSet.member?(seen, key), do: throw({:promql_error, :many_to_many_matching})
+      seen = if matched?, do: MapSet.put(seen, key), else: seen
+      {vector_pair(sample, context), seen}
+    else
+      output = vector_pair(sample, context)
+      # Group modifiers may remove/overwrite a many-side label. Uniqueness is
+      # then per matching group AND final output labels, after filtering; it is
+      # distinct from an ambiguous one-side index or unrelated duplicate outputs.
+      key = {key, Enum.map(output, &elem(&1, 0))}
+
+      if output != [] and MapSet.member?(seen, key),
+        do: throw({:promql_error, :multiple_matches_for_labels})
+
+      seen = if output == [], do: seen, else: MapSet.put(seen, key)
+      {output, seen}
     end
-
-    seen = if output == [], do: seen, else: MapSet.put(seen, key)
-    {output, seen}
   end
 
   defp matched_pair(labels, other, a, b, context) do
@@ -321,7 +332,11 @@ defmodule Pulso.PromQL.Operations do
 
   def call("scalar", [vector], steps) do
     vector = by_time(vector)
-    at_steps(steps, fn ts -> [{%{}, scalar_value(at(vector, ts))}] end)
+
+    at_steps(steps, fn ts ->
+      floats = Enum.reject(at(vector, ts), fn {_, value} -> histogram?(value) end)
+      [{%{}, scalar_value(floats)}]
+    end)
   end
 
   def call("label_replace", [vector | args], _steps), do: vector |> LabelReplace.run(args) |> coalesce()
@@ -761,11 +776,17 @@ defmodule Pulso.PromQL.Operations do
   defp topk_step(op, grouping, k, vector) do
     k = rank_count(k)
 
-    vector
-    |> Enum.reject(fn {_, v} -> histogram?(v) end)
-    |> Enum.group_by(fn {labels, _} -> group_key(labels, grouping) end)
-    |> Enum.sort_by(&elem(&1, 0))
-    |> Enum.flat_map(fn {_, values} -> values |> sort(op == "topk") |> Enum.take(k) end)
+    if k == 0 do
+      []
+    else
+      {histograms, floats} = Enum.split_with(vector, fn {_, v} -> histogram?(v) end)
+      if histograms != [], do: Evaluator.info("PromQL info: ignored histogram in #{op} aggregation")
+
+      floats
+      |> Enum.group_by(fn {labels, _} -> group_key(labels, grouping) end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.flat_map(fn {_, values} -> values |> sort(op == "topk") |> Enum.take(k) end)
+    end
   end
 
   defp rank_count(k) do

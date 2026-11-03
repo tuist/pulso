@@ -24,6 +24,8 @@ use std::sync::Mutex;
 const MAX_SERIES: usize = 10_000;
 const MAX_POINTS: usize = 2_000_000;
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+// Shared with selector evaluation, including across expression leaves.
+const MAX_WORK: usize = 20_000_000;
 const KINDS: [&str; 6] = [
     "unspecified",
     "internal",
@@ -137,6 +139,66 @@ struct Series {
     counts: Vec<u64>,
 }
 
+struct Ranking {
+    top: bool,
+    k: usize,
+    prefilter: Option<(String, f64)>,
+}
+
+impl Ranking {
+    fn new(op: String, k: usize, prefilter: Option<(String, f64)>) -> Res<Self> {
+        if k == 0
+            || (op != "topk" && op != "bottomk")
+            || prefilter.as_ref().is_some_and(|(op, value)| {
+                !matches!(op.as_str(), "=" | "!=" | "<" | "<=" | ">" | ">=") || !value.is_finite()
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            top: op == "topk",
+            k,
+            prefilter,
+        })
+    }
+
+    fn apply(
+        &self,
+        mut finals: Vec<Final>,
+        intervals: usize,
+        budget: &mut Budget,
+    ) -> Res<Vec<Final>> {
+        if let Some((op, threshold)) = &self.prefilter {
+            // Charge every slot before filtering, even NaNs/failed predicates.
+            // Never reset the shared selector work counter at finalization.
+            let points: usize = finals.iter().map(|(_, values)| values.len()).sum();
+            budget.work = budget.work.checked_add(points).ok_or(Error::Budget)?;
+            if budget.work > MAX_WORK {
+                return Err(Error::Budget);
+            }
+            for (_, values) in &mut finals {
+                for value in values {
+                    let keep = !value.is_nan()
+                        && match op.as_str() {
+                            "=" => *value == *threshold,
+                            "!=" => *value != *threshold,
+                            "<" => *value < *threshold,
+                            "<=" => *value <= *threshold,
+                            ">" => *value > *threshold,
+                            ">=" => *value >= *threshold,
+                            _ => unreachable!("validated comparison"),
+                        };
+                    if !keep {
+                        *value = f64::NAN;
+                    }
+                }
+            }
+            finals.retain(|(_, values)| values.iter().any(|v| !v.is_nan()));
+        }
+        Ok(select_k(finals, self.top, self.k, intervals))
+    }
+}
+
 struct State {
     program: Option<Expression>,
     root_only: bool,
@@ -146,8 +208,8 @@ struct State {
     value: Option<Lookup>,
     by: Vec<(Lookup, String)>,
     mapper: Mapper,
-    // Second stage: `topk(k)` (true) or `bottomk(k)` (false).
-    second: Option<(bool, usize)>,
+    // Optional scalar filter followed by existing top-k/bottom-k ranking.
+    second: Option<Ranking>,
     series: HashMap<Key, Series>,
 }
 
@@ -185,13 +247,14 @@ fn lookup(scope: &str, key: &str) -> Res<Lookup> {
 
 #[rustler::nif]
 fn trace_metrics_api_version() -> u32 {
-    3
+    5
 }
 
 /// `program` is a `tempo_expression` program or nil; `op` an operation name;
 /// `value` nil or `{scope, key}`; `by` `[{scope, key, label}]`; times in
 /// nanoseconds, already aligned by the caller; `second` nil or
-/// `{"topk" | "bottomk", k}`.
+/// `{"topk" | "bottomk", k}`, optionally with a third `{comparison, threshold}`
+/// element for a single finite scalar prefilter.
 #[allow(clippy::too_many_arguments)]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn trace_metrics_new<'a>(
@@ -241,9 +304,18 @@ fn trace_metrics_new<'a>(
             .map(|(scope, key, label)| Ok((lookup(&scope, &key)?, label)))
             .collect::<Res<Vec<_>>>()?;
         let second = match second.decode::<(String, usize)>() {
-            Ok((op, k)) if k > 0 && (op == "topk" || op == "bottomk") => Some((op == "topk", k)),
-            Ok(_) => return Err(Error::Invalid),
-            Err(_) => None,
+            Ok((op, k)) => Some(Ranking::new(op, k, None)?),
+            Err(_)
+                if second.decode::<rustler::Atom>().ok() == Some(rustler::types::atom::nil()) =>
+            {
+                None
+            }
+            Err(_) => {
+                let (op, k, filter) = second
+                    .decode::<(String, usize, (String, f64))>()
+                    .map_err(|_| Error::Invalid)?;
+                Some(Ranking::new(op, k, Some(filter))?)
+            }
         };
         let (start, end, step, instant) = window;
         if end <= start || step == 0 || (instant && step != end - start) {
@@ -362,7 +434,7 @@ fn trace_metrics_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -> Term
         if batch.states.len() != 1 {
             return Err(Error::Invalid);
         }
-        batch.states.remove(0).finish(env)
+        batch.states.remove(0).finish(env, &mut batch.budget)
     };
     result(env, finish())
 }
@@ -372,7 +444,7 @@ fn trace_metrics_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -> Term
 #[rustler::nif(schedule = "DirtyCpu")]
 fn trace_metrics_batch_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -> Term<'a> {
     let finish = || {
-        let batch = metrics
+        let mut batch = metrics
             .0
             .try_lock()
             .map_err(|_| Error::Invalid)?
@@ -395,8 +467,8 @@ fn trace_metrics_batch_finish<'a>(env: Env<'a>, metrics: ResourceArc<Metrics>) -
             }
             let mut finals = state.final_series()?;
             state.series = HashMap::new();
-            if let Some((top, k)) = state.second {
-                finals = select_k(finals, top, k, state.mapper.count);
+            if let Some(ranking) = &state.second {
+                finals = ranking.apply(finals, state.mapper.count, &mut batch.budget)?;
             }
             let mut series = Vec::with_capacity(finals.len());
             for (labels, values) in finals {
@@ -577,13 +649,13 @@ impl State {
         Ok(())
     }
 
-    fn finish(mut self, env: Env<'_>) -> Res<Binary<'_>> {
+    fn finish<'a>(mut self, env: Env<'a>, budget: &mut Budget) -> Res<Binary<'a>> {
         let mut finals = self.final_series()?;
         // Finals own their values. Release accumulators before top-k/output
         // allocation instead of retaining both representations through finish.
         self.series = HashMap::new();
-        if let Some((top, k)) = self.second {
-            finals = select_k(finals, top, k, self.mapper.count);
+        if let Some(ranking) = &self.second {
+            finals = ranking.apply(finals, self.mapper.count, budget)?;
         }
         let mut counter = Counter::new(MAX_OUTPUT);
         self.write(&finals, &mut counter)?;
@@ -763,8 +835,8 @@ impl State {
 
 // Tempo's second stage: per interval, the `k` series with the largest
 // (`topk`) or smallest values keep that interval's value and every other
-// value becomes empty. With at most `k` series the input is unchanged. Ties go
-// to the series that comes first in label order.
+// value becomes empty. With at most `k` series the input is unchanged. Ties in
+// homogeneous string groups favor earlier labels for topk, later for bottomk.
 fn select_k(finals: Vec<Final>, top: bool, k: usize, intervals: usize) -> Vec<Final> {
     if finals.len() <= k {
         return finals;
@@ -784,7 +856,11 @@ fn select_k(finals: Vec<Final>, top: bool, k: usize, intervals: usize) -> Vec<Fi
             .collect();
         candidates.sort_by(|a, b| {
             let order = a.1.total_cmp(&b.1);
-            (if top { order.reverse() } else { order }).then(a.0.cmp(&b.0))
+            if top {
+                order.reverse().then(a.0.cmp(&b.0))
+            } else {
+                order.then(b.0.cmp(&a.0))
+            }
         });
         Extend::extend(
             &mut winners,
@@ -1057,6 +1133,83 @@ mod tests {
         assert!(bottom[1].1[0].is_nan());
         assert_eq!(bottom[2].1[0], 2.0);
         assert_eq!(select_k(input, true, 3, 3).len(), 3);
+    }
+
+    #[test]
+    fn homogeneous_string_ties_use_opposite_ranking_directions() {
+        let input: Vec<Final> = ["x", "y", "z"]
+            .into_iter()
+            .map(|name| {
+                (
+                    vec![("label".to_owned(), string_value(name.as_bytes()))],
+                    vec![5.0; 3],
+                )
+            })
+            .collect();
+        assert_eq!(select_k(input.clone(), false, 2, 3), input[1..].to_vec());
+        assert_eq!(select_k(input.clone(), true, 2, 3), input[..2].to_vec());
+    }
+
+    #[test]
+    fn prefilters_preserve_values_and_run_before_ranking() {
+        let input: Vec<Final> = [1.0, 6.0, 11.0]
+            .into_iter()
+            .map(|value| (vec![], vec![value, f64::NAN]))
+            .collect();
+        let ranking = Ranking::new("bottomk".into(), 1, Some((">=".into(), 5.5))).unwrap();
+        let mut budget = Budget::default();
+        let result = ranking.apply(input, 2, &mut budget).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1[0], 6.0);
+        assert!(result[0].1[1].is_nan());
+        assert_eq!(budget.work, 6);
+
+        for (op, expected) in [
+            ("=", vec![0.0]),
+            ("!=", vec![f64::NEG_INFINITY, f64::INFINITY]),
+            ("<", vec![f64::NEG_INFINITY]),
+            ("<=", vec![f64::NEG_INFINITY, 0.0]),
+            (">", vec![f64::INFINITY]),
+            (">=", vec![0.0, f64::INFINITY]),
+        ] {
+            let input = [f64::NEG_INFINITY, -0.0, f64::INFINITY, f64::NAN]
+                .into_iter()
+                .map(|v| (vec![], vec![v]))
+                .collect();
+            let ranking = Ranking::new("topk".into(), 10, Some((op.into(), 0.0))).unwrap();
+            let result = ranking.apply(input, 1, &mut budget).unwrap();
+            let values: Vec<f64> = result.into_iter().map(|(_, v)| v[0]).collect();
+            assert_eq!(values, expected, "{op}");
+            for value in values {
+                if value == 0.0 {
+                    assert!(value.is_sign_negative());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefilters_share_existing_work_across_leaves_and_fail_whole() {
+        let ranking = Ranking::new("topk".into(), 1, Some((">".into(), 10.0))).unwrap();
+        let mut budget = Budget {
+            work: MAX_WORK - 4,
+            ..Budget::default()
+        };
+        let input = || vec![(vec![], vec![f64::NAN, 0.0, 1.0])];
+        // Even a leaf with no surviving samples charges all slots. Another
+        // leaf receives the same remaining work, not a fresh allowance.
+        assert!(ranking.apply(input(), 3, &mut budget).unwrap().is_empty());
+        assert_eq!(budget.work, MAX_WORK - 1);
+        assert!(matches!(
+            ranking.apply(input(), 3, &mut budget),
+            Err(Error::Budget)
+        ));
+
+        for filter in [("unknown", 1.0), ("=", f64::NAN), (">", f64::INFINITY)] {
+            assert!(Ranking::new("topk".into(), 1, Some((filter.0.into(), filter.1))).is_err());
+        }
+        assert!(Ranking::new("topk".into(), 0, None).is_err());
+        assert!(Ranking::new("unknown".into(), 1, None).is_err());
     }
 
     #[test]

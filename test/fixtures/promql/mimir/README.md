@@ -1,6 +1,6 @@
 # Grafana Mimir math and range-function integration cases
 
-These are **1733 selected query-engine integration cases in 94 fixture files**, copied without
+These are **1798 selected query-engine integration cases in 106 fixture files**, copied without
 changing their input samples, expressions or expected values from
 [grafana/mimir at dd039cdd4ba466adb5d28280bf1b8a374a98432e](https://github.com/grafana/mimir/tree/dd039cdd4ba466adb5d28280bf1b8a374a98432e).
 This is not Mimir's complete test suite or its Docker/service integration suite.
@@ -346,6 +346,7 @@ Pulso.
 | `upstream-timestamp.test` | `upstream/functions.test` | 1–5, 536–558, 2358–2367 | 7 |
 | `upstream-absence-over-time.test` | `upstream/functions.test` | 1–5, 2127–2210 | 27 |
 | `upstream-label-replace.test` | `upstream/functions.test` | 1–5, 476–536 | 11 |
+| `mimir-label-replace-regex-error.test` | `ours/functions.test` | 1–2, 343–353, 363–366, 383 | 2 |
 | `upstream-staleness.test` | `upstream/staleness.test` | 1–63 (complete) | 17 |
 | `mimir-math.test` | `ours/functions.test` | 1–2, 74–77, 90–92, 96–97, 406–412, 437–439, 452–454, 476–484, 503–504 | 7 |
 | `collision.test` | `ours/collision.test` | 1–25 (complete) | 4 |
@@ -362,6 +363,7 @@ Pulso.
 | `mimir-transitions.test` | `ours/functions.test` | 1–2, 583–622 | 1 |
 | `upstream-regression.test` | `upstream/functions.test` | 1–5, 365–425, 449–453, 464–474 | 11 |
 | `mimir-regression.test` | `ours/functions.test` | 1–2, 624–658 | 1 |
+| `mimir-rate-name-annotations.test` | `ours/functions.test` | 1–2, 920–944 | 3 |
 | `upstream-mad.test` | `upstream/functions.test` | 1–5, 1601–1643 | 7 |
 | `mimir-mad.test` | `ours/functions.test` | 1–2, 1490–1534 | 8 |
 | `upstream-extremum-timestamps.test` | `upstream/functions.test` | 1–5, 1644–1654 | 2 |
@@ -388,10 +390,15 @@ Pulso.
 | `mimir-label-sort.test` | `ours/functions.test` | 1–2, 1010–1089 | 8 |
 | `upstream-atan2.test` | `upstream/operators.test` | 1–5, 527–547 | 4 |
 | `mimir-atan2.test` | `ours/binary_operators.test` | 1–2, 8–34, 187–274, 414–444 | 32 |
+| `mimir-prefilter-cardinality.test` | `ours/binary_operators.test` | 1–2, 1706–1718 | 2 |
 | `upstream-sort-warnings.test` | `upstream/range_queries.test` | 1–5, 114–127 | 5 |
+| `mimir-sort-histograms.test` | `ours/functions.test` | 1–2, 956–1010 | 7 |
 | `upstream-query-context.test` | `upstream/functions.test` | 1–5, 2431–2553 | 33 |
+| `upstream-scalar.test` | `upstream/functions.test` | 1–5, 2377–2394 | 3 |
 | `upstream-scalar-extrema.test` | `upstream/functions.test` | 1–5, 2570–2619 | 14 |
 | `mimir-scalar-extrema.test` | `ours/functions.test` | 1–2, 1585–1597 | 4 |
+| `upstream-ranking-histogram-annotations.test` | `upstream/aggregators.test` | 1–5, 275–290, 374–425 | 12 |
+| `upstream-aggregation-extrema.test` | `upstream/aggregators.test` | 1–5, 229–274 | 8 |
 | `upstream-dispersion.test` | `upstream/aggregators.test` | 1–14, 188–214, 837–1008 | 36 |
 | `upstream-value-count.test` | `upstream/aggregators.test` | 1–5, 439–488, 1010–1073 | 10 |
 | `mimir-value-count.test` | `ours/aggregators.test` | 1–2, 666–706 | 4 |
@@ -401,6 +408,7 @@ Pulso.
 | `upstream-time-duration.test` | `upstream/functions.test` | 1–27 | 3 |
 | `upstream-time-offset.test` | `upstream/selectors.test` | 1–48 | 7 |
 | `upstream-time-subquery.test` | `upstream/subquery.test` | 1–5, 168–195 | 7 |
+| `upstream-subquery-reset-hints.test` | `upstream/subquery.test` | 1–5, 142–158 | 2 |
 | `upstream-limit.test` | `upstream/limit.test` | 1–179 | 37 |
 | `mimir-limit.test` | `ours/limit.test` | 1–342 | 93 |
 | `upstream-duration-expressions.test` | `upstream/duration_expression.test` | 1–256 | 59 |
@@ -417,6 +425,7 @@ Pulso.
 | `upstream-idelta.test` | `upstream/functions.test` | 1–5, 311–363 | 10 |
 | `upstream-irate.test` | `upstream/functions.test` | 1–5, 222–280 | 11 |
 | `upstream-delta.test` | `upstream/functions.test` | 1–5, 282–310 | 4 |
+| `upstream-float-delta-boundaries.test` | `upstream/functions.test` | 1–5, 2704–2741 | 7 |
 | `upstream-custom-histogram-arithmetic.test` | `upstream/native_histograms.test` | 1–5, 1224–1294, 2152–2180 | 17 |
 | `upstream-histogram-range-aggregation.test` | `upstream/native_histograms.test` | 1–5, 1294–1387 | 20 |
 | `upstream-histogram-group-aggregation.test` | `upstream/native_histograms.test` | 1–5, 1203–1223, 1389–1410 | 3 |
@@ -431,6 +440,7 @@ Pulso.
 | `mimir-histogram-binary.test` | `ours/binary_operators.test` | 1–2, 189–345 | 25 |
 | `mimir-histogram-quantiles.test` | `ours/histogram_quantiles.test` | 1–67 (complete) | 5 |
 | `upstream-classic-histograms.test` | `upstream/histograms.test` | 1–1327 (complete) | 183 |
+| `mimir-empty-load-labels.test` | `ours/histograms.test` | 149–186 | 2 |
 
 For example, reproduce the first extraction from a checkout of that revision:
 
@@ -531,6 +541,30 @@ sed -n '1,2p;624,658p' \
   pkg/streamingpromql/testdata/ours/functions.test > mimir-regression.test
 ```
 
+The separate counter-name annotation selection retains the complete three range
+evaluations and all twelve original samples, including the timestamp controls:
+
+```sh
+sed -n '1,2p;920,944p' \
+  pkg/streamingpromql/testdata/ours/functions.test > mimir-rate-name-annotations.test
+```
+
+Its unchanged `rate` oracle requires an info when an unsuffixed metric produces
+float results, but not for its histogram-only sibling. Authored controls separately
+cover both `rate` and `increase`, all four accepted suffixes, empty names,
+insufficient samples, mixed omission, nonfinite float results, deduplication and
+query/batch annotation isolation. These controls follow the pinned
+`operators/functions/rate_increase.go` output validator and
+`engine_test.go` `TestRateIncreaseAnnotations`, not rewritten fixture expectations.
+Select only this fixture and its controls with
+`--only rate_name_annotations:true`; affected rate/increase fixtures use
+`--only rate_name_affected:true`. The complete source SHA-256 is
+`826775530156676094dacdedec4981a93c26b1228c8e60ca9a7acf553cab3272`.
+Local red/green HTTP and affected-regression evidence is in
+`.amp/in/artifacts/mimir-rate-name-{red,green,affected,regression,provenance}.log`.
+This verifies owned memory and native Parquet/S3-stub requests, not execution of
+the upstream engine or a deployed object-store provider.
+
 The selection preserves every `deriv` evaluation in upstream lines 365–474 and
 the complete sixteen-series Mimir range case. It also retains three supported
 numeric-horizon predictions, one rate control and the prediction/derivative
@@ -594,6 +628,34 @@ All 22 evaluations retain their exact inputs, queries and directives; unrelated
 The Mimir block is complete, including four invalid-name cases and two deliberate
 duplicate-label failures without delayed metric-name removal. The test adapter
 accepts quoted UTF-8 expected label keys, without changing the fixture labels.
+
+The separate `mimir-label-replace-regex-error.test` preserves the complete original
+three-sample setup (including NaN), one valid rewriting evaluation and the invalid
+regex evaluation with its exact diagnostic oracle. Reproduce it with:
+
+```sh
+sed -n '1,2p;343,353p;363,366p;383p' \
+  pkg/streamingpromql/testdata/ours/functions.test > mimir-label-replace-regex-error.test
+```
+
+The source SHA-256 is
+`826775530156676094dacdedec4981a93c26b1228c8e60ca9a7acf553cab3272`;
+the extraction SHA-256 is
+`ea317be818a1d7c3d1f485df188278e07b1ca6f20a45dd238ee47347b909b274`.
+The error text now matches the original oracle. HTTP 400 `bad_data`, destination
+validation precedence, pre-storage rejection and the existing regex validator
+remain unchanged. Only rejected regexes within the existing 1024-byte input
+ceiling are reflected; oversized patterns retain the generic admission error.
+The native validator exposes only `:ok`/`:error`, not separate syntax/schema/work
+failure reasons; this does not claim diagnostic classification beyond that API
+or broaden regex admission. The adjacent upstream `(.*` failure retains its
+original `expect fail` directive, with the harness asserting the new exact message.
+Auth, absent-data/no-provider, Unicode and exact/over-ceiling byte controls are
+authored tests, not additional upstream evaluations. Run the new fixture/controls
+with `--only label_replace_regex_error:true`, and both label-replace fixtures with
+`--only label_replace_regex_affected:true`. Evidence logs are
+`.amp/in/artifacts/mimir-label-replace-regex-{red,red-endpoints,green,affected,regression,provenance}.log`.
+The pinned Mimir engine was not executed for this diagnostic addition.
 
 Four invalid-name regex directives explicitly map to Pulso's exact HTTP 400
 `bad_data` response: empty/invalid-UTF-8 source or destination names reject during
@@ -777,6 +839,87 @@ arithmetic controls, including histogram addition/subtraction/scaling, unsupport
 histogram-pair omissions and scalar arithmetic; it is not 32 new `atan2` cases.
 No runtime operator implementation or test runner is copied.
 
+Reproduce the pre-filter matching-cardinality extraction from the same pinned checkout:
+
+```sh
+sed -n '1,2p;1706,1718p' \
+  pkg/streamingpromql/testdata/ours/binary_operators.test > mimir-prefilter-cardinality.test
+```
+
+Both original failure evaluations and all twelve input samples remain byte-identical.
+One-to-one matching must reject two simultaneous matched input signatures even
+when comparison filtering retains one or neither sample. The grouped sibling
+retains its original failure oracle. The source SHA-256 is
+`8878cd8febe276238e02eadb6797cb8361044dbe1d8b0376facb2350c330871b`;
+the extraction SHA-256 is
+`3d6f189743b7d4b391f25a76cb48eca0203d129af981b91c369ea2257eff9b1c`.
+
+Separate authored controls adapt the original inputs and the source's disjoint
+lifetimes at lines 1722–1744. They cover instant/one-step-range failures with
+zero or one surviving comparisons, reversed operands, empty or populated but
+unmatched counterparts, valid one-to-one matching and per-step isolation.
+Explicit grouping still permits multiple input series; grouped uniqueness
+continues to inspect retained output labels after comparison filtering,
+including labels overwritten by group inclusion. These controls are not extra
+imported evaluations. The HTTP harness preserves the original regex directives
+but asserts Pulso's exact existing 422 execution-error mapping, not equality
+with upstream diagnostic text; grouped output-label collisions retain their
+distinct existing diagnostic.
+
+The active `ours/binary_operators.test` block at lines 1543–1561 remains deliberately
+excluded: its `group_right(__name__)` equality rejects colliding many-side identities
+before comparison filtering, while Pulso's documented grouped uniqueness policy
+checks retained outputs and returns an empty result for that false comparison.
+Public Memory/Parquet/S3 probes confirmed the divergence; the multiplication
+sibling still rejects. This diagnostic addition does not change that policy.
+
+Use `--only prefilter_cardinality:true` for the fixture and its controls, and
+`--only prefilter_cardinality_affected:true` for the selected binary fixtures.
+Local evidence is recorded in
+`.amp/in/artifacts/mimir-prefilter-cardinality-{red,green,green-final,affected,regression,provenance}.log`.
+The initial green attempt exposed an incorrect authored expectation for the
+existing grouped-collision diagnostic; `green-final` records the corrected
+exact assertion. This is public-query evidence with owned memory and native
+Parquet/S3-stub dependencies, not a pinned upstream-engine or deployed-provider run.
+
+The first scoped evaluator/semantics/batch/native-histogram-query run had 53
+passes and one historical-version conflict. `SemanticsTest` originally expected
+success for `a > ignoring(job,instance) sum(a)` and
+`a < ignoring(job,instance) max(a)` over simultaneous values 6 and 8. These
+expectations date to Pulso commit `5e6dc35cb125beec79305f50043bf34c7ecc830d`
+and agree with [Prometheus 3.5.0's post-filter cardinality tracking](https://github.com/prometheus/prometheus/blob/8be3a9560fbdd18a94dedec4b747c35178177202/promql/engine.go#L2712-L2737).
+Actual Prometheus 3.5.0 `promtool test rules` execution of the same values,
+labels, expressions and 30-second evaluation time confirms the original empty
+and single-value-6 results. This is an authored YAML adaptation of the Pulso
+assertions, not a replacement for either imported DSL oracle.
+
+Pinned Mimir's [module replacement](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/go.mod#L341)
+is `github.com/grafana/mimir-prometheus v1.8.2-0.20261021193237-8e0badf11773`,
+not Prometheus 3.5.0. That fork [tracks matched signatures before filtering](https://github.com/grafana/mimir-prometheus/blob/8e0badf1177362e97a9e061424bb5fc233d23c96/promql/engine.go#L3940-L3964).
+Mimir's [one-to-one operator](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/operators/binops/one_to_one_vector_vector_binary_operation.go#L1351-L1358)
+explicitly cites [Prometheus PR 17668](https://github.com/prometheus/prometheus/pull/17668),
+merged December 10, 2025, which labels zero/one-survivor acceptance a bug and
+fixes cardinality checking independently of filtering. The two authored
+success assertions now expect the existing matching error to advance to that
+pinned target; their original inputs and remaining controls are unchanged.
+This is an explicit historical-version update, not evidence that the old
+assertions were incidental mistakes. No ongoing post-filter exception was
+documented in Pulso's test history or query policies. Original upstream DSL
+oracles and grouped-output uniqueness semantics remain unchanged. The version
+comparison and actual historical replay are recorded in
+`.amp/in/artifacts/mimir-prefilter-cardinality-version.log`; the pinned modern
+engine was source-inspected, not executed.
+
+After this explicit version update, the scoped evaluator/semantics/batch/native-
+histogram-query run passes all 54 tests (seed 1983). Public cardinality fixture
+and authored controls pass four tests (seed 1981), affected binary fixtures six
+(seed 1982), and histogram-binary controls four (seed 1984), on both adapters.
+Logs are `mimir-prefilter-cardinality-version-{green,affected,grouped,regression,provenance}.log`
+under `.amp/in/artifacts/`. The harness now uses an exact source-oracle/message
+map to preserve its failure whitelist and complete 422 envelope assertions
+without an extra conditional branch; scoped strict Credo passes both changed
+test files.
+
 Reproduce the sort-warning extraction from the same pinned checkout:
 
 ```sh
@@ -789,6 +932,48 @@ unchanged, including nested `sum(sort(...))`. The adapter maps the known warning
 message exactly after removing upstream expression positions such as `(1:1)`
 and `(1:5)`; it does not accept an arbitrary warning or claim source-position
 parity. The warning is required even without matching series.
+
+The separate `mimir-sort-histograms.test` retains the complete original
+ten-series/fifty-sample setup, five instant evaluations, two range evaluations
+and final `clear` from the pinned `ours/functions.test`. Reproduce it with:
+
+```sh
+sed -n '1,2p;956,1010p' \
+  pkg/streamingpromql/testdata/ours/functions.test > mimir-sort-histograms.test
+```
+
+Its SHA-256 is
+`9825c23ece56ab718e935d9b3a7b45bbe91ef536d1b5c15645b74ade97924bf3`;
+the complete source SHA-256 is
+`826775530156676094dacdedec4981a93c26b1228c8e60ca9a7acf553cab3272`.
+Before the fix, the original instant sort result passed but its public one-step
+range replay retained all five histogram series. Both original multi-step range
+oracles likewise require only the five float series, not ten mixed-type series.
+Range `sort`/`sort_desc` now discard histogram-valued points and omit emptied
+series without sorting the remaining points or changing names, float values or
+warnings. Label-sort variants still retain histograms. The pinned range operator
+factory independently calls `DropHistograms`; this is not the deliberately
+excluded grouped-output cardinality divergence.
+
+Authored public controls cover authenticated instant, one-step/no-warning and
+multi-step requests, mixed types within one series, signed zero, nonfinite
+floats, label-sort histogram preservation and unauthenticated/no-provider reads.
+Batch controls reverse source order to check filtering/warning isolation and
+retain sample/work/result budget failures. These controls are not additional
+upstream evaluations. Run fixture/controls with `--only range_sort_histograms:true`
+and existing sort-warning/label-sort fixtures with `--only range_sort_affected:true`.
+Both fixture wrappers failed before the runtime edit on the one-step range
+replay after the original instant result passed. The final combined focused run
+passes 12 tests (seed 713587); evaluator/batch/semantics regressions pass 50
+(seed 758906). Runs used serial `--max-cases 1 --warnings-as-errors`,
+`ERL_FLAGS='+S 2:2 +SDcpu 1'`, and current artifacts with only the owned evaluator
+source-loaded in disposable VMs, not a normal or native build. Scoped formatting,
+whitespace and strict Credo checks pass. Evidence logs are
+`.amp/in/artifacts/mimir-range-sort-{red,red-controls,green-final,affected,regression,credo-scoped,provenance}.log`.
+The pinned upstream Go engine was source-inspected, not executed. There are no
+new resource ceilings, dependencies, native/storage changes or provider reads;
+the bounded range projection retains only existing float points, leaving scan
+and admission accounting intact.
 
 Reproduce the scalar-context/extrema extractions from the same pinned checkout:
 
@@ -814,6 +999,134 @@ Scalar extrema use Go `math.Min`/`math.Max`, not NaN-ignoring aggregations or
 Go's built-in `min`/`max`: the selected infinity wins even over NaN. The full
 NaN/infinity/signed-zero matrices and sub-millisecond behavior are separate
 Pulso controls, not additional imported cases.
+
+The complete `scalar()`-with-histograms block adds three unchanged evaluations:
+two floats produce NaN, histogram-only input produces NaN, and one float mixed
+with histograms produces that float. The duplicate histogram input is retained.
+Reproduce it from the same pinned checkout:
+
+```sh
+sed -n '1,5p;2377,2394p' \
+  pkg/streamingpromql/testdata/upstream/functions.test > upstream-scalar.test
+```
+
+The ranking-histogram annotation continuation retains the complete twelve-case
+positive-`k` histogram block and its complete original load. Histogram-only empty
+results, mixed inputs, nested counts, grouping and range queries must retain
+`expect info`; no expected result or diagnostic directive is rewritten.
+The eight instant and four range commands add 40 HTTP requests across both
+adapters. Reproduce it from the same pinned checkout:
+
+```sh
+sed -n '1,5p;275,290p;374,425p' \
+  pkg/streamingpromql/testdata/upstream/aggregators.test > upstream-ranking-histogram-annotations.test
+```
+
+Pulso emits one query-local, operation-specific info when positive integer `k`
+actually filters a histogram, deduplicated across groups, input series and steps.
+Separate public controls cover exact notices, float-only/missing inputs, request
+isolation and zero/negative/fractional-below-one `k`, including changing `k` across
+a histogram-to-float transition. These controls are not additional source cases.
+Upstream instant ranking clamps negative `k` to zero and returns before reading
+the input at zero. Its range operator instead reads histogram inputs before
+per-step `k` selection and can emit an info even when all `k` values are zero.
+Pulso deliberately retains its no-notice policy for unexecuted zero-`k` range
+filters in this positive-`k` continuation; zero-`k` range annotation parity is
+not claimed. Existing parameter admission and query budgets remain unchanged.
+
+Focused validation uses the existing memory and native Parquet/S3 HTTP runner:
+
+```sh
+ERL_FLAGS='+S 2:2 +SDcpu 1' mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only ranking_histogram_annotations:true --max-cases 1 --warnings-as-errors --seed 1921
+```
+
+Before the runtime change, both imported fixture wrappers failed at the first
+`expect info` assertion for `topk(100, http_requests_histogram)`. Afterward all
+four focused checks pass, covering 40 unchanged source-fixture HTTP requests
+and 60 supplementary public-control requests. A final replay including the
+pre-existing scalar batch passes all six selected checks; the evaluator,
+semantics and batch test files separately pass 50 checks, serially. Logs are
+`.amp/in/artifacts/mimir-ranking-histogram-{red,green,final-http,regression}.log`.
+This is scoped local HTTP fixture evidence, not a complete-suite, deployed
+provider or representative-capacity claim.
+
+The range-extrema continuation retains the complete original setup and all eight
+`min_over_time`/`max_over_time` evaluations at
+[`upstream/functions.test` lines 1915–1977](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/upstream/functions.test#L1915-L1977).
+Mixed float/histogram windows require info annotations while keeping the original
+float extrema. Float-only, histogram-only and sparse controls retain their
+unchanged values, omissions and `expect no_info` directives. All three load
+directives remain separate, including the upstream histogram-first workaround.
+The eight instant evaluations add 16 HTTP requests per adapter, 32 across memory
+and native Parquet/S3. Reproduce the exact extraction from the same pinned checkout:
+
+```sh
+sed -n '1,5p;1915,1977p' \
+  pkg/streamingpromql/testdata/upstream/functions.test > upstream-range-extrema.test
+```
+
+The complete source file has SHA-256
+`ece0b612aefb95b029fec6685d6655827c6985ee29ab64790e764fcb67f45b71`.
+No input, query, expectation or source header is rewritten. The focused HTTP replay is:
+
+```sh
+ERL_FLAGS='+S 2:2 +SDcpu 1' mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only range_extrema:true --max-cases 1 --warnings-as-errors --seed 1921
+```
+
+The range-dispersion continuation retains all nine original
+`stddev_over_time`/`stdvar_over_time` evaluations and both complete load blocks at
+[`upstream/functions.test` lines 1558–1599](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/upstream/functions.test#L1558-L1599).
+Mixed float/histogram windows keep their zero-valued samples and require info
+annotations. Histogram-only omission, `expect no_info`, ordinary float results,
+parenthesized ranges and the constant-value regression retain their unchanged
+directives and oracles. These nine instant evaluations add 18 HTTP requests per
+adapter, 36 across memory and native Parquet/S3. Reproduce the exact extraction
+from the same pinned checkout, whose complete source-file hash is recorded above:
+
+```sh
+sed -n '1,5p;1558,1599p' \
+  pkg/streamingpromql/testdata/upstream/functions.test > upstream-range-dispersion.test
+```
+
+No input, query, expectation or source header is rewritten. The focused HTTP replay is:
+
+```sh
+ERL_FLAGS='+S 2:2 +SDcpu 1' mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only range_dispersion:true --max-cases 1 --warnings-as-errors --seed 1921
+```
+
+The aggregation-extrema continuation retains the complete original load and all
+eight `min`/`max` evaluations at
+[`upstream/aggregators.test` lines 229–274](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/upstream/aggregators.test#L229-L274).
+Mixed float/histogram and histogram-only aggregations require info annotations;
+the latter still return no samples. Float-only, NaN and grouped controls retain
+their original values and `expect no_info` directives. Unlike the range-vector
+extrema functions, histogram-only aggregations require info too. The eight
+instant evaluations add 16 HTTP requests per adapter, 32 across memory and native
+Parquet/S3. No inputs, source headers or expectations are rewritten:
+
+```sh
+sed -n '1,5p;229,274p' \
+  pkg/streamingpromql/testdata/upstream/aggregators.test > upstream-aggregation-extrema.test
+
+ERL_FLAGS='+S 2:2 +SDcpu 1' mise exec -- mix test \
+  test/pulso_web/controllers/prometheus_math_conformance_test.exs \
+  --only aggregation_extrema:true --max-cases 1 --warnings-as-errors --seed 1921
+```
+
+The complete source-file SHA-256 is
+`92b028897b5da1858097c485b6332fd9f7a227a046467dc8b9c1796b889214a2`;
+the byte-identical extraction is
+`9e67bff7f892b8baa709efd2b2c1e20bab4b966272c7e4e88e91f91245dacdf7`.
+Focused red/green HTTP evidence and affected regressions are recorded locally in
+`.amp/in/artifacts/mimir-aggregation-extrema-{red-focused,green,final-http,regression,provenance}.log`.
+This is local public-query evidence using an owned S3 stub, not upstream-engine,
+deployed-provider or capacity acceptance.
 
 Reproduce the aggregation extractions from the same pinned checkout:
 
@@ -992,6 +1305,179 @@ sed -n '1,5p;78,112p' \
   pkg/streamingpromql/testdata/upstream/range_queries.test > upstream-range-results.test
 ```
 
+### Omitted repetitions and float delta boundaries
+
+`upstream-float-delta-boundaries.test` retains the complete original four-series,
+34-stored-sample setup and all seven active evaluations from
+[`upstream/functions.test` lines 2704–2741](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/upstream/functions.test#L2704-L2741),
+including both empty results and the original six-step range query. No load,
+query or expected value is rewritten. The exact requested extraction contains
+no `clear` directive; each fixture wrapper starts with owned empty storage.
+
+```sh
+sed -n '1,5p;2704,2741p' \
+  pkg/streamingpromql/testdata/upstream/functions.test > upstream-float-delta-boundaries.test
+```
+
+This corrects the **test fixture producer, not Pulso's evaluator or runtime**.
+The pinned
+[`generated_parser.y` lines 924–941](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/prometheus/prometheus/promql/parser/generated_parser.y#L924-L941)
+expands `_xN` into exactly N omitted positions, unlike numeric/histogram
+repetitions, which retain N+1 values. The old test producer treated both forms
+as N+1, shifting `gauge_late` from source minutes 5–10 to minutes 6–11.
+Consequently both public adapter replays failed the unchanged `5.5` delta
+oracle with `4.5`. Specializing only omitted repetitions restores the original
+input timestamps and makes all seven evaluations pass without a runtime edit.
+No previously imported fixture used `_xN`.
+
+Separate authored public HTTP controls cover `_x0`, `_x1`, numeric `x0`/`x1`
+and histogram `x0`/`x1`, checking both sample counts and complete summed values
+through instant and range endpoints. They retain empty early steps, assert no
+warnings/infos and check unauthenticated rejection before S3 reads. These
+controls are not additional upstream evaluations or corpus fixture requests.
+
+Focused replay uses `--only omitted_repetitions:true`; affected existing
+delta/idelta/irate, rate-name, regression, histogram-counter and extrapolation
+fixtures use `--only omitted_repetitions_affected:true`. With
+`ERL_FLAGS='+S 2:2 +SDcpu 1'`, `--no-compile --no-deps-check --max-cases 1
+--warnings-as-errors`, the imported fixture wrappers failed **2/2** before the
+producer correction (seed 92851). Afterward the focused fixture/control replay
+passed **4/4** (seed 92852), and affected fixtures passed **14/14** (seed 92853).
+Evidence is in `.amp/in/artifacts/mimir-omitted-repetitions-{red,green,affected}.log`.
+The final combined focused run passed **18/18** (seed 92854); scoped strict
+Credo, formatting and whitespace checks also passed. Final replay and independent
+registration/count/byte checks are in
+`.amp/in/artifacts/mimir-omitted-repetitions-{final,provenance}.log`.
+The seven source evaluations add 26 HTTP requests and two fixture wrappers;
+the authored controls add two separately counted tests. Mimir itself was not
+executed; the public tests use existing compiled Pulso and native artifacts
+against owned Memory and loopback S3 state, not a production provider.
+
+### Subquery counter reset hints
+
+`upstream-subquery-reset-hints.test` retains the complete original reset-hint
+block from
+[`upstream/subquery.test` lines 142–158](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/upstream/subquery.test#L142-L158),
+preceded by its original five-line license/provenance header. It includes
+`clear`, the full 12-histogram `load 1m` series, the explicit reset at minute
+five and both unchanged evaluations and expected histogram values:
+`increase(native_histogram[10m:3m])` returns count/sum `25`, while
+`increase(native_histogram[10m:15s])` returns count/sum
+`30.769230769230766` at minute ten. Extract it without rewriting any directive:
+
+```sh
+sed -n '1,5p;142,158p' \
+  pkg/streamingpromql/testdata/upstream/subquery.test > upstream-subquery-reset-hints.test
+```
+
+The extraction's SHA-256 is
+`02da6b9211a5c387c22da1304d7ffaa57e6d1db927b542901ee5c8bb83bbcf9c`.
+The complete source file's hash remains
+`898e3ae15d77a65bc56a3ee3a8980e53b098bc6fabc322a0c8b17c32d791fe1d`.
+These two instant evaluations add eight HTTP requests across both endpoints
+and adapters, and two fixture wrappers; authored controls are counted separately.
+
+This is a runtime correction, not another fixture-producer change. Repeated
+subquery observations previously carried the same explicit reset hint into
+multiple adjacent pairs, producing count/sum `40` instead of the original
+high-resolution oracle. At the subquery boundary, only counter reset/no-reset
+hints become unknown, so the outer operation detects resets from its own
+observations. Gauge hints, unknown hints, floats and direct selector behavior
+remain unchanged. The pinned
+[`operators/subquery.go` lines 89–95](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/operators/subquery.go#L89-L95)
+does the same normalization. Its complete file SHA-256 is
+`6566b6bfeef8c76e10b61628a1ec6775b546a52106c630999bbb7d969dadfb82`.
+The excluded grouped-output post-filter uniqueness policy is unchanged.
+
+Four authored tests supplement the two imported wrappers. Public instant/range
+controls use owned Runtime state and bearer authentication on Memory and native
+Parquet/S3: direct versus resampled explicit reset/no-reset hints, unknown hints,
+preserved gauge warnings and float values. They assert no extra infos/warnings,
+`vector(1)` success and missing-auth HTTP 401 before any S3 provider request.
+Separate batches check both source orders without mutating direct observations,
+shared materialization/work exhaustion and no partial over-budget publication.
+Those batch checks call the evaluator directly, not a public budget-error HTTP
+adaptation. The authored public controls add 32 successful and four denied
+requests; neither these nor evaluator batches enter the fixture corpus totals.
+
+With `ERL_FLAGS='+S 2:2 +SDcpu 1'`, serial `--max-cases 1`,
+`--no-compile --no-deps-check --warnings-as-errors`, the unchanged-runtime red
+selection `--only subquery_reset_hints:true` failed all six tests (seed 92971).
+After the correction, the same selection passed all six. The final focused and
+affected selection passed **14/14** (seed 92973), using both
+`--only subquery_reset_hints:true` and `--only subquery_reset_affected:true`;
+the affected files retain histogram-counter/extrapolation and existing subquery
+oracles. Evaluator, semantics and batch regressions passed **50/50** (seed 92972).
+Final source-load runs rejected any compiler diagnostics, with only the
+intentional module-replacement conflict disabled via the supported compiler
+option. Formatting, strict Credo scoped to the two source/test files and exact
+source-byte checks passed. Results were captured in tool output, not new
+artifact files. Mimir itself was not executed. Only the evaluator was
+source-loaded in disposable VMs; persisted/native artifacts were not rebuilt.
+The owned loopback provider is not deployed-provider or capacity evidence.
+
+### Empty-valued load labels
+
+`mimir-empty-load-labels.test` retains both complete active cases from
+[`ours/histograms.test` lines 149–186](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/ours/histograms.test#L149-L186),
+including every `clear`, both `load 6m` blocks, all classic/native rows and the
+unchanged `expect warn` / `expect no_info` directives. The source file has no
+license/header preamble to prepend. Reproduce the byte-identical extraction:
+
+```sh
+sed -n '149,186p' \
+  pkg/streamingpromql/testdata/ours/histograms.test > mimir-empty-load-labels.test
+```
+
+The two loads contain seven series and seven timestamp-zero samples each:
+**14 original samples total, 11 float and three native histogram**. These are
+two instant evaluations, also replayed as one-step ranges: four requests per
+adapter, eight across Memory and native Parquet/S3, in two fixture wrappers.
+They add two evaluations and one fixture file, not new runtime behavior.
+
+This corrects the **test load producer only**. The pinned TSDB
+[`head_append.go` lines 565–574](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/vendor/github.com/prometheus/prometheus/tsdb/head_append.go#L565-L574)
+calls `lset.WithoutEmpty()` before constructing a stored series, and rejects an
+entirely empty resulting label set. Its SHA-256 is
+`ca88062c340dca7e70945a9cb5b823dd9ff8f90f67ea277feaba7568328e8f19`.
+The replay now removes empty-valued load labels before constructing records;
+the expected-output parser and original DSL remain unchanged. In the native
+empty-`le` case this correctly places the native histogram under `series{}`,
+where it collides with the classic histogram: the original oracle keeps only
+`{le="3"} 2.29739670999407` and requires a warning, not the old producer's
+three unannotated outputs. No evaluator, histogram collector, ingestion or
+historical stored records change. The excluded grouped-output post-filter
+uniqueness policy is unaffected.
+
+Four separate authored tests exercise both public endpoints on both adapters
+with owned Runtime state and bearer authentication. Their two float input rows
+check empty-label removal, nonempty ASCII and UTF-8 label-name/value retention,
+and a named metric whose other labels are all empty (the metric name remains).
+An entirely nameless/empty input is not invented as a valid upstream TSDB load.
+Each test also checks `vector(1)` success, missing-auth HTTP 401, no warning/info
+leakage and, on S3, no provider request before auth rejection. These controls
+add 12 successful and four denied requests, not imported evaluations or corpus
+requests. Focused selection is `--only empty_load_labels:true`; existing classic
+histogram, multi-quantile, absence and selector fixtures use
+`--only empty_load_labels_affected:true`.
+
+The complete source `ours/histograms.test` SHA-256 is
+`46b4ae0681f54d45704e3c4904efb54bd9dc69c76b2214d6af86b57fc1ad7374`.
+Mimir itself is not executed by this replay; native Parquet/S3 uses an owned
+loopback provider, not deployed object-store or client acceptance.
+
+With `ERL_FLAGS='+S 2:2 +SDcpu 1'`, `--no-compile --no-deps-check
+--max-cases 1 --warnings-as-errors`, the producer-unchanged red run failed all
+six focused tests (seed 92912); after normalization all six passed (seed 92913).
+The ten affected existing fixture wrappers passed (seed 92914), as did all nine
+discovery-controller tests (seed 92915). After scoped formatting, the combined
+16-test fixture/control selection passed (seed 92916). Strict Credo and scoped
+whitespace/provenance checks passed. Evidence is in
+`.amp/in/artifacts/mimir-empty-load-labels-{red-corrected-controls,green,affected,discovery,final,credo,credo-scoped,format,whitespace,provenance}.log`.
+The preliminary `red.log` also records a control-construction mistake: sending
+instant and range parameters together returned HTTP 400. Endpoint-specific
+parameters were corrected before repeating red; no runtime code was changed.
+
 Reproduce the histogram-annotation extractions from the same pinned checkout:
 
 ```sh
@@ -1078,12 +1564,14 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `mimir-transitions.test` | `157bb3b5a93e1174f3ec038ae5518bd4a15bb4788c1f0ae696dee9e40b36d371` |
 | `upstream-regression.test` | `d4e1c6a72fc624110fb618880acd93db569b1081c33c683bfbad26df12502268` |
 | `mimir-regression.test` | `7e3a378b8700d9f1740d8138359eca4e0d8fe47f7cfa9c76765fc34eb4395513` |
+| `mimir-rate-name-annotations.test` | `7fcbe95f663373df144daaffb67ff66af8fba116eec7199f0f3d73e578f79c77` |
 | `upstream-mad.test` | `5c86a4b06e0a60876226991e3d9bc0814ac09e44a9163833c10be51c44b497c5` |
 | `mimir-mad.test` | `a3bd2325323c555f91bac2e50db96f2b8fc37a02d21a1583da76300a623faa37` |
 | `upstream-extremum-timestamps.test` | `4d3244736aac9c546b1d1613b3d35362b401e38aabf6665c384f9ebec1fc8517` |
 | `mimir-extremum-timestamps.test` | `7f566f497a3ae7f7b289fa193ef37f093f383d9d5e76768f6f1c7e68f7c78758` |
 | `upstream-label-join.test` | `7327afb5243aa0e73093b680632751e3c02ed63dea64853d0ceb4a72ac9588eb` |
 | `mimir-label-join.test` | `b34987b98d5e19ad6b1e6085c2f6195e334a38a046f1f5d97fd09572edf4faf3` |
+| `mimir-label-replace-regex-error.test` | `ea317be818a1d7c3d1f485df188278e07b1ca6f20a45dd238ee47347b909b274` |
 | `upstream-range-quantile.test` | `d9359dcfda4548e775939917b05498ea7cd5890c3d4eeba95c1b50fe7d839c49` |
 | `mimir-range-quantile.test` | `f28effeb7c332397c9c934825ef02d243229e09c9b4539eb8b15d3d4b0582144` |
 | `upstream-smoothing.test` | `f8ff38c664b8ad3028d611f3bcc59dd1407f04f32c74afbcb28866a68c5dd507` |
@@ -1104,10 +1592,17 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `mimir-label-sort.test` | `317a8a89eb000a6bf47062105237702cce538a370c6fef89d6953546a4f7e008` |
 | `upstream-atan2.test` | `438e8607120cbb844a505ae2b9fe9e45fb4d4a45e3ffe8a48bed9899534465b6` |
 | `mimir-atan2.test` | `86b647ba879a1174f61b8e1aed0a71e71c0892f5e29d5e82a4314a5cb7d1bef3` |
+| `mimir-prefilter-cardinality.test` | `3d6f189743b7d4b391f25a76cb48eca0203d129af981b91c369ea2257eff9b1c` |
 | `upstream-sort-warnings.test` | `b98a8e9f19ce5dfffb9e67aa918a6c6b815594a730e15829062aded9b731597f` |
+| `mimir-sort-histograms.test` | `9825c23ece56ab718e935d9b3a7b45bbe91ef536d1b5c15645b74ade97924bf3` |
 | `upstream-query-context.test` | `b2213af3ecbf8ce47c7bceb0860da7089726d7bb57121ea441aaababda025547` |
+| `upstream-scalar.test` | `0238a878ebcd0b1f63dcc065f81af77f3ce6741c65b9edb5cb99257d2c6633e0` |
 | `upstream-scalar-extrema.test` | `cde0efc7590f0d3b4eebe7c35b0412970d774b0be3c98f2b77ad61e8aabb4d5d` |
 | `mimir-scalar-extrema.test` | `d837e8ae8219c45262b3da0fcdef970f768e7357a2395a5d73f0f000775ffe62` |
+| `upstream-ranking-histogram-annotations.test` | `55955b834ca6344f4397f564a2be913ce3c670a5f86437da61e0926770122dad` |
+| `upstream-range-extrema.test` | `d82c02b96ed709454398d87c301de2ea1e11fc61522039c6c68a40d3493505fe` |
+| `upstream-range-dispersion.test` | `9c10d97f9f27c45a245f1903c4e6a84fbfc868a784a29293e1d22d57ca6c4c29` |
+| `upstream-aggregation-extrema.test` | `9e67bff7f892b8baa709efd2b2c1e20bab4b966272c7e4e88e91f91245dacdf7` |
 | `upstream-dispersion.test` | `12a845c9890ba823ef932b41e03d8238d2f296adafb5928d8ee516d936e9ae42` |
 | `upstream-value-count.test` | `c061bff5c769c2312894b17a1c7d988bdfdc34bd4bf041cb7ed952a15a8de905` |
 | `mimir-value-count.test` | `822e203089deb2a749d733a3644cd048e5d29f52bf9c1649051be21974423918` |
@@ -1117,6 +1612,7 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `upstream-time-duration.test` | `a997a6e557809ea296b3c5848d79b02f35c8de6ad32df269bc2183114a708c22` |
 | `upstream-time-offset.test` | `737fe81d1aad5d7c206b9bd98a04d4fd51c7956ceee47c67968b51e68dee1e10` |
 | `upstream-time-subquery.test` | `d1e0de4c55150a743fd08673eed7b7db1c63d34fae34cf257d828b706d817065` |
+| `upstream-subquery-reset-hints.test` | `02da6b9211a5c387c22da1304d7ffaa57e6d1db927b542901ee5c8bb83bbcf9c` |
 | `upstream-limit.test` | `31e6224016d5d92988a48ccb3ccc6732708354036294a4f00711ff0524af5312` |
 | `mimir-limit.test` | `c4c6602c4ac8022522b628a8bdce452832f0a62739c86e98d30f3dcd094dfee3` |
 | `upstream-duration-expressions.test` | `90405f86486b84e2e12f110f1c486411c99f213e581001a344129a7b087fb792` |
@@ -1133,6 +1629,7 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `upstream-idelta.test` | `73fffb079a7393b7e7d216193c8ae9e49c8d4a33359ebd70dbbab507a77433ef` |
 | `upstream-irate.test` | `c7b0a6d060b2e9bac5cfba52259f865970a0cf31acc6084874fa1a5e8409b62d` |
 | `upstream-delta.test` | `0543992eda787fbbaa84b6daad47c1934d39266fd5c48b1dfc768c1590d10d67` |
+| `upstream-float-delta-boundaries.test` | `9b566196238ffa16555200c4de0b3a6dc16c935ce95462fccc69fe785c65d960` |
 | `upstream-custom-histogram-arithmetic.test` | `a2f6751d6614c9f0f866dbb96296341241f1f049f8e4c860711626502a81fd70` |
 | `upstream-histogram-range-aggregation.test` | `f36ed5dcf1ad09f2863a59c43d6054e4f6b852a5c273ca2e1062f6d3df7dc3b8` |
 | `upstream-histogram-group-aggregation.test` | `8140233809e6112aec21df2caf1d6134164c86ab6689bc1995c36ae91b2c6ea5` |
@@ -1147,6 +1644,7 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `mimir-histogram-binary.test` | `9b4fc6752be89e505514284ffddd0ad31a3de7d0ddfed39dcd79d12e7b070b9c` |
 | `mimir-histogram-quantiles.test` | `b43d11cc529f07fb2624f3f3c398536fb973f7fac0cf1852045d680fa86ddfcc` |
 | `upstream-classic-histograms.test` (also complete upstream source) | `1eadbc6129d601f4135da5734c49ec223f5ed52aed861897126ba8fb8bdd375a` |
+| `mimir-empty-load-labels.test` | `5fd5026df225a350f120abb7c5956e6bcdb083d059e327d6067fc83a5d0e44e2` |
 
 The 36 clamp evaluations preserve every assertion in the selected blocks,
 including already-supported `clamp_min`/`clamp_max` controls. Histogram bucket
@@ -1169,9 +1667,9 @@ range replays compare label identities and samples without imposing vector order
 on a matrix. Unsupported syntax fails rather than being silently skipped.
 Every evaluation runs through Pulso's HTTP instant/range query endpoints, using
 both memory storage and the real native S3/Parquet adapter against an owned
-loopback S3 stub. The corpus has 1418 instant evaluations, each also replayed as
-a one-step range, and 315 range evaluations, each requested once: 3151 HTTP
-requests per adapter, 6302 total across 188 fixture wrappers (94 files per
+loopback S3 stub. The corpus has 1471 instant evaluations, each also replayed as
+a one-step range, and 327 range evaluations, each requested once: 3269 HTTP
+requests per adapter, 6538 total across 212 fixture wrappers (106 files per
 adapter). The three-file scalar-context/extrema batch contributes 51 evaluations
 and 72 requests per adapter; the five-file aggregation batch contributes 88
 evaluations (59 instant, 29 range) and 147 requests per adapter. The four-file

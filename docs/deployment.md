@@ -94,7 +94,7 @@ The ones you are most likely to change:
 | `ingestLimits` | Per-request ingest budgets, keyed by setting name, such as `max_records`. |
 | `ingestBatching.flushIntervalMs` | Optional concurrent unkeyed ingest coalescing window (`0..1000` ms); `0` disables it. Read [the tradeoffs](configuration.md#ingest-coalescing). |
 | `mcp.allowedOrigins` | Browser origins allowed to call the Model Context Protocol endpoint. |
-| `sentry.projects` | Experimental Sentry ingest-only project credentials and tenant/service bindings. Empty by default; add exact SDK ingress paths explicitly. See [error tracking](error-tracking.md). |
+| `sentry.projects` | Experimental Sentry ingest-only project credentials and tenant/service bindings, with optional per-project `allowed_domains` (32 patterns maximum, 256 UTF-8 bytes each). Omission preserves unrestricted origins; `[]` denies Origin-bearing requests, not authenticated SDKs without Origin. Empty project map by default; add exact SDK ingress paths explicitly. See [error tracking](error-tracking.md). |
 | `sentry.projectionEnabled` | Separately enable the experimental S3 issue index and bounded error-rate detector, default `false`; no effect on ingest acknowledgment. See [error monitoring](error-monitoring.md). |
 | `sentry.historyDays` | Derived error-history horizon (`1..365` days), default `1`; independent of raw log retention. |
 | `sentry.projectionIntervalMs` | One-project worker cadence (`1000..60000` ms), default `5000`; measure freshness and read cost before reducing it. |

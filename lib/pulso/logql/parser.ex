@@ -227,6 +227,7 @@ defmodule Pulso.LogQL.Parser do
     |> reduce({__MODULE__, :chars_to_number, []})
 
   defcombinatorp(:number_literal, number_literal)
+  defcombinatorp(:unsigned_number_literal, choice([hexadecimal, decimal]) |> reduce({__MODULE__, :chars_to_number, []}))
 
   @doc false
   def chars_to_number(chars) do
@@ -926,10 +927,11 @@ defmodule Pulso.LogQL.Parser do
     |> ignore(string("]"))
     |> unwrap_and_tag(:range)
 
-  # Optional leading quantile or distinct-field argument; validation checks
-  # which parameter type the chosen operator accepts.
+  # Loki's range parameter is a NUMBER token, not a signed scalar expression.
+  # Signs inside exponents remain part of the token. Validation checks which
+  # parameter type the chosen operator accepts.
   range_leading_param =
-    choice([parsec(:number_literal), parsec(:identifier)])
+    choice([parsec(:unsigned_number_literal), parsec(:identifier)])
     |> unwrap_and_tag(:param)
     |> parsec(:ws)
     |> ignore(string(","))

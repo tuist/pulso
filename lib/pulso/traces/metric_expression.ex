@@ -27,6 +27,34 @@ defmodule Pulso.Traces.MetricExpression do
   defp node(_text, _pipeline, depth) when depth > 32, do: fail(:query_expression_limit)
 
   defp node(text, pipeline, depth) do
+    case prefilter_ranking(text, pipeline, depth) do
+      {:ok, leaf} -> leaf
+      :none -> composition(text, pipeline, depth)
+    end
+  end
+
+  # Only one scalar filter on a single, otherwise unranked pipeline may
+  # precede ranking. Keep it in the native leaf so filtering happens before
+  # the existing native select-k, never as a reordered BEAM post-filter.
+  defp prefilter_ranking(text, pipeline, depth) do
+    with [_, prefix, rank, k] <-
+           Regex.run(~r/\A(\{.*)\s*\|\s*(topk|bottomk)\s*\(\s*([0-9]{1,6})\s*\)\z/s, text),
+         true <- Enum.any?(operators(prefix), fn {_, op} -> op in @comparisons end),
+         k = String.to_integer(k),
+         true <- k > 0 do
+      case node(String.trim(prefix), pipeline, depth + 1) do
+        {:filter, op, {:leaf, %{second: nil} = query}, threshold} when is_number(threshold) ->
+          {:ok, {:leaf, %{query | second: {rank, k, {op, threshold}}}}}
+
+        _ ->
+          fail()
+      end
+    else
+      _ -> :none
+    end
+  end
+
+  defp composition(text, pipeline, depth) do
     ops = operators(text)
 
     case choose(ops) do
@@ -180,6 +208,7 @@ defmodule Pulso.Traces.MetricExpression do
   defp leaves({:binary, _, left, right}), do: leaves(left) ++ leaves(right)
   defp size({:binary, _, left, right}), do: 1 + size(left) + size(right)
   defp size({:filter, _, child, _}), do: 1 + size(child)
+  defp size({:leaf, %{second: {_, _, {_, _}}}}), do: 3
   defp size(_), do: 1
 
   # Native leaves retain complete slots off heap. Arithmetic lives here so it

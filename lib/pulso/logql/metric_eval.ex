@@ -108,6 +108,7 @@ defmodule Pulso.LogQL.MetricEval do
     offset = agg.offset_ns || 0
     {first, last} = Enum.min_max(times)
     spec = %{op: :absent_over_time, unwrap: extract_unwrap(agg.inner), grouping: :all}
+    opts = Map.put(opts, :omit_unused_plain_json, is_nil(spec.unwrap))
 
     with {:ok, collected} <-
            collect(agg.inner, spec, tenant, opts, first - offset - agg.range_ns + 1, last - offset) do
@@ -212,7 +213,8 @@ defmodule Pulso.LogQL.MetricEval do
   # Range helpers
   # ---------------------------------------------------------------------------
 
-  defp entry_label_key(%Entry{labels: labels}, unwrap, grouping) do
+  defp entry_label_key(entry, unwrap, grouping) do
+    labels = if is_nil(grouping), do: entry.labels, else: Entry.ordinary_labels(entry)
     labels = if unwrap, do: Map.delete(labels, unwrap.label), else: labels
 
     grouped =
@@ -222,9 +224,7 @@ defmodule Pulso.LogQL.MetricEval do
         %AST.Grouping{mode: :without, labels: names} -> Map.drop(labels, names)
       end
 
-    if Map.get(labels, "__error__", "") == "",
-      do: grouped,
-      else: Map.merge(grouped, Map.take(labels, ["__error__", "__error_details__"]))
+    Entry.preserve_error_labels(entry, grouped)
   end
 
   defp extract_unwrap(%AST.LogQuery{stages: stages}) do
@@ -275,7 +275,7 @@ defmodule Pulso.LogQL.MetricEval do
   defp add_entry(entry, _record, acc, %{op: :approx_count_distinct, param: name} = spec) do
     check_pipeline_error(entry, spec)
 
-    case {entry.timestamp_ns, Map.get(entry.labels, name)} do
+    case {entry.timestamp_ns, Entry.label_value(entry, name)} do
       {ts, value} when is_integer(ts) and is_binary(value) and value != "" ->
         Budget.charge(:log_samples, 1)
         Budget.charge(:materialized, 1)
@@ -288,20 +288,19 @@ defmodule Pulso.LogQL.MetricEval do
 
   # A missing/empty unwrap field supplies no observation, unlike a present
   # nonnumeric field. The fold still charges all scanned/pipeline rows as work.
-  defp add_entry(%Entry{labels: labels} = entry, _record, acc, %{unwrap: %AST.Unwrap{label: label}} = spec)
-       when not is_map_key(labels, label) or :erlang.map_get(label, labels) == "" do
-    check_pipeline_error(entry, spec)
-    acc
-  end
-
+  # Earlier pipeline errors cannot reach the aggregate without an observation.
   defp add_entry(entry, record, acc, spec) do
-    case extract_sample(entry, spec) do
-      {:keep, %Entry{timestamp_ns: ts} = entry, value} when is_integer(ts) ->
-        Budget.charge(:log_samples, 1)
-        add_sample(acc, series_key(entry, spec), {ts, tie(spec.op, record), value})
+    if spec.unwrap && Entry.label_value(entry, spec.unwrap.label) in [nil, ""] do
+      acc
+    else
+      case extract_sample(entry, spec) do
+        {:keep, %Entry{timestamp_ns: ts} = entry, value} when is_integer(ts) ->
+          Budget.charge(:log_samples, 1)
+          add_sample(acc, series_key(entry, spec), {ts, tie(spec.op, record), value})
 
-      _ ->
-        acc
+        _ ->
+          acc
+      end
     end
   end
 
@@ -326,7 +325,7 @@ defmodule Pulso.LogQL.MetricEval do
   end
 
   defp extraction_error(entry, %{label: name, conversion: conversion}) do
-    value = Map.fetch!(entry.labels, name)
+    {:ok, value} = Entry.fetch_label(entry, name)
 
     details =
       case conversion do
@@ -337,11 +336,8 @@ defmodule Pulso.LogQL.MetricEval do
     extraction_error(entry, details)
   end
 
-  defp extraction_error(entry, details) when is_binary(details) do
-    entry
-    |> Entry.put_label("__error__", "SampleExtractionErr", :parsed)
-    |> Entry.put_label("__error_details__", details, :parsed)
-  end
+  defp extraction_error(entry, details) when is_binary(details),
+    do: Entry.set_error(entry, "SampleExtractionErr", details)
 
   defp add_sample(acc, key, sample) do
     case acc do
@@ -370,8 +366,8 @@ defmodule Pulso.LogQL.MetricEval do
   defp entry_value(%{op: :count_over_time}, _entry), do: 1.0
   defp entry_value(%{unwrap: nil}, _entry), do: 1.0
 
-  defp unwrapped(%Entry{labels: labels} = entry, %AST.Unwrap{label: name, conversion: conv} = unwrap) do
-    with value when is_binary(value) <- Map.get(labels, name),
+  defp unwrapped(entry, %AST.Unwrap{label: name, conversion: conv} = unwrap) do
+    with value when is_binary(value) <- Entry.label_value(entry, name),
          number when not is_nil(number) <- parse_unwrap(conv, value) do
       case number do
         {:error, details} -> {:error, extraction_error(entry, details)}
@@ -568,7 +564,7 @@ defmodule Pulso.LogQL.MetricEval do
         do: {name, value}
   end
 
-  defp over_time(:sum_over_time, values), do: Enum.reduce(values, 0.0, &Number.add/2)
+  defp over_time(:sum_over_time, values), do: Number.sum(values)
   defp over_time(:avg_over_time, []), do: :nan
   defp over_time(:avg_over_time, values), do: Number.average(values)
   defp over_time(:max_over_time, values), do: Enum.reduce(values, :nan, &Number.max/2)
@@ -691,7 +687,7 @@ defmodule Pulso.LogQL.MetricEval do
   defp ordered?(left, right, :asc), do: not Number.less?(right, left)
   defp ordered?(left, right, :desc), do: not Number.less?(left, right)
 
-  defp aggregator(:sum, values), do: Enum.reduce(values, 0.0, &Number.add/2)
+  defp aggregator(:sum, values), do: Number.sum(values)
   defp aggregator(:count, values), do: length(values) * 1.0
   defp aggregator(:avg, values), do: over_time(:avg_over_time, values)
   defp aggregator(:min, values), do: over_time(:min_over_time, values)
@@ -763,6 +759,8 @@ defmodule Pulso.LogQL.MetricEval do
 
   defp check_pipeline_error(_entry, %{preserve_errors: true}), do: :ok
 
+  # Admission of samples still guards the rendered error label, just as Loki's
+  # pipelineErr checks sample labels rather than the builder's private error.
   defp check_pipeline_error(%{labels: %{"__error__" => error}}, _spec) when error != "",
     do: throw({:logql_error, :pipeline_error})
 

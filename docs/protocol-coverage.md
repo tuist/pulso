@@ -21,6 +21,336 @@ to support every historical client/session protocol.
 | Tempo compatibility | Experimental bounded v1/v2 exact-ID export with V2 same-span filters and ancestor/descendant depths; separately opt-in retained-context search and discovery; documented typed predicates; TraceQL metrics with `topk`/`bottomk`, core `span:id` grouping (`rate`, `count`/`min`/`max`/`sum`/`avg_over_time`, `quantile_over_time`, `histogram_over_time`), bounded scalar/vector `+ - * /` expressions, typed ordered-label matching/ungrouped broadcasting and value-preserving scalar filters; echo and build info | Full TraceQL including structural/spanset operations and `compare()`, exemplars, unlimited-series overrides, full indexed planning, discovery parity and deployed-client acceptance |
 | Alerting | Native bounded thresholds, authored mixed-source expressions, experimental recordings and delivery | Full Grafana imported-rule execution, lifecycle, routing, notification and template semantics |
 | MCP | Stateless 2026-07-28 tools, capability-scoped Pulso writes and request-scoped subscriptions | Legacy initialize/session protocols; infrastructure remediation is deliberately a separate server |
+| Sentry error collection | [Bounded JSON error envelopes, legacy JSON store and pixel GET ingestion](error-tracking.md), gzip/zlib-wrapped deflate/zstd, configured project credentials, Parquet publication before acknowledgment, MCP diagnosis and optional error monitoring | Full Relay/Sentry ingestion and normalization, symbolication/minidumps, attachments, performance/session/replay storage, Sentry REST issue APIs and lifecycle |
+
+Sentry compatibility work also uses actual Relay integration scenarios. The
+selected [`test_envelope_without_header`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_envelope.py#L73-L87)
+now replays its project-42, envelope-DSN, empty-HTTP-auth-header and exact-message
+input through Pulso, including native Parquet/S3 publication and a cold diagnostic
+read. Six local credential-rejection controls perform no provider requests.
+Pulso retains the scrubbed `message` instead of Relay's normalized `logentry`;
+this is an explicit response/storage adaptation, not complete normalization
+parity or execution of the upstream Relay suite. An empty header alone never
+authenticates, and conflicting credentials still reject.
+
+The same Relay revision's complete two-method
+[`test_options_response`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_store.py#L67-L83)
+also replays the original GET/POST preflight requests for `/store/`, requiring
+POST-only advertised methods and an allowed-header response. Local gzip controls
+cover both `/store/` and `/envelope/`: `Content-Encoding` is now allowed alongside
+the existing ingest headers, without credentials or arbitrary-header reflection.
+Three data-bearing identity/gzip POSTs publish through native Parquet/owned
+loopback S3 and remain readable after a cold manifest reload; three invalid-key
+POSTs do no provider work. The middleware and endpoint behavior are exercised
+through Pulso's production endpoint, not a browser or a running Relay instance.
+This does not import Relay's broader CORS header set, compression formats or
+security-report API. The original test asserts any successful OPTIONS status;
+Pulso retains its existing 204 response.
+
+Relay's [`test_compression`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_basic.py#L253-L271)
+contributes all four matching store cases: gzip, zlib-wrapped deflate, identity
+and an explicitly empty encoding header, with the original `hello world` JSON
+bytes and no content type. An empty header means identity on both ingestion
+endpoints. Six native-Parquet/owned-loopback-S3 publications (including two local
+envelope controls) survive a cold read with original messages and acknowledged
+IDs. Twenty no-provider rejections cover unsupported/stacked encodings, broken
+or truncated checksums/streams, raw DEFLATE, trailing/concatenated streams,
+invalid JSON, wrong keys and unchanged event/wire/expanded-body limits. These
+are local safety controls, not upstream rejection oracles. An exact 16 MiB
+expanded unsupported-item envelope succeeds without publication; one byte over
+fails whole. Shared decompression remains gzip-only outside Sentry's opt-in
+reader. This is production-endpoint replay, not execution of Relay's suite,
+complete compression behavior or SDK/client acceptance.
+
+The zstd row of Relay's
+[`test_store_content_encodings`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_store.py#L1043-L1067)
+now rejects an empty body with `400`, rather than unsupported-encoding `415`.
+The zstd receiving hop from
+[`test_store_content_encodings_chained`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_store.py#L1071-L1082)
+accepts its original `Hello, World!` message through store and an authored
+envelope control; both survive native-Parquet/S3 publication and cold reads.
+This adapts the receiving hop, not Relay forwarding or normalized `logentry`.
+OTP's built-in decoder runs incrementally under the existing wire/output/event
+ceilings and a separate 16 MiB window ceiling. Complete standard single frames
+are required; preset dictionaries, truncation, trailing/concatenated/skippable
+frames and bad checksums reject without publication. These restrictions and
+boundary controls are local safety policies, not extra upstream oracles.
+Brotli, stacked encodings and full compression/client parity remain open.
+
+The same revision's complete
+[`test_corp_response_header`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_basic.py#L274-L291)
+replays an empty project-42 store POST with a query key and asserts
+`Cross-Origin-Resource-Policy: cross-origin`. The source asserts no HTTP status
+or accepted event. Local controls verify the header on both ingestion endpoints'
+preflight, body/authentication rejections, successful Parquet/S3 publication and
+storage failures. MCP still rejects disallowed origins and receives neither
+this header nor wildcard CORS. This is header-level endpoint compatibility,
+not browser/COEP testing or a port of Relay's global response policy.
+
+Relay's complete
+[`test_store_node_base64`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_store.py#L86-L110)
+now replays its original base64/zlib Node payload and octet-stream/auth headers
+through `/api/42/store/`. Its offset-free 2018 timestamp means UTC, following
+Relay's timestamp decoder, while original payload fields and configured project
+ownership remain distinct. Pulso retains `message: "Error: yo mark"` instead of
+Relay's normalized `logentry`; this remains an explicit normalization adaptation.
+Six native-Parquet/owned-loopback-S3 publications (one source case plus five
+local controls) survive cold reads as four distinct event identities. Exact
+1 MiB decoded JSON passes in both base64 forms; one byte over rejects, including
+during inflation. Seventeen no-provider body/authentication/endpoint rejections
+and separate UTC/offset/malformed/range/future controls preserve safety policies.
+Legacy decoding is store-only, single-layer and bounded; full
+timestamp grammar/precision and legacy SDK acceptance remain open.
+The upstream Relay suite was not executed.
+
+The same revision's complete
+[`test_legacy_store`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_store.py#L53-L64)
+now replays both original `Hello, World!` requests to project-less `/api/store/`
+with the helper's octet-stream and Raven authentication headers. The regression
+first reproduced 404. Project resolution requires exactly one configured project
+matching the key, never payload/query project fields or tenant headers. Two
+source requests and two local rotation/second-tenant controls publish through
+native Parquet/owned-loopback S3 and survive cold reads with their acknowledged
+IDs and configured project/service ownership. Twelve no-provider rejection
+controls cover absent/invalid/conflicting/ambiguous credentials, empty
+configuration, project-scoped key binding, malformed JSON and unchanged event/
+wire ceilings. Ambiguity rejection is a local security policy, not an upstream
+oracle. Pulso retains scrubbed `message`, not normalized `logentry`; no Relay
+execution, legacy SDK acceptance or storage-format change is claimed.
+
+The same Relay pin's `endpoints/store.rs:106–121` dispatches an exact raw
+`application/x-sentry-envelope` POST Content-Type to envelope parsing, after
+request authentication. Independently authored public requests reproduced
+Pulso's `400 invalid_event` while the equivalent `/envelope/` request succeeded.
+Store now reuses its bounded envelope decoder and header-credential validation.
+Four store publications and four envelope controls retain IDs, event contents,
+project attribution and binary-attachment discard counts through identity/gzip,
+project-scoped/project-less requests and cold native-Parquet/owned-S3 reads.
+Seventeen no-publication boundary attempts cover credential agreement, DSN-only
+store rejection, ambiguous/project-less DSNs, exact raw media type, GET isolation,
+framing/size rejection and empty/unsupported-only envelopes; storage failures
+remain retryable503. These are consumers of a source-declared dispatch contract,
+not imported Relay tests or upstream execution. A header-only JSON object under
+the exact envelope media type is no longer ingested as a legacy JSON event.
+Upgrade ingress applications consistently; ceilings/native/storage formats stay
+unchanged. This does not extend supported envelope item types.
+
+Relay's complete environment-tag promotion cases in
+`relay-event-normalization/src/normalize/mod.rs:797–842` (same pin) now have
+independent store/envelope consumers. Legacy `environment` tags previously
+published with an empty resource projection: the public environment filter
+returned zero instead of six matching events after cold native-Parquet/S3
+reads. Missing/empty/non-string top-level environments now fall back to object
+tags or the first matching ordered pair, using the existing scalar conversion
+and trimmed tag value. Nonempty top-level strings retain precedence; empty/null
+first tags do not yield ownership to later duplicates. Twenty-four publications
+check the two original promotion inputs and empty control plus precedence,
+object/list, duplicate, scalar, whitespace and malformed-value controls.
+Retained scrubbed events/tags and issue IDs stay unchanged. This is projection
+compatibility, not full Relay tag/environment validation or normalized-event
+JSON parity. Upgrade ingress apps consistently; stored projections are not
+repaired and native/storage formats and ceilings are unchanged. Relay was not
+executed and no licensed source test file was copied.
+
+The same Relay pin's `extractors/request_meta.rs:663–687` accepts a
+case-insensitive Sentry scheme in `Authorization` or `X-Sentry-Auth`. Public
+replay first returned 403 for a valid Authorization-only store request. Both
+header locations now share Pulso's existing key parser and all supplied keys
+must still agree. Fifteen independently authored store/envelope/pixel requests
+cover the alternate header and mixed-case schemes, including project-less
+store URLs; a sixteenth request verifies agreement across both headers, query
+key and envelope DSN. Cold native-Parquet/owned-S3 reads retain all identities,
+raw events and configured project/service ownership despite spoofed tenancy.
+Nine no-provider controls cover invalid/missing/duplicate/conflicting keys,
+duplicate Authorization fields and ingest/read credential separation. Browser
+preflight now permits Authorization without cookies or read-policy changes.
+These are consumers of the source-declared authentication contract, not copied
+upstream tests or Relay execution. Pulso's agreement policy intentionally differs
+from Relay's rejection of multiple auth methods; Basic auth remains unsupported
+on Sentry routes. No storage/native/budget change; upgrade ingress apps together.
+
+Relay's complete four-execution
+[`test_store_pixel_gif`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_basic.py#L116-L141)
+now replays both original JSON/base64-zlib inputs through `GET /api/42/store/`.
+Its unused `trailing_slash` parameter preserves two executions per input, not
+invented slash variants. Replay first reproduced 404. All four source events
+and two local project-less/exact-size controls survive native Parquet/owned-S3
+publication and cold reads; successful GETs return a 1×1 GIF, not JSON IDs.
+Twelve no-provider rejection controls preserve credential isolation, the
+1,000,000-byte query ceiling, the 1 MiB decoded/inflated event cap and envelope
+route isolation. A separate storage-failure control returns 503, never a GIF.
+Non-cacheable responses and rejecting HEAD probes before publication are local
+safety policies, not upstream assertion oracles. URL data can reach proxy logs
+before scrubbing; POST is preferred. Normalization, browser/SDK acceptance and
+running Relay's suite remain open; storage/keyed bytes and dependencies are unchanged.
+
+Relay's complete six-row
+[`test_store_allowed_origins_passes`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/tests/integration/test_basic.py#L169-L203)
+now replays project 42, Origin `http://valid.com` and `{"message":"hi"}` with
+the original wildcard/exact/scheme-only/domain-only/empty/nonmatching policies.
+Optional per-project `allowed_domains` enforces these restrictions after key
+resolution. All four accepted source events and five local controls survive
+cold native-Parquet/S3 reads; rejected requests perform no provider operations.
+No-Origin SDK acceptance, wildcard label boundaries, IPv6/explicit-port matching,
+malformed origins and ambiguous project-less keys have separate local controls.
+The bounded pattern/origin grammar and explicit `403` are local policies: the
+upstream test asserts capture/noncapture, not rejection status. Omission keeps
+the existing unrestricted policy. This does not claim browser/SDK acceptance,
+Relay execution or full normalization/origin-parser parity.
+
+The complete three-row Relay
+[`test_level`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/relay-event-schema/src/protocol/types.rs#L1153-L1169)
+decoder oracle now replays through store/envelope ingestion and cold
+native-Parquet/S3 MCP log reads: `log` → `info`, integer 30 → `warning`, and
+`critical` → `fatal`. Other integer Python levels share the canonical projection.
+Original event levels remain unchanged; custom strings and unsupported-value
+fallbacks retain existing policies. These are explicitly unit-to-HTTP
+adaptations, not original Relay ingestion scenarios or full normalization parity.
+Twenty-two publications cover source rows and separate controls, including
+distinguishing integer 30 from float 30.0. Projection changes apply only to new
+events; upgrade all Sentry-serving apps for consistency, without rewriting history.
+
+Relay's `test_timestamp_to_datetime` additionally supplies five nonnegative
+float timestamp oracles, including both sides of second-boundary rounding.
+Floating seconds now round their fractional part to microseconds before
+assembling integer nanoseconds. Twelve store/envelope publications preserve
+original values through cold native-Parquet/S3 MCP reads, including a separate
+modern-epoch control. The same source test's four negative inputs retain
+Pulso's pre-epoch rejection without provider access; those are deliberate
+incompatibilities, not passing Relay normalization cases. These scalar-to-HTTP
+adaptations do not establish full timestamp/normalization parity. Integer seconds,
+ISO parsing, retention and future-time policies remain unchanged.
+
+Relay's complete three-input
+[`test_values_deserialization`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/relay-event-schema/src/protocol/types.rs#L1078-L1119)
+also supplies equivalent wrapped, array and single-object exception containers.
+These decode oracles are adapted into store/envelope events; titles and Pulso
+group identity are separately authored consumer expectations, not original Relay
+ingestion or Sentry grouping oracles. Ten durable publications include separate
+last-exception/stack-frame controls. Cold native-Parquet/S3 MCP reads preserve
+original containers while grouping equivalent new events together. Old persisted
+fallback issue IDs are not rewritten or merged, although read-time titles now
+recognize the containers. Upgrade Sentry-serving apps consistently; other
+container normalization and full Relay compatibility remain open.
+
+Relay's complete
+[`test_logentry_from_message`](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/relay-event-schema/src/protocol/logentry.rs#L178-L191)
+supplies the original string `hi` and decoded `formatted: hi` oracle. Public
+store/envelope consumers preserve the raw string while selecting the same title
+and new-event group as a formatted object. Eight durable publications include
+separate canonical-object, distinct-message and exception-precedence controls,
+verified by cold native-Parquet/S3 MCP reads. These are explicit decoder-to-HTTP
+adaptations; titles and Pulso identity are authored expectations, not Sentry
+grouping oracles. Existing IDs are not rewritten; full logentry normalization,
+parameter interpolation and Relay-suite execution remain open.
+
+Relay's seven complete successful
+[`fingerprint.rs` decoder cases](https://github.com/getsentry/relay/blob/a68f1dbec05258cfa27b01059e1c1816d10c7257/relay-event-schema/src/protocol/fingerprint.rs#L125-L215)
+cover strings, Python-spelled booleans, integers, truncated floats, null omission
+and empty defaults. These decoder inputs/oracles are adapted to both ingestion
+routes and cold native-Parquet/S3 MCP reads. Forty publications include canonical
+string counterparts and separate negative-zero/integer/float-bound controls;
+raw fingerprint types survive while equivalent grouping components share an ID.
+Twenty-two malformed/precision/size rejections make no provider requests.
+Pulso deliberately rejects bad components whole instead of Relay's soft-error
+stripping (including the two original out-of-precision float rows). Existing
+string identities and supplied count/byte limits stay unchanged. This proves
+Pulso grouping consumers, not Sentry issue identity or full normalization parity.
+
+Relay's complete `event.rs:1037–1049` `test_lenient_release` decodes numeric
+release `42` as `"42"`. Authored store/envelope and cold native-Parquet/S3 MCP
+consumers now find both numeric and canonical-string events under that filter;
+previously only strings matched. Twenty-eight publications retain raw values,
+with separate scalar/precision/long-string controls and unchanged authorization.
+The existing bounded scalar conversion is shared with fingerprints, whose
+stricter component count/byte admission remains. This is new-event release
+projection, not raw event normalization, old-data repair or Relay-suite parity.
+
+Relay's complete `exception.rs:145–156` object-value decoder oracle converts
+`{"value":{"unauthorized":true}}` to a JSON-text value. Public store/envelope
+consumers now use that text for titles and new-event default grouping while
+preserving scrubbed event types. Thirty-two cold native-Parquet/S3 publications
+include canonical-string counterparts, nested ordering, arrays and scalar controls;
+five additional publications check scrub-before-render, null/empty behavior,
+typed prefixes, custom fingerprints and Unicode title truncation. Unauthorized
+requests do no provider work. Numeric text uses Pulso JSON; complete Relay float
+formatting and old-ID/materialized-summary migration are not claimed.
+
+Relay's complete message-only normalization cases in
+`relay-event-normalization/src/logentry.rs:156–190` retain their message strings
+as formatted values; `event.rs:218` aliases top-level `message` to that decoder.
+Twelve authored store/envelope consumers of those three cases now project the
+same titles/groups through legacy message objects and explicit logentries.
+Previously four legacy events fell into `Error`. Eight additional publications
+cover formatted/null/empty precedence, exception/explicit-logentry priority,
+scrubbing, invalid types and Unicode title bounds; unauthorized requests cause
+no provider work. Original scrubbed fields and custom fingerprints stay intact.
+These are normalization-to-HTTP adaptations, not original Relay grouping
+oracles or full parameter-interpolation/normalization parity. New default IDs
+can change; old issue IDs/materialized summaries are not migrated.
+
+Relay's source-declared non-object logentry conversion (`protocol/logentry.rs:119–134`,
+`protocol/types.rs:793–802`, same pin) now supplies JSON display text for numbers,
+true and arrays across canonical/legacy message names. Sixty independently authored
+store/envelope publications include string counterparts and cold Parquet/S3
+title/group/raw-value checks; seven boundary publications cover false/null,
+canonical presence, object/exception precedence, privacy, truncation and literal
+fingerprints. Two unauthorized attempts do no provider work. Public red returned
+`Error` for true; the corrected projection returns `true`. No copied upstream
+test rows, upstream execution, full float-format parity or old-ID migration is
+claimed; budgets and native/storage formats are unchanged.
+
+Relay also declares exact `sentry.interfaces.Message` and
+`sentry.interfaces.Exception` aliases (`event.rs:218,364`). Complete selected
+message decoder/normalization and exception roundtrip values now retain
+canonical titles and Pulso groups across twenty store/envelope publications,
+cold native-Parquet/S3 MCP and direct storage reads. Previously ten legacy
+events produced `Error`. Twenty-eight authored publications cover canonical
+presence (including null/invalid values), case/exact-name boundaries, chain
+containers, scrubbing, Unicode title bounds and unchanged custom fingerprints;
+two unauthorized requests cause no provider work. Stored event shapes stay
+unchanged. These are source-decoder/alias adaptations, not Relay grouping
+oracles or general normalization. Upgrade query/ingress apps consistently;
+retained issue IDs/materialized summaries are not migrated.
+
+The nested exception `sentry.interfaces.Stacktrace` alias also feeds existing
+frame-based default grouping when canonical `stacktrace` is absent. Eight
+independently authored store/envelope publications expose the prior split between
+equivalent canonical/legacy events and collapse of distinct legacy frames. Cold
+native-Parquet/S3 MCP and direct storage reads now retain two frame-specific
+groups without changing source exceptions. Twenty-four boundary publications
+cover canonical presence (including null, malformed and empty values), exact
+names and literal custom fingerprints; two unauthorized attempts do no provider
+work. The alias is source-declared in Relay `exception.rs:50–54`; group equivalence
+is a Pulso contract, not an original Relay grouping oracle. New-write identities
+can change; historical groups are not migrated. Top-level stacktrace grouping,
+symbolication and general alias normalization remain open.
+
+Relay's complete user/request roundtrip inputs and explicit legacy aliases
+(`user.rs:143–186`, `request.rs:634–723`, `event.rs:345–351`) expose a Pulso
+privacy-policy mismatch: canonical fields were scrubbed, but equivalent
+`sentry.interfaces.User` / `sentry.interfaces.Http` fields survived persistence.
+Eight store/envelope publications now apply identical whole-field filtering,
+with cold native-Parquet/S3 MCP and direct storage reads proving write-time
+scrubbing. Two further authored publications cover recursive/case/exact-name/
+title/custom-fingerprint controls; unauthorized requests do no provider work.
+The input shapes and aliases are source-backed; the conservative privacy policy
+and HTTP/MCP assertions are Pulso controls, not Relay privacy oracles.
+Upgrade ingress applications; retained objects/evidence/IDs are not scrubbed or
+migrated. No automatic cleanup, native/storage-format or resource-limit change.
+
+Sentry trace correlation accepts canonical dashed UUIDs as well as undashed
+32-digit hexadecimal IDs, normalizing only the projected ID. A disposable replay
+of all four active Relay `protocol/contexts/trace.rs:562–615` formatting rows
+exposed lost correlation on four dashed-ID store/envelope publications; cold
+native-Parquet/S3 MCP and direct storage reads now retain it. Permanent regression
+inputs are independently authored, not copied Relay test code: eight publications
+cover upper/lower dashed and undashed IDs, with sixteen further boundary
+publications and two unauthorized/no-provider controls. Malformed hyphen positions,
+invalid hex and unchanged 16-digit span-ID grammar remain discriminating controls.
+Raw contexts and issue groups stay unchanged; old absent projections are not
+backfilled. This is not complete TraceId grammar, nil-ID repair or cross-signal
+automatic correlation parity. No native/storage-format or resource-limit change.
 
 PromQL, LogQL and trace predicates share a bounded regex profile accepting
 braced hexadecimal escapes followed by repetition, literal quoting (`\Q...\E`,
@@ -80,7 +410,7 @@ Negated scalar classes correctly exclude separately listed U+D7FF/U+E000
 members across the surrogate hole, including raw/hexadecimal/range forms,
 folding, captures and repetition. Independent Go/fork oracles and the same
 local HTTP harnesses cover matching and rejection before storage.
-Upgrade all query-serving app/native pairs to log tuple `{1,1,17}`; trace/metric
+Upgrade all query-serving app/native pairs to log tuple `{1,1,18}`; trace/metric
 tuples, storage and keyed bytes are unchanged. See
 [query regex semantics](querying.md#shared-query-regex-semantics).
 
@@ -115,9 +445,92 @@ case-insensitive, `step` accepts float seconds/durations, `since` governs defaul
 bounds, and repeated/mixed or omitted/lone-empty series selectors work. Positive
 log intervals sample globally before limits under bounded collection/sorting;
 zero retains streaming top-k. Existing endpoint/scan/work/heap/inclusive-point
-ceilings remain. Full error-body/duplicate-scalar/RFC3339 grammar, tail scheduling
-and engine/client/deployed-capacity parity remain open. See the
-[source-table qualifications](../test/fixtures/logs/loki-upstream/http-parameters.md).
+ceilings remain. A separate calendar continuation replays all 16 original Go
+long-fraction rows plus 89 authored actual-Go helper controls. It accepts
+single-digit hours, comma fractions and Go's inclusive 24-hour/60-minute zone
+bounds while retaining exact nanoseconds and Pulso's int64/128-byte ceilings.
+Six successful spellings and six rejection controls exercise 72 GET/form-POST
+query attempts against native Parquet/owned-loopback S3. This is selected
+grammar evidence, not exhaustive RFC3339 acceptance. Stream discovery now
+uses first-value scalar precedence for `query`/`start`/`end`/`since`, with form
+values before URL values. Ninety-seven authored HTTP attempts cover nonempty
+retained dictionaries, empty/default and invalid-first values, and unchanged
+selector unions; all 27 rejected requests perform no provider work. Prometheus
+duplicate rejection and discovery ceilings remain unchanged. A literal-name
+continuation adds 66 GET/form-POST attempts: 44 nonempty dictionary successes
+and 22 rejections without provider work. Bracketed scalar names remain unused
+literal keys, not Plug-expanded arrays/maps; explicit malformed scalar values
+still reject. Twenty-eight executed Go 1.27.3 form controls independently cover
+literal lookup, first values and body-before-URL precedence, not Loki HTTP.
+Index statistics now validates the range-query superset too: uint32 limit,
+direction, positive step/11,000 integer intervals and nonnegative interval.
+Forty-four authored GET/form-POST attempts cover 12 complete metadata estimates
+and 32 pre-provider rejections; accepted parameters do not truncate estimates,
+and stats still never reads Parquet payloads.
+Scalar precedence on other Loki endpoints, exact HTTP error bodies, tail scheduling and
+engine/client/deployed-capacity parity remain open. See the
+[source-table qualifications](../test/fixtures/logs/loki-upstream/http-parameters.md)
+and [calendar oracles](../test/fixtures/logs/loki-upstream/http-calendar-timestamps.md).
+
+Detected-field requests also follow Loki's legacy limit fallback: missing/empty
+`limit` selects `field_limit`, while a nonempty primary value keeps precedence.
+Twelve authored combinations exercise 48 GET/form-POST attempts across fields
+and field values with nonempty native Parquet/owned-loopback-S3 results; all
+24 invalid requests reject before provider work. The 5000 endpoint ceiling
+remains stricter than the upstream uint32 helper. These are supplementary
+source-derived controls, not additional frozen upstream table rows.
+
+Detected-field step admission follows the pinned request parser: a minimum of
+1 ms and at most 11,000 integer-truncated intervals, using the original duration
+before millisecond truncation. Nineteen authored controls exercise 76 GET/form-POST
+attempts across fields/values, including both interval-boundary sides and 1.5 ms
+precision; 40 rejections prove no provider requests, while 36 successes retain
+the expected sampled fields/values. This is HTTP admission, not new bucketing or
+full detected-field sampling/diagnostic parity. Existing resource limits remain.
+
+The complete pinned `TestNestedJSONFieldDetection` retains both original
+two-line setups: seven valid nested-field path/type oracles and ten difficult-key
+path oracles. The latter previously returned an empty public response because
+its objects contain trailing commas. A detector-local, string-aware fallback
+now removes only terminal object commas before strict decoding of the whole
+result. GET/form POST replay preserves original line bytes, paths and the valid
+pair's types through native Parquet/owned S3. Authored repaired/string-escape/
+malformed-input controls distinguish this from broad JSON leniency; arrays,
+transport JSON and ordinary LogQL `| json` retain their existing grammar.
+Newest-line sampling, no-provider auth/admission rejection and scan exhaustion
+remain covered. This is detector compatibility, not complete malformed-input,
+duplicate-key, parser-hint or upstream HTTP-envelope parity.
+
+The complete pinned numeric-boolean `TestQuerier_DetectedLabels` subtest now
+retains its three-name oracle through public GET/form POST. All five original
+names and nine values are adapted from the ingester mock into singleton-label
+streams; `/series` independently verifies their native-Parquet/S3 persistence.
+Label suggestions now keep nonempty value sets containing only literal `0`/
+`1`, not arbitrary signed/decimal numeric spellings. Static-label and other
+numeric/UUID filtering, integer-first field typing and resource ceilings stay
+unchanged. Separate controls cover singleton/pair/mixed sets, absent windows,
+authorization, admission and fail-whole scans. The source mock, carrier lines,
+time window and exact-cardinality checks are distinguished; no upstream-server,
+HLL-estimation or deployed-client parity claim.
+
+Detected JSON field values also follow the existing frozen JSON parser's
+`utf8 error rune` oracle: decoded U+FFFD becomes a space. Public GET/form POST
+previously retained U+FFFD even though ordinary `| json` already matched the
+original complete three-field oracle. The detector now applies that cleanup
+only to decoded JSON string values, not stored lines, keys/paths or structured
+metadata. This reuses an existing source row, not an additional imported case;
+the detector route/window and boundary/auth/resource controls are authored
+adaptations. No transport decoder, native/storage-format or resource-limit change.
+
+Automatic detected logfmt fields also preserve first-retained extraction
+ownership after key sanitization and stream-label suffixing. The existing frozen
+`duplicate from line property` row (`parser_test.go:1301–1311`) previously
+returned the later `10ms` value rather than original `foo bar`; an explicit
+`| logfmt` pipeline could then show both. Ordinary parsing already matches the
+complete source oracle. The detector now retains the first final destination,
+including normalized aliases and suffix collisions, without changing metadata,
+raw bytes or resource policies. HTTP detector replay is an authored adaptation
+of the existing parser row, not a new source import or full detector parity.
 
 Loki's complete `Test_writeError` table is frozen separately: 25 original rows,
 each with direct and gRPC-status-roundtrip assertions (50 upstream executions,
@@ -233,7 +646,7 @@ stream/parser collisions and native label-cache isolation have separate controls
 Error-preservation and stream-isolation controls bring the source replay to
 398 reads plus three pushes. Numeric hash bits, optimized Go types/cache/reference
 identity and hint contracts are not claimed. Upgrade query-serving app/native
-pairs to `{1,1,17}`; budgets, storage and keyed bytes are unchanged. See the
+pairs to `{1,1,18}`; budgets, storage and keyed bytes are unchanged. See the
 [sample-extractor ledger](../test/fixtures/logs/loki-upstream/sample-extractors.md).
 
 LogQL range pipelines may precede or follow the bracket/offset, and complete
@@ -333,6 +746,12 @@ Timestamp/Unix helpers are covered by the continuation below. Channel/function
 iteration, remaining date functions, non-UTF-8 decoded/sliced values,
 exact template errors and general
 pipeline-error ownership remain incomplete; this is not full formatter parity.
+The complete four-oracle `formatters.logqltest:85–105` block now preserves
+active error details across ordinary label formatting. Hidden ordinary values
+survive error resets and renames; templates, filters and grouped output retain
+their distinct lookup rules. Thirteen additional actual pinned Loki pipeline
+comparisons cover those ownership distinctions, separate from upstream engine
+rows. Native reserved-label and complete diagnostic parity remain open.
 
 Finite template float literals preserve decimal/scientific/hexadecimal syntax,
 signed zero and Go's direct-constant versus typed-pipeline integer argument rules.
@@ -543,6 +962,39 @@ The 104 frozen cases and HTTP/Parquet/S3 regressions close literal decoding,
 not exact parser-error text/positions, full LogQL or client acceptance. See
 the [query contracts](querying.md#parser-labels-and-quantities) and
 [string-literal fixtures](../test/fixtures/logs/loki-upstream/README.md#string-literal-continuation).
+
+LogQL vector `sum` now uses compensated summation as well as `sum_over_time`.
+The pinned Loki `TestVectorAggEvaluator_Precision/sum()` oracle retains all
+10,001 original values (`1e16`, then 10,000 ones) and the exact expected
+`10000000000010000`. Distinct streams adapt the unit inputs into a public
+vector; a sorted instant wrapper restores original numeric order. Authenticated
+instant/range GET/form POST replay through native Parquet/S3, with the later
+empty window omitted. This is an explicit unit-to-HTTP adaptation, not an
+unchanged upstream HTTP scenario. Existing float64 and resource bounds remain.
+
+Four unchanged `range_aggregations.logqltest:409–440` evaluations and all five
+original inputs now replay malformed-JSON quantiles through HTTP/Parquet/S3.
+Missing/empty unwrap targets supply no observation, so prior parser errors
+cannot fail those aggregates. Usable targets and count/bytes observations keep
+their error guards. Separate native-eligible/fallback controls and direct native
+Parquet replay protect path parity and sample/work accounting. Upgrade all
+query-serving app/native pairs to log tuple `{1,1,18}`; storage/keyed bytes and
+resource ceilings are unchanged.
+
+Five unchanged `range_aggregations.logqltest:1727–1745` absence evaluations
+retain both original streams and malformed JSON. Unwrapped-free
+`absent_over_time` omits unused plain JSON extraction only when the entire
+pipeline contains plain JSON and line filters. Label/error/format consumers,
+explicit extraction and other parsers keep normal execution; metadata errors
+and admission/work/scan policies remain intact. General hint-driven parser
+parity stays open. This is application-only; log tuple `{1,1,18}` is unchanged.
+
+The complete `log_selection.logqltest:28–36` case retains its two original
+lines and start-inclusive/end-exclusive selection oracle. External raw-log
+`/query_range` now excludes the line exactly at `end` before top-k selection;
+metric ends, instant logs, other APIs and shared storage/MCP bounds remain
+unchanged. Equal windows remain empty with ordinary validation and resource
+admission. Upgrade query-serving applications; no native/storage-byte change.
 
 Logfmt log-line decoding is a separate covered slice: default recovery, strict
 `LogfmtParserErr` byte positions, empty-value policy, normalized first duplicates
@@ -798,8 +1250,67 @@ strict tolerance and capped relative scale, avoiding arithmetic failures on
 large finite counts. Six public HTTP controls and 10,030 actual pinned Go
 quantile/repair comparisons cover these numerical extremes separately from
 the imported engine count.
-The complete selected corpus now contains 1733 evaluations in 94 files, replayed
-through 6302 HTTP requests across both adapters. The preceding 81 evaluations add
+The complete two-failure `ours/binary_operators.test:1706–1718` block retains
+all twelve samples and original failure directives. One-to-one comparison
+cardinality checks matching inputs before filtering; zero or one surviving
+output cannot hide duplicate counterparts. Checks remain evaluation-step-local,
+unmatched many-side inputs stay nonconflicting, and grouped output-label
+uniqueness remains separate. Public execution failures use Pulso's existing
+HTTP 422 envelope, not an exact upstream error-string claim.
+Two unchanged `ours/functions.test` evaluations add the complete three-sample
+`label_replace` setup, its valid control and literal invalid-regex diagnostic.
+Invalid bounded patterns still reject before storage with HTTP 400/`bad_data`,
+now retaining `invalid regular expression in label_replace(): <pattern>`.
+Destination-validation precedence and the 1024-byte regex ceiling are unchanged;
+the upstream engine oracle does not establish HTTP-status parity.
+Seven unchanged `ours/functions.test:956–1010` sorting evaluations retain all
+ten series/fifty samples. Range `sort`/`sort_desc` now omit native-histogram
+points instead of returning five unexpected histogram series; mixed series
+retain float points, and emptied series disappear. Label sorting still keeps
+histograms. Existing range warnings, ordering, sample admission and budgets
+remain; the exact original five instant controls pass too.
+The complete two-evaluation `upstream/subquery.test:142–158` reset block retains
+all twelve native-histogram samples and one explicit reset hint. A 15-second
+subquery previously repeated that hint, yielding increase 40 instead of the
+original 30.769230769230766 on both endpoints/adapters; the three-minute control
+already returned 25. Subquery materialization clears only explicit reset/no-reset
+hints to unknown, preserving gauges, floats and stored/direct-selector metadata.
+This follows pinned Mimir `operators/subquery.go:89–95`, not a test-producer
+adjustment. Existing work/sample/materialization limits remain authoritative;
+upgrade query applications without rewriting stored data or native formats.
+The complete selected corpus now contains 1798 evaluations in 106 files, replayed
+through 6538 HTTP requests across both adapters. Two unchanged empty-`le`
+histogram evaluations retain all fourteen input samples and original warning/
+no-info directives. The test load producer now removes empty-valued labels as
+the pinned upstream TSDB does, while expected output labels stay untouched.
+This restores native/classic histogram identity and warning behavior without
+an evaluator, ingestion or historical-record change. Authored public controls
+retain nonempty ASCII/UTF-8 labels and a metric whose other labels are all empty.
+Seven unchanged float-delta boundary cases retain all four original series/34
+samples. Their `_xN` source
+tokens now produce N omitted positions in the test loader, rather than N+1;
+numeric/histogram repetitions remain N+1. This corrects the fixture producer,
+not the already-correct evaluator. Authored public zero/one repetition controls
+check counts and complete sums on both endpoints/adapters without changing
+upstream inputs or expected results. Three unchanged timestamp/rate
+evaluations retain all twelve original samples and require the possible-non-counter
+name info only for produced float results. Separate rate/increase controls cover
+suffix/empty-name exclusions, insufficient/mixed/histogram-only windows,
+nonfinite float outputs and query/batch isolation. Eight unchanged aggregation-extrema
+evaluations preserve `min`/`max` histogram-ignored infos for mixed and
+histogram-only groups, alongside float/NaN/grouping no-info controls. Nine unchanged dispersion
+evaluations preserve mixed-window `stddev_over_time`/`stdvar_over_time` infos,
+histogram-only omission and constant-value regression oracles. Eight unchanged range-extrema
+evaluations preserve mixed-window `min_over_time`/`max_over_time` info notices
+without inventing notices for histogram-only windows; expected values and
+the original split loads are unchanged. Twelve unchanged positive-`k`
+ranking evaluations preserve histogram-omission info notices for `topk` and
+`bottomk`, including empty/mixed results, grouping and range queries.
+Zero-`k` range annotation parity remains open; Pulso retains no notices for
+unexecuted filters. Three unchanged `scalar()`
+evaluations preserve only-float cardinality: histograms are ignored, so one
+float alongside histograms returns that float, while zero or multiple floats
+return NaN. The preceding 81 evaluations add
 absence, timestamp/rounding, complete absence-over-time/staleness blocks and
 label replacement, including original failure assertions. Multi-metric absence
 no longer rejects distinct source names as intermediate duplicate identities.
@@ -811,6 +1322,56 @@ Top-level range-vector range queries now return the exact default Mimir error
 before storage. Upgrade query applications;
 native/storage/keyed bytes are unchanged. Remaining native annotation/iterator
 and deployed-client/provider/capacity gaps are not closed by this batch.
+
+Loki's original negative `quantile_over_time(-0.1, ...)` rejection now replays
+with its complete seven-row load and original median/+Inf controls. Leading
+signs reject before provider access, including `-0` and explicit plus signs;
+signed decimal/hex exponents and ordinary signed scalar expressions retain
+their existing meanings. Authenticated GET/form-POST instant/range requests
+assert `400`/`parse_error`, not exact upstream diagnostic wording. Parser,
+storage and query-budget boundaries otherwise remain unchanged.
+
+The complete Loki `binary_operations.logqltest:888–929` block retains all
+57 inputs and ten evaluations through instant/range GET and form POST.
+Duplicate indexed-side failures now include the original right-hand-side
+diagnostic substring; the eight successful group-right evaluations retain
+their original labels, values and timestamps. Authored controls cover left-side
+failures, unrelated matching diagnostics and fail-whole authentication/budgets.
+PromQL keeps its existing public matching error. This is diagnostic content,
+not general upstream wire parity or a change to matching/cardinality policies.
+
+The separate complete `binary_operations.logqltest:750–789` block retains 57
+source entries and ten evaluations for missing versus explicit `group_left`
+modifiers. Four public GET/form-POST instant/range failures previously exposed
+`:many_to_many_matching` instead of the original diagnostic substring
+`multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)`.
+Loki error rendering now retains that message and HTTP 400/`evaluation_failed`,
+without changing the shared matcher, indexed-side diagnostics or grouped-output
+uniqueness. All eight successful original evaluations retain their label/value/
+timestamp oracles, including bare and empty-parenthesized group modifiers.
+This is diagnostic compatibility, not exact upstream HTTP framing parity.
+
+The complete `vector_aggregations.logqltest:898–939` topk block preserves all
+378 entries and nine evaluations. Seven successful source evaluations already
+matched; fractional and missing parameters correctly rejected before provider
+access but both exposed `:invalid_aggregation_parameter`. Static validation
+and HTTP rendering now distinguish the original `invalid parameter` and
+`parameter required` substrings, retaining HTTP 400/`evaluation_failed`.
+The readable invalid-parameter message also applies to the existing shared
+invalid-aggregation reason; its internal atom and rejection outcomes are unchanged.
+Authenticated GET/form POST exercise the original cases plus range placements,
+raw-input checks, auth/no-provider, admission/no-provider and fail-whole scan
+controls through native-Parquet/owned-S3. Ranking, integer admission, zero-rank
+policy and native/storage/budget contracts are unchanged. These are source
+substring oracles, not exact upstream HTTP-envelope or Go-suite parity.
+
+Loki's complete two-row `Test_SampleExpr_Sort_Fail` at `ast_test.go:219–230`
+now rejects named grouping on `sort`/`sort_desc` before provider work, instead
+of accepting the original invalid queries. Empty grouping and ordinary
+aggregators remain valid. Authored nested/placement, empty/nonempty storage,
+asymmetric sorting and authentication controls stay separate from the original
+parser oracles. HTTP uses 400/`parse_error` with the original diagnostic
+substring; this is not exact upstream HTTP framing/position parity.
 
 The time-modifier batch closes signed offsets, unitless duration literals and
 numeric/`start()`/`end()` `@` anchors on selectors and explicit-resolution
@@ -942,6 +1503,56 @@ Upgrade query-serving applications and native artifacts together for consistent
 vocabulary and budget accounting. Native tuples and storage/keyed bytes are
 unchanged; no retry drain or data migration is needed.
 
+Five selected `TestParseIdentifier` rows retain their original mixed
+quoted/ordinary keys and exact decoded attribute mappings. HTTP discovery now
+normalizes dot-separated portions, such as `span."bar z".foo`, before existing
+scope/key validation. Authored native-Parquet/S3 consumers cover v1/v2,
+JSON/protobuf, filtered/windowed reads, malformed/unauthorized no-provider
+rejection and decoded-byte limits. Fully quoted keys retain Pulso's documented
+JSON-compatible escapes; mixed portions use Tempo's quote/backslash profile.
+This is not full lexer concatenation, predicate/search/metric grammar or
+upstream HTTP-result parity. No native or storage-format change is needed.
+
+Four unchanged Tempo `TestQuerierParseSearchRequest` rows retain the exact
+`limit=0`, `-5`, `five` and `4294967298` requests and their parameter-specific
+error messages. Public authenticated rejection remains HTTP 400 with no provider
+work, alongside native-Parquet/S3 successful-selector controls. Default 100,
+cap 1000, existing numeric grammar, ten-byte diagnostic context and window/auth
+precedence remain unchanged; over-cap policy failures stay generic. These are
+helper diagnostic oracles with authored HTTP consumers, not upstream server
+execution or complete error-wire parity. No native/storage change is needed.
+
+Three more unchanged search-request rows preserve parameter-specific `spss`
+ParseUint errors for `-2`, `four` and `4294967296`. Four authored public tests
+issue 33 search GETs and four OTLP publications: nine successes prove default
+3, explicit 1/2/100 and existing plus/leading-zero sampling behavior; all 24
+rejection/auth attempts avoid provider work. Shared bounded diagnostic handling
+preserves limit behavior and auth/window/limit precedence, with the same
+ten-byte context cap. Parsed zero/over-100 and longer values remain generic
+policy errors. Original helper errors and authored HTTP/count consumers are
+distinct; full numeric grammar, server-error and deployed-client parity remain
+open. No native/storage or resource-ceiling change.
+
+Three unchanged paired-window rows also retain exact start/end ParseUint
+diagnostics for negative bounds and uint32 overflow. The existing bounded
+parser now supplies parameter context before digit/window-policy checks;
+partial/mixed-zero/reversed windows, plus-prefixed numeric bounds and longer
+inputs still reject generically. Four public tests exercise 32 search GETs
+and four OTLP publications: eight successes retain equivalent trace results,
+while all 24 rejection/auth attempts leave provider histories unchanged.
+Original helper errors are distinct from authored producer/numerical/HTTP
+controls. Start-before-end and auth/unknown/window/limit precedence remain;
+no accepted grammar, storage/native or resource-ceiling change.
+
+Tempo's original empty-Accept format-selection row now selects JSON for a single
+explicitly empty header, as it already did for no header. Authored v1/v2 public
+lookup consumers use actual HTTP listeners, native Parquet/owned S3 and body
+equivalence with no-Accept/JSON controls. Protobuf success, wildcard/list/quality
+and multiple-header policies remain unchanged; unsupported media, multiple empty
+headers and empty-plus-protobuf still reject without provider work. This ports
+one helper row, not general content negotiation or deployed-client acceptance.
+No native/storage-format or resource-ceiling change is needed.
+
 Mimir's `TestFormatQueryAPIEndpoint` now replays its exact expression and
 formatted result. Formatting covers Pulso's supported grammar over GET/form
 POST, without executing queries or accessing storage. Output preserves operator
@@ -970,10 +1581,54 @@ validation cases, plus Mimir's exact two-series fingerprint fixture. Ungrouped
 trace counts/rates now return zeros for empty selections; grouped and numeric
 observations remain empty. Range admission caps the requested interval quotient
 at 10,000 before alignment, without increasing other ceilings. The small-step
-case preserves HTTP 400, not Tempo's diagnostic wording. Mimir's fixture already
+case also preserves Tempo's actionable diagnostic: a six-minute range with
+`35ms` step returns HTTP 400 containing
+`step of 35ms is too small, minimum step for given range is 36ms`, before any
+provider read. Zero/malformed steps retain their existing rejection behavior.
+All four original `TestParseQueryRangeNegativeStep` rows also preserve
+`step must be positive` for negative numeric/duration steps; authored controls
+prove no provider work with visible Parquet and unchanged instant-step ignoring.
+Only the application diagnostic changes; metrics capability 5 remains sufficient.
+The complete four instant/range wrappers from `TestParseQueryRequestInvalidBounds`
+also retain `could not parse 'start' parameter` / `could not parse 'end' parameter`
+on malformed bounds. Visible-Parquet/authentication and discovery controls
+preserve no-provider rejection, existing validation order and generic errors
+for admitted invalid windows. Full Go parser diagnostics and multi-error
+precedence parity are not claimed; accepted timestamps/defaults are unchanged.
+The complete `invalid since` row from `Test_determineBounds` retains its original
+December 17–18, 2022 bounds, `HI!` value and `could not parse 'since' parameter:`
+substring through both metrics endpoints. Query/step/span producers are authored
+HTTP adaptations of that helper row. Parsed nonpositive `since` policy failures
+remain generic; malformed parsing alone gains context, with no provider work.
+Mimir's fixture already
 passed and its two series do not collide under Pulso's hash, so it is not proof
 of Pulso hash-collision handling. Upgrade all query-serving app/native pairs for
 consistent trace metrics; storage, keyed bytes and the native ABI are unchanged.
+
+Tempo's complete `TestTiesInBottomK / all values tied` engine subtest additionally
+replays all three original arrays (`x/y/z = [5,5,5]`, `k=2`) through an explicit
+nine-span HTTP adapter. Bottom-k now keeps `y,z`; top-k still keeps `x,y`.
+Both standalone and arithmetic-leaf native finalizers are exercised through
+authenticated OTLP ingestion and cold native-Parquet/S3 reads. This verifies
+homogeneous string-label tie direction, not full mixed-type/multi-label ordering.
+The three original `TestMetricsSecondStage` filter-before-ranking query strings
+also retain their parser acceptance oracle through HTTP. Their numerical OTLP
+loads are explicit local adaptations, not upstream numerical expectations.
+A single finite scalar filter now executes before native ranking on an unranked
+leaf, including arithmetic-leaf finalization. An order-sensitive grouped bottom-k
+control distinguishes this from ranking first. All finalized slots spend shared
+native work before filtering; repeated ranking, multiple prefilters and ranking
+arithmetic results remain unsupported.
+Upgrade all serving app/native pairs to trace metrics capability **5**;
+trace search/export/discovery tuples, storage/keyed bytes and ceilings are unchanged.
+
+The original `Test_parseTimestamp / RFC3339nano format` scalar oracle also
+retains the final nanosecond in `2009-11-10T23:00:00.000000001Z`. A one-span
+HTTP metric consumer is an explicit authored adaptation, not an upstream metric
+evaluation. Instant/range endpoints now preserve RFC3339 fractional tails;
+numeric bounds, timezone controls and adjacent boundary exclusions guard the
+fix. This application-only change retains trace metrics capability 5 and
+existing numeric-time/window policies, not full RFC3339 grammar parity.
 
 All fifteen rows of Tempo's public `TestDefaultQueryRangeStep` engine table also
 replay through authenticated HTTP and native Parquet. Omitted range steps now

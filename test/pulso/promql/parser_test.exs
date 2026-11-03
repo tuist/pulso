@@ -5,6 +5,20 @@ defmodule Pulso.PromQL.ParserTest do
   alias Pulso.PromQL.Parser
   alias Pulso.Runtime.Task
 
+  @tag :label_replace_regex_error
+  test "label_replace retains bounded rejected regexes after destination validation" do
+    assert Parser.parse(~s|label_replace(series, "export", "$1", "label", "[.*")|) ==
+             {:error, {:invalid_label_replace_regex, "[.*"}}
+
+    assert Parser.parse(~s|label_replace(series, "", "$1", "label", "[.*")|) ==
+             {:error, :invalid_label_replace}
+
+    regex = String.duplicate("a", 1024) <> "["
+
+    assert Parser.parse(~s|label_replace(series, "export", "$1", "label", #{JSON.encode!(regex)})|) ==
+             {:error, :invalid_label_replace}
+  end
+
   test "histogram trims share comparison precedence and survive formatter round trips" do
     for query <- [
           "h </ 1 + 2 * 3",

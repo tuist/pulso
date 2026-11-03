@@ -9,6 +9,7 @@ defmodule PulsoWeb.TempoController do
   alias Pulso.Traces.SearchExpression
   alias Pulso.Traces.Tempo
   alias Pulso.Traces.TempoDiscovery
+  alias Pulso.Traces.TempoDuration
   alias Pulso.Traces.TempoFilter
   alias Pulso.Traces.TempoIntrinsics
   alias Pulso.Traces.TempoSearch
@@ -160,8 +161,9 @@ defmodule PulsoWeb.TempoController do
     end
   end
 
-  defp stored_discovery_key(scope, <<"\"", _::binary>> = quoted) when byte_size(quoted) <= 2048 do
-    with {:ok, key} when is_binary(key) and key != "" <- Pulso.JSON.decode(quoted),
+  defp stored_discovery_key(scope, key) when byte_size(key) <= 2048 do
+    with true <- String.valid?(key),
+         {:ok, key} when key != "" <- discovery_key_parts(key),
          :ok <- TempoDiscovery.validate(scope, key) do
       {:ok, scope, key}
     else
@@ -169,22 +171,64 @@ defmodule PulsoWeb.TempoController do
     end
   end
 
-  defp stored_discovery_key(scope, key) do
-    with :ok <- TempoDiscovery.validate(scope, key),
-         false <- Regex.match?(~r/[\s{}()=~!<>&|^,"]/u, key) do
-      {:ok, scope, key}
-    else
-      _ -> {:error, :unsupported_trace_discovery}
+  defp stored_discovery_key(_scope, _key), do: {:error, :unsupported_trace_discovery}
+
+  # Whole quoted keys retain the documented JSON-compatible escape contract.
+  # A non-whole input falls through to the narrower mixed-portion grammar.
+  defp discovery_key_parts(<<"\"", _rest::binary>> = key) do
+    case Pulso.JSON.decode(key) do
+      {:ok, decoded} when is_binary(decoded) -> {:ok, decoded}
+      _ -> discovery_key_parts(key, [])
     end
   end
+
+  defp discovery_key_parts(key), do: discovery_key_parts(key, [])
+
+  # Normalize dot-separated quoted/ordinary portions only. Retain the existing
+  # rejection of suffixes/adjacent quotes after a quoted portion, even though
+  # Tempo's lexer accepts more general concatenation. Input bounds also bound
+  # all temporary chunks; existing validation applies to the decoded key.
+  defp discovery_key_parts(text, parts) do
+    case :binary.split(text, "\"") do
+      [ordinary] ->
+        if ordinary_discovery_key?(ordinary),
+          do: {:ok, IO.iodata_to_binary(Enum.reverse([ordinary | parts]))},
+          else: :error
+
+      [ordinary, quoted] ->
+        with true <- ordinary_discovery_key?(ordinary),
+             true <- ordinary == "" or String.ends_with?(ordinary, "."),
+             {:ok, decoded, tail} <- discovery_quoted_key(quoted, []),
+             true <- tail == "" or String.starts_with?(tail, ".") do
+          discovery_key_parts(tail, [decoded, ordinary | parts])
+        end
+    end
+  end
+
+  defp ordinary_discovery_key?(key), do: not Regex.match?(~r/[\s{}()=~!<>&|^,"]/u, key)
+
+  # Pinned Tempo parseQuotedAtrribute accepts only escaped quote/backslash,
+  # not JSON control/Unicode escapes. Quoted dots remain literal key bytes;
+  # retain the existing rejection of literal ASCII controls in quoted keys.
+  defp discovery_quoted_key(<<"\"", rest::binary>>, parts), do: {:ok, IO.iodata_to_binary(Enum.reverse(parts)), rest}
+
+  defp discovery_quoted_key(<<"\\", escaped, rest::binary>>, parts) when escaped in [?", ?\\],
+    do: discovery_quoted_key(rest, [<<escaped>> | parts])
+
+  defp discovery_quoted_key(<<"\\", _rest::binary>>, _parts), do: :error
+
+  defp discovery_quoted_key(<<char::utf8, rest::binary>>, parts) when char >= 32,
+    do: discovery_quoted_key(rest, [<<char::utf8>> | parts])
+
+  defp discovery_quoted_key(_rest, _parts), do: :error
 
   def search(conn, params) do
     with {:ok, tenant} <- tenant(conn),
          :ok <- authorize(conn, tenant),
          true <- Enum.all?(Map.keys(params), &(&1 in ~w(q start end limit spss))),
          {:ok, {start, finish}} <- search_window(params),
-         {:ok, limit} <- positive(params["limit"], 100, 1000),
-         {:ok, spss} <- positive(params["spss"], 3, 100),
+         {:ok, limit} <- search_positive(params["limit"], :limit, 100, 1000),
+         {:ok, spss} <- search_positive(params["spss"], :spss, 3, 100),
          {:ok, format} <- format(conn),
          {:ok, body} <-
            TempoSearch.query(
@@ -211,12 +255,13 @@ defmodule PulsoWeb.TempoController do
         {:ok, {0, 0}}
 
       {start, finish} when is_binary(start) and is_binary(finish) ->
-        with {:ok, start_s} <- seconds(start),
-             {:ok, finish_s} <- seconds(finish),
+        with {:ok, start_s} <- search_seconds(start, :start),
+             {:ok, finish_s} <- search_seconds(finish, :end),
              true <- Regex.match?(~r/\A[0-9]+\z/, start) and Regex.match?(~r/\A[0-9]+\z/, finish),
              true <- (start_s == 0 and finish_s == 0) or (start_s > 0 and finish_s >= start_s) do
           {:ok, {start_s, finish_s}}
         else
+          {:error, _reason} = error -> error
           _ -> {:error, :unsupported_parameters}
         end
 
@@ -258,17 +303,19 @@ defmodule PulsoWeb.TempoController do
   defp metrics_window(params, instant) do
     now = System.system_time(:nanosecond)
 
-    with {:ok, finish} <- tempo_time(params["end"], now),
-         {:ok, since} <- tempo_duration(params["since"], 3_600_000_000_000),
-         {:ok, start} <- tempo_time(params["start"], min(finish, now) - since),
-         {:ok, step} <- if(instant, do: {:ok, nil}, else: tempo_duration(params["step"], nil)) do
+    with {:ok, finish} <- tempo_time(params["end"], now, "end"),
+         {:ok, since} <- tempo_duration(params["since"], 3_600_000_000_000, :since),
+         {:ok, start} <- tempo_time(params["start"], min(finish, now) - since, "start"),
+         {:ok, step} <- if(instant, do: {:ok, nil}, else: tempo_duration(params["step"], nil, :step)) do
       {:ok, {start, finish, step}}
     end
   end
 
-  defp tempo_time(nil, default), do: {:ok, default}
+  # Only metric timestamp parsing gets parameter context. Admitted timestamps
+  # rejected by later window validation retain their existing policy errors.
+  defp tempo_time(nil, default, _parameter), do: {:ok, default}
 
-  defp tempo_time(value, _default) when is_binary(value) and byte_size(value) <= 64 do
+  defp tempo_time(value, _default, parameter) when is_binary(value) and byte_size(value) <= 64 do
     cond do
       Regex.match?(~r/\A[0-9]{1,10}\z/, value) ->
         {:ok, String.to_integer(value) * 1_000_000_000}
@@ -283,42 +330,88 @@ defmodule PulsoWeb.TempoController do
 
       true ->
         case DateTime.from_iso8601(value) do
-          {:ok, datetime, _offset} -> {:ok, DateTime.to_unix(datetime, :nanosecond)}
-          _ -> {:error, :unsupported_parameters}
+          {:ok, datetime, _offset} -> {:ok, DateTime.to_unix(datetime, :nanosecond) + submicrosecond(value)}
+          _ -> {:error, {:invalid_trace_metrics_timestamp, parameter}}
         end
     end
   end
 
-  defp tempo_time(_value, _default), do: {:error, :unsupported_parameters}
+  defp tempo_time(_value, _default, parameter), do: {:error, {:invalid_trace_metrics_timestamp, parameter}}
 
-  defp tempo_duration(nil, default), do: {:ok, default}
+  # DateTime validates the existing ISO8601 grammar and applies the zone, but
+  # keeps only microseconds. Restore the original fraction's final nanoseconds;
+  # longer fractions still truncate, and numeric timestamps never use this path.
+  defp submicrosecond(value) do
+    case Regex.run(~r/[.,]([0-9]+)/, value, capture: :all_but_first) do
+      [fraction] -> fraction |> String.pad_trailing(9, "0") |> String.slice(6, 3) |> String.to_integer()
+      _ -> 0
+    end
+  end
 
-  defp tempo_duration(value, _default) when is_binary(value) do
-    case Pulso.PromQL.Time.parse_seconds(value) do
+  defp tempo_duration(nil, default, _parameter), do: {:ok, default}
+
+  defp tempo_duration(value, _default, parameter) do
+    case parse_tempo_duration(value) do
       {:ok, ns} when ns > 0 ->
         {:ok, ns}
 
+      {:ok, ns} when ns < 0 and parameter == :step ->
+        {:error, {:negative_trace_metrics_step, value}}
+
+      {:error, _reason} when parameter == :since ->
+        {:error, :invalid_trace_metrics_since}
+
       _ ->
-        with {:error, _} <- SearchExpression.go_duration(value),
-             {:error, _} <- Parser.parse_duration(value) do
-          {:error, :unsupported_parameters}
-        else
-          {:ok, ns} when ns > 0 -> {:ok, ns}
-          _ -> {:error, :unsupported_parameters}
-        end
+        {:error, :unsupported_parameters}
     end
   end
 
-  defp tempo_duration(_value, _default), do: {:error, :unsupported_parameters}
+  # The existing Go-duration parser is unsigned. Reuse its grammar after a
+  # single minus, without admitting signed PromQL-only units such as days.
+  defp parse_tempo_duration("-" <> unsigned = value) do
+    with {:error, _} <- Pulso.PromQL.Time.parse_seconds(value),
+         {:ok, ns} <- SearchExpression.go_duration(unsigned) do
+      {:ok, -ns}
+    end
+  end
 
-  defp positive(nil, default, _max), do: {:ok, default}
+  # Keep the existing duration parsers and their precedence; parameter-specific
+  # diagnostics are selected only after parsing.
+  defp parse_tempo_duration(value) when is_binary(value) do
+    with {:error, _} <- Pulso.PromQL.Time.parse_seconds(value),
+         {:error, _} <- SearchExpression.go_duration(value) do
+      Parser.parse_duration(value)
+    end
+  end
 
-  defp positive(value, _default, max) do
-    case seconds(value) do
+  defp parse_tempo_duration(_value), do: {:error, :unsupported_parameters}
+
+  defp search_positive(nil, _parameter, default, _max), do: {:ok, default}
+
+  defp search_positive(value, parameter, _default, max) do
+    case search_seconds(value, parameter) do
       {:ok, n} when n >= 1 and n <= max -> {:ok, n}
-      _ -> {:error, :unsupported_parameters}
+      {:ok, 0} when parameter == :limit -> {:error, {:invalid_trace_search_limit, :zero}}
+      {:ok, _n} -> {:error, :unsupported_parameters}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp search_seconds(value, parameter) do
+    case seconds(value) do
+      {:ok, _n} = result -> result
+      _ -> search_parse_error(value, parameter)
+    end
+  end
+
+  # Preserve seconds/1 admission and its ten-byte bound. Only classify a
+  # rejected bounded value; operator caps and larger inputs stay generic.
+  defp search_parse_error(value, parameter) when is_binary(value) and byte_size(value) <= 10 do
+    reason = if Regex.match?(~r/\A[0-9]+\z/, value), do: :range, else: :syntax
+    {:error, {:invalid_trace_search_parameter, parameter, reason, value}}
+  end
+
+  defp search_parse_error(_value, _parameter), do: {:error, :unsupported_parameters}
 
   def trace(conn, params), do: lookup(conn, params, false)
   def trace_v2(conn, params), do: lookup(conn, params, true)
@@ -406,6 +499,7 @@ defmodule PulsoWeb.TempoController do
 
   defp format(conn) do
     case get_req_header(conn, "accept") do
+      [""] -> {:ok, "json"}
       ["application/protobuf"] -> {:ok, "protobuf"}
       values -> json_format(values)
     end
@@ -436,6 +530,30 @@ defmodule PulsoWeb.TempoController do
       )
 
   defp failure(conn, :not_found), do: send_resp(conn, 404, "")
+
+  defp failure(conn, {:invalid_trace_search_limit, :zero}),
+    do: error(conn, 400, "invalid limit: must be a positive number")
+
+  defp failure(conn, {:invalid_trace_search_parameter, parameter, reason, value}) do
+    detail = if reason == :range, do: "value out of range", else: "invalid syntax"
+    error(conn, 400, "invalid #{parameter}: strconv.ParseUint: parsing #{Pulso.GoUnicode.quote(value)}: #{detail}")
+  end
+
+  defp failure(conn, {:invalid_trace_metrics_timestamp, parameter}),
+    do: error(conn, 400, "could not parse '#{parameter}' parameter")
+
+  defp failure(conn, :invalid_trace_metrics_since), do: error(conn, 400, "could not parse 'since' parameter:")
+
+  defp failure(conn, {:negative_trace_metrics_step, value}),
+    do: error(conn, 400, "cannot parse #{inspect(value)}: step must be positive")
+
+  defp failure(conn, {:trace_metrics_step_too_small, step, minimum}) do
+    error(
+      conn,
+      400,
+      "step of #{TempoDuration.format(step)} is too small, minimum step for given range is #{TempoDuration.format(minimum)}"
+    )
+  end
 
   defp failure(conn, reason)
        when reason in [

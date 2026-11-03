@@ -265,6 +265,9 @@ alerting:
 sentry:
   # Experimental JSON error ingestion. Numeric project ID => tenant, service,
   # public_key_hashes (1..8 lowercase SHA-256 digests of ingest-only DSN keys).
+  # Optional allowed_domains: up to 32 origin patterns, 1..256 UTF-8 bytes each.
+  # Omission allows all origins; [] denies Origin-bearing requests. SDKs without
+  # Origin still require valid credentials and are unaffected by that list.
   # Empty disables ingestion. Error events share log retention. Add exact SDK
   # paths to ingress.paths explicitly; see docs/error-tracking.md.
   projects: {}

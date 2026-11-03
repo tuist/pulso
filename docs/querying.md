@@ -63,6 +63,19 @@ They are disabled unless Tempo search is enabled (`PULSO_TEMPO_SEARCH_ENABLED`).
 Queries take `q` (or `query`), `start`, `end` (Unix seconds, nanoseconds or
 RFC3339; by default the hour before `end`, or `since`) and, for ranges, `step`
 (seconds or a duration; by default about 240 points).
+RFC3339 bounds preserve fractional nanoseconds, including digits beyond
+microseconds and timezone offsets. Upgrade query-serving applications for this
+boundary fix; numeric timestamp semantics, alignment and native metrics
+capability 5 are unchanged.
+
+Malformed metric `start`/`end` values return HTTP `400` naming the parameter:
+`could not parse 'start' parameter` or `could not parse 'end' parameter`.
+Malformed metric `since` values return `could not parse 'since' parameter:`.
+Successfully parsed zero/negative `since` values and invalid windows retain
+the existing generic rejection.
+Parsing grammar, defaults and existing end-before-since-before-start validation
+order are unchanged; complete upstream timestamp error text is not implemented.
+Upgrade query-serving applications for consistent diagnostics.
 
 Without `step`, windows shorter than one minute use multiples of 50 ms, with a
 50 ms minimum. Longer windows use a one-second minimum and round the window's
@@ -86,7 +99,16 @@ aggregate in seconds, and quantiles interpolate between power-of-two duration
 buckets. `with (...)` hints
 are accepted and ignored, so sampled queries return exact results. `| topk(n)` and
 `| bottomk(n)` keep, at each interval, the `n` series with the largest or
-smallest values, as Tempo does (ties go to the series first in label order).
+smallest values. For homogeneous string-label groups, top-k ties favor earlier
+labels and bottom-k ties favor later labels, as Tempo does. Full mixed-type/
+multi-label comparator parity is not established.
+A single finite scalar filter can precede ranking on an otherwise unranked
+pipeline, for example `{} | rate() > 10 | topk(5)`. Filtering runs before
+ranking, preserving qualifying values; ranking first can select different
+series. Every finalized slot, including missing or rejected samples, spends
+the same native work budget shared with selectors and other expression leaves.
+Multiple prefilters, repeated ranking and ranking an arithmetic result remain
+unsupported.
 `compare()` is not supported.
 
 Parenthesized metric pipelines compose with `+`, `-`, `*` and `/`, including
@@ -128,7 +150,14 @@ metadata and budget errors still fail the whole query rather than becoming zeros
 
 Range requests reject HTTP `400` when integer division of the original
 `end - start` by `step` exceeds 10,000, before alignment adds boundary intervals.
-Zero steps also reject. Alignment can therefore produce more than 10,000 output
+The diagnostic reports the requested step and minimum step for that range
+(the original width divided by 10,000, rounded down). For example, a six-minute
+range with `35ms` step reports a `36ms` minimum, without reading storage.
+Negative range steps reject with `400` and `step must be positive`, before
+reading storage. Zero and malformed steps retain their existing rejection policy;
+this diagnostic change does not broaden duration grammar or change native metrics
+capability 5. Upgrade query-serving applications for consistent diagnostics.
+Alignment can therefore produce more than 10,000 output
 points per series. Instant requests use one interval and ignore `step`.
 
 Spans are reduced natively per stored segment without being decoded into
@@ -150,7 +179,7 @@ span-ID grouping can read legacy rows with valid core fields. The same five-key,
 10,000-series and point/byte ceilings apply; exceeding them fails whole, never
 truncates. There is no unlimited-series override. Upgrade every query-serving
 app/native pair before relying on this syntax: startup requires trace metrics
-capability **3**, independently of the trace search/export/discovery tuple.
+capability **5**, independently of the trace search/export/discovery tuple.
 Storage format and keyed encoder bytes are unchanged; no retry drain or data
 migration is needed for this addition.
 
@@ -257,7 +286,12 @@ Pulso implements a subset of the
 - Nested `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`, `stdvar`,
   `quantile(q, vector)` and `count_values(label, vector)` aggregations with
   `by` and `without` grouping; `topk` and `bottomk` reject NaN and ranking
-  parameters at or above the signed int64 maximum; values below one yield no results
+  parameters at or above the signed int64 maximum; values below one yield no results.
+  Positive-`k` ranking ignores native histograms with query-local info notices;
+  unexecuted zero-`k` filters emit none (a remaining range-query difference from Mimir)
+- `min`, `max`, `stddev` and `stdvar` aggregations ignore native histograms with
+  query-local info notices, including histogram-only groups that produce no
+  sample. Float-only groups emit no histogram-ignored notice
 - Value-independent `limitk(k, vector)` and `limit_ratio(r, vector)` sampling
   aggregations, preserving complete float/native-histogram samples and labels
 - Scalar literals, unary signs, arithmetic (`+`, `-`, `*`, `/`, `%`, `^`, `atan2`),
@@ -265,18 +299,29 @@ Pulso implements a subset of the
 - Scalar query-context `start()`, `end()`, `step()`, `range()`, and two-scalar
   `min_of(a, b)`/`max_of(a, b)`
 - Vector matching with `on`, `ignoring`, `group_left`, and `group_right`;
-  ambiguous matches and duplicate output series return explicit errors
+  ambiguous matches and duplicate output series return explicit errors.
+  One-to-one cardinality is checked at each evaluation step before comparison
+  filtering: a false comparison cannot hide duplicate matching inputs. Inputs
+  without a counterpart do not create many-side matching conflicts. Upgrade
+  query-serving applications for consistent rejection; storage is unchanged
 - Classic `histogram_quantile`, `clamp`, `clamp_min`, `clamp_max`, `label_replace`, `label_join`,
   `vector`, `scalar`, `time`, `pi`, `round`, `abs`, `floor`, `ceil`, `sqrt`, `exp`,
   `ln`, `log2`, `log10`, `deg`, `rad`, `asin`, `acos`, `atan`, `sin`, `cos`, `tan`,
   `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `sgn`, `timestamp`, `absent`, `sort`, `sort_desc`,
   `sort_by_label`, `sort_by_label_desc`, `year`, `month`, `day_of_month`,
   `day_of_week`, `day_of_year`, `days_in_month`, `hour`, and `minute`
+  (`scalar` ignores native histograms and returns the sole float at each step,
+  or NaN if there are zero or multiple floats)
 - Subqueries such as `sum_over_time((max by(job)(gauge))[6h:5m])`;
   inner grids align independently to epoch multiples. Signed offsets and `@`
   anchors are supported. An omitted resolution (`[6h:]`) uses a fixed one-minute
   grid, independent of the outer step, window and nesting. Top-level subqueries
-  return matrices through the instant query endpoint
+  return matrices through the instant query endpoint. Native-histogram subqueries
+  clear explicit reset/no-reset hints on resampled points, so repeated selections
+  of one source sample cannot repeat a reset and skipped source samples cannot
+  suppress one. Gauge hints, floats and direct range-selector behavior remain
+  unchanged. Upgrade all query-serving applications for corrected counter range
+  results; no ingest/storage/native-format change or historical rewrite is needed
 - Stale markers: instant selectors stop at the latest stale marker until a new
   sample arrives; range functions ignore stale markers
 - IEEE-754 NaN and infinities, returned as `"NaN"`, `"+Inf"`, or `"-Inf"` in
@@ -470,8 +515,12 @@ nonempty values; do not rely on their relative order across implementations.
 Label sorting preserves names, labels, floats, signed zeros, NaNs, infinities
 and native histograms. Comparisons charge label lookup and inspected bytes to
 the shared work budget. Range queries bypass sorting and retain their normal
-label ordering. All four sort functions emit a deduplicated warning when range
-start and end differ, including empty inputs; a one-time range has no warning.
+label ordering. Value-based `sort` and `sort_desc` omit histogram-valued points
+in both instant and range queries, including single-step ranges; mixed series
+retain their float points and histogram-only series disappear. Range value
+sorting still does not reorder results. All four sort functions emit a
+deduplicated warning when range start and end differ, including empty inputs;
+a one-time range has no warning.
 Diagnostics omit upstream expression positions and remain local to each batch
 source. Existing sample/result/heap limits apply. Upgrade all query-serving
 applications; no native or stored-format change is required. Experimental
@@ -501,6 +550,12 @@ whole query, not just that step. Ambiguous one-side matches and unrelated
 duplicate output identities retain their existing diagnostics. Upgrade all
 query-serving applications for consistent error responses; successful samples,
 resource ceilings, native artifacts, storage and keyed bytes are unchanged.
+
+Invalid bounded regexes in PromQL `label_replace` reject before storage with
+`invalid regular expression in label_replace(): <pattern>`. The response
+remains HTTP 400 with `errorType="bad_data"`; destination validation, regex
+admission and resource ceilings are unchanged. This diagnostic does not imply
+complete upstream parser-error or HTTP-status parity.
 
 `label_join(vector, "destination", "separator", "source", ...)` joins source
 label values in argument order. Missing source labels contribute empty strings;
@@ -616,6 +671,13 @@ subtraction or reset-recovery additions, not every intermediate layout change.
 A failed middle-family check replaces that window's earlier gauge notices;
 other windows and batch sources keep their own notices. Native bucket/bound
 work charges the shared query/batch budget before reset detection and mapping.
+
+When `rate` or `increase` produces a float result, a nonempty metric name not
+ending in `_total`, `_sum`, `_count` or `_bucket` adds a deduplicated query-local
+`infos` notice that it might not be a counter. This is a naming heuristic, not
+counter-type validation. Histogram-only outputs, omitted windows and empty names
+do not receive this notice; samples and arithmetic are unchanged. Upgrade
+query-serving applications for consistent annotations; no native/storage change.
 
 `changes(series[window])` counts unequal consecutive nonstale observations;
 `resets(series[window])` counts counter resets. For floats, any decrease is a
@@ -912,10 +974,16 @@ keyed-byte change is required.
 
 Functions, aggregations and comparisons that only read floats (`min`, `max`,
 `topk`, `abs`, `min_over_time`, `>`, and so on) leave histograms out, and
-windows or groups mixing floats and histograms have no result, as in
-Prometheus. Custom-bucket histograms (schema -53) are supported. Arithmetic
-mixing them with exponential ones has no result; `irate` can instead treat a
+`min_over_time`/`max_over_time` retain float extrema with an info annotation
+when a window also contains histograms. Histogram-only extrema are empty
+without that notice. Operations requiring a single sample type, such as
+`sum_over_time`, omit mixed windows instead. Custom-bucket histograms
+(schema -53) are supported. Arithmetic mixing them with exponential ones has
+no result; `irate` can instead treat a
 changed bucket family as a reset and use the newest histogram directly.
+`stddev_over_time`/`stdvar_over_time` likewise ignore histograms and add info only
+for mixed windows, not histogram-only input. Upgrade query-serving applications
+for these notices; numerical results are unchanged.
 
 Native addition and subtraction reconcile differing custom layouts to their
 common bounds, rolling remaining buckets into `+Inf` with source-ordered
@@ -1095,6 +1163,13 @@ object and version evidence; there is no automatic repair command.
 the tenant in the `X-Scope-OrgID` header, like Loki, or the username of HTTP
 Basic credentials when the header is absent.
 
+Raw-log `/query_range` windows are start-inclusive and end-exclusive:
+`start <= timestamp < end`, before ordering and `limit`. A line exactly at
+`end` is not returned; equal bounds produce no lines after normal validation.
+Upgrade query-serving applications for consistent range boundaries. Metric
+evaluation keeps its inclusive end; instant log queries, discovery/detected
+APIs and MCP/shared storage bounds are unchanged. No native/storage-format change.
+
 When a range query omits `step`, the resolution is the window duration divided
 by 250, rounded down to whole seconds, with a one-second minimum, as in Loki.
 Supply `step` explicitly when you need a finer grid: a coarse default grid may
@@ -1262,7 +1337,7 @@ occupied suffixed name. Parsers use the same metadata-name protection as other
 attributes. Use pipeline filters such as `{app="api"} | trace_id="..."` or metric
 grouping to query the IDs; they are not added to stream selectors or discovery.
 This applies to already-stored logs too, without rewriting records. Upgrade all
-query-serving app/native pairs to log codec tuple `{1,1,17}` before relying on
+query-serving app/native pairs to log codec tuple `{1,1,18}` before relying on
 these labels; storage formats, keyed bytes and resource ceilings are unchanged.
 
 Without an encoding header, log results keep merged stream, structured-metadata
@@ -1320,6 +1395,18 @@ it later. Missing rename sources do not add empty labels. Templates within one
 stage share the labels captured at its first template, after preceding renames;
 later assignments do not change that snapshot. A later `label_format` stage
 takes a new snapshot.
+
+Active pipeline errors own their error/details independently of ordinary
+same-named labels. Formatting `__error_details__` cannot hide an active parser
+diagnostic in output or error-preserving metric groups. Dropping the active
+details reveals any ordinary value beneath them; renames and ordinary details
+filters read that ordinary value. General templates read the rendered active
+diagnostic, except a single-field `line_format "{{.__error_details__}}"`, which
+uses ordinary lookup. `keep` preserves both error names. A genuine later error
+replaces the active diagnostic without destroying hidden ordinary labels.
+These formatter pipelines use the bounded Elixir evaluator; existing work,
+output and fail-whole limits remain. Upgrade query-serving applications for
+consistent behavior; no native/storage-format change is required.
 
 Both formatters support literal text, missing-as-empty `{{.label}}` lookups,
 quoted string, boolean, `nil`, signed-int64 integer, finite float and rune constants, parenthesized
@@ -1582,7 +1669,7 @@ at least their byte length, including unknown names that emit nothing.
 Each additional duplicate capture examined also spends one work unit, even
 when every candidate is unmatched and the reference emits no bytes.
 Output/work exhaustion fails the whole query, never as a preservable formatting error. Matching
-query-serving apps/native artifacts require log codec tuple `{1,1,17}` for
+query-serving apps/native artifacts require log codec tuple `{1,1,18}` for
 regex replacement; storage and keyed encoder bytes are unchanged.
 
 `trunc count text` selects the first count bytes, or the final -count bytes for
@@ -1827,7 +1914,7 @@ selection; it is not a preservable formatting
 error. Existing query length, scan, work, deadline and heap limits still apply.
 Channel/function iteration, date-layout/timezone functions beyond the timestamp
 helpers above and other Go-template built-ins remain unsupported. Upgrade every
-query-serving app/native pair to log tuple `{1,1,17}` for regex counting/replacement;
+query-serving app/native pair to log tuple `{1,1,18}` for regex counting/replacement;
 storage-format and keyed-ingest bytes are unchanged.
 
 `| json` flattens nested object scalar fields with `_` separators, sanitizes
@@ -2040,7 +2127,7 @@ wording and positions remain incomplete.
 
 Upgrade every serving app/native pair together before relying on these parser
 collision, logfmt, quantity and filter-error semantics. The required log codec
-tuple is `{1,1,17}`; older artifacts fail startup. They do not change stored
+tuple is `{1,1,18}`; older artifacts fail startup. They do not change stored
 records or keyed encoder bytes.
 
 ### Limits and metric evaluation
@@ -2134,6 +2221,18 @@ against `PULSO_QUERY_MAX_LOG_SAMPLES` and every selected line as work (see
 [query budgets](configuration.md#query-budgets)); log queries do not use
 PromQL's `PULSO_QUERY_MAX_SAMPLES`.
 
+LogQL `sum_over_time` and vector `sum` use compensated floating-point summation,
+retaining small contributions across observations and series, including when
+large positive and negative values cancel.
+This is still float64 arithmetic, not exact arbitrary-precision summation;
+existing selected-sample, window-work and output ceilings are unchanged.
+
+The leading `quantile_over_time` parameter is an unsigned numeric token:
+`-0.1`, `-0` and explicitly signed `+0.5` reject before storage, while exponent
+signs such as `5e-1` remain valid. Values above one still return `+Inf`;
+signed scalar expressions elsewhere retain their existing meanings. Rejections
+use the existing parse-error envelope, not exact upstream diagnostic text.
+
 ### Stream discovery
 
 `/loki/api/v1/labels`, `/loki/api/v1/label/<name>/values` (both with an
@@ -2145,6 +2244,18 @@ Empty values count as absent. Repeated `match` and `match[]` values are unioned
 and deduplicated. Omission or a lone `{}` selector (including ASCII spaces)
 discovers all streams under the same budgets. Without explicit bounds,
 discovery covers the last hour; `since` can change that window.
+
+On these three discovery endpoints, repeated scalar `query`, `start`, `end`
+and `since` parameters use their first value. Form-body values precede URL
+values, including empty values: an empty first value uses the parameter's
+default, while an invalid first value rejects even if a later value is valid.
+Names are literal: `query[]`, `start[]`, `end[]`, `since[]` and nested bracket
+spellings are separate, unused parameters, not arrays/maps of the scalar name.
+They neither select streams nor override or repair a malformed literal parameter.
+This does not change repeated selector unions, discovery request-size ceilings
+or the separate Prometheus discovery duplicate-parameter rejection policy.
+Upgrade query-serving applications for these discovery parsing semantics;
+native/storage/keyed-byte formats and resource ceilings are unchanged.
 
 Discovery selectors and the `query` parameter of `/loki/api/v1/index/stats`
 accept only label matchers. A pipeline such as `{job="api"} |= "error"` or
@@ -2164,7 +2275,13 @@ selector when a broad request fails.
 alone, which Grafana shows before running a query. It counts whole stored
 segments that overlap the range and can match an exact service selector, so it
 is an upper bound; `streams` is always `0` because Pulso does not index
-streams.
+streams. GET and form POST validate the same range parameters as Loki:
+positive uint32 `limit`, case-insensitive `forward`/`backward` direction,
+positive `step` with at most 11,000 integer intervals, and nonnegative
+`interval`. Empty values use the range-query defaults. These parameters are
+validated even though statistics use only the selector and time bounds;
+they do not sample or truncate the estimated totals. Invalid parameters
+return `400` before storage reads. Existing window policies still apply.
 
 `/loki/api/v1/index/volume` and `/loki/api/v1/index/volume_range` return log
 bytes per group, largest first. Both accept GET and form POST:
@@ -2227,7 +2344,12 @@ Grafana's Loki query builder and Logs Drilldown use these for suggestions.
 `/loki/api/v1/detected_labels` returns the stream labels an optional `query`
 selector matches, with their number of distinct values, from the same complete
 discovery as `series`. Like Loki, it omits labels whose values are all numbers
-or UUIDs, except `cluster`, `namespace`, `instance` and `pod`.
+or UUIDs, except `cluster`, `namespace`, `instance` and `pod`, and nonempty
+value sets containing only the literal strings `0` and/or `1`. Other numeric
+spellings such as `0.0`, `+0` or `-0` do not get this boolean exception.
+Detected-field typing still classifies `0`/`1` as integers; only label
+suggestion filtering changes. Upgrade query-serving applications; no native
+or storage-format change is required.
 
 `/loki/api/v1/detected_fields` and
 `/loki/api/v1/detected_field/<name>/values` read the newest `line_limit`
@@ -2237,8 +2359,44 @@ structured metadata (log attributes), labels the query's own parsers extract,
 and the line parsed as JSON (nested objects joined with `_`, reported with their
 JSON path) or otherwise as logfmt. Types are Loki's: `int`, `float`,
 `boolean`, `duration`, `bytes` or `string`. `limit` (default 1000, at most
-5000) caps the number of fields or values. Cardinality is the exact count of
-distinct values in the sampled lines, where Loki estimates it.
+5000) caps the number of fields or values. A missing or empty `limit` falls
+back to the legacy `field_limit` parameter; if both are missing/empty, the
+default applies. A nonempty `limit` takes precedence, even when invalid.
+The selected value must be a positive integer at most 5000; invalid values
+reject before storage rather than silently using the default. Cardinality is
+the exact count of distinct values in the sampled lines, where Loki estimates it.
+
+Detected-field JSON observation also recognizes a trailing comma after an
+object's final value, including nested objects, without changing stored lines.
+This is local to field detection: commas inside strings stay literal, trailing
+array commas and other malformed structures remain invalid, and ordinary
+LogQL `| json` and JSON transport admission do not change. Invalid detector
+JSON still falls back to logfmt. The additional scan/decode stays after
+newest-line selection under existing query-worker bounds; it does not make
+field discovery a complete malformed-JSON parser. Upgrade query-serving
+applications; no native/storage-format change is required.
+
+JSON string values observed by field detection replace decoded U+FFFD (`�`)
+characters with spaces, matching ordinary LogQL JSON extraction. This includes
+JSON `\ufffd` escapes, but not literal backslash text. Original stored lines,
+JSON keys/paths and structured metadata remain unchanged. Upgrade query-serving
+applications for this observation-only correction; storage formats and resource
+ceilings do not change.
+
+Automatic logfmt field detection keeps the first retained value for each final
+field name, including sanitized-key aliases and stream-label `_extracted`
+suffix collisions. Empty values are skipped by default, so an empty first pair
+does not claim the name. Stored lines, metadata and ordinary LogQL parsing stay
+unchanged. Upgrade query-serving applications for consistent suggestions;
+storage formats and resource ceilings do not change.
+
+Both endpoints validate `step` as seconds or an ordered integer Prometheus
+duration, with a minimum of 1 ms. Omission or an empty value uses the whole-second
+floor of the window divided by 250, at least one second. The integer-truncated
+number of intervals must not exceed 11,000, calculated with the original duration
+before any millisecond truncation. Malformed, smaller or overflowing steps return
+HTTP 400 before storage; parameter text remains bounded to 128 bytes. This is
+request admission, not a change to Pulso's newest-line sampling or field results.
 
 Both time bounds are inclusive. The newest-line limit applies across all
 matching segments, not separately to each segment or time bucket. Widening the
@@ -2246,6 +2404,8 @@ window may reveal older field values only when they fit in that sample; it does
 not turn these suggestions into a complete retained-field inventory. GET and
 form POST use the same bounds and sampling rules, and existing scan/query
 resource limits still apply to wide windows.
+Upgrade query-serving applications for empty-limit fallback and step admission;
+native/storage/keyed-byte formats and existing resource ceilings are unchanged.
 
 ### Live tail
 
@@ -2410,7 +2570,8 @@ shared schema admission; counting allocates no name metadata. Existing program,
 scan, work and heap limits also apply.
 
 Upgrade every query-serving app/native pair before relying on these forms.
-The required log capability tuple is `{1,1,17}` for correlation-ID metadata,
+The required log capability tuple is `{1,1,18}` for missing unwrap values before
+prior pipeline-error checks, correlation-ID metadata,
 scalar class complements, Unicode property admission and numeric/repeated capture names;
 trace/metric capability tuples, storage formats and keyed bytes are unchanged.
 Unsupported syntax rejects rather than switching dialects. Remaining pipeline
@@ -2428,8 +2589,13 @@ the default start using ordered integer Prometheus durations such as `1d2h`;
 an explicit start wins, but malformed `since` still rejects. Supply explicit
 bounds for older data.
 `time`, `start` and `end` accept integer Unix timestamps, decimal Unix seconds
-or RFC3339 strings. RFC3339 retains nanosecond fractions; decimal seconds follow
-Loki's float64 conversion and millisecond fractional rounding, not exact decimal
+or RFC3339 strings. Calendar parsing follows Go's RFC3339Nano grammar, including
+single-digit hours, dot/comma fractions and signed timezone offsets with hours
+up to 24 and minutes up to 60 (inclusive). Clock hours still stop at 23;
+lowercase `t`/`z`, leap seconds and malformed dates reject. Fractions retain
+the first nine digits, truncating additional digits rather than rounding.
+Decimal seconds follow Loki's float64 conversion and millisecond fractional
+rounding, not exact decimal
 nanoseconds. As in Loki, integer strings of at most ten
 characters mean Unix seconds; longer integer strings mean Unix nanoseconds.
 The converted value must fit signed int64 nanoseconds. Use RFC3339 to identify
@@ -2462,14 +2628,47 @@ window. Set operators preserve sample values and unmatched right-hand union
 members. Empty-label aggregations remain vectors, and ambiguous arithmetic
 matching returns an error rather than overwriting a series.
 
+For duplicate indexed-side series in LogQL binary matching, the error message
+identifies the `right hand-side`, or the `left hand-side` when `group_right`
+indexes the left operand. A matched many-side collision without an explicit
+group modifier reports `multiple matches for labels: many-to-one matching must
+be explicit (group_left/group_right)`. These remain HTTP 400/`evaluation_failed`;
+matching, filtering and grouped-output uniqueness policies are unchanged.
+Upgrade query-serving applications; no native or storage change is required.
+
+LogQL ranking parameters validate before storage reads. For `topk`, an omitted
+parameter reports `parameter required`, while a fractional parameter reports
+`invalid parameter`. These remain HTTP 400/`evaluation_failed`; valid ranking
+results, integer admission, zero-rank policy and budgets are unchanged.
+Upgrade query-serving applications; no native or storage change is required.
+
+LogQL `sort` and `sort_desc` reject nonempty `by` or `without` grouping,
+including nested aggregations, before reading storage. Empty `by ()` and
+`without ()` remain admitted, as do ungrouped sorts and grouping on ordinary
+aggregators. Rejections use HTTP 400/`parse_error` with
+`sort and sort_desc doesn't allow grouping by`. Upgrade query-serving
+applications; sorting algorithms, budgets and native/storage formats are unchanged.
+
+For `absent_over_time` without `unwrap`, a pipeline consisting only of plain
+`json` parsers and line filters skips unused JSON extraction. Malformed JSON
+then still proves presence instead of creating an unused parser error. The
+whole pipeline must qualify: label/error filters, format stages, explicit JSON
+fields and other parsers retain ordinary execution and error checks. Pre-existing
+metadata errors still fail observations. Validation and selected scan/work
+charges remain; this is not general parser-hint or error-suppression support.
+Upgrade query-serving applications; log codec `{1,1,18}` remains sufficient.
+
 Every `unwrap` aggregation skips missing or empty target fields, including
 duration/byte conversions. They create neither observations nor empty series;
 `absent_over_time` therefore returns one when all target fields in the window
 are missing/empty. Present malformed values still fail evaluated windows.
+An earlier pipeline error on a skipped line does not fail the aggregation:
+there is no observation to carry it. Usable unwrap targets and count/bytes
+observations retain their existing error checks on both native and Elixir paths.
 Skipped fields consume scan and pipeline work, not retained-log-sample quota.
 Upgrade every query-serving app/native pair before relying on this behavior;
-the required log codec tuple is `{1,1,8}`. Old native artifacts fail startup
-rather than serving the previous extraction-error behavior. No storage-format,
+the required log codec tuple is `{1,1,18}`. Old native artifacts fail startup
+rather than serving the previous error behavior. No storage-format,
 keyed encoder-byte change, migration or retry drain is needed.
 
 `rate_counter({app="api"} | logfmt | unwrap requests [5m])` treats the extracted
@@ -2517,7 +2716,9 @@ evaluated window fail the whole query, including invalid middle samples in
 or quantile. Invalid unwrap samples fetched only between sparse evaluation
 windows do not invalidate windows they do not belong to. Unpreserved nonempty
 `__error__` labels fail metric queries before grouping can discard them; the
-strict guard on missing unwrap fields remains. Complete parser-error generation
+guard applies only when a usable unwrap target supplies an observation.
+Missing/empty targets skip earlier errors but still spend scan/pipeline work.
+Complete parser-error generation
 remains unsupported; quoted/raw string literals use Loki's scanner/decoder
 profile above, and runtime numeric/duration/byte conversion details use the Go
 profiles above.

@@ -37,7 +37,7 @@ and trace/span identifiers are retained as part of the event, subject to scrubbi
 and budgets. Native crash minidumps are not JSON events and are unsupported.
 
 `PULSO_SENTRY_PROJECTS_JSON` is a JSON object with at most 256 projects. IDs are
-1–32 decimal digits. Each object has exactly `tenant`, `service` and
+1–32 decimal digits. Each object requires `tenant`, `service` and
 `public_key_hashes`; tenant/service use 1–128 letters, digits, `_`, `.` or `-`.
 There must be 1–8 lowercase SHA-256 hex digests per project. Invalid configuration
 stops startup. Give a project its own key; sharing a key intentionally permits
@@ -46,6 +46,24 @@ restarting all nodes, updating SDKs, then removing the old digest and restarting
 Keep project IDs bound to the same tenant/service across deployments. Changing
 the mapping changes attribution for future events, not stored records; do not
 reassign IDs or reuse old DSNs across tenant trust boundaries.
+
+Optionally set `allowed_domains` per project to restrict browser ingestion on
+store, pixel and envelope routes. Omission preserves unrestricted origins;
+`[]` denies all requests carrying an Origin header. Requests without Origin
+remain accepted with valid credentials, including with an empty list.
+Allow at most 32 nonempty UTF-8 patterns, each at most 256 bytes. Examples:
+`["https://app.example.com", "https://*.example.com:8443"]`. Components compare
+case-insensitively; omitted scheme/port or a whole `*` component is unrestricted.
+A leading domain `*` matches the root or subdomains only on a label boundary;
+other embedded stars are literal. Bracketed IPv6 is supported. Pattern paths
+are ignored and explicit ports compare literally, without default-port inference.
+With this option set, Origin must be a single HTTP(S) origin of at most 2048
+bytes, without credentials, path, query or fragment; opaque/malformed origins
+reject with `403`. These grammar bounds and the rejection status are local
+policies, not full Relay origin-parser parity. Origin never replaces a key or
+resolves an ambiguous project-less key. This is a browser restriction, not
+authentication: non-browser clients can omit or forge the header. Restart all
+serving instances after changing the project map so restrictions agree.
 
 The Helm chart accepts this map as `sentry.projects`. Its ingress does **not**
 expose SDK paths by default. Add an exact path for each enabled endpoint, alongside
@@ -64,6 +82,9 @@ ingress:
       pathType: Exact
     - path: /api/42/store/
       pathType: Exact
+    # Optional, for legacy clients without a project in their URL.
+    - path: /api/store/
+      pathType: Exact
     - path: /mcp
       pathType: Exact
 ```
@@ -73,20 +94,74 @@ ingress:
 - `POST /api/<project>/envelope/`: byte-framed Sentry envelopes, including an
   optional final newline and length-delimited multiline/binary items. At most one
   `event` item. Empty envelopes are valid.
-- `POST /api/<project>/store/`: legacy plain JSON error events. Base64/zlib store
-  bodies are unsupported.
-- Both endpoints accept identity and gzip encoding; other encodings return `415`.
+- `POST /api/<project>/store/`: JSON error events, including legacy base64 JSON
+  and base64-wrapped zlib bodies without a `Content-Encoding` header. Legacy
+  decoding runs after authentication and any HTTP decompression; its decoded
+  event is limited to 1 MiB before JSON parsing. Zlib must be one complete,
+  checksummed stream. Raw unwrapped zlib, raw DEFLATE, gzip inside base64 and
+  recursive base64 reject. Base64 envelope framing is not supported.
+  An exact `Content-Type: application/x-sentry-envelope` instead selects the
+  bounded envelope decoder, with the same event/item/body ceilings and discard
+  reporting as `/envelope/`. This is a raw, case-sensitive match; media-type
+  parameters do not select it. Store still requires credentials in the request
+  header/query, even when the envelope contains a DSN. Supplied DSN credentials
+  must also agree with the request. Use the JSON media type for a JSON event:
+  a lone JSON object under the envelope media type is a header-only envelope,
+  returning `id: null` without storing an event. Upgrade ingress applications
+  consistently before sending envelopes to store URLs.
+- `POST /api/store/`: the same store receiver for legacy clients whose URL has
+  no project ID. The presented key must match exactly one configured project;
+  missing, unknown or ambiguous keys return `403`. Key rotation aliases within
+  one project are supported. Payload `project`, query `project_id` and tenant
+  headers cannot choose the project. Prefer project-scoped URLs when projects
+  share a key; those URLs continue to authenticate only their named project.
+  Envelope POSTs can use a uniquely resolving request credential without a DSN;
+  an envelope DSN cannot bind to a project-less URL and rejects.
+- `GET /api/<project>/store/` and `GET /api/store/`: legacy pixel ingestion.
+  URL-encode the JSON event or its base64/base64-zlib representation in
+  `sentry_data`, with the same configured credentials and project-binding rules.
+  After durable publication, the response is a 1×1 `image/gif` with
+  `Cache-Control: no-store`, not a JSON event ID. Invalid requests and storage
+  failures return error statuses, never a successful pixel. `HEAD` probes return
+  `405` without publication; envelope GET ingestion is not supported.
+  **Prefer POST:** URLs can expose unscrubbed event data in proxy, access or
+  security logs before Pulso's payload scrubbing. Omit query strings from such
+  logs and do not cache ingestion responses.
+- POST bodies accept identity, gzip, zlib-wrapped `deflate` and `zstd` encoding;
+  other encodings return `415`. Deflate requires one complete stream with a
+  valid checksum; raw DEFLATE, trailing bytes and concatenated streams reject.
+  Zstd requires one complete standard frame without a preset dictionary and a
+  window no larger than 16 MiB; checksums, when present, must validate.
+  Truncated, trailing, concatenated and skippable frames reject with `400`;
+  oversized windows or expanded bodies return `413`.
+  An omitted or single empty `Content-Encoding` value means identity, not gzip
+  auto-detection. Brotli and stacked encodings remain unsupported.
   Envelope requests may use the standard SDK media type, no content type, or
   browser simple-request media types. Browser ingestion supports `OPTIONS` and
-  wildcard, credential-free CORS; reads do not inherit this policy.
+  wildcard, credential-free CORS. Preflight advertises `POST` only and permits
+  `Content-Encoding` for compressed requests, alongside `Content-Type`,
+  `Authorization`, `X-Sentry-Auth`, `sentry-trace` and `baggage`. Ingestion
+  responses include `Cross-Origin-Resource-Policy: cross-origin`, including
+  preflight and rejected requests. This does not enable cookie authentication;
+  reads do not inherit these policies.
 - Credentials may be `X-Sentry-Auth: Sentry sentry_key=<PUBLIC_KEY>, sentry_version=7`,
-  query parameter `sentry_key`, or the envelope header's `dsn`. When multiple
-  forms are present, keys must agree and the DSN project must match the URL.
+  the same Sentry scheme in `Authorization`, query parameter `sentry_key`, or
+  (on `/envelope/`) the envelope header's `dsn`. The Sentry scheme is
+  case-insensitive in either header; field names remain case-sensitive.
+  When multiple forms are present, keys must agree and the DSN project must match
+  the URL.
+  An exactly empty `X-Sentry-Auth` value is treated as absent; a valid query key
+  or envelope DSN is still required. Nonempty malformed headers remain invalid.
   Unknown projects/keys and missing or inconsistent credentials return `403`.
+  Other `Authorization` schemes do not supply a Sentry key: tenant bearer tokens
+  cannot ingest Sentry events, and Sentry keys cannot authorize reads. HTTP Basic
+  authentication on Sentry routes is not supported. Upgrade all Sentry-serving
+  apps before relying on the alternate header or mixed-case scheme spelling.
 - Credential configuration, not payload fields or `X-Scope-OrgID`, determines
   tenant and service. Public DSN keys allow **ingestion only**, never queries.
-- `200` with `{"id":"<event ID>","discarded_items":{}}` follows durable event
-  publication: Parquet segment PUT and conditional manifest publication. Storage
+- Successful POST responses use `200` with `{"id":"<event ID>","discarded_items":{}}`.
+  Both POST success and a pixel GET's `200` follow durable event publication:
+  Parquet segment PUT and conditional manifest publication. Storage
   failure returns `503` with `Retry-After: 5`, never local acceptance. This is a
   truthful negative acknowledgment, **not a guarantee of SDK redelivery**.
   Stock Python 2.72.0 and Node 11.8.0 SDKs did not replay failed `503` uploads in
@@ -102,16 +177,51 @@ ingress:
   `400`, with no append. Envelope event IDs take precedence over payload IDs;
   32-hex or canonical dashed UUIDs normalize to lowercase hex. Missing IDs are
   generated, so clients without stable IDs cannot deduplicate retries.
-- Timestamps accept Unix seconds or ISO-8601 with a timezone, must be nonnegative
-  signed-64-bit nanoseconds, and cannot exceed the node clock by ten minutes.
-  Missing timestamps use receipt time. No clock-drift correction is applied.
-  Log retention can independently reject expired/future records with `400`.
-- Limits: 4 MiB wire body, 16 MiB expanded gzip body, 1 MiB per event, 100 envelope
-  items and 16 KiB per envelope/item header. Event structure follows the shared
+- Newly ingested events project Sentry level aliases `log` → `info` and
+  `critical` → `fatal`, and integer Python levels 10/20/30/40/50 →
+  `debug`/`info`/`warning`/`error`/`fatal`, into log severity text and numbers.
+  The original event's `level` remains unchanged. Unknown nonempty string levels
+  retain their text with error severity; missing or other unsupported values
+  retain the existing error fallback. This is not full event normalization.
+  Upgrade all Sentry-serving instances for consistent projection; stored history
+  is not rewritten and no storage migration is required.
+- Environment filters also recognize legacy `tags.environment` (object tags or
+  ordered key/value pairs) when the top-level environment is absent, empty or
+  non-string. A nonempty top-level string wins; otherwise the first matching
+  tag owns the projection, even when empty or null. Tag scalar values use the
+  release scalar conversion below, then trim surrounding whitespace. The raw
+  scrubbed event and tags remain unchanged. This is not full Relay tag or
+  environment validation. Upgrade all Sentry-serving instances for consistent
+  new-event filtering; existing stored projections are not repaired. No storage
+  migration or issue-ID change is required.
+- Release filters use scalar normalization: strings stay unchanged, booleans
+  become `True`/`False`, signed-int64/unsigned-uint64 integers become decimal
+  strings, and floats strictly inside ±2⁵³ truncate toward zero (including
+  `-0`). Null, containers and out-of-precision floats project an empty release.
+  The scrubbed event keeps its original release type/value. Upgrade all
+  Sentry-serving instances for consistent filtering of new events; previously
+  stored empty release projections are not repaired. Issue IDs and existing
+  string releases are unchanged. No storage-format migration is required.
+- Timestamps accept Unix seconds or ISO-8601. Floating-point Unix seconds round
+  to the nearest microsecond, including carry into the next second; the raw event
+  value is preserved. Integer seconds remain exact. Upgrade all Sentry-serving
+  instances for consistent new-event timestamps; stored history is not rewritten.
+  Offset-free date-times mean UTC,
+  not the node's local timezone; malformed dates/offsets still reject. Times
+  must be nonnegative signed-64-bit nanoseconds and cannot exceed the node clock
+  by ten minutes. Missing timestamps use receipt time. No clock-drift correction
+  is applied. Log retention can independently reject expired/future records
+  with `400`, including legacy events with old source timestamps.
+- Limits: 4 MiB wire body, 16 MiB expanded gzip/deflate/zstd body, 1 MiB per event,
+  100 envelope items and 16 KiB per envelope/item header. Event structure follows the shared
   `PULSO_INGEST_MAX_DEPTH`, `MAX_NODES`, `MAX_ATTRIBUTES` and `MAX_KEY_BYTES`
   budgets; event string/aggregate bytes are capped at 1 MiB. Fingerprints contain
-  at most 32 strings of 256 bytes each. Oversized bodies/events/items/structure
-  return `413`. These are request safety limits, **not per-key rate limiting**.
+  at most 32 supplied components, with strings capped at 256 bytes each.
+  Oversized bodies/events/items/structure return `413`. Pixel query strings retain the existing 1,000,000-byte application
+  ceiling (`414` above it); decoded/inflated events still cap at 1 MiB. HTTP
+  servers and proxies can impose lower URL limits; the default HTTP/1 request
+  line limit is 10,000 bytes. These are request safety limits,
+  **not per-key rate limiting**.
 
 ## Query errors and issue groups
 
@@ -183,10 +293,95 @@ fingerprints override grouping; `{{ default }}` expands default components.
 JSON-framed components prevent delimiter collisions. This is **Pulso grouping**,
 not byte-for-byte Sentry or Atlas grouping compatibility.
 
+Fingerprint arrays accept strings, booleans (`True`/`False`), signed-int64 or
+unsigned-uint64 integers, and floats with absolute value strictly below 2⁵³.
+Floats truncate toward zero, preserving a negative-zero component as `-0`.
+Null components are ignored; an empty effective fingerprint uses default grouping.
+Only grouping components are converted: the scrubbed event keeps its original
+fingerprint values. At most 32 supplied components and 256 bytes per string
+are accepted. Malformed components and out-of-range numbers reject the whole
+event, rather than silently falling back to another group. Upgrade all
+Sentry-serving applications for consistent admission; existing issue IDs and
+accepted string-fingerprint identities are unchanged. No storage migration.
+
+Exception containers may be a `{"values":[...]}` object, a direct array or a
+single exception object. Titles and new-event grouping select the last exception
+consistently across these forms; the scrubbed event retains its original shape.
+Upgrade all Sentry-serving applications for consistent grouping of new events.
+Previously stored issue IDs are not rewritten or merged: old array/single-object
+events can remain in their former fallback groups, even though raw retained-window
+issue titles now recognize their exception details. Existing wrapped-event identities are
+unchanged. This does not normalize other Sentry container fields.
+
+A nonempty string `logentry` supplies the same title and new-event grouping
+message as `{"formatted":"..."}`. Exception values still take precedence,
+and the scrubbed event retains the original string. Upgrade Sentry-serving
+applications consistently; existing issue IDs are not rewritten or merged.
+This does not interpolate log parameters or implement full Relay normalization.
+
+Non-object `logentry`, legacy `message` and `sentry.interfaces.Message` values
+also supply JSON display text for numbers, `true` and arrays. Literal `false`
+and null remain absent; objects still require string `formatted`/`message`
+fields. Rendering follows scrubbing and preserves the original event values,
+exception precedence and the 500-character title bound. Numeric text uses
+Pulso's JSON encoder, not complete Relay float-format parity. Upgrade query and
+ingress apps together: new default groups can change, but retained issue IDs
+and materialized summaries are not migrated. Storage/native formats are unchanged.
+
+Legacy top-level `message` objects also use their string `message` field when
+`formatted` is absent or null, rather than falling back to `Error`. Explicit
+`logentry` and exception values retain precedence, and empty formatted strings
+remain empty. Scrubbed event shapes and custom fingerprints stay unchanged.
+Upgrade Sentry-serving applications consistently for new default groups;
+retained issue IDs and materialized summaries are not migrated. The existing
+500-character title limit still applies, without parameter interpolation or
+any storage-format/native change.
+
+The exact legacy names `sentry.interfaces.Message` and
+`sentry.interfaces.Exception` also supply logentry and exception details for
+titles and new default groups. A present canonical `logentry` or `exception`
+field takes priority over its alias, even when null or malformed; similarly
+prefixed or differently cased names are not aliases. Original scrubbed event
+shapes and custom fingerprints stay unchanged. Upgrade query and ingress
+applications together: raw retained-window titles can improve, but old stored
+issue IDs and materialized summaries are not rewritten or merged. This does
+not add general alias normalization, parameter interpolation or a native/
+storage-format change.
+
+Within an exception, `sentry.interfaces.Stacktrace` supplies frame-based default
+grouping when `stacktrace` is absent. A present canonical field wins even when
+null, malformed or empty; similarly named fields are not aliases. Original
+scrubbed exceptions and literal custom fingerprints stay unchanged; `{{default}}`
+fingerprint components use the frame-based default. Upgrade
+ingress applications consistently: new legacy-stacktrace events can get different
+issue IDs, while retained issue IDs and materialized summaries are not rewritten
+or merged. This does not add top-level event-stacktrace grouping or symbolication.
+
+Non-string exception `value` fields supply compact JSON text for issue titles
+and new-event default grouping instead of disappearing into the fallback
+message. Object keys sort lexically, including nested objects; strings remain
+literal and null retains the existing fallback. Conversion happens after
+scrubbing, so filtered credentials cannot reappear in a title. Original scrubbed
+event types and custom fingerprints remain unchanged, with the same 500-character
+title bound. Numeric rendering uses Pulso's JSON encoder, not a claim of complete
+Relay float-format parity. Upgrade all Sentry-serving applications consistently:
+new default groups can differ for these values, while previously stored issue
+IDs and already-materialized index summaries are not rewritten or merged.
+No storage-format or native upgrade is required.
+
 Events also work with existing LogQL, for example
 `{error_source="sentry", error_project="42", environment="production"}`.
 Their trace/span IDs support correlation with other logs. LogQL counts raw
 attempts rather than deduplicated errors.
+
+For new events, `contexts.trace.trace_id` accepts either 32 hexadecimal digits
+or a canonical dashed UUID (`8-4-4-4-12` digits), case-insensitively. Correlation
+fields store lowercase, undashed IDs; the original scrubbed context is preserved.
+Span IDs still require exactly 16 hexadecimal digits. Invalid optional correlation
+IDs produce absent correlation fields rather than rejecting the event; this is
+separate from validation of the event's own `event_id`. Upgrade ingress
+applications consistently. Previously stored absent correlation IDs are not
+backfilled, and issue grouping, resource ceilings and storage formats do not change.
 
 ## Storage, privacy and limits
 
@@ -218,13 +413,23 @@ policy or event deletion API. Use Pulso's coordinated retention, not independent
 bucket lifecycle deletion of live segments.
 
 Before persistence, Pulso removes entire `user`, `request` and `headers` fields
-and recursively filters common named credentials such as authorization, cookie,
-password, secret, token, API keys and DSNs. This is a conservative baseline, not
+and the legacy `sentry.interfaces.User` / `sentry.interfaces.Http` equivalents.
+These exact interface names are matched case-insensitively, including nested
+objects; similarly prefixed arbitrary names are not interface aliases.
+Common named credentials such as authorization, cookie, password, secret,
+token, API keys and DSNs are recursively filtered. This is a conservative baseline, not
 general PII detection: exception messages, URLs, source context, breadcrumbs,
 tags and arbitrary `extra` strings can still contain sensitive information.
 Configure SDK `before_send` scrubbing and keep `send_default_pii` disabled.
 Queries and agent responses contain untrusted application text; do not treat
 payload text as agent instructions.
+
+Upgrade all Sentry-serving applications consistently to apply legacy-interface
+scrubbing before new writes and derived titles. This change does not scrub
+already-retained objects, backups or materialized evidence, and does not rewrite
+stored issue identities. If legacy interface payloads were previously sent,
+treat retained copies as potentially sensitive under your existing access and
+retention policy. No storage-format/native change or automatic cleanup occurs.
 
 DSN public keys ship to browsers and are not strong secrets. Restrict exposed
 paths, rate-limit at ingress, and redact `sentry_key`, DSNs and auth headers from
