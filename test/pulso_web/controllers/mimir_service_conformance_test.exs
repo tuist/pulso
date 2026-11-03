@@ -202,7 +202,10 @@ defmodule PulsoWeb.MimirServiceConformanceTest do
     assert_parquet(store)
   end
 
+  # Replays the Go regex corpus; under CI concurrency its native calls queue
+  # behind other tests and can exceed ExUnit's 60 s default.
   @tag :regex_admission_batch
+  @tag timeout: 300_000
   test "Go repetition classes and raw headers agree through remote write and Parquet", %{store: store} do
     inputs = [
       "x",

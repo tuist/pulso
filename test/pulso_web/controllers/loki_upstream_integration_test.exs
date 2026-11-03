@@ -2095,7 +2095,10 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     assert_parquet_read(ctx)
   end
 
+  # Replays the Go regex corpus; under CI concurrency its native calls queue
+  # behind other tests and can exceed ExUnit's 60 s default.
   @tag :regex_admission_batch
+  @tag timeout: 300_000
   test "Go repetition class and raw-header admission agree through log Parquet", ctx do
     inputs = [
       "x",

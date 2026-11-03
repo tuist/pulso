@@ -105,6 +105,10 @@ defmodule Pulso.QueryRegexTest do
     end
   end
 
+  # About 67,000 dirty-CPU NIF calls. Alone this takes ~2 s, but every call
+  # queues behind concurrent tests' native work: with CI's concurrency it took
+  # 75 s, past ExUnit's 60 s default. The corpus is fixed, so this stays bounded.
+  @tag timeout: 300_000
   test "repetition, class and raw-header admission replay actual Go answers" do
     for path <- [@admission, @classes, @ranges, @names, @flags, @unicode, @erased, @nested, @selector_names],
         row <- path |> File.read!() |> Pulso.JSON.decode!() |> Map.fetch!("cases") do
