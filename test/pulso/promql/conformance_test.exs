@@ -96,8 +96,10 @@ defmodule Pulso.PromQL.ConformanceTest do
         "histogram_quantile(0.3,nan_bucket)",
         "histogram_quantile(0.3,nan_last_bucket)",
         "histogram_quantile(0.3,inf_last_bucket)",
-        "gauge > ignoring(job) sum(gauge)",
-        "gauge < ignoring(job) max(gauge)",
+        # Explicit grouping: Prometheus 3.15 and Mimir reject the one-to-one
+        # form before filtering (as Pulso does); Prometheus 3.5.0 filtered first.
+        "gauge > ignoring(job) group_left sum(gauge)",
+        "gauge < ignoring(job) group_left max(gauge)",
         "gauge > bool 3",
         "3 < gauge",
         "gauge == bool gauge",
