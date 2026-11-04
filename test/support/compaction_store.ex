@@ -102,6 +102,12 @@ defmodule Pulso.Test.CompactionStore do
     none = List.first(get_req_header(conn, "if-none-match"))
 
     if (match != nil and (is_nil(object) or elem(object, 0) != match)) or (none == "*" and object != nil) do
+      # Lost conditional writes of a root, for tests asserting there were none.
+      state =
+        if String.ends_with?(key, "manifest.json"),
+          do: Map.update(state, :manifest_conflicts, 1, &(&1 + 1)),
+          else: state
+
       {{412, nil, ""}, state}
     else
       etag = "\"#{state.version + 1}\""

@@ -153,7 +153,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   end
 
   defp publish_replacement(tenant, config, sources, replacement, grace) do
-    case publish(tenant, config, sources, replacement, grace, 5) do
+    case publish(tenant, config, sources, replacement, grace) do
       {:error, {:unpublished_replacement, reason}} ->
         discard_replacement(config, replacement, {:error, reason})
 
@@ -268,23 +268,44 @@ defmodule Pulso.Storage.S3.SignalCompactor do
 
   defp merge_log_labels(segment, _config, _sources), do: segment
 
-  defp publish(tenant, config, _sources, replacement, _grace, 0) do
-    # The last conditional response can also have been lost after success.
-    # Resolve it before declaring exhaustion or reclaiming this unique upload.
-    with {:ok, current, _etag} <- load(tenant, config),
-         {:ok, published} <- published?(current, replacement.key, tenant, config) do
-      if published, do: :ok, else: {:error, :cas_retries_exhausted}
+  # Through the manifest owner, so local appends cannot slip in between the
+  # read of the root and its conditional write. Every attempt first checks for
+  # an earlier publication whose response was lost.
+  defp publish(tenant, config, sources, replacement, grace) do
+    transaction = &replacement_write(&1, tenant, config, sources, replacement, grace)
+
+    case ManifestOwner.transact(tenant, signal_string(config), config, transaction) do
+      {:ok, :ok} -> :ok
+      {:error, :cas_retries_exhausted} -> resolve_exhausted(tenant, config, replacement)
+      error -> error
     end
   end
 
-  defp publish(tenant, config, sources, replacement, grace, attempts) do
-    with {:ok, current, etag} <- load(tenant, config),
+  defp replacement_write(current, tenant, config, sources, replacement, grace) do
+    case published?(current, replacement.key, tenant, config) do
+      {:ok, true} ->
+        {:done, :ok}
+
+      # Prepared before the conditional write: a failure here proves this
+      # unique key was never published.
+      {:ok, false} ->
+        current |> prepare_replacement(sources, replacement, grace, tenant, config) |> prepared_write()
+
+      error ->
+        error
+    end
+  end
+
+  defp prepared_write({:ok, updated}), do: {:write, updated, updated |> Manifest.encode() |> IO.iodata_to_binary(), :ok}
+  defp prepared_write({:ok, sealed, payload}), do: {:write, sealed, payload, :ok}
+  defp prepared_write({:error, reason}), do: {:error, {:unpublished_replacement, reason}}
+
+  # The last conditional response can also have been lost after success.
+  # Resolve it before declaring exhaustion or reclaiming this unique upload.
+  defp resolve_exhausted(tenant, config, replacement) do
+    with {:ok, current, _etag} <- load(tenant, config),
          {:ok, published} <- published?(current, replacement.key, tenant, config) do
-      if published do
-        :ok
-      else
-        publish_current(current, etag, tenant, config, sources, replacement, grace, attempts)
-      end
+      if published, do: :ok, else: {:error, :cas_retries_exhausted}
     end
   end
 
@@ -397,39 +418,6 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp prepare_replacement(root, sources, replacement, grace, _tenant, _config),
     do: Manifest.replace(root, sources, replacement, System.system_time(:millisecond) + grace)
 
-  defp publish_current(current, etag, tenant, config, sources, replacement, grace, attempts) do
-    case prepare_replacement(current, sources, replacement, grace, tenant, config) do
-      {:ok, updated} ->
-        updated
-        |> Manifest.encode()
-        |> IO.iodata_to_binary()
-        |> write_replacement(etag, tenant, config, sources, replacement, grace, attempts)
-
-      {:ok, _sealed, payload} ->
-        write_replacement(payload, etag, tenant, config, sources, replacement, grace, attempts)
-
-      # This branch precedes the conditional PUT. publish/7 has just loaded
-      # authoritative state and proved the unique key absent (active/retired or
-      # expired keys return success before here), including earlier lost replies.
-      {:error, reason} ->
-        {:error, {:unpublished_replacement, reason}}
-    end
-  end
-
-  defp write_replacement(payload, etag, tenant, config, sources, replacement, grace, attempts) do
-    case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal_string(config)), payload, etag) do
-      {:ok, _etag} ->
-        :ok
-
-      {:error, :precondition_failed} ->
-        Process.sleep(10 * (6 - attempts))
-        publish(tenant, config, sources, replacement, grace, attempts - 1)
-
-      error ->
-        error
-    end
-  end
-
   @doc "Delete up to max_deletions (128) expired objects; persist progress and retry failed keys on later passes."
   def cleanup(tenant, config, opts \\ []) do
     monitor(:cleanup, fn -> do_cleanup(tenant, config, opts) end)
@@ -495,7 +483,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   end
 
   defp finish_paged_cleanup(tenant, config, {deleted, _, _, _} = work, errors) do
-    with :ok <- publish_paged_cleanup(tenant, config, work, 5) do
+    with :ok <- publish_paged_cleanup(tenant, config, work) do
       if errors == [], do: {:ok, length(deleted)}, else: {:error, {:cleanup_failed, Enum.reverse(errors)}}
     end
   end
@@ -511,33 +499,31 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end)
   end
 
-  defp publish_paged_cleanup(_tenant, _config, _work, 0), do: {:error, :cas_retries_exhausted}
-
-  defp publish_paged_cleanup(tenant, config, work, attempts) do
-    case load(tenant, config) do
-      {:ok, %{version: 4} = current, etag} -> put_paged_cleanup(current, etag, tenant, config, work, attempts)
-      # Retention converted the root meanwhile; it owns cleanup now.
-      {:ok, _current, _etag} -> :ok
-      error -> error
-    end
-  end
-
-  defp put_paged_cleanup(current, etag, tenant, config, {deleted, pages, gc_refs, cursor} = work, attempts) do
+  defp publish_paged_cleanup(tenant, config, {deleted, pages, gc_refs, cursor}) do
     signal = signal_string(config)
 
-    with {:ok, updated} <-
-           JournalManifest.apply_cleanup(current, deleted, pages, gc_refs, cursor, tenant, signal, config),
-         false <- updated == current,
-         {:ok, {_sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
-         {:error, :precondition_failed} <-
-           ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal), payload, etag) do
-      publish_paged_cleanup(tenant, config, work, attempts - 1)
-    else
-      true -> :ok
-      {:ok, _etag} -> :ok
-      error -> error
+    transaction = fn
+      %{version: 4} = current ->
+        current
+        |> JournalManifest.apply_cleanup(deleted, pages, gc_refs, cursor, tenant, signal, config)
+        |> cleanup_write(current, tenant, signal, config)
+
+      # Retention converted the root meanwhile; it owns cleanup now.
+      _current ->
+        {:done, :ok}
     end
+
+    with {:ok, :ok} <- ManifestOwner.transact(tenant, signal, config, transaction), do: :ok
   end
+
+  defp cleanup_write({:ok, current}, current, _tenant, _signal, _config), do: {:done, :ok}
+
+  defp cleanup_write({:ok, updated}, _current, tenant, signal, config) do
+    with {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
+         do: {:write, sealed, payload, :ok}
+  end
+
+  defp cleanup_write(error, _current, _tenant, _signal, _config), do: error
 
   defp validate_cleanup_limit(maximum) when is_integer(maximum) and maximum > 0, do: :ok
   defp validate_cleanup_limit(_), do: {:error, :invalid_cleanup_options}
@@ -566,7 +552,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     {deleted, errors} = Enum.reduce(candidates, {[], []}, &delete_retired(&1, &2, config))
     {cursor, _} = List.last(candidates)
 
-    with :ok <- publish_deletions(tenant, config, deleted, cursor, 5) do
+    with :ok <- publish_deletions(tenant, config, deleted, cursor) do
       if errors == [], do: {:ok, length(deleted)}, else: {:error, {:cleanup_failed, Enum.reverse(errors)}}
     end
   end
@@ -579,28 +565,16 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp publish_deletions(_tenant, _config, _deleted, _cursor, 0), do: {:error, :cas_retries_exhausted}
-
-  defp publish_deletions(tenant, config, deleted, cursor, attempts) do
-    with {:ok, current, etag} <- load(tenant, config) do
+  defp publish_deletions(tenant, config, deleted, cursor) do
+    transaction = fn current ->
       updated = Manifest.mark_deleted(current, deleted, cursor)
 
-      if updated == current do
-        :ok
-      else
-        write_deletions(updated, etag, tenant, config, deleted, cursor, attempts)
-      end
+      if updated == current,
+        do: {:done, :ok},
+        else: {:write, updated, updated |> Manifest.encode() |> IO.iodata_to_binary(), :ok}
     end
-  end
 
-  defp write_deletions(updated, etag, tenant, config, deleted, cursor, attempts) do
-    payload = updated |> Manifest.encode() |> IO.iodata_to_binary()
-
-    case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal_string(config)), payload, etag) do
-      {:ok, _etag} -> :ok
-      {:error, :precondition_failed} -> publish_deletions(tenant, config, deleted, cursor, attempts - 1)
-      error -> error
-    end
+    with {:ok, :ok} <- ManifestOwner.transact(tenant, signal_string(config), config, transaction), do: :ok
   end
 
   defp load(tenant, config), do: Retention.load(tenant, signal_string(config), config)

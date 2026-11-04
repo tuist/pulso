@@ -1,6 +1,7 @@
 defmodule Pulso.Storage.S3.CompactionWorker do
   @moduledoc """
-  Opt-in background metrics maintenance on the rendezvous owner. Durable
+  Opt-in background maintenance (compaction and cleanup) of each enabled signal
+  on its rendezvous owner. Log lines name the signal they maintain. Durable
   manifest discovery includes tenants never observed by this node. Membership
   disagreement can overlap work; conditional publication keeps those races safe.
 
@@ -49,7 +50,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         :ok = CompactionOwnership.join_once(config)
         run_pass(config)
       else
-        Logger.warning("metrics compaction remains withdrawn while an earlier task is still running")
+        Logger.warning("compaction remains withdrawn while an earlier task is still running")
         config
       end
 
@@ -61,7 +62,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   def handle_info(_message, config), do: {:noreply, config}
 
   defp run_pass(config) do
-    case run_operation(fn -> CompactionDiscovery.tenants(config) end, "*", "discovery", config) do
+    case run_operation(fn -> CompactionDiscovery.tenants(config) end, {nil, "*"}, "discovery", config) do
       {:ok, tenants} -> Enum.reduce_while(tenants, config, &maintain_tenant/2)
       _error -> config
     end
@@ -123,7 +124,13 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   # merging while each merge makes progress, within a per-pass budget, so
   # compaction can catch up instead of falling further behind.
   defp merge_while_progressing(module, tenant, config, opts, remaining) do
-    result = run_operation(fn -> merge_operation(module, tenant, config, opts) end, tenant, "merge", config)
+    result =
+      run_operation(
+        fn -> merge_operation(module, tenant, config, opts) end,
+        {signal_of(module), tenant},
+        "merge",
+        config
+      )
 
     case result do
       {:ok, %{merged: merged}} when merged > 0 and remaining > 1 ->
@@ -148,15 +155,16 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp cleanup_if_owner(result, tenant, signal, config, module, opts) do
     # Recheck after the merge: ownership may have moved while storage was busy.
     if CompactionOwnership.local_owner?(tenant, signal, config) do
-      run_operation(fn -> module.cleanup(tenant, config, opts) end, tenant, "cleanup", config)
+      run_operation(fn -> module.cleanup(tenant, config, opts) end, {signal, tenant}, "cleanup", config)
     else
       result
     end
   end
 
-  defp run_operation(operation, tenant, name, config) do
+  # `subject` is `{signal, tenant}`; discovery spans every signal and tenant.
+  defp run_operation(operation, subject, name, config) do
     Pulso.SelfMetrics.track(:compaction, metric_dimension(name), fn ->
-      do_run_operation(operation, tenant, name, config)
+      do_run_operation(operation, subject, name, config)
     end)
   end
 
@@ -164,11 +172,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp metric_dimension("cleanup"), do: :worker_cleanup
   defp metric_dimension("discovery"), do: :worker_discovery
 
-  defp do_run_operation(operation, tenant, name, config) do
+  defp do_run_operation(operation, subject, name, config) do
     task =
       Task.Supervisor.async_nolink(CompactionTasks, fn ->
         Process.set_label({:pulso, :maintenance})
-        execute_operation(operation, tenant, name)
+        execute_operation(operation, subject, name)
       end)
 
     case Task.yield(task, operation_timeout(config, name)) do
@@ -176,7 +184,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         result
 
       {:exit, reason} ->
-        report_failure(tenant, name, reason)
+        report_failure(subject, name, reason)
 
       nil ->
         # Keep the task supervised until it finishes. Killing a process inside
@@ -185,41 +193,45 @@ defmodule Pulso.Storage.S3.CompactionWorker do
         Process.demonitor(task.ref, [:flush])
         CompactionOwnership.leave(config)
         :telemetry.execute([:pulso, :compaction, :timeout], %{}, %{operation: name})
-        report_failure(tenant, name, :timeout)
+        report_failure(subject, name, :timeout)
     end
   end
 
   defp operation_timeout(config, "discovery"), do: Map.get(config, :compaction_discovery_timeout_ms, 60_000)
   defp operation_timeout(config, _operation), do: Map.get(config, :compaction_timeout_ms, 30_000)
 
-  defp report_failure(tenant, name, reason) do
-    Logger.warning("metrics compaction #{name} failed tenant=#{tenant}: #{inspect(reason)}")
+  defp report_failure(subject, name, reason) do
+    Logger.warning("#{label(subject, name)} failed #{tenant(subject)}: #{inspect(reason)}")
     {:error, reason}
   end
 
-  defp execute_operation(operation, tenant, name) do
+  defp execute_operation(operation, subject, name) do
     result = operation.()
-    report_result(result, tenant, name)
+    report_result(result, subject, name)
     result
   rescue
     exception ->
-      Logger.warning("metrics compaction #{name} raised tenant=#{tenant}: #{Exception.message(exception)}")
+      Logger.warning("#{label(subject, name)} raised #{tenant(subject)}: #{Exception.message(exception)}")
       {:error, :operation_raised}
   catch
     kind, reason ->
-      Logger.warning("metrics compaction #{name} exited tenant=#{tenant}: #{inspect({kind, reason})}")
+      Logger.warning("#{label(subject, name)} exited #{tenant(subject)}: #{inspect({kind, reason})}")
       {:error, :operation_exited}
   end
 
-  defp report_result({:error, :not_found}, tenant, operation) do
-    Logger.debug("metrics compaction #{operation} missing object tenant=#{tenant}")
+  defp report_result({:error, :not_found}, subject, name) do
+    Logger.debug("#{label(subject, name)} missing object #{tenant(subject)}")
   end
 
-  defp report_result({:ok, _}, _tenant, _operation), do: :ok
+  defp report_result({:ok, _}, _subject, _name), do: :ok
 
-  defp report_result({:error, reason}, tenant, operation) do
-    Logger.warning("metrics compaction #{operation} failed tenant=#{tenant}: #{inspect(reason)}")
+  defp report_result({:error, reason}, subject, name) do
+    Logger.warning("#{label(subject, name)} failed #{tenant(subject)}: #{inspect(reason)}")
   end
+
+  defp label({nil, _tenant}, name), do: "compaction #{name}"
+  defp label({signal, _tenant}, name), do: "#{signal} compaction #{name}"
+  defp tenant({_signal, tenant}), do: "tenant=#{tenant}"
 
   defp schedule(config) do
     interval = Map.get(config, :compaction_interval_ms, 60_000)

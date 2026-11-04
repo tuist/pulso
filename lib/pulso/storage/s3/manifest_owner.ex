@@ -351,6 +351,30 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
+  @doc """
+  Apply a maintenance change to the root of `(tenant, signal)`, serialized with
+  this node's ingest publications.
+
+  `fun.(root)` runs inside the owner against its current root and returns
+  `{:write, updated, payload, result}` to publish `payload` (the encoding of
+  `updated`) with a conditional write, `{:done, result}` when nothing needs to
+  change, or `{:error, reason}`. A conflicting write by another instance reloads
+  the root and runs `fun` again, up to five times. Returns `{:ok, result}`.
+
+  Compaction and cleanup used to read and rewrite the root on their own, so on
+  a prefix whose appends commit back to back their conditional writes kept
+  losing to ingest. Local appends now wait for the transaction and are applied
+  on top of it; conditional writes still order this owner against other
+  instances.
+  """
+  @spec transact(String.t(), String.t(), map(), (Manifest.t() -> term()), timeout()) ::
+          {:ok, term()} | {:error, term()}
+  def transact(tenant, signal, config, fun, timeout \\ 120_000)
+      when is_binary(tenant) and is_binary(signal) and is_map(config) and is_function(fun, 1) do
+    with {:ok, pid} <- ensure_started(tenant, signal, config),
+         do: call_owner(pid, {:transact, fun, config}, timeout)
+  end
+
   @spec start_link(opts()) :: Elixir.GenServer.on_start()
   def start_link(opts) do
     tenant = Keyword.fetch!(opts, :tenant)
@@ -435,6 +459,19 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
+  def handle_call({:transact, fun, config}, _from, state) do
+    owner_config = state.config
+
+    case loaded_for_transaction(%{state | config: config}) do
+      {:ok, loaded} ->
+        {reply, updated} = run_transaction(loaded, fun, @cas_max_retries)
+        {:reply, reply, %{updated | config: owner_config}, @idle_hibernate_ms}
+
+      {:error, _} = error ->
+        {:reply, error, state, @idle_hibernate_ms}
+    end
+  end
+
   @impl true
   def handle_info(:flush, state) do
     do_flush(state)
@@ -444,6 +481,68 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     # `:hibernate` compacts the process heap and drops the stack; a
     # manual `garbage_collect/1` beforehand would be redundant.
     {:noreply, state, :hibernate}
+  end
+
+  # Maintenance needs a published root: never one rebuilt from a LIST.
+  defp loaded_for_transaction(%{loaded?: true, etag: etag} = state) when is_binary(etag),
+    do: {:ok, adopt_cached_root(state)}
+
+  defp loaded_for_transaction(state) do
+    token = ManifestCache.token(state.tenant, state.signal)
+
+    case load_manifest(state, false) do
+      {:ok, manifest, etag} when is_binary(etag) ->
+        cache_loaded(state, manifest, etag, token)
+        {:ok, %{state | manifest: manifest, etag: etag, loaded?: true}}
+
+      {:ok, _rebuilt, nil} ->
+        {:error, :not_found}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp run_transaction(state, _fun, 0), do: {{:error, :cas_retries_exhausted}, state}
+
+  defp run_transaction(state, fun, attempts) do
+    case fun.(state.manifest) do
+      {:write, updated, payload, result} -> write_transaction(state, fun, attempts, {updated, payload, result})
+      {:done, result} -> {{:ok, result}, state}
+      {:error, _} = error -> {error, state}
+    end
+  end
+
+  defp write_transaction(state, fun, attempts, {updated, payload, result}) do
+    base = ManifestCache.publication_base(state.tenant, state.signal)
+    key = Manifest.manifest_key(state.tenant, state.signal)
+
+    case ObjectStore.put_if_match(state.config, key, payload, state.etag) do
+      {:ok, etag} ->
+        ManifestCache.publish(state.tenant, state.signal, {updated, payload}, etag, state.etag, base)
+        {{:ok, result}, %{state | manifest: updated, etag: etag}}
+
+      {:error, :precondition_failed} ->
+        retry_transaction(state, fun, attempts)
+
+      # The write may still have landed; the next publication's conditional
+      # write finds out and reloads.
+      {:error, _} = error ->
+        {error, state}
+    end
+  end
+
+  defp retry_transaction(state, fun, attempts) do
+    case load_manifest(state, false) do
+      {:ok, manifest, etag} when is_binary(etag) ->
+        run_transaction(%{state | manifest: manifest, etag: etag}, fun, attempts - 1)
+
+      {:ok, _rebuilt, nil} ->
+        {{:error, :not_found}, state}
+
+      {:error, _} = error ->
+        {error, state}
+    end
   end
 
   defp cache_loaded(_state, _manifest, nil, _token), do: :ok
@@ -543,6 +642,17 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     %{state | timer_ref: nil}
   end
 
+  # Copy a cached root only when another path (retention) replaced it.
+  defp adopt_cached_root(state) do
+    with {version, etag, _token} when version in [3, 4] and etag != state.etag <-
+           ManifestCache.info(state.tenant, state.signal),
+         %{manifest: %{version: ^version} = manifest, etag: ^etag} <- ManifestCache.get(state.tenant, state.signal) do
+      %{state | manifest: manifest, etag: etag, loaded?: true}
+    else
+      _ -> state
+    end
+  end
+
   defp do_flush(%{pending: []} = state) do
     {:noreply, %{state | timer_ref: nil}, @idle_hibernate_ms}
   end
@@ -551,15 +661,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     base = ManifestCache.publication_base(state.tenant, state.signal)
     state = %{state | timer_ref: nil}
 
-    # Copy a cached root only when another path (retention) replaced it.
-    state =
-      with {version, etag, _token} when version in [3, 4] and etag != state.etag <-
-             ManifestCache.info(state.tenant, state.signal),
-           %{manifest: %{version: ^version} = manifest, etag: ^etag} <- ManifestCache.get(state.tenant, state.signal) do
-        %{state | manifest: manifest, etag: etag, loaded?: true}
-      else
-        _ -> state
-      end
+    state = adopt_cached_root(state)
 
     {state, deferred} = partition_waiters(state)
     started = System.monotonic_time()

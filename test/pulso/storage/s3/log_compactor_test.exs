@@ -110,7 +110,7 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
 
       Runtime.put_env(:pulso, S3, config)
       start_supervised!(ManifestSupervision)
-      %{config: config, tenant: "log-compact-#{System.unique_integer([:positive])}"}
+      %{agent: agent, config: config, tenant: "log-compact-#{System.unique_integer([:positive])}"}
     end
 
     defp segments(ctx) do
@@ -170,6 +170,52 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       assert {:ok, %{merged: 2}} = LogCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
 
       assert {:ok, ~s(["a","b"])} = S3.log_discovery_json(ctx.tenant, "values", "pod", start_ts: 0, end_ts: 10)
+    end
+
+    test "compaction and cleanup commit while appends land continuously", ctx do
+      # An object store with real request latency, under a prefix that commits
+      # appends back to back: every manifest change a compaction prepares from
+      # its own read of the root is outdated by the time it is written.
+      store = {CompactionStore, agent: ctx.agent, before_request: fn _method, _key, _body -> Process.sleep(25) end}
+      server = start_supervised!({Bandit, plug: store, ip: {127, 0, 0, 1}, port: 0}, id: :slow_store)
+      {:ok, {_, port}} = ThousandIsland.listener_info(server)
+      config = %{ctx.config | endpoint: "http://127.0.0.1:#{port}", access_key_id: "slow-#{System.unique_integer()}"}
+      Runtime.put_env(:pulso, S3, config)
+      ctx = %{ctx | config: config}
+
+      for ts <- 1..20, do: assert(:ok = S3.append(:logs, ctx.tenant, [record(ts, "api", "a")]))
+      # Recent appends stay unsettled, so only the backlog above is merged.
+      parent = self()
+      now = System.os_time(:nanosecond)
+
+      appenders =
+        for i <- 1..8,
+            do: Runtime.Task.async(fn -> append_until_stopped(parent, ctx.tenant, now + i * 1_000_000, 0) end)
+
+      for _ <- appenders, do: assert_receive(:appending, 30_000)
+
+      assert {:ok, %{merged: 20}} = LogCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+      assert {:ok, 20} = LogCompactor.cleanup(ctx.tenant, ctx.config)
+
+      for task <- appenders, do: send(task.pid, :stop)
+      appended = appenders |> Enum.map(&Runtime.Task.await(&1, 30_000)) |> Enum.sum()
+      assert {:ok, records} = S3.query(:logs, ctx.tenant, [])
+      assert length(records) == 20 + appended
+      assert Enum.count(segments(ctx), &String.contains?(Path.basename(&1.key), "-compact-")) == 1
+      # One node's maintenance and appends are serialized by its manifest
+      # owner, so none of their conditional root writes lost to another.
+      assert Agent.get(ctx.agent, &Map.get(&1, :manifest_conflicts, 0)) == 0
+    end
+
+    defp append_until_stopped(parent, tenant, now, count) do
+      receive do
+        :stop -> count
+      after
+        0 ->
+          :ok = S3.append(:logs, tenant, [record(now + count, "api", "live")])
+          if count == 2, do: send(parent, :appending)
+          append_until_stopped(parent, tenant, now, count + 1)
+      end
     end
 
     test "log-only workers join the logs eligibility group and catch up on a backlog in one pass", ctx do

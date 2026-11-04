@@ -1445,6 +1445,16 @@ nodes. Discovery has its own 60-second deadline (`compaction_discovery_timeout_m
 These limits bound admitted work during a stall. A late task may still publish or clean up;
 conditional publication and durable retirement safeguards remain mandatory.
 
+Merge and cleanup publications of every signal run inside the node's manifest
+owner for that tenant and signal (`ManifestOwner.transact/5`), the process
+that also commits this node's appends. Local appends wait for the transaction
+and are applied on top of it, so a prefix that commits appends back to back
+cannot make maintenance lose every conditional root write. Before this, a
+compaction that read and rewrote the root on its own spanned several commits at
+object-store latency and gave up with `cas_retries_exhausted`. Writes from
+other instances still race through the root's conditional write; the owner
+reloads and reruns the change up to five times.
+
 A merge selects at least two segments from the same hour partition, up to 32
 segments, 8 MiB of encoded input, and 100,000 samples. Each candidate must be at
 most 1 MiB and have known byte and row counts. Native metric codecs preserve every
