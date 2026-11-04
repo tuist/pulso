@@ -74,9 +74,7 @@ defmodule Pulso.SelfMetrics do
     increment("pulso_keyed_publication_conflicts_total", "", 0)
     increment("pulso_usage_dropped_total", "", 0)
     increment("pulso_tenant_purged_objects_total", "", 0)
-    increment("pulso_manifest_cache_evictions_total", "", 0)
-    increment("pulso_manifest_cache_evicted_bytes_total", "", 0)
-    for state <- [:on, :off], do: increment("pulso_memory_pressure_transitions_total", ~s(state="#{state}"), 0)
+    seed_memory_counters()
 
     seed_admission_rejections()
 
@@ -97,6 +95,12 @@ defmodule Pulso.SelfMetrics do
     end
 
     {:ok, nil}
+  end
+
+  defp seed_memory_counters do
+    increment("pulso_manifest_cache_evictions_total", "", 0)
+    increment("pulso_manifest_cache_evicted_bytes_total", "", 0)
+    for state <- [:on, :off], do: increment("pulso_memory_pressure_transitions_total", ~s(state="#{state}"), 0)
   end
 
   defp seed_admission_rejections do
