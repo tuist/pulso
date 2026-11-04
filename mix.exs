@@ -4,7 +4,7 @@ defmodule Pulso.MixProject do
   def project do
     [
       app: :pulso,
-      version: "1.29.8",
+      version: "1.29.9",
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
