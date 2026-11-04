@@ -2,6 +2,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
   @moduledoc false
   import Bitwise
 
+  alias Pulso.Codec.NIF
+
   @zero_id String.duplicate("0", 32)
   @max_bloom_bytes 8192
   @write_bloom_bytes 1024
@@ -171,7 +173,13 @@ defmodule Pulso.Storage.S3.TraceSummary do
     services = page_services(summaries)
     hashes = page_hashes(summaries)
     bits = if hashes, do: page_bloom(hashes), else: page_canonical(summaries)
-    %{"v" => 1, "s" => services, "b" => if(bits, do: Base.encode64(bits))}
+    page = %{"v" => 1, "s" => services, "b" => if(bits, do: Base.encode64(bits))}
+
+    # Like each entry's own flag: every row's promoted service is its original
+    # string resource service.name, so resource service.name filters prune.
+    if services && Enum.all?(summaries, &match?(%__MODULE__{pruning_safe?: true}, &1)),
+      do: Map.put(page, "k", true),
+      else: page
   end
 
   defp page_services(summaries) do
@@ -264,7 +272,9 @@ defmodule Pulso.Storage.S3.TraceSummary do
     bits = parse_bits(wire["b"])
     service = opts[:service]
     id = opts[:trace_id]
-    (is_nil(service) or is_nil(services) or service in services) and page_id_matches?(bits, id)
+
+    (is_nil(service) or is_nil(services) or service in services) and page_id_matches?(bits, id) and
+      resource_services_match?(wire["k"] == true, services, opts)
   end
 
   def page_matches?(_wire, _opts), do: true
@@ -279,15 +289,61 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
   def matches?(nil, _opts), do: true
 
-  def matches?(%__MODULE__{services: services, bits: bits, lookup_bits: canonical}, opts) do
+  def matches?(%__MODULE__{services: services, bits: bits, lookup_bits: canonical} = summary, opts) do
     service = Keyword.get(opts, :service)
     trace_id = Keyword.get(opts, :trace_id)
 
     (is_nil(service) or is_nil(services) or service in services) and
+      resource_services_match?(summary.pruning_safe?, services, opts) and
       if(canonical,
         do: page_id_matches?(canonical, trace_id),
         else: is_nil(trace_id) or is_nil(bits) or member?(bits, trace_id)
       )
+  end
+
+  # `query_traces` resource filters on service.name (exact `resource` strings,
+  # `resource_regex` patterns) can only match a row whose original string
+  # service.name satisfies them. Where the summary proves that column is each
+  # row's promoted service, a source none of whose services satisfies them
+  # holds no match. Without that proof, sources are always read.
+  defp resource_services_match?(true, [_ | _] = services, opts) do
+    exact = opts |> Keyword.get(:resource) |> service_name()
+    pattern = opts |> Keyword.get(:resource_regex) |> service_name()
+
+    (is_nil(exact) and is_nil(pattern)) or
+      Enum.any?(
+        services,
+        &((not is_binary(exact) or &1 == exact) and (not is_binary(pattern) or regex_match?(pattern, &1)))
+      )
+  end
+
+  defp resource_services_match?(_proven, _services, _opts), do: true
+
+  defp service_name(%{"service.name" => value}) when is_binary(value), do: value
+  defp service_name(_filters), do: nil
+
+  # The regex engine and anchoring `Pulso.Traces.RegexFilters` evaluates rows
+  # with. Summaries repeat the same few services; memoized per process.
+  @regex_memo {__MODULE__, :regex_memo}
+  defp regex_match?(pattern, service) do
+    memo = Process.get(@regex_memo, %{})
+
+    case memo do
+      %{{^pattern, ^service} => matched} ->
+        matched
+
+      _ ->
+        # A pattern the engine rejects fails the query's own scan; never prune on it.
+        matched =
+          try do
+            NIF.match_metric_regex(Pulso.QueryRegex.anchor(pattern), service) == true
+          rescue
+            ArgumentError -> true
+          end
+
+        if map_size(memo) < 4096, do: Process.put(@regex_memo, Map.put(memo, {pattern, service}, matched))
+        matched
+    end
   end
 
   defp member?(bits, id) do

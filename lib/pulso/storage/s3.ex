@@ -633,7 +633,10 @@ defmodule Pulso.Storage.S3 do
     selectors = wanted |> Enum.map(&elem(&1, 0)) |> List.to_tuple()
     state = %{bytes: 0, rows: 0, segments: 0, count: 0, batches: %{}}
     items = Enum.with_index(union)
-    concurrency = prefetch_depth(%{signal: :metrics, opts: opts}, union, Map.get(config, :query_prefetch, 1))
+
+    {_initial, concurrency} =
+      prefetch_depth(%{signal: :metrics, opts: opts}, union, Map.get(config, :query_prefetch, 1))
+
     visit = &visit_selector_segment(&1, &2, &3, {needs, selectors, config, opts})
 
     result =
@@ -1386,54 +1389,81 @@ defmodule Pulso.Storage.S3 do
   end
 
   # Object GET latency dominates scans on real object stores. With
-  # `query_prefetch` above 1 (opt-in), the next segments are fetched while
-  # earlier ones are processed, in order; a halted scan stops outstanding
-  # fetches. Budgets are still charged as segments are visited, so up to
-  # `query_prefetch - 1` extra reads can happen past an exhausted budget or an
-  # early stop. The default reads strictly one segment at a time.
+  # `query_prefetch` above 1, the next segments are fetched while earlier ones
+  # are processed, in order; a halted scan stops outstanding fetches. Budgets
+  # are still charged as segments are visited, so up to depth - 1 extra reads
+  # can happen past an exhausted budget or an early stop. `query_prefetch: 1`
+  # reads strictly one segment at a time.
   defp scan_sources(sources, ctx, state) do
     items = Enum.with_index(sources)
-    concurrency = prefetch_depth(ctx, sources, Map.get(ctx.config, :query_prefetch, 1))
+    {initial, maximum} = prefetch_depth(ctx, sources, Map.get(ctx.config, :query_prefetch, 1))
 
-    if concurrency > 1 and length(items) > 1 and prefetchable?(ctx) do
+    if maximum > 1 and length(items) > 1 and prefetchable?(ctx) do
       # Each task copies its closure: capture only the config, the byte limit
       # and one key, never `ctx` with its candidate segment list and options.
       config = ctx.config
       limit = ctx.opts[:max_scan_bytes]
-
-      items
-      |> Stream.map(fn {segment, _} -> segment.key end)
-      |> Pulso.Runtime.Task.async_stream(&prefetch(config, limit, &1),
-        max_concurrency: concurrency,
-        ordered: true,
-        timeout: :infinity
-      )
-      |> Stream.zip(items)
-      |> Enum.reduce_while({:ok, state}, fn {{:ok, fetched}, item}, acc -> visit_segment(item, acc, ctx, fetched) end)
+      fetch = fn key -> prefetch(config, limit, key) end
+      prefetched_scan(items, :queue.new(), 0, {initial, maximum}, fetch, ctx, {:ok, state})
     else
       Enum.reduce_while(items, {:ok, state}, &visit_segment(&1, &2, ctx))
     end
   end
 
-  # Small uncompacted log and metric segments make full scans latency-bound:
-  # one GET per push or remote-write batch. Metric scans and unlimited log
-  # scans read further ahead while the candidates' sizes keep at most
-  # @prefetch_bytes in flight. Limited log queries keep the configured depth,
-  # since they usually stop after a few segments and every prefetched read
-  # past the stop is wasted.
-  @prefetch_bytes 16 * 1024 * 1024
-  @max_prefetch 32
-  defp prefetch_depth(%{signal: signal, opts: opts}, sources, configured)
-       when signal in [:logs, :metrics] and configured > 1 do
-    if opts[:log_window] do
-      configured
-    else
-      largest = sources |> Enum.map(&(&1.byte_size || @prefetch_bytes)) |> Enum.max(fn -> @prefetch_bytes end)
-      max(configured, min(@max_prefetch, div(@prefetch_bytes, max(largest, 1))))
+  # Fetches run `depth` segments ahead of the one being visited. A scan that
+  # can stop early starts at `initial` and reads as far ahead as it has
+  # already visited, up to `maximum`: one that keeps going becomes as
+  # latency-tolerant as a full scan, while one that stops after a few segments
+  # wastes few reads.
+  defp prefetched_scan(items, queue, visited, {initial, maximum} = depth, fetch, ctx, acc) do
+    {items, queue} = fill_prefetch(items, queue, min(maximum, max(initial, visited)), fetch)
+
+    case :queue.out(queue) do
+      {:empty, _} ->
+        acc
+
+      {{:value, {task, item}}, queue} ->
+        item
+        |> visit_segment(acc, ctx, Pulso.Runtime.Task.await(task, :infinity))
+        |> next_prefetched(items, queue, visited + 1, depth, fetch, ctx)
     end
   end
 
-  defp prefetch_depth(_ctx, _sources, configured), do: configured
+  defp next_prefetched({:cont, acc}, items, queue, visited, depth, fetch, ctx),
+    do: prefetched_scan(items, queue, visited, depth, fetch, ctx, acc)
+
+  defp next_prefetched({:halt, acc}, _items, queue, _visited, _depth, _fetch, _ctx) do
+    queue |> :queue.to_list() |> Enum.each(fn {task, _} -> Pulso.Runtime.Task.shutdown(task, :brutal_kill) end)
+    acc
+  end
+
+  defp fill_prefetch([{segment, _} = item | rest] = items, queue, depth, fetch) do
+    if :queue.len(queue) < depth do
+      key = segment.key
+      fill_prefetch(rest, :queue.in({Pulso.Runtime.Task.async(fn -> fetch.(key) end), item}, queue), depth, fetch)
+    else
+      {items, queue}
+    end
+  end
+
+  defp fill_prefetch([], queue, _depth, _fetch), do: {[], queue}
+
+  # Small uncompacted segments make scans latency-bound: one GET per push or
+  # remote-write batch. Scans read up to @max_prefetch segments ahead while
+  # the candidates' sizes keep at most @prefetch_bytes in flight. Metric scans
+  # and unlimited log scans start there; log and trace scans that can stop
+  # early start at the configured depth and grow towards it.
+  @prefetch_bytes 16 * 1024 * 1024
+  @max_prefetch 32
+  defp prefetch_depth(%{signal: signal, opts: opts}, sources, configured)
+       when configured > 1 and signal in [:logs, :metrics, :traces] do
+    largest = sources |> Enum.map(&(&1.byte_size || @prefetch_bytes)) |> Enum.max(fn -> @prefetch_bytes end)
+    maximum = max(configured, min(@max_prefetch, div(@prefetch_bytes, max(largest, 1))))
+    stops_early? = signal == :traces or (signal == :logs and opts[:log_window] != nil)
+    if stops_early?, do: {configured, maximum}, else: {maximum, maximum}
+  end
+
+  defp prefetch_depth(_ctx, _sources, configured), do: {configured, configured}
 
   # Footer-first metric reads issue their own ranged requests.
   defp prefetchable?(%{signal: :metrics, metric_discovery?: false, config: %{metric_footer_pruning_enabled: true}}),

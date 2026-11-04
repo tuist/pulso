@@ -203,6 +203,70 @@ defmodule Pulso.Storage.S3.TracesTest do
              S3.query(:traces, ctx.tenant, service: "tuist-server", limit: 1, max_scan_rows: 0)
   end
 
+  test "resource service.name filters skip proven sources of other services", ctx do
+    [base | _] = ctx.spans
+    services = ["kura-cache-0", "tuist-server", "kura-meta-1", "noise"]
+
+    rows =
+      for n <- 1..24 do
+        service = Enum.at(services, rem(n, 4))
+
+        resource =
+          Enum.map(base.otlp["resource"], fn pair ->
+            if pair["key"] == "service.name", do: %{pair | "value" => %{"stringValue" => service}}, else: pair
+          end)
+
+        %{
+          base
+          | service: service,
+            resource: Map.put(base.resource, "service.name", service),
+            trace_id: Base.encode16(<<n::128>>, case: :lower),
+            timestamp_ns: n * 1000,
+            end_timestamp_ns: n * 1000 + 10,
+            otlp: %{base.otlp | "resource" => resource}
+        }
+      end
+
+    Enum.each(rows, &assert(:ok == S3.append(:traces, ctx.tenant, [&1])))
+    {:ok, entry} = ManifestOwner.ensure_loaded(ctx.tenant, "traces", Runtime.get_env(:pulso, S3))
+    assert Enum.all?(entry.manifest.segments, & &1.trace_summary.pruning_safe?)
+
+    query = fn opts ->
+      Agent.update(ctx.agent, &%{&1 | reads: []})
+      {:ok, spans} = S3.query(:traces, ctx.tenant, Keyword.merge([start_ts: 0, end_ts: 100_000, limit: 50], opts))
+      reads = Agent.get(ctx.agent, fn state -> Enum.count(state.reads, &String.ends_with?(&1, ".parquet")) end)
+      {spans |> Enum.map(& &1.service) |> Enum.frequencies(), reads}
+    end
+
+    # Only the 12 kura sources can hold a match; the rest are never read.
+    assert query.(resource_regex: %{"service.name" => "kura-(.*)-.*"}) ==
+             {%{"kura-cache-0" => 6, "kura-meta-1" => 6}, 12}
+
+    assert query.(resource: %{"service.name" => "noise"}) == {%{"noise" => 6}, 6}
+    assert query.(resource_regex: %{"service.name" => "missing.*"}) == {%{}, 0}
+
+    # Other resource keys say nothing about services: every source is read.
+    assert {%{}, 24} = query.(resource_regex: %{"service.namespace" => "kura"})
+
+    # Without the proof that the promoted service is the original string
+    # service.name, sources are read.
+    Agent.update(ctx.agent, fn state ->
+      key = Manifest.manifest_key(ctx.tenant, "traces")
+      {etag, body} = Map.fetch!(state.objects, key)
+      {:ok, root} = Manifest.decode(body)
+
+      segments =
+        Enum.map(root.segments, &%{&1 | trace_summary: %{&1.trace_summary | pruning_safe?: false}})
+
+      body = %{root | segments: segments} |> Manifest.encode() |> IO.iodata_to_binary()
+      %{state | objects: Map.put(state.objects, key, {etag <> "-unproven", body})}
+    end)
+
+    assert :ok = stop_supervised(ManifestSupervision)
+    start_supervised!(ManifestSupervision)
+    assert query.(resource: %{"service.name" => "noise"}) == {%{"noise" => 6}, 24}
+  end
+
   test "trace search scans every object before limiting traces; one hot trace cannot hide another", ctx do
     [base | _] = ctx.spans
     a = %{base | trace_id: Base.encode16(<<1::128>>, case: :lower), timestamp_ns: 1000, end_timestamp_ns: 2000}

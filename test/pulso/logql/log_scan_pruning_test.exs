@@ -41,7 +41,16 @@ defmodule Pulso.LogQL.LogScanPruningTest do
          end}
       )
 
-    server = start_supervised!({Bandit, plug: {CompactionStore, agent: store}, ip: {127, 0, 0, 1}, port: 0})
+    # Optional segment GET latency, with in-flight and peak counts: 1 delay
+    # in ms (0 is none), 2 in flight, 3 peak.
+    gate = :atomics.new(3, [])
+    hook = fn method, key, _body -> if method == "GET", do: delay_segment_get(gate, key) end
+
+    server =
+      start_supervised!(
+        {Bandit, plug: {CompactionStore, agent: store, before_request: hook}, ip: {127, 0, 0, 1}, port: 0}
+      )
+
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
 
     config = %{
@@ -101,7 +110,26 @@ defmodule Pulso.LogQL.LogScanPruningTest do
 
     # Small enough that the unpruned window cannot be read in one query.
     budget(300)
-    %{store: store, tenant: tenant, records: List.flatten(batches)}
+    %{store: store, tenant: tenant, records: List.flatten(batches), config: config, gate: gate}
+  end
+
+  defp delay_segment_get(gate, key) do
+    delay = :atomics.get(gate, 1)
+
+    if delay > 0 and String.ends_with?(key, ".parquet") do
+      peak(gate, :atomics.add_get(gate, 2, 1))
+      Process.sleep(delay)
+      :atomics.sub(gate, 2, 1)
+    end
+  end
+
+  defp peak(gate, value) do
+    current = :atomics.get(gate, 3)
+    if value > current and :atomics.compare_exchange(gate, 3, current, value) != :ok, do: peak(gate, value)
+  end
+
+  defp page_reads(ctx) do
+    ctx.store |> Agent.get(& &1.reads) |> Enum.count(&String.ends_with?(&1, "-leaf.json"))
   end
 
   defp budget(segments) do
@@ -169,6 +197,42 @@ defmodule Pulso.LogQL.LogScanPruningTest do
     {result, reads} = logs(ctx, ~s({cluster="tuist-canary"} |= "\\"i\\":59"), %{limit: 3})
     assert reads == 3
     assert timestamps(result) == [598 * @second + 1, 599 * @second, 599 * @second + 1]
+  end
+
+  test "leaf summaries skip whole manifest pages no selected stream can be in", ctx do
+    # Cold page cache: planning must read every leaf it cannot rule out.
+    :ok = S3.MetadataCache.clear()
+    {result, reads} = logs(ctx, ~s({namespace="missing"}), %{limit: 5})
+    assert result == {:ok, []}
+    assert {reads, page_reads(ctx)} == {0, 0}
+
+    {result, reads} = metric(ctx, ~s<sum(count_over_time({namespace="missing"} [#{@segments + 1}s])) or vector(0)>)
+    assert {:ok, {:vector, [{_, {_, +0.0}}]}} = result
+    assert {reads, page_reads(ctx)} == {0, 0}
+
+    # Every leaf holds kura segments, so each is read once.
+    {_result, reads} = logs(ctx, ~s({namespace="kura"}), %{limit: 5})
+    assert reads == 3
+    assert page_reads(ctx) > 0
+  end
+
+  test "limited scans that cannot stop early read further ahead", ctx do
+    budget(10_000)
+    Runtime.put_env(:pulso, S3, %{ctx.config | query_prefetch: 4})
+    :atomics.put(ctx.gate, 1, 5)
+
+    # No line matches, so every segment is read; read-ahead grows past the
+    # configured depth of 4 towards 32 while the scan keeps going.
+    {result, reads} = logs(ctx, ~s({cluster="tuist-canary"} |= "no line has this"), %{limit: 10})
+    assert result == {:ok, []}
+    assert reads == @segments
+    assert :atomics.get(ctx.gate, 3) > 8
+
+    # A scan that stops after three segments reads at most the configured
+    # depth past them.
+    {result, reads} = logs(ctx, ~s({namespace="kura", container="kura"} | json), %{limit: 5})
+    assert length(timestamps(result)) == 5
+    assert reads in 3..7
   end
 
   test "stream-label selectors prune segments of metric queries", ctx do

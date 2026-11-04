@@ -42,6 +42,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
   @leaf_bytes 131_072
   @leaf_read_entries 2048
   @page_limit 1_048_576
+  @leaf_reads 32
   @root_limit 1_048_576
   @root_entries 4096
   @ref_bytes 4096
@@ -350,7 +351,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   @doc """
   Active segments that can match a query, newest `max_ts` first. Reads only
-  pages whose ranges and summaries can match, eight at a time, and fails as
+  pages whose ranges and summaries can match, 32 at a time, and fails as
   soon as more candidates than the query may scan are found.
   """
   def query(%Manifest{version: @version} = root, tenant, signal, opts, config),
@@ -399,9 +400,10 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   # The first `n` candidates in a limited log query's scan order: newest
   # `max_ts` first (backward) or oldest `min_ts` first (forward). Leaves are
-  # read in the order of their bound on that key, eight at a time, and reading
-  # stops once `n` candidates are held and no unread leaf can order before
-  # the last of them. Candidates beyond `n` are never visited by the scan.
+  # read in the order of their bound on that key, eight at first and twice as
+  # many each round up to @leaf_reads, and reading stops once `n` candidates
+  # are held and no unread leaf can order before the last of them. Candidates
+  # beyond `n` are never visited by the scan.
   defp window(leaves, found, {order, n}, read) do
     {bound, rank} =
       case order do
@@ -411,16 +413,21 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
     leaves
     |> Enum.sort_by(bound)
-    |> Enum.chunk_every(8)
-    |> Enum.reduce_while(found |> Enum.sort_by(rank) |> Enum.take(n), fn chunk, held ->
-      chunk = if length(held) < n, do: chunk, else: Enum.filter(chunk, &(bound.(&1) <= elem(rank.(List.last(held)), 0)))
+    |> window_rounds(8, found |> Enum.sort_by(rank) |> Enum.take(n), n, bound, rank, read)
+  end
 
-      if chunk == [] do
-        {:halt, held}
-      else
-        {:cont, (held ++ Enum.concat(read.(chunk))) |> Enum.sort_by(rank) |> Enum.take(n)}
-      end
-    end)
+  defp window_rounds([], _size, held, _n, _bound, _rank, _read), do: held
+
+  defp window_rounds(leaves, size, held, n, bound, rank, read) do
+    {chunk, rest} = Enum.split(leaves, size)
+    chunk = if length(held) < n, do: chunk, else: Enum.filter(chunk, &(bound.(&1) <= elem(rank.(List.last(held)), 0)))
+
+    if chunk == [] do
+      held
+    else
+      held = (held ++ Enum.concat(read.(chunk))) |> Enum.sort_by(rank) |> Enum.take(n)
+      window_rounds(rest, min(2 * size, @leaf_reads), held, n, bound, rank, read)
+    end
   end
 
   defp limited_trace_scan?("traces", opts),
@@ -449,6 +456,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
   defp matches?(s, "logs", opts), do: Segment.matches_log_service?(s, opts)
   defp matches?(s, "traces", opts), do: TraceSummary.matches?(s.trace_summary, opts)
   defp leaf_matches?(ref, "traces", opts), do: TraceSummary.page_matches?(ref["q"], opts)
+  defp leaf_matches?(ref, "logs", opts), do: Segment.log_page_matches?(ref["q"], opts)
   defp leaf_matches?(_ref, _signal, _opts), do: true
 
   defp intersects?(ref, start, finish),
@@ -776,7 +784,10 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   defp put_leaves(leaves, tenant, signal, config), do: concurrently(leaves, &leaf_ref(&1, tenant, signal, config))
 
-  defp concurrently(items, fun) do
+  defp concurrently(items, fun, concurrency \\ 16)
+  defp concurrently(items, fun, _concurrency) when length(items) <= 1, do: Enum.map(items, fun)
+
+  defp concurrently(items, fun, concurrency) do
     items
     |> Pulso.Runtime.Task.async_stream(
       fn item ->
@@ -786,7 +797,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
           {:journal_manifest, reason} -> {:error, reason}
         end
       end,
-      max_concurrency: 16,
+      max_concurrency: concurrency,
       timeout: :infinity
     )
     |> Enum.map(fn
@@ -844,9 +855,12 @@ defmodule Pulso.Storage.S3.JournalManifest do
     }
 
     stats =
-      if signal == "traces" and segments != [],
-        do: Map.put(stats, "q", TraceSummary.page_summary(Enum.map(segments, &Segment.to_wire/1))),
-        else: stats
+      cond do
+        segments == [] -> stats
+        signal == "traces" -> Map.put(stats, "q", TraceSummary.page_summary(Enum.map(segments, &Segment.to_wire/1)))
+        signal == "logs" -> put_summary(stats, Segment.log_page_summary(segments))
+        true -> stats
+      end
 
     "m"
     |> put_page(Manifest.encode(%{leaf | version: 2, paging: nil, cleanup_cursor: nil}), "leaf", tenant, signal, config)
@@ -872,6 +886,9 @@ defmodule Pulso.Storage.S3.JournalManifest do
       "rd" => children |> Enum.map(& &1["rd"]) |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     })
   end
+
+  defp put_summary(stats, nil), do: stats
+  defp put_summary(stats, summary), do: Map.put(stats, "q", summary)
 
   defp bounded_reference(ref) do
     ref = if ref_bytes(ref) > @ref_bytes, do: Map.delete(ref, "q"), else: ref
@@ -1021,26 +1038,27 @@ defmodule Pulso.Storage.S3.JournalManifest do
     end
   end
 
-  # Leaves to read, descending into matching index pages.
+  # Leaves to read, descending into matching index pages one level at a time
+  # and reading each level's pages concurrently: a long range spans dozens of
+  # index pages, at object-store latency each.
   defp collect_leaves(refs, select, tenant, signal, config, deadline) do
-    Enum.flat_map(refs, fn ref ->
-      cond do
-        not select.(ref) ->
-          []
+    {leaves, indexes} = refs |> Enum.filter(select) |> Enum.split_with(&(&1["h"] == 0))
 
-        ref["h"] == 0 ->
-          [ref]
-
-        true ->
-          collect_leaves(read_index(ref, tenant, signal, config, deadline), select, tenant, signal, config, deadline)
-      end
-    end)
+    indexes
+    |> concurrently(&read_index(&1, tenant, signal, config, deadline), @leaf_reads)
+    |> Enum.concat()
+    |> case do
+      [] -> leaves
+      children -> leaves ++ collect_leaves(children, select, tenant, signal, config, deadline)
+    end
   end
 
   defp read_leaves(refs, tenant, signal, config, deadline, fun),
     do: refs |> stream_leaves(tenant, signal, config, deadline, fun) |> Enum.to_list()
 
-  # Leaf reads run eight at a time; each task returns only what `fun` keeps.
+  # Leaf reads run @leaf_reads at a time: planning a long range reads one
+  # page per few hundred segments, at object-store latency each. Each task
+  # returns only what `fun` keeps.
   defp stream_leaves(refs, tenant, signal, config, deadline, fun) when length(refs) <= 1,
     do: Enum.map(refs, &fun.(read_leaf(&1, tenant, signal, config, deadline)))
 
@@ -1054,7 +1072,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
           {:journal_manifest, reason} -> {:error, reason}
         end
       end,
-      max_concurrency: 8,
+      max_concurrency: @leaf_reads,
       timeout: :infinity
     )
     |> Stream.map(fn

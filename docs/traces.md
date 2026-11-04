@@ -1541,7 +1541,13 @@ rebuilding small complete hash sets at that same geometry. Leaf blooms cap at
 2 KiB and their independent complete service sets at 512 encoded bytes. Missing
 summaries never authorize pruning. Older 8 KiB segment
 blooms remain readable. Truly unknown or legacy sets always scan; collisions
-and saturation only add reads. Exact-ID lookup reserves 64 KiB per overlapping
+and saturation only add reads. `query_traces` `resource` string equality and
+`resource_regex` patterns on `service.name` also skip segments, and leaves
+written by this release, whose complete service sets prove that every row's
+original string `service.name` is one of them and none satisfies the filter.
+Segments and leaves without that proof are read. Other resource keys, such as
+`service.namespace`, and span attributes never prune. Limited scans that keep
+going read further ahead, up to 32 segments within 16 MiB in flight. Exact-ID lookup reserves 64 KiB per overlapping
 live bucket in addition to its 8 MiB metadata-byte default, capped at 32 MiB;
 an explicit configured byte limit is never raised. Other searches and
 maintenance retain their 8 MiB default. Lookup still reads live bucket indexes,

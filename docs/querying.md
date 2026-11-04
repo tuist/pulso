@@ -2153,8 +2153,16 @@ GET per segment read. Pulso reads fewer segments in three ways:
   label counts as the empty value, as in LogQL. Segments written before this
   release, and labels a summary omits, are always read. Log compaction keeps the
   summaries of the segments it merges.
-- **Full log scans read ahead.** Metric queries and unlimited log queries read
-  up to 32 segments ahead while those segments keep at most 16 MiB in flight
+- **Stream labels prune manifest pages.** Planning reads the manifest pages
+  covering the time range, up to 32 at once. Each page written by this release
+  records the union of its segments' service and label sets (within 2 KiB), so
+  a selector that none of a page's segments can match skips the whole page.
+  Pages written by earlier releases are always read.
+- **Scans read ahead.** Metric queries and unlimited log queries read up to 32
+  segments ahead while those segments keep at most 16 MiB in flight. Limited
+  log and trace queries start at `PULSO_QUERY_PREFETCH` segments ahead and read
+  as far ahead as they have already read, up to the same bound, so a limited
+  query that has to scan its whole range is not held to the configured depth
   (see `PULSO_QUERY_PREFETCH` in [configuration](configuration.md#query-budgets)).
 
 Line filters do not prune segments; they are evaluated natively on every row

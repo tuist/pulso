@@ -326,6 +326,38 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   @doc "Stream-label summary of a segment holding exactly the rows of segments with `summaries`."
   def merge_log_labels(summaries), do: MetricLabelSummary.union(summaries, @log_label_names)
 
+  @doc """
+  Wire summary of a manifest page's active log segments, so planning can skip
+  the whole page: their complete service and stream-label sets (`"ls"`,
+  `"el"`). Each is omitted when any segment's is unknown or the union is too
+  large, labels first, since root references repeat it on every append. `nil`
+  when neither is known.
+  """
+  @page_summary_bytes 2048
+  def log_page_summary(segments) do
+    services =
+      if Enum.all?(segments, &is_list(&1.log_services)) do
+        services = segments |> Enum.flat_map(& &1.log_services) |> Enum.uniq() |> Enum.sort()
+        if length(services) <= 128, do: services
+      end
+
+    labels = merge_log_labels(Enum.map(segments, & &1.log_labels))
+
+    [%{"ls" => services, "el" => labels}, %{"ls" => services}]
+    |> Enum.map(&Map.put(Map.reject(&1, fn {_, v} -> is_nil(v) end), "v", 1))
+    |> Enum.find(&(map_size(&1) > 1 and IO.iodata_length(Pulso.JSON.encode_to_iodata!(&1)) <= @page_summary_bytes))
+  end
+
+  @doc "Whether a page with `log_page_summary/1` summary `wire` may hold a segment matching `opts`."
+  def log_page_matches?(%{"v" => 1} = wire, opts),
+    do:
+      matches_log_service?(
+        %__MODULE__{log_services: valid_services(wire["ls"]), log_labels: MetricLabelSummary.parse(wire["el"])},
+        opts
+      )
+
+  def log_page_matches?(_wire, _opts), do: true
+
   # The value the native matcher sees for `name` (`matchers_pass` in
   # segment_parquet.rs): `service_name` prefers a nonempty promoted service,
   # every other summarized name reads the top-level resource string. A missing

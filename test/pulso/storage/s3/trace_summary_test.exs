@@ -90,4 +90,29 @@ defmodule Pulso.Storage.S3.TraceSummaryTest do
     records = for n <- 1..129, do: %{trace_id: Base.encode16(<<n::128>>, case: :lower), service: "s#{n}"}
     assert TraceSummary.build(records).services == nil
   end
+
+  test "proven page service sets prune resource service.name filters, unproven ones never do" do
+    proven = for service <- ["kura-cache-0", "api"], do: TraceSummary.build([%{trace_id: nil, service: service}], true)
+    page = TraceSummary.page_summary(Enum.map(proven, &%{"t" => TraceSummary.to_wire(&1)}))
+    assert page["k"] == true
+
+    assert TraceSummary.page_matches?(page, resource_regex: %{"service.name" => "kura-.*"})
+    refute TraceSummary.page_matches?(page, resource_regex: %{"service.name" => "kura-meta.*"})
+    assert TraceSummary.page_matches?(page, resource: %{"service.name" => "api"})
+    refute TraceSummary.page_matches?(page, resource: %{"service.name" => "web"})
+    # Both filters must hold for the same service.
+    refute TraceSummary.page_matches?(page,
+             resource: %{"service.name" => "api"},
+             resource_regex: %{"service.name" => "kura.*"}
+           )
+
+    assert TraceSummary.page_matches?(page, resource_regex: %{"service.namespace" => "nothing"})
+
+    unproven = [TraceSummary.build([%{trace_id: nil, service: "api"}]) | proven]
+    page = TraceSummary.page_summary(Enum.map(unproven, &%{"t" => TraceSummary.to_wire(&1)}))
+    refute Map.has_key?(page, "k")
+    assert TraceSummary.page_matches?(page, resource: %{"service.name" => "web"})
+    refute TraceSummary.matches?(hd(proven), resource: %{"service.name" => "web"})
+    assert TraceSummary.matches?(hd(unproven), resource: %{"service.name" => "web"})
+  end
 end
