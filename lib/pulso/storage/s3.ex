@@ -84,6 +84,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.Record.SpanKey
   alias Pulso.Runtime
   alias Pulso.Storage.S3.AppendBuffer
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.KeyedPublication
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
@@ -727,7 +728,7 @@ defmodule Pulso.Storage.S3 do
   defp ensure_policy(root, tenant, signal, config) do
     cond do
       not Retention.enforcing?(config, signal) -> {:ok, root}
-      root.segments == [] and map_size(root.retired) == 0 -> convert_empty(tenant, signal, config)
+      Manifest.empty?(root) -> convert_empty(tenant, signal, config)
       true -> {:error, :retention_migration_required}
     end
   end
@@ -745,6 +746,11 @@ defmodule Pulso.Storage.S3 do
   defp query_segments(%Manifest{version: 3} = root, signal, start_ts, end_ts, opts, tenant, config) do
     opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts)
     PagedManifest.query(root, tenant, signal_string(signal), opts, config)
+  end
+
+  defp query_segments(%Manifest{version: 4} = root, signal, start_ts, end_ts, opts, tenant, config) do
+    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts)
+    JournalManifest.query(root, tenant, signal_string(signal), opts, config)
   end
 
   defp query_segments(manifest, signal, start_ts, end_ts, opts, _tenant, _config) do

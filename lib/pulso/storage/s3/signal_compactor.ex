@@ -25,6 +25,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   alias Pulso.Codec.NIF
   alias Pulso.ObjectStore
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
@@ -292,6 +293,13 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     if result == {:error, :retention_expired}, do: {:ok, false}, else: result
   end
 
+  defp published?(%{version: 4} = root, key, tenant, config) do
+    {:ok, segment} = ManifestOwner.segment_from_key(key)
+
+    with {:ok, found} <- JournalManifest.lookup(root, segment, tenant, signal_string(config), config),
+         do: {:ok, found != :absent}
+  end
+
   defp published?(manifest, key, _tenant, _config),
     do: {:ok, Enum.any?(manifest.segments, &(&1.key == key)) or Map.has_key?(manifest.retired, key)}
 
@@ -328,10 +336,26 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
+  defp advance_empty_cursor(%{version: 4}, candidates, tenant, config) do
+    next = candidates.paging["compaction_candidate"]
+
+    advance = fn root ->
+      if root.version == 4, do: {JournalManifest.advance_cursor(root, next), :ok}, else: {root, :ok}
+    end
+
+    case Retention.transact(tenant, signal_string(config), config, advance) do
+      {:ok, :ok} -> :ok
+      error -> error
+    end
+  end
+
   defp advance_empty_cursor(_root, _candidates, _tenant, _config), do: :ok
 
   defp compaction_candidates(%{version: 3} = root, tenant, config),
     do: PagedManifest.candidates(root, tenant, signal_string(config), config)
+
+  defp compaction_candidates(%{version: 4} = root, tenant, config),
+    do: JournalManifest.candidates(root, tenant, signal_string(config), config)
 
   defp compaction_candidates(root, _tenant, _config), do: {:ok, root}
 
@@ -353,31 +377,48 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     )
   end
 
+  defp prepare_replacement(%{version: 4} = root, sources, replacement, grace, tenant, config) do
+    deadline = System.system_time(:millisecond) + grace
+    signal = signal_string(config)
+
+    with {:ok, updated} <- JournalManifest.replace(root, sources, replacement, deadline, tenant, signal, config),
+         {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
+         do: {:ok, sealed, payload}
+  end
+
   defp prepare_replacement(root, sources, replacement, grace, _tenant, _config),
     do: Manifest.replace(root, sources, replacement, System.system_time(:millisecond) + grace)
 
   defp publish_current(current, etag, tenant, config, sources, replacement, grace, attempts) do
     case prepare_replacement(current, sources, replacement, grace, tenant, config) do
       {:ok, updated} ->
-        payload = updated |> Manifest.encode() |> IO.iodata_to_binary()
+        updated
+        |> Manifest.encode()
+        |> IO.iodata_to_binary()
+        |> write_replacement(etag, tenant, config, sources, replacement, grace, attempts)
 
-        case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal_string(config)), payload, etag) do
-          {:ok, _etag} ->
-            :ok
-
-          {:error, :precondition_failed} ->
-            Process.sleep(10 * (6 - attempts))
-            publish(tenant, config, sources, replacement, grace, attempts - 1)
-
-          error ->
-            error
-        end
+      {:ok, _sealed, payload} ->
+        write_replacement(payload, etag, tenant, config, sources, replacement, grace, attempts)
 
       # This branch precedes the conditional PUT. publish/7 has just loaded
       # authoritative state and proved the unique key absent (active/retired or
       # expired keys return success before here), including earlier lost replies.
       {:error, reason} ->
         {:error, {:unpublished_replacement, reason}}
+    end
+  end
+
+  defp write_replacement(payload, etag, tenant, config, sources, replacement, grace, attempts) do
+    case ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal_string(config)), payload, etag) do
+      {:ok, _etag} ->
+        :ok
+
+      {:error, :precondition_failed} ->
+        Process.sleep(10 * (6 - attempts))
+        publish(tenant, config, sources, replacement, grace, attempts - 1)
+
+      error ->
+        error
     end
   end
 
@@ -412,11 +453,81 @@ defmodule Pulso.Storage.S3.SignalCompactor do
          :ok <- validate_cleanup_limit(maximum),
          {:ok, manifest, _etag} <- load(tenant, config),
          :ok <- migration_gate(manifest, config) do
-      if manifest.version == 3 do
-        Retention.cleanup_retired(tenant, signal_string(config), config, opts)
-      else
-        manifest |> deletion_candidates(tenant, maximum, config) |> delete_candidates(tenant, config)
+      case manifest.version do
+        3 -> Retention.cleanup_retired(tenant, signal_string(config), config, opts)
+        4 -> cleanup_paged(manifest, tenant, maximum, config)
+        _ -> manifest |> deletion_candidates(tenant, maximum, config) |> delete_candidates(tenant, config)
       end
+    end
+  end
+
+  # Retired segments as for flat roots, plus manifest pages superseded by
+  # compaction once their reader grace has passed. A gc page is deleted only
+  # after every page it lists, so a missing gc page means its work is done.
+  defp cleanup_paged(root, tenant, maximum, config) do
+    signal = signal_string(config)
+    now = System.system_time(:millisecond)
+
+    with {:ok, plan} <- JournalManifest.cleanup_plan(root, now, maximum, tenant, signal, config) do
+      retired = Enum.filter(plan.retired, fn {key, _} -> valid_segment_key?(tenant, key, config) end)
+      {deleted, errors} = Enum.reduce(retired, {[], []}, &delete_retired(&1, &2, config))
+      pages = delete_pages(plan.pages, config)
+
+      gc_refs =
+        for {ref, keys} <- plan.gc_pages,
+            length(delete_pages(keys, config)) == length(keys) and delete_pages([ref["k"]], config) != [],
+            do: ref["k"]
+
+      cursor = with {key, _} <- List.last(retired), do: key
+
+      if retired == [] and pages == [] and gc_refs == [],
+        do: {:ok, 0},
+        else: finish_paged_cleanup(tenant, config, {deleted, pages, gc_refs, cursor}, errors)
+    end
+  end
+
+  defp finish_paged_cleanup(tenant, config, {deleted, _, _, _} = work, errors) do
+    with :ok <- publish_paged_cleanup(tenant, config, work, 5) do
+      if errors == [], do: {:ok, length(deleted)}, else: {:error, {:cleanup_failed, Enum.reverse(errors)}}
+    end
+  end
+
+  # The keys that were deleted (or were already absent).
+  defp delete_pages(keys, config) do
+    keys
+    |> Pulso.Runtime.Task.async_stream(&{&1, ObjectStore.delete(config, &1)}, max_concurrency: 8, timeout: :infinity)
+    |> Enum.flat_map(fn
+      {:ok, {key, :ok}} -> [key]
+      {:ok, {key, {:error, :not_found}}} -> [key]
+      _ -> []
+    end)
+  end
+
+  defp publish_paged_cleanup(_tenant, _config, _work, 0), do: {:error, :cas_retries_exhausted}
+
+  defp publish_paged_cleanup(tenant, config, work, attempts) do
+    case load(tenant, config) do
+      {:ok, %{version: 4} = current, etag} -> put_paged_cleanup(current, etag, tenant, config, work, attempts)
+      # Retention converted the root meanwhile; it owns cleanup now.
+      {:ok, _current, _etag} -> :ok
+      error -> error
+    end
+  end
+
+  defp put_paged_cleanup(current, etag, tenant, config, {deleted, pages, gc_refs, cursor} = work, attempts) do
+    signal = signal_string(config)
+
+    with {:ok, updated} <-
+           JournalManifest.apply_cleanup(current, deleted, pages, gc_refs, cursor, tenant, signal, config),
+         false <- updated == current,
+         {:ok, {_sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
+         {:error, :precondition_failed} <-
+           ObjectStore.put_if_match(config, Manifest.manifest_key(tenant, signal), payload, etag) do
+      publish_paged_cleanup(tenant, config, work, attempts - 1)
+    else
+      true -> :ok
+      {:ok, _etag} -> :ok
+      error -> error
     end
   end
 

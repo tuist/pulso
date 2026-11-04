@@ -46,10 +46,22 @@ defmodule Pulso.Storage.S3.MetadataCache do
   @doc false
   def clear, do: GenServer.call(__MODULE__, :clear)
 
+  @doc "Cached pages and their accounted bytes (the quantity bounded by the cache ceiling)."
+  def stats do
+    GenServer.call(__MODULE__, :stats, 1000)
+  catch
+    :exit, _ -> {0, 0}
+  end
+
   @impl true
   def handle_call(:clear, _from, _state) do
     :ets.delete_all_objects(table())
     {:reply, :ok, %{bytes: 0}}
+  end
+
+  def handle_call(:stats, _from, state) do
+    memory = :ets.info(table(), :memory) * :erlang.system_info(:wordsize) + state.bytes
+    {:reply, {:ets.info(table(), :size), memory}, state}
   end
 
   def handle_call({:put, ref, data}, _from, state) do

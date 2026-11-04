@@ -117,7 +117,12 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_detailed_operation_duration_seconds` | Histogram | Same as above, plus bucket `le` | Operation duration; buckets at 5 ms, 10 ms, 50 ms, 100 ms, 500 ms, 1 s, 5 s, 10 s, and +Inf |
 | `pulso_ingest_stage_duration_seconds` | Histogram | `signal`, `stage`, plus bucket `le` | Where ingest time goes. Per request: `decode` (receiver decoding after the body is read), `prepare` (OTLP log timestamp fill, trace retention filter, remote-write metadata publication) and `buffer_wait` (time in the coalescing window). Per published segment, which a coalesced flush shares: `encode` (Parquet), `summarize` (manifest summary), `segment_put`, `manifest_wait` (from handing the segment to the manifest owner until its publication starts, including queueing behind the publication in flight) and `manifest_commit` (merge, encode and conditional write of the manifest, including retries). Buckets at 1, 5, 10, 25, 50, 100, 250, 500 ms, 1, 2.5, 5 s and +Inf |
 | `pulso_manifest_segments` | Gauge | `signal` | Segments listed in manifest roots cached on this node, summed over tenants; for retention-managed roots, only the inline recent tail |
-| `pulso_manifest_bytes` | Gauge | `signal` | Encoded bytes of those cached manifest roots. A flat root is rewritten whole on every publication, so `manifest_commit` grows with it |
+| `pulso_manifest_bytes` | Gauge | `signal` | Encoded bytes of those cached manifest roots. A flat root is rewritten whole on every publication, so `manifest_commit` grows with it; a paged root stays small |
+| `pulso_manifest_referenced_segments` | Gauge | `signal` | Active segments the cached roots reference, including through paged-manifest pages, summed over tenants; retention-managed roots count only their inline tail |
+| `pulso_manifest_roots` | Gauge | `signal`, `format` (`flat`, `paged`, `retention`) | Cached manifest roots by format. A `flat` root that keeps growing is the history-dependent ingest cost described in [manifest format](configuration.md#manifest-format) |
+| `pulso_manifest_commit_duration_seconds` | Histogram | `signal`, `format`, `root_bytes_le` (`65536`, `262144`, `1048576`, `4194304`, `16777216`, `+Inf`), plus bucket `le` | One manifest publication: building and encoding the root, writing any new pages and the conditional root write, including conflict retries. `root_bytes_le` is the encoded size of the written root, so commit time can be compared by manifest size. Same buckets as `pulso_ingest_stage_duration_seconds` |
+| `pulso_manifest_page_cache_entries` | Gauge | None | Immutable manifest pages (paged and retention formats) cached on this node |
+| `pulso_manifest_page_cache_bytes` | Gauge | None | Accounted size of that page cache; it is bounded at 16 MiB |
 | `pulso_ingest_delivery_records_total` | Counter | `signal`, `outcome` | Known receiver deliveries: `accepted` after append success; `rejected` combines decoder drops and decoded records whose append failed |
 | `pulso_object_bytes_total` | Counter | `operation`, `purpose`, `direction` | Successful logical GET body bytes and PUT payload bytes, partitioned by purpose |
 | `pulso_detailed_compaction_segments_total` | Counter | `operation` | Source segments merged by `compact`, or confirmed retirement deletions by `cleanup` |
@@ -257,6 +262,12 @@ sum by (signal, stage) (rate(pulso_ingest_stage_duration_seconds_sum[5m]))
 
 # Flat manifest size per signal, the main driver of manifest_commit.
 pulso_manifest_bytes
+
+# Manifest commit p90 by format and root size; flat roots grow, paged stay small.
+histogram_quantile(0.9, sum by (le, signal, format, root_bytes_le) (rate(pulso_manifest_commit_duration_seconds_bucket[5m])))
+
+# Roots still in the flat format.
+sum by (signal) (pulso_manifest_roots{format="flat"})
 
 # Detailed public query failures.
 sum by (instance, operation, outcome) (

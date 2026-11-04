@@ -7,6 +7,7 @@ defmodule Pulso.Storage.S3.Retention do
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.CASBackoff
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.LogCompactor
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.ManifestCache
@@ -41,6 +42,9 @@ defmodule Pulso.Storage.S3.Retention do
     cond do
       known_version == 3 ->
         ObjectStore.get_bounded(config, key, etag, Pages.root_limit())
+
+      known_version == 4 ->
+        ObjectStore.get_bounded(config, key, etag, JournalManifest.root_limit())
 
       # Conversion, policy inspection and maintenance decode a whole legacy root
       # into one process, so they keep an explicit legacy budget.
@@ -518,6 +522,14 @@ defmodule Pulso.Storage.S3.Retention do
   end
 
   defp bound(%Manifest{paging: nil} = root, _config), do: root
+
+  defp bound(%Manifest{version: 4} = root, _config) do
+    case JournalManifest.bounded(root) do
+      {:ok, root} -> root
+      {:error, reason} -> Pages.fail(reason)
+    end
+  end
+
   defp bound(root, config), do: Pages.bounded(root, config)
 
   # After an ambiguous write, our own nonce in the current root proves commit.
@@ -549,8 +561,22 @@ defmodule Pulso.Storage.S3.Retention do
 
   defp activate(%Manifest{version: 3} = root, _tenant, _signal, _config), do: root
 
+  # A paged (format-4) root is read whole into one flat manifest first, within
+  # the same legacy budget a flat root of that size would need.
+  defp activate(%Manifest{version: 4} = root, tenant, signal, config) do
+    if config[:retention_empty_conversion_only] == true and not Manifest.empty?(root),
+      do: Pages.fail(:retention_migration_required)
+
+    limit = Map.get(config, :retention_legacy_max_bytes, @legacy_limit)
+
+    case JournalManifest.materialize(root, tenant, signal, config, limit) do
+      {:ok, flat} -> activate(flat, tenant, signal, config)
+      {:error, reason} -> Pages.fail(reason)
+    end
+  end
+
   defp activate(root, tenant, signal, config) do
-    if config[:retention_empty_conversion_only] == true and (root.segments != [] or map_size(root.retired) != 0),
+    if config[:retention_empty_conversion_only] == true and not Manifest.empty?(root),
       do: Pages.fail(:retention_migration_required)
 
     if config[:retention_migration_notify], do: send(config.retention_migration_notify, {:retention_migration, self()})

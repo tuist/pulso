@@ -33,6 +33,7 @@ defmodule Pulso.Storage.S3.Manifest do
       producing a sorted output — O(n) rather than O(n log n).
   """
 
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest.Retirement
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.PagedManifest
@@ -103,7 +104,7 @@ defmodule Pulso.Storage.S3.Manifest do
       "cleanup_cursor" => cursor
     }
 
-    wire = if version == 3, do: Map.put(wire, "p", manifest.paging), else: wire
+    wire = if version in [3, 4], do: Map.put(wire, "p", manifest.paging), else: wire
     wire = if names == [], do: wire, else: Map.put(wire, "names", names)
     wire = if labels == [], do: wire, else: Map.put(wire, "labels", labels)
     wire = if services == [], do: wire, else: Map.put(wire, "services", services)
@@ -112,7 +113,7 @@ defmodule Pulso.Storage.S3.Manifest do
     rest = wire |> Pulso.JSON.encode_to_iodata!() |> IO.iodata_to_binary()
     json = ["{\"s\":[", Enum.intersperse(wire_segments, ?,), "],", binary_part(rest, 1, byte_size(rest) - 1)]
 
-    if version == 3 do
+    if version in [3, 4] do
       # Verify exact payload bytes, independent of OTP term encoding or JSON
       # map iteration order across reader/writer upgrades.
       {["{\"root_sha\":\"", root_digest(json), "\",\"payload\":", json, "}"], cache}
@@ -163,16 +164,18 @@ defmodule Pulso.Storage.S3.Manifest do
 
   # Tombstones remain after deletion: a delayed idempotent ingest retry must
   # never reintroduce records that already live in a replacement segment.
-  defp validate_version(version) when version in [1, 2, 3], do: :ok
+  defp validate_version(version) when version in [1, 2, 3, 4], do: :ok
   defp validate_version(_), do: {:error, :unsupported_manifest_version}
 
   defp validate_paging(3, paging), do: PagedManifest.validate(paging)
+  defp validate_paging(4, paging), do: JournalManifest.validate(paging)
   defp validate_paging(_, nil), do: :ok
   defp validate_paging(_, _), do: {:error, :invalid_manifest}
 
   defp validate_fields(1, _wire), do: :ok
   defp validate_fields(2, %{"retired" => _}), do: :ok
   defp validate_fields(3, %{"retired" => retired, "p" => _}) when is_map(retired) and map_size(retired) == 0, do: :ok
+  defp validate_fields(4, %{"retired" => retired, "p" => _} = wire) when is_map(retired), do: no_cursor(wire)
   defp validate_fields(_, _wire), do: {:error, :invalid_manifest}
 
   defp root_digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
@@ -187,8 +190,8 @@ defmodule Pulso.Storage.S3.Manifest do
   end
 
   defp unwrap_root(bytes), do: {:ok, bytes, false}
-  defp validate_root_digest(3, true), do: :ok
-  defp validate_root_digest(3, _), do: {:error, :invalid_manifest}
+  defp validate_root_digest(version, true) when version in [3, 4], do: :ok
+  defp validate_root_digest(version, _) when version in [3, 4], do: {:error, :invalid_manifest}
   defp validate_root_digest(_, false), do: :ok
   defp validate_root_digest(_, _), do: {:error, :invalid_manifest}
 
@@ -200,7 +203,27 @@ defmodule Pulso.Storage.S3.Manifest do
       else: {:error, :retention_capacity}
   end
 
+  defp validate_root_bounds(4, segments, bytes) do
+    if bytes <= JournalManifest.root_limit() and length(segments) <= JournalManifest.root_entries(),
+      do: :ok,
+      else: {:error, :manifest_capacity}
+  end
+
   defp validate_root_bounds(_, _, _), do: :ok
+
+  # Format 4 tracks cleanup per page, not with a flat key cursor.
+  defp no_cursor(%{"cleanup_cursor" => cursor}) when not is_nil(cursor), do: {:error, :invalid_manifest}
+  defp no_cursor(_wire), do: :ok
+
+  @doc "Whether a root references no segment or retirement at all, including through pages."
+  @spec empty?(t()) :: boolean()
+  def empty?(%__MODULE__{segments: [], retired: retired, version: 4, paging: %{"refs" => refs}}),
+    do: map_size(retired) == 0 and refs == []
+
+  def empty?(%__MODULE__{segments: segments, retired: retired, version: version}) when version in [1, 2, 3],
+    do: segments == [] and map_size(retired) == 0
+
+  def empty?(%__MODULE__{}), do: false
 
   defp decode_cursor(cursor) when is_nil(cursor) or is_binary(cursor), do: {:ok, cursor}
   defp decode_cursor(_), do: {:error, :invalid_manifest}

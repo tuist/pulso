@@ -226,6 +226,16 @@ trace_compaction_enabled = env_var.("PULSO_TRACE_COMPACTION_ENABLED", "false") i
 log_compaction_enabled = env_var.("PULSO_LOG_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 metric_footer_pruning_enabled = env_var.("PULSO_METRICS_FOOTER_PRUNING_ENABLED", "false") in ["1", "true", "yes"]
 
+# paged (default): manifests without retention keep a bounded root and
+# immutable pages, converting flat roots on their next publication. Releases
+# before 1.27 cannot read paged roots. flat keeps writing flat roots (whose cost
+# grows with history) but still reads and extends roots that are already paged.
+manifest_format =
+  case env_var.("PULSO_MANIFEST_FORMAT", "paged") do
+    value when value in ["paged", "flat"] -> value
+    _ -> raise "PULSO_MANIFEST_FORMAT must be paged or flat"
+  end
+
 # Optional node-local unkeyed coalescing; disabled unless explicitly enabled.
 ingest_flush_interval_ms =
   case Integer.parse(env_var.("PULSO_INGEST_FLUSH_INTERVAL_MS", "0")) do
@@ -476,6 +486,7 @@ case config_env() do
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
       metric_footer_pruning_enabled: metric_footer_pruning_enabled,
+      manifest_format: manifest_format,
       bucket: env_var.("PULSO_S3_BUCKET", "pulso"),
       # mise/utilities/dev_instance_env.sh sets PULSO_S3_ENDPOINT per worktree.
       # The fallback matches the docker-compose default host port when mise
@@ -542,6 +553,7 @@ case config_env() do
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
       metric_footer_pruning_enabled: metric_footer_pruning_enabled,
+      manifest_format: manifest_format,
       bucket: require_env.("PULSO_S3_BUCKET"),
       endpoint: env_var.("PULSO_S3_ENDPOINT", nil),
       region: require_env.("PULSO_S3_REGION"),

@@ -24,8 +24,20 @@ within each signal (above-share tenants keep one free slot per other active
 tenant; best effort, keyed by pre-auth `X-Scope-OrgID`), and lets coalesced
 requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
-16 per tenant/signal) so uploads overlap the serialized manifest CAS. Flat
-manifests still grow without retention; see `docs/configuration.md#ingest-admission`.
+16 per tenant/signal) so uploads overlap the serialized manifest CAS.
+
+Prefixes without enforced retention now default to format-4 paged manifests
+(`Pulso.Storage.S3.JournalManifest`, `PULSO_MANIFEST_FORMAT=paged|flat`): a
+bounded `root_sha` root with an inline tail (spill at 512 entries/128 KiB) and a
+fanout-16 binary-counter tree of immutable, nonce-tagged pages under
+`journal/`, so append cost and cached-manifest memory no longer grow with
+history. Flat roots convert on their next publication; pre-1.27 releases reject
+format 4 (fail closed, no overwrite). Keyed lookups descend by `max_ts` ranges;
+compaction/cleanup rewrite one leaf path and supersede pages after the grace;
+enforcing retention materializes format 4 into format 3 within the legacy byte
+limit. `pulso_manifest_commit_duration_seconds{signal,format,root_bytes_le}`,
+`pulso_manifest_roots` and page-cache gauges watch it. Total bucket metadata
+still grows until retention. See `docs/configuration.md#manifest-format`.
 
 Current trace search capability is **5**, tuple `{2,1,3,5,12}`, superseding the
 search4 snapshot references below. Unscoped original-string/int64 search uses

@@ -7,6 +7,7 @@ defmodule Pulso.Storage.S3.TracesTest do
   alias Pulso.Runtime
   alias Pulso.Runtime.Task
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
@@ -487,7 +488,9 @@ defmodule Pulso.Storage.S3.TracesTest do
 
     assert Task.await(task, 30_000) == :ok
     assert {:ok, %{manifest: manifest}} = ManifestOwner.ensure_loaded(ctx.tenant, "traces", config)
-    assert length(manifest.segments) == 20_001
+    # That append converted the flat history into pages; the root lists only its tail.
+    assert manifest.version == 4
+    assert JournalManifest.referenced(manifest) == 20_001
   end
 
   test "ack follows segment PUT and manifest CAS, retries deduplicate, and filters isolate signals", ctx do

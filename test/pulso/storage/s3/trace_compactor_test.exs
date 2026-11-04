@@ -15,7 +15,7 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.OTLPTraceFixture, as: Fixture
 
-  setup do
+  setup tags do
     agent =
       start_supervised!(
         {Agent,
@@ -47,6 +47,9 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
       refresh_stale_ms: 0
     }
 
+    # Tests of the flat format's own behaviour opt out of paged manifests.
+    config = if tags[:manifest_format], do: Map.put(config, :manifest_format, tags[:manifest_format]), else: config
+
     Runtime.put_env(:pulso, S3, config)
     start_supervised!(ManifestSupervision)
     {:ok, [span], 0} = Traces.decode(Fixture.payload())
@@ -72,6 +75,7 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
     assert Pulso.JSON.decode!(json)["span_count"] == 0
   end
 
+  @tag manifest_format: "flat"
   test "flat roots discard unused ID hashes while retaining exact-ID pruning", ctx do
     assert :ok = S3.append(:traces, ctx.tenant, [ctx.span])
     [segment] = load(ctx).segments

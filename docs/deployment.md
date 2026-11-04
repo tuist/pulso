@@ -346,6 +346,18 @@ overlap older and newer versions once a prefix has been converted. After
 conversion, rolling back to a release without retention is not supported; fix
 forward instead.
 
+### Paged manifest boundary
+
+Starting with 1.27.0, `manifestFormat: paged` (the default) converts each flat
+tenant/signal manifest to a paged format on its next ingest write. Releases
+before 1.27.0 reject paged manifests and fail those requests rather than read or
+overwrite them, so mixing versions cannot lose data, but older pods cannot serve
+converted prefixes until they are replaced. A single-replica rolling update only
+sees retryable ingest errors on the old pod during the overlap. To avoid them,
+roll out with `manifestFormat: flat`, then set `paged` in a second upgrade once no
+older pod remains. Rolling back below 1.27.0 after conversion is not supported.
+See [manifest format](configuration.md#manifest-format).
+
 ### Native library compatibility
 
 Pulso's object-storage client and telemetry codec are native libraries that must come from the same

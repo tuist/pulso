@@ -29,7 +29,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
 
   @moduletag timeout: 120_000
 
-  setup do
+  setup tags do
     agent =
       start_supervised!(
         {Agent,
@@ -61,6 +61,9 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       allow_http: true,
       refresh_stale_ms: 0
     }
+
+    # Tests of the flat format's own behaviour opt out of paged manifests.
+    config = if tags[:manifest_format], do: Map.put(config, :manifest_format, tags[:manifest_format]), else: config
 
     Runtime.put_env(:pulso, S3, config)
 
@@ -414,6 +417,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert %{pending: 0, waiters: 0, queued: 0, committing_since: nil} = info
   end
 
+  @tag manifest_format: "flat"
   test "compacted name summaries preserve selective query budgets and retirement metadata", ctx do
     for ts <- 1..4, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
     matchers = [{"__name__", :eq, "requests"}]
@@ -999,6 +1003,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:ok, ^etag, ^body} = ObjectStore.get_if_none_match(ctx.config, key, nil)
   end
 
+  @tag manifest_format: "flat"
   test "an owner loaded before compaction preserves the new metadata when background compaction is disabled", ctx do
     for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
     assert load(ctx).version == 1

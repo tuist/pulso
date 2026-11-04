@@ -122,6 +122,8 @@ spec:
             {{- end }}
             - name: PULSO_S3_ALLOW_HTTP
               value: {{ .Values.storage.allowHttp | quote }}
+            - name: PULSO_MANIFEST_FORMAT
+              value: {{ include "pulso.manifestFormat" . | quote }}
             - name: PULSO_METRICS_COMPACTION_ENABLED
               value: {{ .Values.metricsCompaction.enabled | quote }}
             {{- if and .Values.otlpGrpc.enabled (ne $pool "query") (ne $pool "maintenance") }}

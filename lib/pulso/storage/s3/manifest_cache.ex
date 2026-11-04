@@ -30,6 +30,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
   use Pulso.Runtime.GenServer
 
   alias Pulso.Runtime.GenServer
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Retention
 
@@ -194,8 +195,10 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
     entry = %{
       payload: payload,
-      # Root size for node-local gauges; a managed root counts only its tail.
+      # Root size for node-local gauges; paged and managed roots list only
+      # their tail. Paged roots also know every segment their pages reference.
       segments: length(manifest.segments),
+      referenced: JournalManifest.referenced(manifest),
       version: manifest.version,
       etag: etag,
       token: make_ref(),
@@ -225,13 +228,34 @@ defmodule Pulso.Storage.S3.ManifestCache do
   defp wire({%Manifest{} = manifest, payload}) when is_binary(payload), do: {manifest, payload}
   defp wire(%Manifest{} = manifest), do: {manifest, IO.iodata_to_binary(Manifest.encode(manifest))}
 
-  @doc "Cached root segment counts and encoded bytes per signal, summed over tenants, without copying payloads."
+  @doc """
+  Per signal, summed over tenants without copying payloads: listed root
+  segments (`0`), encoded root bytes (`1`), referenced segments (`2`) and the
+  number of roots per format (`"flat"`, `"paged"`, `"retention"`).
+  """
   def sizes do
     :ets.select(table(), [
-      {{{:_, :"$1"}, %{payload: :"$2", segments: :"$3"}}, [], [{{:"$1", :"$3", {:byte_size, :"$2"}}}]}
+      {{{:_, :"$1"}, %{payload: :"$2", segments: :"$3", referenced: :"$4", version: :"$5"}}, [],
+       [{{:"$1", :"$3", {:byte_size, :"$2"}, :"$4", :"$5"}}]}
     ])
-    |> Enum.reduce(%{}, fn {signal, segments, bytes}, acc ->
-      Map.update(acc, signal, {segments, bytes}, fn {s, b} -> {s + segments, b + bytes} end)
+    |> Enum.reduce(%{}, fn {signal, segments, bytes, referenced, version}, acc ->
+      format =
+        case version do
+          4 -> "paged"
+          3 -> "retention"
+          _ -> "flat"
+        end
+
+      totals = Map.get(acc, signal, %{0 => 0, 1 => 0, 2 => 0})
+
+      totals =
+        totals
+        |> Map.update!(0, &(&1 + segments))
+        |> Map.update!(1, &(&1 + bytes))
+        |> Map.update!(2, &(&1 + referenced))
+        |> Map.update(format, 1, &(&1 + 1))
+
+      Map.put(acc, signal, totals)
     end)
   rescue
     ArgumentError -> %{}

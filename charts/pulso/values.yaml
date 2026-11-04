@@ -107,6 +107,16 @@ storage:
 metricsFooterPruning:
   enabled: false
 
+# Manifest format for prefixes without enforced retention (PULSO_MANIFEST_FORMAT).
+# paged: a bounded root over immutable pages, so ingest cost and manifest memory
+#        do not grow with history. Flat manifests convert on their next write;
+#        releases before 1.27.0 cannot read converted manifests and fail requests
+#        for them (no data loss). Upgrade every pod before relying on paged writes.
+# flat:  the pre-1.27 unbounded list. Use it only while an older release still
+#        writes to the bucket; it does not convert paged manifests back.
+# See docs/configuration.md#manifest-format.
+manifestFormat: paged
+
 metricsCompaction:
   # Merges small metrics segments in the background. Enable it only once every
   # Pulso version writing to the bucket supports compaction, and turn on

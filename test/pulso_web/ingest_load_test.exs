@@ -111,7 +111,8 @@ defmodule PulsoWeb.IngestLoadTest do
       access_key_id: "load-#{System.unique_integer([:positive])}",
       secret_access_key: "load",
       allow_http: true,
-      ingest_flush_interval_ms: env_int("PULSO_LOAD_FLUSH_INTERVAL_MS", 50)
+      ingest_flush_interval_ms: env_int("PULSO_LOAD_FLUSH_INTERVAL_MS", 50),
+      manifest_format: System.get_env("PULSO_LOAD_MANIFEST_FORMAT", "paged")
     })
 
     Runtime.put_env(:pulso, Pulso.IngestAdmission, max_concurrent: env_int("PULSO_LOAD_MAX_CONCURRENT", 16))
@@ -135,9 +136,13 @@ defmodule PulsoWeb.IngestLoadTest do
   end
 
   # Steady Alloy-shaped traffic against flat manifests already holding tens of
-  # thousands of segments, as a single node without retention accumulates:
+  # thousands of segments, as a single node without retention accumulates.
+  # PULSO_LOAD_MANIFEST_FORMAT=flat keeps them flat; paged (the default)
+  # converts them on the first write. PULSO_LOAD_PHASES splits the report into
+  # equal phases with latency, memory and manifest size each:
   #
   #     PULSO_LOAD_S3_LATENCY_MS=40..90 PULSO_LOAD_S3_MB_PER_S=45 PULSO_LOAD_FLUSH_INTERVAL_MS=20 \\
+  #       PULSO_LOAD_LOG_SEGMENTS=50000 PULSO_LOAD_PHASES=4 \\
   #       mix test test/pulso_web/ingest_load_test.exs --only staging_load
   @tag :staging_load
   test "steady Alloy traffic over large flat manifests", ctx do
@@ -163,12 +168,20 @@ defmodule PulsoWeb.IngestLoadTest do
 
     # Warm up: the first request per signal loads its large manifest.
     for signal <- [:loki_pb, :rw_steady, :traces] do
-      deliver(ctx, :ets.new(:warmup, [:public, :duplicate_bag]), signal, staging_body(signal, 0), 500, 4)
+      warmup = :ets.new(:warmup, [:public, :duplicate_bag])
+      deliver(ctx, warmup, signal, staging_body(signal, 0), 500, 4)
+      attempts = for {_, :attempt, status, ms} <- :ets.tab2list(warmup), do: "#{status} in #{round(ms)} ms"
+      IO.puts("warmup #{signal} (first write, includes any manifest conversion): #{Enum.join(attempts, ", ")}")
     end
 
     :ets.delete_all_objects(stats)
+    ctx.trim.()
+    :erlang.garbage_collect()
     deadline = System.monotonic_time(:millisecond) + seconds * 1000
     started = System.monotonic_time(:millisecond)
+    trimmer = Task.async(fn -> trim_loop(ctx.trim, deadline) end)
+    runtime = Runtime.current()
+    sampler = Task.async(fn -> Runtime.with(runtime, fn -> sample_phases(ctx.store, started, deadline, []) end) end)
 
     # Eight alloy-logs pods at 0.5 push/s each, one remote-write shard and one trace exporter.
     pods = for pod <- 1..8, do: Task.async(fn -> pod_loop(ctx, results, deadline, pod) end)
@@ -176,8 +189,12 @@ defmodule PulsoWeb.IngestLoadTest do
     traces = Task.async(fn -> paced(ctx, results, deadline, :traces, 2000) end)
     Task.await_many([rw, traces | pods], :infinity)
     elapsed = (System.monotonic_time(:millisecond) - started) / 1000
+    Task.await(trimmer, :infinity)
+    samples = Task.await(sampler, :infinity)
 
     IO.puts(staging_report(results, ctx, elapsed))
+    IO.puts(phase_report(results, samples, started, seconds * 1000, env_int("PULSO_LOAD_PHASES", 1)))
+    IO.puts(retained_report(ctx.store))
     assert :ets.select_count(results, [{{:loki_pb, :attempt, 204, :_}, [], [true]}]) > 0
   end
 
@@ -272,6 +289,91 @@ defmodule PulsoWeb.IngestLoadTest do
       "traces" ->
         segment
     end
+  end
+
+  # Every second: VM memory and the cached manifest state of this node.
+  defp sample_phases(store, started, deadline, acc) do
+    now = System.monotonic_time(:millisecond)
+
+    if now < deadline do
+      sizes = S3.ManifestCache.sizes()
+      {pages, page_bytes} = S3.MetadataCache.stats()
+
+      sample = %{
+        at: now - started,
+        memory: :erlang.memory(:total),
+        # Bodies the fake S3 server holds (manifests and pages), not Pulso's memory.
+        store: Agent.get(store, fn state -> Enum.sum(for {_, {_, body}} <- state.objects, do: byte_size(body)) end),
+        referenced: for(signal <- ["logs", "metrics"], do: sizes |> Map.get(signal, %{}) |> Map.get(2, 0)),
+        root_bytes: Enum.sum(for {_, size} <- sizes, do: Map.get(size, 1, 0)),
+        pages: pages,
+        page_bytes: page_bytes
+      }
+
+      Process.sleep(1000)
+      sample_phases(store, started, deadline, [sample | acc])
+    else
+      Enum.reverse(acc)
+    end
+  end
+
+  # Memory still referenced after every process collects its garbage.
+  defp retained_report(store) do
+    for pid <- Process.list(), do: :erlang.garbage_collect(pid)
+    stored = Agent.get(store, fn state -> Enum.sum(for {_, {_, body}} <- state.objects, do: byte_size(body)) end)
+    memory = :erlang.memory()
+
+    top =
+      for(
+        pid <- Process.list(),
+        info = Process.info(pid, [:memory, :binary, :registered_name, :initial_call]),
+        do: info
+      )
+      |> Enum.map(fn info ->
+        binary = info[:binary] |> Enum.uniq_by(&elem(&1, 0)) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+        {info[:memory] + binary, info[:registered_name], info[:initial_call]}
+      end)
+      |> Enum.sort(:desc)
+      |> Enum.take(5)
+      |> Enum.map_join(", ", fn {bytes, name, call} ->
+        "#{inspect(if name == [], do: call, else: name)} #{div(bytes, 1_048_576)} MiB"
+      end)
+
+    mib = &div(&1, 1_048_576)
+
+    "retained after full GC: total #{mib.(memory[:total])} MiB, fake-S3 bodies #{mib.(stored)} MiB, " <>
+      "ets #{mib.(memory[:ets])} MiB, binary #{mib.(memory[:binary])} MiB, processes #{mib.(memory[:processes])} MiB; " <>
+      "largest: #{top}"
+  end
+
+  defp phase_latency(rows, signal, in_phase) do
+    ok = for {^signal, at, status, ms} <- rows, in_phase.(at), is_integer(status) and status < 300, do: ms
+    "#{signal} p50 #{pct(ok, 0.5)} p90 #{pct(ok, 0.9)}"
+  end
+
+  defp phase_report(results, samples, started, total_ms, phases) do
+    width = div(total_ms, phases)
+    rows = :ets.select(results, [{{:"$1", :at, :"$2", :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}])
+
+    lines =
+      for phase <- 0..(phases - 1) do
+        {low, high} = {phase * width, (phase + 1) * width}
+        in_phase = fn at -> at - started >= low and at - started < high end
+
+        latency = for signal <- [:loki_pb, :rw_steady, :traces], do: phase_latency(rows, signal, in_phase)
+
+        window = Enum.filter(samples, &(&1.at >= low and &1.at < high))
+        last = List.last(window) || %{referenced: [0, 0], root_bytes: 0, pages: 0, page_bytes: 0}
+        peak = window |> Enum.map(& &1.memory) |> Enum.max(fn -> 0 end)
+        own = window |> Enum.map(&(&1.memory - &1.store)) |> Enum.max(fn -> 0 end)
+        [logs, metrics] = last.referenced
+
+        "  phase #{phase + 1} (#{div(low, 1000)}-#{div(high, 1000)} s): #{Enum.join(latency, ", ")} ms; " <>
+          "peak VM #{div(peak, 1_048_576)} MiB (#{div(own, 1_048_576)} MiB without fake-S3 bodies); segments logs #{logs} metrics #{metrics}; " <>
+          "cached roots #{div(last.root_bytes, 1024)} KiB, page cache #{last.pages} pages #{div(last.page_bytes, 1024)} KiB"
+      end
+
+    Enum.join(["", "phases (manifest format #{System.get_env("PULSO_LOAD_MANIFEST_FORMAT", "paged")}):" | lines], "\n")
   end
 
   defp staging_report(results, ctx, elapsed) do
@@ -425,6 +527,7 @@ defmodule PulsoWeb.IngestLoadTest do
     {path, headers} = target(signal)
     {status, ms} = post(ctx.api <> path, body, headers)
     :ets.insert(results, {signal, :attempt, status, ms})
+    :ets.insert(results, {signal, :at, System.monotonic_time(:millisecond), status, ms})
 
     if status in [429, 503] do
       Process.sleep(backoff)

@@ -7,6 +7,7 @@ defmodule Pulso.Storage.S3.PagedManifest do
   import Kernel, except: [floor: 1]
 
   alias Pulso.ObjectStore
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Retirement
   alias Pulso.Storage.S3.Manifest.Segment
@@ -768,6 +769,9 @@ defmodule Pulso.Storage.S3.PagedManifest do
       :ok
     end)
   end
+
+  def validate_context(%Manifest{version: 4} = root, tenant, signal),
+    do: JournalManifest.validate_context(root, tenant, signal)
 
   def validate_context(_root, _tenant, _signal), do: {:ok, :ok}
 

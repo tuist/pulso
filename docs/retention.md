@@ -78,7 +78,10 @@ same pages instead of new ones. From then on Pulso refuses to rebuild that
 manifest by listing objects: if the manifest is missing, reads and writes fail
 with an error instead of resurrecting expired or unpublished data.
 
-Prefixes that are not retention-managed keep the existing format. Ordinary
+Prefixes that are not retention-managed keep their flat or paged (format 4,
+see [manifest format](configuration.md#manifest-format)) manifest. Enforcing
+retention on a paged prefix reads its pages into one list under the same 16 MiB
+conversion limit as a flat manifest, then converts it to format 3. Ordinary
 queries and appends read their manifests without a size limit in every mode,
 as before. When a node does not yet know a prefix's format (after a restart, for
 example), its first read is capped at 512 KiB, the format-3 limit; a larger

@@ -13,6 +13,7 @@ defmodule Pulso.Metrics do
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
+  alias Pulso.Storage.S3.MetadataCache
 
   @table __MODULE__
   @handler {__MODULE__, :metrics}
@@ -94,8 +95,12 @@ defmodule Pulso.Metrics do
     {"pulso_compaction_segments_total", "counter",
      "Source segments merged or retirement deletions confirmed by successful maintenance calls."},
     {"pulso_compaction_timeouts_total", "counter",
-     "Background worker deadlines exceeded, including still-running native work."}
+     "Background worker deadlines exceeded, including still-running native work."},
+    {"pulso_manifest_commit_duration_seconds", "histogram",
+     "Manifest publications by signal, root format and encoded root size bucket (root_bytes_le): " <>
+       "build, encode, page writes and the conditional root write, including conflict retries."}
   ]
+  @root_size_labels Enum.map([65_536, 262_144, 1_048_576, 4_194_304, 16_777_216], &{&1, Integer.to_string(&1)})
   @purposes ["none", "segment", "manifest", "metadata_page", "other"]
   @outcomes ["ok", "error", "exception", "conflict", "not_modified", "not_found", "rejected"]
   @gauge_help %{
@@ -118,7 +123,10 @@ defmodule Pulso.Metrics do
     "pulso_query_inflight" => "Interactive queries holding a node-local slot.",
     "pulso_query_max_concurrent" => "Node-local interactive query slots.",
     "pulso_memory_budget_bytes" => "Memory budget that sized this node's slots; 0 when fixed defaults apply.",
-    "pulso_vm_run_queue" => "BEAM scheduler run-queue length."
+    "pulso_vm_run_queue" => "BEAM scheduler run-queue length.",
+    "pulso_manifest_page_cache_entries" => "Immutable manifest pages in this node's bounded page cache.",
+    "pulso_manifest_page_cache_bytes" =>
+      "Accounted bytes of this node's bounded manifest page cache (16 MiB ceiling), including table memory."
   }
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -212,6 +220,30 @@ defmodule Pulso.Metrics do
       stage(signal, stage, started)
     end
   end
+
+  @doc """
+  Record one manifest publication of `signal` that began at `started` (native
+  monotonic time) and wrote a root of `bytes` in format `version`.
+  """
+  def manifest_commit(signal, version, bytes, started) when signal in @signals and is_integer(bytes) do
+    format =
+      case version do
+        4 -> "paged"
+        3 -> "retention"
+        _ -> "flat"
+      end
+
+    size = Enum.find_value(@root_size_labels, "+Inf", fn {bound, label} -> if bytes <= bound, do: label end)
+
+    record_histogram(
+      "pulso_manifest_commit_duration_seconds",
+      [{"signal", signal}, {"format", format}, {"root_bytes_le", size}],
+      System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond),
+      @stage_bucket_labels
+    )
+  end
+
+  def manifest_commit(_signal, _version, _bytes, _started), do: :ok
 
   defp outcome({:error, reason}) when reason in [:already_exists, :precondition_failed], do: "conflict"
   defp outcome({:error, :not_found}), do: "not_found"
@@ -377,6 +409,7 @@ defmodule Pulso.Metrics do
     case name do
       "pulso_operation_duration_seconds_" <> _ -> "pulso_operation_duration_seconds"
       "pulso_ingest_stage_duration_seconds_" <> _ -> "pulso_ingest_stage_duration_seconds"
+      "pulso_manifest_commit_duration_seconds_" <> _ -> "pulso_manifest_commit_duration_seconds"
       _ -> name
     end
   end
@@ -387,6 +420,9 @@ defmodule Pulso.Metrics do
 
   defp counter_order({{"pulso_ingest_stage_duration_seconds_" <> suffix, labels}, _}),
     do: histogram_order("pulso_ingest_stage_duration_seconds", suffix, labels, @stage_bucket_labels)
+
+  defp counter_order({{"pulso_manifest_commit_duration_seconds_" <> suffix, labels}, _}),
+    do: histogram_order("pulso_manifest_commit_duration_seconds", suffix, labels, @stage_bucket_labels)
 
   defp counter_order({{name, labels}, _}), do: {name, labels, 0}
 
@@ -415,9 +451,13 @@ defmodule Pulso.Metrics do
 
   defp render_counter({{name, labels}, value}) do
     value =
-      if name in ["pulso_operation_duration_seconds_sum", "pulso_ingest_stage_duration_seconds_sum"],
-        do: seconds(value),
-        else: Integer.to_string(value)
+      if name in [
+           "pulso_operation_duration_seconds_sum",
+           "pulso_ingest_stage_duration_seconds_sum",
+           "pulso_manifest_commit_duration_seconds_sum"
+         ],
+         do: seconds(value),
+         else: Integer.to_string(value)
 
     [
       exported_name(name),
@@ -461,22 +501,40 @@ defmodule Pulso.Metrics do
   end
 
   # Flat roots are rewritten whole on every publication, so their size is the
-  # main driver of manifest commit time.
+  # main driver of manifest commit time. Paged roots list only their tail and
+  # reference the rest through immutable pages.
   defp manifest_size_gauges do
     sizes = ManifestCache.sizes()
+    {page_entries, page_bytes} = MetadataCache.stats()
 
-    for {name, index, help} <- [
-          {"pulso_manifest_segments", 0, "Segments listed in cached manifest roots, summed over tenants."},
-          {"pulso_manifest_bytes", 1, "Encoded bytes of cached manifest roots, summed over tenants."}
-        ] do
-      [
-        metric_header(name, "gauge", help),
-        for signal <- @signals do
-          value = sizes |> Map.get(signal, {0, 0}) |> elem(index)
-          [name, "{signal=\"", signal, "\"} ", Integer.to_string(value), "\n"]
-        end
-      ]
-    end
+    [
+      for {name, index, help} <- [
+            {"pulso_manifest_segments", 0, "Segments listed in cached manifest roots, summed over tenants."},
+            {"pulso_manifest_bytes", 1, "Encoded bytes of cached manifest roots, summed over tenants."},
+            {"pulso_manifest_referenced_segments", 2,
+             "Active segments cached roots reference, including through manifest pages, summed over tenants. " <>
+               "Retention-managed roots count only their inline tail."}
+          ] do
+        [
+          metric_header(name, "gauge", help),
+          for signal <- @signals do
+            value = sizes |> Map.get(signal, %{}) |> Map.get(index, 0)
+            [name, "{signal=\"", signal, "\"} ", Integer.to_string(value), "\n"]
+          end
+        ]
+      end,
+      metric_header(
+        "pulso_manifest_roots",
+        "gauge",
+        "Cached manifest roots by signal and format (flat, paged, retention)."
+      ),
+      for signal <- @signals, format <- ["flat", "paged", "retention"] do
+        value = sizes |> Map.get(signal, %{}) |> Map.get(format, 0)
+        ["pulso_manifest_roots{signal=\"", signal, "\",format=\"", format, "\"} ", Integer.to_string(value), "\n"]
+      end,
+      gauge("pulso_manifest_page_cache_entries", page_entries),
+      gauge("pulso_manifest_page_cache_bytes", page_bytes)
+    ]
   end
 
   defp memory_budget_bytes do

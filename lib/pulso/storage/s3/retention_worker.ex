@@ -7,6 +7,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
   alias Pulso.Runtime.GenServer
   alias Pulso.Runtime.ProcessGroup
   alias Pulso.Runtime.Task
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.RetentionScope
@@ -139,7 +140,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
     with {:ok, root, _} <- Retention.load(tenant, signal, config) do
       cond do
         root.version == 3 -> run_managed_stages(tenant, signal, config)
-        map_size(root.retired) > 0 -> Retention.cleanup_retired(tenant, signal, config)
+        JournalManifest.cleanup_pending?(root) -> Retention.cleanup_retired(tenant, signal, config)
         true -> :ok
       end
     end

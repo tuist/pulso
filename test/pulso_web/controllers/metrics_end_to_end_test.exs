@@ -20,7 +20,7 @@ defmodule PulsoWeb.MetricsEndToEndTest do
   alias Pulso.Test.OTLPMetricFixture, as: Fixture
   alias Pulso.Test.RuntimePlug
 
-  setup do
+  setup tags do
     Runtime.share()
 
     store =
@@ -52,7 +52,8 @@ defmodule PulsoWeb.MetricsEndToEndTest do
       secret_access_key: "test",
       allow_http: true,
       refresh_stale_ms: 0,
-      metric_footer_pruning_enabled: true
+      metric_footer_pruning_enabled: true,
+      manifest_format: Map.get(tags, :manifest_format, "paged")
     }
 
     tenant = "metric-http-#{System.unique_integer([:positive])}"
@@ -328,6 +329,7 @@ defmodule PulsoWeb.MetricsEndToEndTest do
     assert Req.get!(ctx.url <> "/api/v1/labels", headers: headers(ctx)).body["data"] == []
   end
 
+  @tag manifest_format: "flat"
   test "discovery charges actual footer rows despite an undercounted flat manifest and shares OR scan limits", ctx do
     rows =
       for n <- 1..3, do: %MetricSample{timestamp_ns: n, value: 1.0, labels: %{"__name__" => "metric", "host" => "a"}}

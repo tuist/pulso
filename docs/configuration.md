@@ -35,6 +35,7 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_S3_ENDPOINT` | Amazon S3 | URL of an S3-compatible endpoint, for example `https://<account>.r2.cloudflarestorage.com`. |
 | `PULSO_S3_ALLOW_HTTP` | `false` | Allow a plain-HTTP storage endpoint. Use only for storage on a private network. |
 | `PULSO_METRICS_FOOTER_PRUNING_ENABLED` | `false` | Optional bounded suffix-GET exclusion for ordinary metric queries. Requires strong ETags, suffix Range and GET If-Match; may add GETs/earlier scan rejection. See [provider prerequisites and bounds](metric-footer-pruning.md). |
+| `PULSO_MANIFEST_FORMAT` | `paged` | Manifest format for prefixes without enforced retention. `paged` keeps the conditionally written root bounded and converts flat manifests on their next write, so ingest cost and manifest memory no longer grow with history. `flat` keeps writing flat lists; use it while older releases still write to the bucket. Read [Manifest format](#manifest-format) first. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
 | `PULSO_TEMPO_SEARCH_ENABLED` | `false` | Opt in to experimental Tempo `/api/search`, resource/span/instrumentation/event/link tag discovery (names/values optionally filtered on parent-span strings; filtered names are complete conservative hints, not matching-key proofs) and corresponding MCP tools. Complete-context search may use publication-proven exact resource.service.name candidate-source pruning plus conservative trace-ID context selection; unknown/legacy sources still read, without time clipping. Retained catalog metadata/page/heap bounds can bind before the hard 8192-reference ceiling; actual fetched inputs cumulatively cap at 1024 / 32 MiB / 1,000,000 raw rows, plus 65,536 matching-or-legacy-unknown IDs and independent output bounds. Index-probe exhaustion reads conservatively and can fail late; unread irrelevant objects are not scrubbed. Requires metadata2/export3/search5/discovery12, tuple `{2,1,3,5,12}`, on every serving artifact. Representative postings/capacity/client acceptance remains pending. Discovery does not use this service/ID plan. Discovery also caps requested-owner-plus-attribute work at 2,000,000 per scan attempt before filtering, lowering flat-scope capacity as attribute counts grow. Search always returns the most recent matching traces, so `with (most_recent=true)` is optional (Grafana omits it); bounded same-span negated-regex/status/int64 OR/span-duration and unscoped span-first expressions use full-scope admission without the service planner and an additional 20M prefilter work ceiling per scan attempt; see [expression semantics](trace-query-expressions.md). Static intrinsic names/seven v2 enum-or-empty vocabularies require the same gate/admission/auth but read no storage and prove no stored presence. Default names combine all five namespaces plus static v2 suggestions under one 2M-work/5000-scope-name-pair budget (20 intrinsic reservations apply even for v1 flattening), with service.name hints even unfiltered and without original attrs; storage errors fail whole rather than emitting partial suggestions. None values combine resource/span/instrumentation originals, not all name scopes. Bounded resource/span string filters select one parent before three-owner union/work, a complete extension rather than Tempo's ignored-query behavior. Same-key equality, nonstring/nested/intrinsic filters reject; values retain original types, matching complex targets fail, and legacy/corruption fail even on nonmatches. Filtered-none needs query-aware unscoped execution or bounded reference, plus separate explicit windowed-filtered-none support; old unfiltered/window callbacks cannot silently ignore the new mode. Floats (including non-finite classes) and seven stored intrinsic strings and event:timeSinceStart exact signed int nanosecond offsets read bounded data, accepting same-parent string filters; event-time filters are a disclosed complete extension versus upstream's empty path. Effective event time0 may yield negative offsets; no events invent no values. Invalid requested event times fail even on nonmatches and parent+all event attrs charge before filtering. New explicit event-time and separate windowed-event-time execution is required, never old string/window callbacks. These are distinct from storage-free static vocabulary. Paired positive discovery time bounds select retention-visible immutable segment envelopes, not span starts; all raw header/provider costs still apply, no indexed I/O gain or cross-window dictionary cache. Compaction can broaden suggestions, excluded payloads are not integrity-scrubbed. Matching capability-12 artifacts are required on every serving instance; flat/old adapters reject unsupported windows. Root name/service dictionaries select parent trace IDs then recover complete retained context, including roots outside predicate/window. Missing/ambiguous roots or missing original string root service fail409 whole, never default/skip. In-flight children-before-root and retention-straddling/multi-root traces can make broad/recent autocomplete unusable; this is a strict default-off extension, not transparent replacement. Root S3 input is the whole retained tenant, capped1024 objects/32MiB compressed/1M raw rows regardless of window/matches; no service/ID planner, local replay decodes all sources without another GET and cross-checks header/body rows. 65,536 candidates/16MiB bookkeeping,2M resource/span/link owner+attr work plus normal dictionary/result limits; dedicated root/window support required. Canonical trace:duration also measures complete retained max-end/min-start, without requiring roots. It may grow during ingest or shrink with retention, not exporter duration. Unfiltered emits int nanoseconds; any supported parent filter emits Go-style duration strings (including µs); both sort lexically. Do not cache across filter/type changes. Root capture/input/replay limits remain; duration work is2 resource/span owners+attrs,65,536 groups/80B per-summary charge within16MiB charged bookkeeping (not total native memory),5000 values/independent1MiB dictionaries/results. Broad nanosecond dictionaries commonly fail422. Dedicated duration/window support fences old root/string callbacks. Static duration/span:duration/traceDuration empty vocabularies remain unchanged. Zero/partial discovery windows, stored span-duration intrinsics, exact upstream distinct-omission/dynamic dedicated-column parity, full TraceQL and deployed-client parity remain unsupported. HTTP metadata search accepts omitted bounds or paired zeros for all retained context with unchanged ceilings; partial search windows reject. See [Tempo search](traces.md#experimental-tempo-search). |
 | `PULSO_LOG_COMPACTION_ENABLED` | `false` | Merge small log segments natively in the background. Read [Log compaction](#log-compaction) first. |
@@ -510,6 +511,42 @@ acknowledged records, failures, node memory, and delivery latency. Larger source
 batches and low concurrency may already make coalescing unnecessary. Disable it
 by setting the window back to `0` and restarting nodes; stored data needs no
 migration.
+
+## Manifest format
+
+Every tenant and signal has one `manifest.json` that lists its segments and is
+rewritten with a conditional write on every ingest publication. Releases before
+format 4 kept that list flat, so each write downloaded, re-encoded and uploaded
+the whole history: ingest latency and node memory grew with the age of a
+deployment even at constant traffic, unless retention removed old data.
+
+With the default `PULSO_MANIFEST_FORMAT=paged`, the manifest is a small root
+that keeps only recently published segments inline and references older ones
+through immutable pages under `.../signal=<s>/journal/`. An append rewrites only
+the root, plus one page every 512 segments. Its cost and the memory a node uses
+to cache manifests stay flat as history grows. Queries read the pages they need
+through a bounded 16 MiB page cache. Prefixes with enforced retention keep using
+the retention format.
+
+Existing flat manifests convert automatically on their next ingest write. A
+conversion of tens of thousands of segments writes about one page per 512 segments
+before the root and is a one-time cost of a few seconds.
+
+**Upgrade every node before paged writes start.** Releases before format 4 do not
+read paged manifests. They reject them and fail the request (clients retry)
+rather than reading or overwriting them, so mixing versions cannot lose data, but
+older nodes cannot serve converted prefixes. For a single replica or a quick
+rollout, upgrade normally: ingest landing on the old pod during the overlap gets
+retryable errors. To avoid even that, roll out with `PULSO_MANIFEST_FORMAT=flat`
+(chart: `manifestFormat: flat`), then switch back to `paged` once no older pod
+remains. Setting `flat` again later does not convert paged manifests back, and
+rolling back to an older release after conversion is not supported.
+
+Paged manifests hold the same metadata as flat ones, including retirement
+records, so the total metadata in the bucket still grows with history. Retention
+is what removes old data; paging only stops ingest from paying for it on every
+write. Watch `pulso_manifest_commit_duration_seconds` and
+`pulso_manifest_roots` (see [self-monitoring](self-monitoring.md)).
 
 ## Metrics compaction
 

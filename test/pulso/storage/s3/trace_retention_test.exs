@@ -120,7 +120,8 @@ defmodule Pulso.Storage.S3.TraceRetentionTest do
     Runtime.put_env(:pulso, S3, config)
     old = %{ctx.span | timestamp_ns: 1, end_timestamp_ns: 2}
     assert :ok = S3.append(:traces, ctx.tenant, [old])
-    assert root(ctx).version == 1
+    # Not retention-managed: the default paged format, not format 3.
+    assert root(ctx).version == 4
   end
 
   test "first enforcement creates the shared paged root and rejects expired and future batches", ctx do

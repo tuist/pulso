@@ -19,3 +19,12 @@ Check readiness:
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pulso.fullname" . }} 4000:{{ .Values.service.port }}
   curl -s localhost:4000/readyz
+{{- if or .Values.metricsCompaction.enabled .Values.logCompaction.enabled .Values.traceCompaction.enabled .Values.retention.enabled (gt (int .Values.retention.logsDays) 0) (gt (int .Values.retention.metricsDays) 0) (gt (int .Values.retention.tracesDays) 0) }}
+
+Compaction or retention is enabled. Afterwards the manifests are the only record
+of which objects are live: Pulso refuses to rebuild them from a bucket listing.
+Pulso does not require or check bucket versioning, but without versioning (or
+manifest backups) a deleted or corrupted manifest cannot be restored. With
+versioning on, add a lifecycle rule that expires noncurrent versions, or deleted
+objects keep using storage. See docs/configuration.md#metrics-compaction.
+{{- end }}

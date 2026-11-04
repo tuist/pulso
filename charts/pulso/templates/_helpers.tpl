@@ -261,3 +261,14 @@ Whether pods join the Erlang cluster used for rendezvous ownership. Takes
 {{- define "pulso.clustered" -}}
 {{- if (index . 0).Values.clustering.enabled }}true{{- end }}
 {{- end }}
+
+{{/*
+Validated manifest format: paged or flat.
+*/}}
+{{- define "pulso.manifestFormat" -}}
+{{- $format := toString .Values.manifestFormat -}}
+{{- if not (has $format (list "paged" "flat")) -}}
+{{- fail (printf "manifestFormat must be paged or flat, got %q" $format) -}}
+{{- end -}}
+{{- $format -}}
+{{- end -}}

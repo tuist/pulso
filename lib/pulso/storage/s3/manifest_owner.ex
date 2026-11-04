@@ -59,6 +59,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   alias Pulso.ObjectStore
   alias Pulso.Runtime.GenServer
   alias Pulso.Runtime.Registry
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
@@ -75,6 +76,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   @cas_max_retries 5
   @published_payload {__MODULE__, :published_payload}
   @wire_cache {__MODULE__, :wire_cache}
+  @published_bytes {__MODULE__, :published_bytes}
   # A cached manifest is served without I/O for this long after its
   # last refresh; beyond it, `ensure_loaded/3` issues a conditional GET
   # to pick up cross-node writes. This is the bound on cross-node
@@ -543,8 +545,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
     # Copy a cached root only when another path (retention) replaced it.
     state =
-      with {3, etag, _token} when etag != state.etag <- ManifestCache.info(state.tenant, state.signal),
-           %{manifest: %{version: 3} = manifest, etag: ^etag} <- ManifestCache.get(state.tenant, state.signal) do
+      with {version, etag, _token} when version in [3, 4] and etag != state.etag <-
+             ManifestCache.info(state.tenant, state.signal),
+           %{manifest: %{version: ^version} = manifest, etag: ^etag} <- ManifestCache.get(state.tenant, state.signal) do
         %{state | manifest: manifest, etag: etag, loaded?: true}
       else
         _ -> state
@@ -562,6 +565,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
     result = cas_with_retry(state, state.pending, @cas_max_retries)
     for _waiter <- state.waiters, do: Pulso.Metrics.stage(state.signal, :manifest_commit, started)
+    observe_commit(state, result, started)
     state = %{state | commit_ms: average_commit(state.commit_ms, started)}
     publish_queue_depth(%{state | pending: remaining, waiters: deferred})
 
@@ -600,16 +604,30 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  # Flat (unretained) manifests are rewritten whole on every flush and decoded
-  # by every query, so their cost grows with history. Say so, rarely.
+  # One publication's duration by its root's encoded size: flat roots make it
+  # grow with history, paged roots keep it flat.
+  defp observe_commit(state, {kind, manifest, _etag, _outcomes}, started) when kind in [:ok, :skipped] do
+    bytes =
+      case Process.delete(@published_bytes) do
+        bytes when is_integer(bytes) -> bytes
+        _ -> nil
+      end
+
+    if bytes, do: Pulso.Metrics.manifest_commit(state.signal, manifest.version, bytes, started)
+  end
+
+  defp observe_commit(_state, _result, _started), do: Process.delete(@published_bytes)
+
+  # Flat manifests are rewritten whole on every flush and decoded by every
+  # query, so their cost grows with history. Say so, rarely.
   @flat_warning_segments 20_000
-  defp warn_flat_growth(state, %Manifest{version: version, segments: segments}) when version != 3 do
+  defp warn_flat_growth(state, %Manifest{version: version, segments: segments}) when version in [1, 2] do
     count = length(segments)
 
     if count >= @flat_warning_segments and Pulso.SelfMetrics.due?({:flat_manifest, state.signal}, 600_000) do
       Logger.warning(
         "flat #{state.signal} manifest tenant=#{state.tenant} has #{count} segments and grows with every append; " <>
-          "enable retention (and compaction) to bound manifest memory and publication cost"
+          "set PULSO_MANIFEST_FORMAT=paged (the default) to bound manifest memory and publication cost"
       )
     end
   end
@@ -669,16 +687,20 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp cas_with_retry(state, segments, retries_left) do
     {eligible, outcomes} = publication_requests(state)
 
-    case prepare_publication(state, segments, eligible) do
+    state
+    |> prepare_publication(segments, eligible)
+    |> seal(state)
+    |> case do
       {:skip, manifest} ->
         {:skipped, manifest, state.etag, outcomes}
 
-      {:ok, merged} ->
+      {:ok, merged, payload} ->
         attempt = %{
           state: state,
           segments: segments,
           retries_left: retries_left,
           merged: merged,
+          payload: payload,
           eligible: eligible,
           outcomes: outcomes
         }
@@ -699,16 +721,68 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp prepare_publication(%{manifest: %{version: 3}} = state, _segments, eligible),
     do: PagedManifest.register(state.manifest, eligible, state.tenant, state.signal, state.config)
 
-  defp prepare_publication(state, segments, _eligible), do: {:ok, Manifest.merge(state.manifest, segments)}
+  defp prepare_publication(%{manifest: %{version: 4}} = state, segments, _eligible),
+    do: JournalManifest.register(state.manifest, segments, state.tenant, state.signal, state.config)
 
-  defp publish(%{state: state, merged: merged} = attempt) do
-    payload = encode_cached(merged)
+  # A flat root is converted by the publication that next changes it. A failed
+  # conversion (an unreachable store, an unexpected key) keeps it flat for now:
+  # ingest must not depend on the conversion succeeding.
+  defp prepare_publication(state, segments, _eligible) do
+    if state.manifest.version in [1, 2] and JournalManifest.enabled?(state.config, state.signal) do
+      case convert(state) do
+        {:ok, root} -> JournalManifest.register(root, segments, state.tenant, state.signal, state.config)
+        :flat -> {:ok, Manifest.merge(state.manifest, segments)}
+      end
+    else
+      {:ok, Manifest.merge(state.manifest, segments)}
+    end
+  end
 
+  defp convert(state) do
+    started = System.monotonic_time(:millisecond)
+
+    case JournalManifest.convert(state.manifest, state.tenant, state.signal, state.config) do
+      {:ok, root} ->
+        Logger.info(
+          "converting #{state.signal} manifest tenant=#{state.tenant} to the paged format: " <>
+            "#{length(state.manifest.segments)} segments in #{System.monotonic_time(:millisecond) - started} ms"
+        )
+
+        {:ok, root}
+
+      {:error, reason} ->
+        if Pulso.SelfMetrics.due?({:manifest_conversion, state.signal}, 60_000) do
+          Logger.warning(
+            "keeping flat #{state.signal} manifest tenant=#{state.tenant}: conversion failed #{inspect(reason)}"
+          )
+        end
+
+        :flat
+    end
+  end
+
+  # A paged root spills its tail while encoding; publish exactly what was sealed.
+  defp seal({:ok, %{version: 4} = merged}, state) do
+    case JournalManifest.seal(merged, state.tenant, state.signal, state.config, Process.get(@wire_cache, %{})) do
+      {:ok, {sealed, payload, cache}} ->
+        Process.put(@wire_cache, cache)
+        {:ok, sealed, payload}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp seal({:ok, merged}, _state), do: {:ok, merged, encode_cached(merged)}
+  defp seal(other, _state), do: other
+
+  defp publish(%{state: state, payload: payload} = attempt) do
     case attempt_cas(state, payload) do
       {:ok, new_etag} ->
         # Let the cache store these exact bytes instead of encoding again.
         Process.put(@published_payload, {new_etag, payload})
-        {:ok, merged, new_etag, attempt.outcomes}
+        Process.put(@published_bytes, byte_size(payload))
+        {:ok, attempt.merged, new_etag, attempt.outcomes}
 
       {:error, _} = error ->
         # Resolve internally retried/lost CAS responses before returning failure.
@@ -732,7 +806,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  defp resolve_cas_failure({:ok, %{version: 3} = current, etag}, attempt),
+  defp resolve_cas_failure({:ok, %{version: version} = current, etag}, attempt) when version in [3, 4],
     do: resolve_managed_failure(current, etag, attempt)
 
   # A fresh legacy root can also prove that a lost response committed.
@@ -759,10 +833,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp resolve_managed_failure(current, etag, %{merged: merged, error: {:error, reason}} = attempt) do
     cond do
-      current.paging["nonce"] == merged.paging["nonce"] ->
+      merged.paging != nil and current.paging["nonce"] == merged.paging["nonce"] ->
         {:ok, current, etag, attempt.outcomes}
 
-      merged.version != 3 ->
+      merged.version != current.version ->
         retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
 
       publication_visible?(current, attempt.eligible, attempt.state) ->
@@ -777,6 +851,15 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp retry_cas(attempt, state), do: cas_with_retry(state, attempt.segments, attempt.retries_left - 1)
+
+  # As for flat roots, only an active entry proves publication. A retired one
+  # still needs this attempt's revision bump, which rearms deletion of the
+  # object the retry may have uploaded again.
+  defp publication_visible?(%{version: 4} = current, eligible, state) do
+    Enum.all?(eligible, fn segment ->
+      JournalManifest.lookup(current, segment, state.tenant, state.signal, state.config) == {:ok, :active}
+    end)
+  end
 
   defp publication_visible?(current, eligible, state) do
     case PagedManifest.with_budget(state.config, fn ->

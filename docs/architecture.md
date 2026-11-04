@@ -184,9 +184,9 @@ For each signal Pulso stores:
 
 - **Segment files** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/date=<Y-m-d>/hour=<H>/<min_ts>-<max_ts>-<suffix>.parquet`): immutable Parquet objects containing the records themselves. The zero-padded 20-digit `[min_ts, max_ts]` tail is what the query path prunes against at LIST time; the `date=`/`hour=` partitions are derived from `min_ts` as UTC and let Athena-style callers prune without opening the manifest.
 - **Sidecar index files** (`.bloom`, `.postings`, `.stats`), written alongside the segment at flush time, immutable, live in S3. **External sidecars are not yet implemented.** Metrics now have bounded label→canonical-series→row-group postings inside their existing Parquet footer, reducing native decode work. Opt-in footer-first metric reads can also avoid full-object GETs when no group survives, under one strong-ETag snapshot. External label postings and selected-column/group range reads remain follow-ups.
-- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it. Formats 1 and 2 are flat lists. Format 3, written only when retention is enforced, is a bounded root over immutable time-bucket pages; see [Retention implementation](#retention-implementation).
+- **Per-tenant, per-signal manifest** (`s3://<bucket>/tenants/<tenant>/v4/signal=<s>/manifest.json`): the list of segments that currently exist for this (tenant, signal), each with its time range, row count, and any tiny summary metadata the query planner needs to decide whether to open it. Formats 1 and 2 are flat lists, rewritten whole on every publication. Format 3, written only when retention is enforced, is a bounded root over immutable time-bucket pages; see [Retention implementation](#retention-implementation). Format 4, the default for every prefix without enforced retention, is a bounded root over an immutable page tree; see [Format 4 manifests](#format-4-manifests).
 
-The manifest root is the only file for a tenant that ever gets rewritten. Segments, sidecar indexes and format-3 metadata pages are write-once.
+The manifest root is the only file for a tenant that ever gets rewritten. Segments, sidecar indexes and format-3/format-4 metadata pages are write-once.
 
 ### Target segment lifecycle
 
@@ -672,8 +672,8 @@ segments/bytes/rows, recovering missing trace row counts from Parquet footers,
 rather than rejecting all potential older candidates up front. Explicit result
 limits do not retain every matching span. Default unbounded raw responses still error above 5,000 matches. Traces
 have opt-in native compaction and use the shared format-3 event-time retention
-and bounded immutable catalogs. Flat manifests remain unbounded when retention
-has not been enforced. This is not a production Tempo replacement.
+and bounded immutable catalogs. Without enforced retention, paged format-4
+roots keep ingest cost bounded, but total catalog metadata still grows. This is not a production Tempo replacement.
 
 Full grammar coverage is a long tail; ship the useful subset first. Each language is parsed in Elixir; the intended query plan compiles to DataFusion in Rust. Today label and time filters run in the Rust Parquet decoder, while log and metric aggregations run in Elixir. Metrics fetch the selected interval once per selector for all evaluation steps, without a sample limit that could silently truncate aggregations. The initial metrics evaluator enforces independent sample, work, scan, result, heap, and concurrency limits with explicit errors; columnar aggregation remains a follow-up.
 
@@ -1498,6 +1498,64 @@ even after extended refresh failures; the grace period alone cannot bound every
 snapshot's lifetime.
 
 The next metrics work is label posting indexes, followed by OpenTelemetry metrics ingestion and then alert evaluation.
+
+## Format 4 manifests
+
+A flat manifest lists every segment ever published, including permanent
+retirement tombstones, and each publication downloads, decodes, re-encodes and
+uploads all of it. Without retention, publication latency and node memory
+therefore grow with the age of the deployment. Format 4 removes that dependency
+without requiring retention or compaction.
+
+The root uses the format-3 `root_sha` envelope and holds:
+
+- an inline tail of recently published segments and retirements. When it
+  exceeds 512 entries or 128 KiB, the publication that crosses the limit first
+  writes the tail as an immutable leaf page (a format-2 document);
+- page references ordered oldest first, at most 15 per tree height. Every 16
+  references of one height are packed into an index page one height higher
+  (a binary-counter tree, fanout 16, height at most 12), so the root holds
+  O(log n) references;
+- superseded pages awaiting deletion: up to 256 inline, then in immutable gc
+  pages (at most 512 references);
+- a fresh nonce on every mutating write, used to recognize lost-CAS outcomes.
+
+Pages live under `tenants/<t>/v4/signal=<s>/journal/` with SHA-256 content
+names, carry the nonce of the root that created them, and are uploaded before
+the root CAS that references them; a page PUT alone never acknowledges data.
+References record their subtree's entry counts, active time range, the range of
+`max_ts` over every entry (so keyed lookups descend only into pages that can
+contain a key), the earliest pending retirement deadline and, for traces, the
+same service/ID pruning summary as format 3. The root is capped at 1 MiB and
+4,096 entries. Pages are verified by size and digest and cached as verified
+bytes in the shared 16 MiB / 512-page metadata cache; the encoded root is the
+only per-prefix entry in the manifest cache.
+
+An unkeyed append rewrites only the tail and, every 512 entries, writes one
+leaf plus at most one index page per completed height. Its cost does not depend
+on history. A keyed append also checks the pages whose key range covers its
+deterministic key, so its first lookup can read O(log n) pages, which are then
+cached. Queries prune by reference time ranges before reading pages and read at
+most eight pages concurrently; `max_scan_segments` is enforced while pages are
+read. Compaction selects candidates from the tail, the four newest leaves and
+four leaves picked by a rotating cursor. It rewrites the path from one leaf to
+the root and records the pages it supersedes. Cleanup deletes retired segments
+and superseded pages after the compaction grace (default one hour).
+
+A node converts a flat root on its next publication: small histories stay
+inline, larger ones are written as leaves packed bottom-up, and only then is the
+format-4 root published with the flat root's ETag as its precondition. A failed
+conversion leaves the flat root in place and logs a warning. Releases before
+format 4 reject the root with `unsupported_manifest_version` and fail the
+request rather than read or overwrite it, so a rolling update can cause retryable
+errors on not-yet-upgraded nodes but cannot lose data. `PULSO_MANIFEST_FORMAT=flat`
+keeps writing flat roots, but it does not convert format-4 roots back. Enforcing
+retention converts format 4 to format 3 through the existing flat-size migration
+limit; a format-4 history larger than that limit cannot be activated.
+
+Permanent tombstones still exist in format 4, but they sit in pages that appends
+never rewrite. Total metadata in the bucket still grows with history until
+retention removes it.
 
 ## Retention implementation
 
