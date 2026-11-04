@@ -51,6 +51,13 @@ with `INVALID_ARGUMENT`; they are never silently omitted or converted into a
 default tenant/unkeyed request. Unknown metadata, including binary `-bin` fields,
 is not interpreted.
 
+Tenant and credential are checked from metadata before the listener reads or
+decompresses the message, so a call without valid credentials is answered
+(`UNAUTHENTICATED`, `PERMISSION_DENIED` or retryable `UNAVAILABLE`) without
+reading its body. Authorization runs again when the message is ingested. This
+changes the listener's native interface: upgrade the application and its
+native artifacts together.
+
 For example, an OpenTelemetry Collector exporter:
 
 ```yaml

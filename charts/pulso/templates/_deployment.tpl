@@ -180,6 +180,10 @@ spec:
               value: {{ .Values.alerting.principals | toJson | quote }}
             - name: PULSO_WORKLOAD_IDENTITY_JSON
               value: {{ .Values.workloadIdentity.trust | toJson | quote }}
+            {{- if .Values.issuer }}
+            - name: PULSO_ISSUER_JSON
+              value: {{ .Values.issuer | toJson | quote }}
+            {{- end }}
             {{- with .Values.tenantLimits }}
             - name: PULSO_TENANT_LIMITS_JSON
               value: {{ . | toJson | quote }}

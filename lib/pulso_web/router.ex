@@ -9,6 +9,8 @@ defmodule PulsoWeb.Router do
     get "/metrics", MetricsController, :index
     get "/healthz", HealthController, :live
     get "/readyz", HealthController, :ready
+    get "/.well-known/oauth-protected-resource", OAuthMetadataController, :show
+    get "/.well-known/oauth-protected-resource/*resource", OAuthMetadataController, :show
   end
 
   # MCP clients advertise both application/json and text/event-stream, and

@@ -19,6 +19,7 @@ import Config
 alias Pulso.Alerting.GraphPreview
 alias Pulso.Alerting.Principal
 alias Pulso.Alerting.Targets
+alias Pulso.Auth.Issuer
 alias Pulso.Auth.SharedSecret
 alias Pulso.Auth.WorkloadIdentity
 alias Pulso.Errors.Projection
@@ -140,6 +141,22 @@ workload_trust =
     {:ok, entries} -> WorkloadIdentity.parse!(entries)
     _ -> raise "PULSO_WORKLOAD_IDENTITY_JSON is not valid JSON"
   end
+
+# Trusted credential issuer (Tuist in the hosted product): offline-verified
+# tokens whose claims carry tenant and scopes. See docs/issuer-credentials.md.
+issuer_config =
+  case env_var.("PULSO_ISSUER_JSON", "") do
+    "" ->
+      nil
+
+    blob ->
+      case JSON.decode(blob) do
+        {:ok, raw} -> Issuer.parse!(raw)
+        _ -> raise "PULSO_ISSUER_JSON is not valid JSON"
+      end
+  end
+
+config :pulso, Issuer, issuer_config
 
 config :pulso, Pulso.Reliability,
   enabled: reliability_enabled,
@@ -528,15 +545,16 @@ case config_env() do
               raise "PULSO_TENANT_TOKENS is not valid JSON: #{inspect(reason)}"
           end
 
-        _ when workload_trust != [] or tenant_registry_enabled ->
+        _ when workload_trust != [] or tenant_registry_enabled or issuer_config != nil ->
           %{}
 
         _ ->
           raise """
           environment variable PULSO_TENANT_TOKENS is missing or empty.
           Pulso.Auth.SharedSecret requires at least one tenant token in prod
-          unless PULSO_WORKLOAD_IDENTITY_JSON configures workload identity or
-          PULSO_TENANT_REGISTRY_ENABLED provisions tenants through the admin API.
+          unless PULSO_WORKLOAD_IDENTITY_JSON configures workload identity,
+          PULSO_TENANT_REGISTRY_ENABLED provisions tenants through the admin API,
+          or PULSO_ISSUER_JSON configures a trusted issuer.
           """
       end
 

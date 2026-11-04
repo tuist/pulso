@@ -99,8 +99,8 @@ crash on boot.
 {{- end }}
 {{- end }}
 {{- if not .Values.existingSecret }}
-{{- if and (not .Values.tenantTokens) (not .Values.workloadIdentity.trust) (not .Values.tenantRegistry.enabled) }}
-{{- fail "tenantTokens needs at least one tenant unless workloadIdentity.trust or tenantRegistry.enabled is set (or set existingSecret)" }}
+{{- if and (not .Values.tenantTokens) (not .Values.workloadIdentity.trust) (not .Values.tenantRegistry.enabled) (not .Values.issuer) }}
+{{- fail "tenantTokens needs at least one tenant unless workloadIdentity.trust, tenantRegistry.enabled or issuer is set (or set existingSecret)" }}
 {{- end }}
 {{- range .Values.admin.tokenHashes }}
 {{- if not (regexMatch "^sha256\\$[0-9a-f]{64}$" (toString .)) }}

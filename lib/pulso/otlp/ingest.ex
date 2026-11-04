@@ -118,6 +118,7 @@ defmodule Pulso.OTLP.Ingest do
   def classify(:traces, :too_many_trace_nodes), do: {413, "too_many_trace_nodes"}
   def classify(signal, :too_many_otlp_nodes) when signal in [:logs, :metrics], do: {413, "too_many_otlp_nodes"}
   def classify(_signal, :owner_overloaded), do: {429, "ingest capacity exhausted"}
+  def classify(_signal, :rate_limited), do: {429, "tenant ingest quota exceeded"}
 
   def classify(_signal, reason)
       when reason in [:invalid_otlp, :invalid_protobuf, :invalid_gzip, :retention_expired, :timestamp_too_new],

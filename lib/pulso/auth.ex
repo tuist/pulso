@@ -19,7 +19,8 @@ defmodule Pulso.Auth do
 
   `Pulso.Auth.WorkloadIdentity` additionally accepts Kubernetes projected
   ServiceAccount tokens bound to tenants and capabilities, alongside either
-  module.
+  module. `Pulso.Auth.Issuer` accepts credentials minted by one trusted issuer
+  (Tuist in the hosted product), whose claims carry the tenant and scopes.
 
   The active implementation is read from `Runtime.get_env(:pulso,
   Pulso.Auth)[:module]` at call time so tests can swap it without
@@ -27,6 +28,7 @@ defmodule Pulso.Auth do
   """
 
   alias Plug.Conn
+  alias Pulso.Auth.Issuer
   alias Pulso.Auth.WorkloadIdentity
   alias Pulso.Runtime
 
@@ -46,17 +48,32 @@ defmodule Pulso.Auth do
   @spec verify(Conn.t(), String.t(), WorkloadIdentity.capability()) :: :ok | {:error, reason()}
   def verify(conn, tenant, capability) when is_binary(tenant) and capability in [:read, :ingest] do
     verified =
-      with trust when trust != [] <- WorkloadIdentity.trust(),
-           {:ok, token} <- bearer(conn),
-           true <- WorkloadIdentity.jwt?(token) do
-        WorkloadIdentity.verify(token, tenant, capability, trust)
-      else
-        _ -> module().verify(conn, tenant)
+      case issuer_principal(conn) do
+        :none -> verify_configured(conn, tenant, capability)
+        result -> Issuer.authorize(result, tenant, capability)
       end
 
     # Suspended and deleted tenants are refused whatever the credential.
     with :ok <- verified, do: Pulso.Tenants.check(tenant)
   end
+
+  defp verify_configured(conn, tenant, capability) do
+    with trust when trust != [] <- WorkloadIdentity.trust(),
+         {:ok, token} <- bearer(conn),
+         true <- WorkloadIdentity.jwt?(token) do
+      WorkloadIdentity.verify(token, tenant, capability, trust)
+    else
+      _ -> module().verify(conn, tenant)
+    end
+  end
+
+  @doc """
+  The authentication result for a Tuist-issued credential on `conn`, or
+  `:none` when the request carries no such credential. `PulsoWeb.Authenticate`
+  verifies it once before the body is read and stores it on the conn.
+  """
+  def issuer_principal(%Conn{private: %{pulso_issuer: result}}), do: result
+  def issuer_principal(conn), do: Issuer.from_conn(conn)
 
   defp bearer(conn) do
     with [header] <- Conn.get_req_header(conn, "authorization"),

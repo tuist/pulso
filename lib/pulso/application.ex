@@ -6,7 +6,9 @@ defmodule Pulso.Application do
   use Application
 
   alias Pulso.Alerting.Subscriptions
+  alias Pulso.Auth.Issuer
   alias Pulso.Auth.JWKS
+  alias Pulso.Auth.Membership
   alias Pulso.Codec.NIF
   alias Pulso.Health.StorageMonitor
   alias Pulso.Loki.Tail
@@ -44,7 +46,7 @@ defmodule Pulso.Application do
       ] ++
         storage_children() ++
         maintenance(Pulso.Alerting.Supervisor.children()) ++
-        JWKS.children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
+        JWKS.children() ++ issuer_children() ++ [PulsoWeb.Endpoint] ++ otlp_grpc_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
@@ -62,6 +64,15 @@ defmodule Pulso.Application do
 
   # Background workers run only on instances with the maintenance role.
   defp maintenance(children), do: if(Pulso.Roles.enabled?(:maintenance), do: children, else: [])
+
+  # Issuer keys and status are cached before the endpoint accepts traffic. The
+  # membership scope lets instances divide tenant quotas among themselves.
+  defp issuer_children do
+    case Issuer.children() do
+      [] -> []
+      cache -> [%{id: Membership, start: {:pg, :start_link, [Membership]}} | cache]
+    end
+  end
 
   # The OTLP/gRPC listener starts after the endpoint, only when configured.
   defp otlp_grpc_children do

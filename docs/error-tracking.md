@@ -159,6 +159,10 @@ ingress:
   apps before relying on the alternate header or mixed-case scheme spelling.
 - Credential configuration, not payload fields or `X-Scope-OrgID`, determines
   tenant and service. Public DSN keys allow **ingestion only**, never queries.
+  With a [trusted issuer](issuer-credentials.md#status-list), projects can also
+  come from its signed status list; `PULSO_SENTRY_PROJECTS_JSON` wins for the
+  same project ID. Keys sent in `X-Sentry-Auth`, `Authorization: Sentry` or
+  `sentry_key` are checked before the body is read.
 - Successful POST responses use `200` with `{"id":"<event ID>","discarded_items":{}}`.
   Both POST success and a pixel GET's `200` follow durable event publication:
   Parquet segment PUT and conditional manifest publication. Storage
@@ -175,8 +179,13 @@ ingress:
   SDKs may ignore this diagnostic; disable unsupported collection explicitly.
 - Malformed events/framing, invalid IDs/fingerprints and invalid timestamps return
   `400`, with no append. Envelope event IDs take precedence over payload IDs;
-  32-hex or canonical dashed UUIDs normalize to lowercase hex. Missing IDs are
-  generated, so clients without stable IDs cannot deduplicate retries.
+  32-hex, canonical dashed UUIDs, `{dashed-UUID}` and `urn:uuid:dashed-UUID`
+  normalize to lowercase hex. Hexadecimal digits and the URN prefix are
+  case-insensitive. Wrappers require the exact dashed `8-4-4-4-12` form;
+  nested wrappers, whitespace and wrappers around undashed IDs reject.
+  Missing IDs are generated, so clients without stable IDs cannot deduplicate
+  retries. Upgrade all ingress instances for consistent wrapper acceptance;
+  existing accepted IDs, storage formats and retry bytes are unchanged.
 - Newly ingested events project Sentry level aliases `log` → `info` and
   `critical` → `fatal`, and integer Python levels 10/20/30/40/50 →
   `debug`/`info`/`warning`/`error`/`fatal`, into log severity text and numbers.

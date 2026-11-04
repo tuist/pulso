@@ -5,8 +5,11 @@ defmodule PulsoWeb.OTLPGRPC do
   over gRPC without an HTTP bridge.
 
   A Rust listener (tonic) owns HTTP/2, gzip/zstd decompression, message
-  limits and backpressure, and hands each raw request message to this
-  process. Every call then runs in its own supervised task through exactly
+  limits and backpressure. Before it reads or decompresses a message, it asks
+  this process to admit the call from its metadata alone (tenant and
+  credential), so unauthenticated callers spend no decode work; only admitted
+  calls hand their raw request message over. Every call then runs in its own
+  supervised task through exactly
   the OTLP/HTTP path: the same tenancy (`x-scope-orgid` metadata or Basic
   credentials), authorization, idempotency keys, decoding, storage and
   partial-success semantics.
@@ -77,16 +80,17 @@ defmodule PulsoWeb.OTLPGRPC do
   @impl true
   def handle_info({:pulso_otlp_grpc, reply, signal, headers, body}, state) do
     heap_words = state.heap_words
+    {:noreply, run(state, reply, fn -> answer(reply, signal, headers, body, heap_words) end)}
+  end
 
-    task =
-      Task.Supervisor.async_nolink(
-        state.tasks,
-        Runtime.capture(fn -> answer(reply, signal, headers, body, heap_words) end)
-      )
-
-    timer = Process.send_after(self(), {:handler_deadline, task.ref}, state.handler_timeout_ms)
-    pending = %{reply: reply, pid: task.pid, timer: timer, expired?: false}
-    {:noreply, %{state | pending: Map.put(state.pending, task.ref, pending)}}
+  # Header-only admission: the listener waits for this answer before it reads
+  # or decompresses the message.
+  def handle_info({:pulso_otlp_grpc_admit, reply, signal, headers}, state) do
+    {:noreply,
+     run(state, reply, fn ->
+       {code, message, details} = signal |> admit(headers) |> to_grpc()
+       NIF.otlp_grpc_reply(reply, code, message, details)
+     end)}
   end
 
   def handle_info({ref, _result}, state) when is_reference(ref) do
@@ -140,8 +144,17 @@ defmodule PulsoWeb.OTLPGRPC do
     :ok
   end
 
+  # Every call answers through `reply`; a crashed or timed-out task answers
+  # from the DOWN/deadline handlers instead.
+  defp run(state, reply, fun) do
+    task = Task.Supervisor.async_nolink(state.tasks, Runtime.capture(fun))
+    timer = Process.send_after(self(), {:handler_deadline, task.ref}, state.handler_timeout_ms)
+    pending = %{reply: reply, pid: task.pid, timer: timer, expired?: false}
+    %{state | pending: Map.put(state.pending, task.ref, pending)}
+  end
+
   defp ensure_api! do
-    if NIF.otlp_grpc_api_version() != 2,
+    if NIF.otlp_grpc_api_version() != 3,
       do: raise("OTLP/gRPC native artifact is incompatible; rebuild with PULSO_NIF_FORCE_BUILD=1")
   end
 
@@ -152,16 +165,23 @@ defmodule PulsoWeb.OTLPGRPC do
   end
 
   @doc false
-  # The OTLP/HTTP pipeline on a header-only conn: gRPC metadata carries the
-  # same tenant, credential and idempotency headers.
-  def handle(signal, headers, body) do
-    conn = PulsoWeb.BasicTenant.call(%Plug.Conn{req_headers: headers}, [])
+  # Authorization from metadata alone, before the message is read.
+  def admit(signal, headers) do
+    case authorize(headers) do
+      {:ok, _conn, _tenant} -> {:ok, :admitted}
+      {:error, reason} -> {:error, Ingest.classify(signal, reason)}
+    end
+  end
 
+  @doc false
+  # The OTLP/HTTP pipeline on a header-only conn: gRPC metadata carries the
+  # same tenant, credential and idempotency headers. Authorization repeats
+  # here because the message is a separate delivery from its admission.
+  def handle(signal, headers, body) do
     result =
-      with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
-           :ok <- S3.validate_tenant(tenant),
-           :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
-           :ok <- admit(signal, tenant, byte_size(body)),
+      with {:ok, conn, tenant} <- authorize(headers),
+           :ok <- PulsoWeb.Authenticate.charge_quota(conn, byte_size(body)),
+           :ok <- acquire(signal, tenant, byte_size(body)),
            {:ok, key} <- OTLPHTTP.single_header(conn, "idempotency-key", nil) do
         with {:ok, _rejected, _message} = ok <-
                Ingest.ingest(signal, tenant, key, Ingest.decode(signal, :protobuf, body)) do
@@ -179,7 +199,7 @@ defmodule PulsoWeb.OTLPGRPC do
   # Each call runs in its own task, so its slot is released when it exits.
   # Configured tenant limits apply to the verified tenant and the decompressed
   # message size.
-  defp admit(signal, tenant, bytes) do
+  defp acquire(signal, tenant, bytes) do
     limited = if Pulso.TenantLimits.configured?(), do: tenant
 
     with :ok <- tenant_rate(limited, bytes),
@@ -199,7 +219,20 @@ defmodule PulsoWeb.OTLPGRPC do
     end
   end
 
+  defp authorize(headers) do
+    conn =
+      %Plug.Conn{req_headers: headers}
+      |> PulsoWeb.BasicTenant.call([])
+      |> PulsoWeb.Authenticate.assign_principal()
+
+    with {:ok, tenant} <- OTLPHTTP.single_header(conn, "x-scope-orgid", "default"),
+         :ok <- S3.validate_tenant(tenant),
+         :ok <- Pulso.Auth.verify(conn, tenant, :ingest),
+         do: {:ok, conn, tenant}
+  end
+
   @doc false
+  def to_grpc({:ok, :admitted}), do: {0, "", ""}
   def to_grpc({:ok, rejected}), do: to_grpc({:ok, rejected, "invalid records rejected"})
   def to_grpc({:ok, rejected, message}), do: {0, "", Ingest.response_protobuf(rejected, message)}
   def to_grpc({:error, {429, message}}), do: {8, message, status_details(8, message, retry_info(1))}

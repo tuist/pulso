@@ -118,12 +118,14 @@ defmodule PulsoWeb.OTLPGRPCTest do
       {:ok, conn, ref} =
         Mint.HTTP2.request(conn, "POST", @logs, [{"content-type", "application/grpc"}, {"te", "trailers"}], :stream)
 
+      admit(:logs)
       {:ok, conn} = Mint.HTTP2.stream_request_body(conn, ref, <<0, 1::32>>)
       {conn, headers} = incomplete_response(conn, ref, [])
       assert {"grpc-status", "14"} in headers
       refute_received {:pulso_otlp_grpc, _, _, _, _}
 
       next = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @logs, "") end)
+      admit(:logs)
       assert_receive {:pulso_otlp_grpc, reply, :logs, _, ""}, 5_000
       assert :ok = NIF.otlp_grpc_reply(reply, 0, "", "")
       assert %{status: 0} = Task.await(next, 5_000)
@@ -174,6 +176,7 @@ defmodule PulsoWeb.OTLPGRPCTest do
 
     try do
       first = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
+      admit(:traces)
       assert_receive {:pulso_otlp_grpc, first_reply, :traces, _, ""}, 5_000
       assert %{status: 14, message: "ingest timed out"} = Task.await(first, 5_000)
 
@@ -182,9 +185,11 @@ defmodule PulsoWeb.OTLPGRPCTest do
       second = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
       assert %{status: 14, message: "ingest timed out"} = Task.await(second, 5_000)
       refute_received {:pulso_otlp_grpc, _, _, _, _}
+      refute_received {:pulso_otlp_grpc_admit, _, _, _}
 
       assert :ok = NIF.otlp_grpc_reply(first_reply, 0, "", "")
       third = Task.Supervisor.async_nolink(tasks, fn -> GRPCClient.unary(port, @traces, "") end)
+      admit(:traces)
       assert_receive {:pulso_otlp_grpc, third_reply, :traces, _, ""}, 5_000
       assert :ok = NIF.otlp_grpc_reply(third_reply, 0, "", "")
       assert %{status: 0} = Task.await(third, 5_000)
@@ -265,6 +270,10 @@ defmodule PulsoWeb.OTLPGRPCTest do
         {Task,
          fn ->
            receive do
+             {:pulso_otlp_grpc_admit, reply, :traces, _headers} -> NIF.otlp_grpc_reply(reply, 0, "", "")
+           end
+
+           receive do
              {:pulso_otlp_grpc, _reply, :traces, _headers, _body} -> exit(:crashed)
            end
          end}
@@ -280,12 +289,37 @@ defmodule PulsoWeb.OTLPGRPCTest do
     end
   end
 
+  # Answer the listener's header-only admission request as the owner process.
+  defp admit(signal) do
+    assert_receive {:pulso_otlp_grpc_admit, reply, ^signal, _headers}, 5_000
+    assert :ok = NIF.otlp_grpc_reply(reply, 0, "", "")
+  end
+
+  test "a call refused at admission never reads or forwards its message" do
+    {:ok, listener, port} = NIF.otlp_grpc_start("127.0.0.1", 0, self(), 1_048_576, 4, 10_000)
+
+    try do
+      metadata = [{"authorization", "Bearer nope"}, {"x-scope-orgid", "acme"}]
+      call = Task.async(fn -> GRPCClient.unary(port, @traces, OTLPTraceFixture.protobuf(), metadata: metadata) end)
+
+      assert_receive {:pulso_otlp_grpc_admit, reply, :traces, headers}, 5_000
+      assert {"authorization", "Bearer nope"} in headers
+      assert :ok = NIF.otlp_grpc_reply(reply, 16, "unauthorized", "")
+      assert %{status: 16, message: "unauthorized"} = Task.await(call, 5_000)
+      refute_received {:pulso_otlp_grpc, _, _, _, _}
+    after
+      NIF.otlp_grpc_stop(listener)
+    end
+  end
+
   test "messages over the size limit are rejected before reaching the BEAM" do
     {:ok, listener, port} = NIF.otlp_grpc_start("127.0.0.1", 0, self(), 16, 4, 10_000)
 
     try do
       for opts <- [[], [gzip: true]] do
-        assert %{status: 8} = GRPCClient.unary(port, @traces, OTLPTraceFixture.protobuf(), opts)
+        call = Task.async(fn -> GRPCClient.unary(port, @traces, OTLPTraceFixture.protobuf(), opts) end)
+        admit(:traces)
+        assert %{status: 8} = Task.await(call, 5_000)
         refute_received {:pulso_otlp_grpc, _, _, _, _}
       end
     after

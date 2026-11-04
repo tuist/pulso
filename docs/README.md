@@ -70,6 +70,9 @@ stores raw records, indefinitely unless event-time expiry is configured.
   and what does and does not scale with more instances.
 - [Tenants and usage](tenants.md): the admin API, runtime tenant provisioning,
   suspension and deletion, and per-tenant usage metering.
+- [Issuer credentials](issuer-credentials.md): trust one external issuer (such
+  as Tuist) whose offline-verified tokens and ingest keys carry tenant and
+  scopes, its signed status list, quotas, MCP OAuth discovery and client setup.
 - [Querying](querying.md): the Model Context Protocol tools, the Prometheus and
   Loki query APIs, the supported query subset, and query limits.
 - [Alerting](alerting.md): experimental native threshold/recording evaluation,

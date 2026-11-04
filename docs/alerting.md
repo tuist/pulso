@@ -17,7 +17,11 @@ Import success is not query, template, lifecycle, or notification compatibility.
 ## Configure credentials and evaluation
 
 Alerting does not accept the existing tenant-shared token as an administrative
-identity. Configure dedicated principals in `PULSO_ALERTING_PRINCIPALS_JSON`:
+identity. A [trusted issuer](issuer-credentials.md) credential acts as a
+principal for its tenant: its `alert:*` scopes are the capabilities and its
+subject (with any delegating `act`) is the recorded identity. Suspended tenants
+stop evaluating. Otherwise, configure dedicated principals in
+`PULSO_ALERTING_PRINCIPALS_JSON`:
 
 ```json
 [

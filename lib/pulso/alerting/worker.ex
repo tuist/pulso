@@ -6,6 +6,7 @@ defmodule Pulso.Alerting.Worker do
   alias Pulso.Alerting.Membership
   alias Pulso.Alerting.Notifier
   alias Pulso.Alerting.Tasks
+  alias Pulso.Auth.Issuer
   alias Pulso.Runtime
   alias Pulso.Runtime.GenServer
   alias Pulso.Runtime.Task
@@ -73,9 +74,13 @@ defmodule Pulso.Alerting.Worker do
   defp evaluate_tenant(prefix, total, nodes, opts) do
     tenant = prefix |> String.trim_trailing("/") |> String.split("/") |> List.last()
 
-    # Suspended and deleted tenants are not evaluated.
-    case if(Pulso.Tenants.active?(tenant), do: Repository.list(tenant, opts), else: :inactive) do
-      {:ok, ids} -> Enum.reduce(ids, total, &evaluate_owned(tenant, &1, &2, nodes, opts))
+    # Suspended and deleted tenants are not evaluated, whether the tenant
+    # registry or the issuer status list marks them.
+    with true <- Pulso.Tenants.active?(tenant),
+         false <- Issuer.suspended?(tenant),
+         {:ok, ids} <- Repository.list(tenant, opts) do
+      Enum.reduce(ids, total, &evaluate_owned(tenant, &1, &2, nodes, opts))
+    else
       _ -> total
     end
   end

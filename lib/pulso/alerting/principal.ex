@@ -1,9 +1,32 @@
 defmodule Pulso.Alerting.Principal do
   @moduledoc "Capability-scoped alerting identities from operator configuration, not caller assertions."
 
+  alias Pulso.Auth.Issuer
   alias Pulso.Runtime
 
+  @doc """
+  Authenticates an alerting principal for `tenant`. A Tuist-issued credential
+  maps its subject (with any delegating actor) and `alert:*` scopes onto the
+  principal; otherwise the bearer must match a configured principal.
+  """
   def authenticate(conn, tenant) do
+    case Pulso.Auth.issuer_principal(conn) do
+      :none -> authenticate_configured(conn, tenant)
+      {:ok, %{tenant: ^tenant} = principal} -> {:ok, issuer_principal(principal)}
+      _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp issuer_principal(principal) do
+    %{
+      tenant: principal.tenant,
+      id: Issuer.actor_id(principal),
+      type: principal.type,
+      capabilities: Enum.filter(principal.scopes, &String.starts_with?(&1, "alert:"))
+    }
+  end
+
+  defp authenticate_configured(conn, tenant) do
     with true <- valid_id?(tenant),
          [header] <- Plug.Conn.get_req_header(conn, "authorization"),
          true <- String.valid?(header),

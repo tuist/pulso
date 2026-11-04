@@ -79,7 +79,8 @@ The ones you are most likely to change:
 | Value | Purpose |
 | --- | --- |
 | `storage.*` | Bucket, region, endpoint, and credentials. |
-| `tenantTokens` | Tenant name to token digest. Optional when `workloadIdentity.trust` is set. |
+| `tenantTokens` | Tenant name to token digest. Optional when `workloadIdentity.trust` or `issuer` is set. |
+| `issuer` | Trusted credential issuer whose signed tokens carry tenant and scopes. Empty disables it. See [issuer credentials](issuer-credentials.md). |
 | `workloadIdentity.trust` | Trusted Kubernetes ServiceAccount token issuers with inline or URL-fetched public keys and subject-to-tenant/capability bindings. See [workload identity](configuration.md#workload-identity). |
 | `workloadIdentity.kubernetesApiToken.enabled` | Mount a projected Kubernetes API token and the cluster CA for [JWKS URL key sources](configuration.md#jwks-url-key-sources). Default `false`. |
 | `existingSecret` | Use a Secret you manage instead of chart-rendered credentials. |

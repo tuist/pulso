@@ -48,10 +48,16 @@ defmodule PulsoWeb.Endpoint do
   # Node-local concurrent ingest bound, before any ingest body is read.
   plug PulsoWeb.IngestAdmission
 
+  # Header-only: verify issuer credentials, and authorize OTLP exports and
+  # hosted MCP calls, before any body is read below.
+  plug PulsoWeb.Authenticate
+
   plug PulsoWeb.SentryBody
 
+  # No multipart parser: no route accepts uploads, and multipart parsing
+  # would spool unauthenticated bodies to disk.
   plug Plug.Parsers,
-    parsers: [:urlencoded, :multipart, PulsoWeb.OTLPJSONParser],
+    parsers: [:urlencoded, PulsoWeb.OTLPJSONParser],
     pass: ["*/*"],
     json_decoder: Phoenix.json_library(),
     # Compressed (on-the-wire) body cap; decompressed size is capped in

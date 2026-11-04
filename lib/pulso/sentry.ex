@@ -1,6 +1,7 @@
 defmodule Pulso.Sentry do
   @moduledoc "Operator-provisioned, ingest-only Sentry project credentials. No accounts database."
 
+  alias Pulso.Auth.Issuer
   alias Pulso.Runtime
 
   def validate_projects!(projects) do
@@ -11,7 +12,8 @@ defmodule Pulso.Sentry do
     if valid?, do: projects, else: raise(ArgumentError, "PULSO_SENTRY_PROJECTS_JSON contains invalid projects")
   end
 
-  defp valid_project?({id, value}) when is_binary(id) and is_map(value) do
+  @doc "Whether `{id, project}` is a valid Sentry project entry (environment or issuer status list)."
+  def valid_project?({id, value}) when is_binary(id) and is_map(value) do
     Regex.match?(~r/\A[0-9]{1,32}\z/, id) and
       Map.keys(value) -- ~w(tenant service public_key_hashes allowed_domains) == [] and
       valid_name?(value["tenant"]) and valid_name?(value["service"]) and
@@ -19,7 +21,7 @@ defmodule Pulso.Sentry do
       valid_key_hashes?(value["public_key_hashes"])
   end
 
-  defp valid_project?(_), do: false
+  def valid_project?(_), do: false
 
   defp valid_key_hashes?(hashes) when is_list(hashes) and length(hashes) in 1..8 do
     Enum.all?(hashes, &(is_binary(&1) and Regex.match?(~r/\A[0-9a-f]{64}\z/, &1)))
@@ -27,9 +29,30 @@ defmodule Pulso.Sentry do
 
   defp valid_key_hashes?(_), do: false
 
+  @doc """
+  Whether the request carries Sentry credentials outside the body (header or
+  `sentry_key` query parameter), so it can be authorized before the body is read.
+  """
+  def request_credentials?(conn) do
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    Plug.Conn.get_req_header(conn, "x-sentry-auth") not in [[], [""]] or
+      Enum.any?(Plug.Conn.get_req_header(conn, "authorization"), &Regex.match?(~r/\Asentry /i, &1)) or
+      is_binary(conn.query_params["sentry_key"])
+  end
+
+  # Operator-configured projects take precedence over projects published in
+  # the issuer status list for the same ID.
+  defp projects do
+    Map.merge(
+      Issuer.sentry_projects(),
+      Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), :projects, %{})
+    )
+  end
+
   def authorize(conn, project_id, headers) do
     conn = Plug.Conn.fetch_query_params(conn)
-    projects = Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), :projects, %{})
+    projects = projects()
     projects = if is_nil(project_id), do: projects, else: Map.take(projects, [project_id])
 
     with true <- map_size(projects) > 0,

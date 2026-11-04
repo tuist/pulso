@@ -103,9 +103,14 @@ Every ingest and query request belongs to a tenant. Sentry SDK ingestion maps
 project credentials to tenant/service instead of trusting tenant headers; its
 public keys never grant read access. Other HTTP requests name the tenant in the
 `X-Scope-OrgID` header, the convention Loki, Mimir, and Cortex clients already
-support; requests without the header use the tenant `default`. Model Context
-Protocol tools take the tenant as an argument instead. Tenant names use letters,
-digits, `_`, `.`, and `-`, up to 128 characters.
+support; requests without the header use the tenant `default`, unless their
+credential comes from a [trusted issuer](issuer-credentials.md), which names the
+tenant itself. Model Context Protocol tools take the tenant as an argument
+instead. Tenant names use letters, digits, `_`, `.`, and `-`, up to 128
+characters.
+
+For a hosted deployment with many tenants, configure `PULSO_ISSUER_JSON`
+instead of per-tenant tokens: see [issuer credentials](issuer-credentials.md).
 
 Requests authenticate with `Authorization: Bearer <token>`, or with HTTP Basic
 credentials whose username is the tenant and whose password is the token, the

@@ -2,6 +2,7 @@ defmodule PulsoWeb.SentryController do
   use PulsoWeb, :controller
 
   alias Plug.Parsers.RequestTooLargeError
+  alias Pulso.Auth.Quota
   alias Pulso.Errors
   alias Pulso.Sentry
   alias Pulso.Sentry.Envelope
@@ -67,7 +68,10 @@ defmodule PulsoWeb.SentryController do
   defp ingest(conn, _id, _project, _headers, nil, discarded), do: success(conn, nil, discarded)
 
   defp ingest(conn, id, project, headers, event, discarded) do
+    body = conn.private[:sentry_body]
+
     with :ok <- Pulso.Tenants.check(project["tenant"]),
+         :ok <- Quota.charge(project["tenant"], if(is_binary(body), do: byte_size(body), else: 0)),
          {:ok, record} <- Errors.record(event, headers, id, project),
          :ok <- Pulso.Metrics.append(:logs, project["tenant"], [record], 0, []) do
       success(conn, record.resource["error_event_id"], discarded)
@@ -88,6 +92,10 @@ defmodule PulsoWeb.SentryController do
 
   defp failure(conn, {:error, :invalid_sentry_key}), do: conn |> put_status(403) |> json(%{error: "invalid_sentry_key"})
   defp failure(conn, {:error, :forbidden}), do: conn |> put_status(403) |> json(%{error: "forbidden"})
+
+  # Sentry SDKs back off on 429 using Retry-After.
+  defp failure(conn, {:error, :rate_limited}),
+    do: conn |> put_resp_header("retry-after", "10") |> put_status(429) |> json(%{error: "rate_limited"})
 
   defp failure(conn, {:error, reason})
        when reason in [:event_too_large, :too_many_items, :attributes_too_large, :too_many_records],

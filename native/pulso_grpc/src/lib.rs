@@ -43,7 +43,7 @@ fn native_allocated_bytes() -> i64 {
 }
 
 mod atoms {
-    rustler::atoms! { ok, error, logs, metrics, traces, pulso_otlp_grpc, already_replied }
+    rustler::atoms! { ok, error, logs, metrics, traces, pulso_otlp_grpc, pulso_otlp_grpc_admit, already_replied }
 }
 
 // Request metadata the BEAM needs for tenancy, authorization and retries.
@@ -96,7 +96,8 @@ type Outcome = Result<Bytes, (i32, String, Bytes)>;
 struct PendingReply {
     sender: oneshot::Sender<Outcome>,
     // A transport timeout/cancellation must not admit more outstanding BEAM work.
-    _permit: OwnedSemaphorePermit,
+    // Admission replies hold none: the route keeps its permit while it waits.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct Reply(Mutex<Option<PendingReply>>);
@@ -188,15 +189,10 @@ impl tower_service::Service<tonic::Request<Bytes>> for Export {
     }
 }
 
-async fn forward(
-    bridge: Arc<Bridge>,
-    signal: Signal,
-    request: tonic::Request<Bytes>,
-    permit: OwnedSemaphorePermit,
-) -> Result<tonic::Response<Bytes>, Status> {
+fn forwarded(metadata: &http::HeaderMap) -> Result<Vec<(String, String)>, Status> {
     let mut headers = Vec::new();
     for name in FORWARDED {
-        for value in request.metadata().get_all(name).iter() {
+        for value in metadata.get_all(name).iter() {
             // Never turn malformed tenancy or idempotency into an omitted
             // header, or conceal an invalid duplicate from the shared receiver.
             let value = value
@@ -205,11 +201,60 @@ async fn forward(
             headers.push((name.to_owned(), value.to_owned()));
         }
     }
+    Ok(headers)
+}
+
+// Ask the BEAM to authorize the call from its metadata alone, before tonic
+// buffers or decompresses the message, so unauthenticated callers cannot
+// spend decompression work or message memory.
+async fn admit(bridge: &Bridge, signal: Signal, metadata: &http::HeaderMap) -> Result<(), Status> {
+    let headers = forwarded(metadata)?;
+    let (tx, rx) = oneshot::channel();
+    let reply = ResourceArc::new(Reply(Mutex::new(Some(PendingReply {
+        sender: tx,
+        _permit: None,
+    }))));
+
+    let mut env = OwnedEnv::new();
+    let sent = env.send_and_clear(&bridge.owner, |env| {
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        (
+            atoms::pulso_otlp_grpc_admit(),
+            reply.clone(),
+            signal.atom(),
+            headers,
+        )
+            .encode(env)
+    });
+    drop(reply);
+    if sent.is_err() {
+        return Err(Status::unavailable("ingest handler is not running"));
+    }
+
+    match rx.await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err((code, message, details))) => {
+            Err(Status::with_details(Code::from_i32(code), message, details))
+        }
+        Err(_) => Err(Status::unavailable("ingest handler exited")),
+    }
+}
+
+async fn forward(
+    bridge: Arc<Bridge>,
+    signal: Signal,
+    request: tonic::Request<Bytes>,
+    permit: OwnedSemaphorePermit,
+) -> Result<tonic::Response<Bytes>, Status> {
+    let headers = forwarded(request.metadata().as_ref())?;
     let payload = ResourceArc::new(Payload(request.into_inner()));
     let (tx, rx) = oneshot::channel();
     let reply = ResourceArc::new(Reply(Mutex::new(Some(PendingReply {
         sender: tx,
-        _permit: permit,
+        _permit: Some(permit),
     }))));
 
     let mut env = OwnedEnv::new();
@@ -280,6 +325,9 @@ async fn route_admitted(
         Ok(permit) => permit,
         Err(_) => return Ok(Status::unavailable("listener is shutting down").into_http()),
     };
+    if let Err(status) = admit(&bridge, signal, req.headers()).await {
+        return Ok(status.into_http());
+    }
     let mut grpc = Grpc::new(RawCodec)
         .accept_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Zstd)
@@ -348,7 +396,8 @@ otlp_service!(
 
 #[rustler::nif]
 fn otlp_grpc_api_version() -> u32 {
-    2
+    // 3: every call is admitted from its metadata before the message is read.
+    3
 }
 
 /// Bind `ip:port` (port 0 picks one) and serve until stopped or until the

@@ -33,10 +33,28 @@ secretKeyBase: ""
 #
 #   printf '%s' "$TOKEN" | shasum -a 256 | awk '{print "sha256$" $1}'
 #
-# At least one tenant is required unless workloadIdentity.trust or
-# tenantRegistry.enabled is set.
+# At least one tenant is required unless workloadIdentity.trust,
+# tenantRegistry.enabled or issuer is set.
 tenantTokens: {}
 #  production: "sha256$5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+
+# Trusted credential issuer (for example Tuist): Pulso verifies its signed
+# access tokens and ingest keys offline against its JWKS, and takes tenant and
+# scopes from their claims, so tenants need no Pulso configuration. Keys and
+# the signed status list (revocations, suspensions, Sentry projects, quotas)
+# are cached per instance and mirrored to the bucket. Empty disables it.
+# See docs/issuer-credentials.md.
+issuer: {}
+#  issuer: https://tuist.dev
+#  audience: https://eu.pulso.tuist.dev       # this deployment's canonical URL
+#  jwks_url: https://tuist.dev/.well-known/pulso/jwks.json
+#  status_url: https://tuist.dev/api/pulso/status.jwt   # optional
+#  refresh_interval_seconds: 60               # 10..3600
+#  key_retention_seconds: 604800              # keys stay usable this long after the last fetch
+#  expired_grace_seconds: 3600                # expired ingest tokens answer 503, not 401
+#  max_access_ttl_seconds: 86400
+#  max_ingest_key_ttl_seconds: 31622400
+#  mirror: true                               # copy keys/status to auth/issuer/ in the bucket
 
 workloadIdentity:
   # Trusted Kubernetes projected ServiceAccount token issuers. Callers send the

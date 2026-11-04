@@ -33,7 +33,12 @@ defmodule PulsoWeb.SentryBody do
         conn |> send_resp(204, "") |> halt()
 
       "POST" ->
-        read(conn)
+        # Credentials outside the body are checked before reading it; only a
+        # DSN carried in the envelope header needs the body first.
+        if Pulso.Sentry.request_credentials?(conn) and
+             match?({:error, _}, Pulso.Sentry.authorize(conn, project(conn), %{})),
+           do: error(conn, 403, "invalid_sentry_key"),
+           else: read(conn)
 
       "GET" when endpoint == "store" ->
         conn = conn |> put_resp_header("cache-control", "no-store") |> fetch_query_params()
@@ -45,6 +50,13 @@ defmodule PulsoWeb.SentryBody do
 
       _ ->
         conn
+    end
+  end
+
+  defp project(conn) do
+    case Enum.map(conn.path_info, &URI.decode/1) do
+      ["api", project, _endpoint] -> project
+      _ -> nil
     end
   end
 
