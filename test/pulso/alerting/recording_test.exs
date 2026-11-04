@@ -461,7 +461,16 @@ defmodule Pulso.Alerting.RecordingTest do
   end
 
   test "only authoritative metrics expiry retires an intent, with a committed diagnostic event", ctx do
-    Runtime.put_env(:pulso, S3, Map.merge(ctx.config, %{retention_mode: "enforce", metrics_retention_days: 1}))
+    Runtime.put_env(
+      :pulso,
+      S3,
+      Map.merge(ctx.config, %{
+        retention_mode: "enforce",
+        retention_manifest_format: "bucketed",
+        metrics_retention_days: 1
+      })
+    )
+
     assert {:ok, _} = create(ctx)
     assert {:ok, _} = tick(ctx, 1_000_000_000)
     assert {:ok, :expired} = Recording.publish_one("alerts", "record", ctx.opts)
@@ -476,7 +485,16 @@ defmodule Pulso.Alerting.RecordingTest do
   end
 
   test "recording expiry history and retained state stay classified after conversion, including legacy events", ctx do
-    Runtime.put_env(:pulso, S3, Map.merge(ctx.config, %{retention_mode: "enforce", metrics_retention_days: 1}))
+    Runtime.put_env(
+      :pulso,
+      S3,
+      Map.merge(ctx.config, %{
+        retention_mode: "enforce",
+        retention_manifest_format: "bucketed",
+        metrics_retention_days: 1
+      })
+    )
+
     assert {:ok, created} = create(ctx)
     assert {:ok, _} = tick(ctx, 1_000_000_000)
     assert {:ok, :expired} = Recording.publish_one("alerts", "record", ctx.opts)
@@ -559,7 +577,15 @@ defmodule Pulso.Alerting.RecordingTest do
   end
 
   test "event replay preserves authorized threshold history across recording conversion and hidden pages", ctx do
-    Runtime.put_env(:pulso, S3, Map.merge(ctx.config, %{retention_mode: "enforce", metrics_retention_days: 1}))
+    Runtime.put_env(
+      :pulso,
+      S3,
+      Map.merge(ctx.config, %{
+        retention_mode: "enforce",
+        retention_manifest_format: "bucketed",
+        metrics_retention_days: 1
+      })
+    )
 
     threshold = %{
       "kind" => "promql_threshold",

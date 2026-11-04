@@ -144,7 +144,12 @@ defmodule PulsoWeb.LogsEndToEndTest do
   end
 
   test "observed-only logs are range-queryable and admitted into managed retention", ctx do
-    Runtime.put_env(:pulso, S3, Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1}))
+    Runtime.put_env(
+      :pulso,
+      S3,
+      Map.merge(ctx.config, %{retention_mode: "enforce", retention_manifest_format: "bucketed", logs_retention_days: 1})
+    )
+
     now = System.system_time(:nanosecond)
     observed = %{"observedTimeUnixNano" => Integer.to_string(now), "body" => %{"stringValue" => "observed"}}
     event = %{"timeUnixNano" => Integer.to_string(now + 1), "body" => %{"stringValue" => "event"}}

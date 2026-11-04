@@ -10,6 +10,7 @@ defmodule Pulso.Storage.S3.Retention do
   alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.LogCompactor
   alias Pulso.Storage.S3.Manifest
+  alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.MetricsCompactor
@@ -34,6 +35,23 @@ defmodule Pulso.Storage.S3.Retention do
   @doc "Whether this node enforces retention for `signal` (and therefore gates legacy roots)."
   def enforcing?(config, signal),
     do: Map.get(config, :retention_mode, "observe") == "enforce" and days(config, signal) > 0
+
+  @doc """
+  Whether enforcing retention converts `signal`'s prefixes to the bucketed
+  format-3 manifest. By default (`:retention_manifest_format` `"paged"`)
+  retention keeps format 4, so manifest backups and hour finalization keep
+  working; `"bucketed"` and flat manifests use format 3. Prefixes already in
+  format 3 stay there either way.
+  """
+  def bucketed?(config, signal),
+    do:
+      enforcing?(config, signal) and
+        (Map.get(config, :retention_manifest_format, "paged") == "bucketed" or
+           Map.get(config, :manifest_format, "paged") == "flat")
+
+  @doc "The retention floor a root enforces, in event-time nanoseconds, or nil."
+  def retention_floor(%Manifest{version: 3} = root), do: Pages.floor(root)
+  def retention_floor(root), do: JournalManifest.retention_floor(root)
 
   @doc false
   def fetch_root(tenant, signal, config, etag, known_version \\ nil) do
@@ -198,7 +216,9 @@ defmodule Pulso.Storage.S3.Retention do
       duration = days(config, signal)
 
       floor =
-        if duration > 0, do: max(Pages.floor(root) || 0, max(0, now - duration * @day_ns)), else: Pages.floor(root)
+        if duration > 0,
+          do: max(retention_floor(root) || 0, max(0, now - duration * @day_ns)),
+          else: retention_floor(root)
 
       stats = metadata_stats(root)
 
@@ -206,7 +226,7 @@ defmodule Pulso.Storage.S3.Retention do
        Map.merge(stats, %{
          format: root.version,
          desired_days: duration,
-         floor_ns: Pages.floor(root),
+         floor_ns: retention_floor(root),
          proposed_floor_ns: floor,
          inline_segments: length(root.segments),
          catchup: if(root.paging, do: root.paging["catchup"])
@@ -225,8 +245,78 @@ defmodule Pulso.Storage.S3.Retention do
       now_ms = Keyword.get(opts, :now_ms, div(now_ns, 1_000_000))
       config = Map.put(config, :retention_conversion, true)
 
-      transact(tenant, signal, config, &advance_step(&1, now_ns, now_ms, tenant, signal, config))
+      if bucketed?(config, signal),
+        do: advance_bucketed(tenant, signal, config, now_ns, now_ms),
+        else: advance_paged(tenant, signal, config, now_ns, now_ms)
     end
+  end
+
+  defp advance_bucketed(tenant, signal, config, now_ns, now_ms),
+    do: transact(tenant, signal, config, &advance_step(&1, now_ns, now_ms, tenant, signal, config))
+
+  # ---- format-4 retention ----------------------------------------------------
+
+  @hour_ns 3_600_000_000_000
+
+  # The floor moves in whole hours, so an idle prefix's root is rewritten at
+  # most hourly. Expiry pages are planned outside the manifest owner, which
+  # only commits the plan (see JournalManifest.expire_plan/7), so ingest
+  # publications never wait on page I/O. A flat root is converted first.
+  defp advance_paged(tenant, signal, config, now_ns, now_ms) do
+    floor = div(max(0, now_ns - days(config, signal) * @day_ns), @hour_ns) * @hour_ns
+    deadline = now_ms + effective_grace(config, signal)
+    leaves = Map.get(config, :retention_expiry_leaves, 32)
+
+    case load(tenant, signal, config) do
+      # Format 3 stays format 3.
+      {:ok, %Manifest{version: 3}, _etag} ->
+        advance_bucketed(tenant, signal, config, now_ns, now_ms)
+
+      {:ok, root, _etag} ->
+        with {:ok, changes} <- plan_expiry(root, floor, deadline, leaves, tenant, signal, config) do
+          commit = &commit_expiry(&1, floor, deadline, changes, tenant, signal, config)
+          ManifestOwner.transact(tenant, signal, config, commit)
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp plan_expiry(%Manifest{version: 4} = root, floor, deadline, leaves, tenant, signal, config),
+    do: Pages.with_budget(config, fn -> expire_plan!(root, floor, deadline, leaves, tenant, signal, config) end)
+
+  defp plan_expiry(_root, _floor, _deadline, _leaves, _tenant, _signal, _config), do: {:ok, []}
+
+  defp expire_plan!(root, floor, deadline, leaves, tenant, signal, config) do
+    case JournalManifest.expire_plan(root, floor, deadline, leaves, tenant, signal, config) do
+      {:ok, changes} -> changes
+      {:error, reason} -> Pages.fail(reason)
+    end
+  end
+
+  defp commit_expiry(%Manifest{version: 4} = current, floor, deadline, changes, tenant, signal, config) do
+    with {:ok, {updated, retired}} <-
+           JournalManifest.apply_expiry(current, floor, deadline, changes, tenant, signal, config) do
+      result = %{format: 4, floor_ns: JournalManifest.retention_floor(updated), retired: retired}
+      write_expiry(updated, current, result, tenant, signal, config)
+    end
+  end
+
+  defp commit_expiry(%Manifest{version: version} = flat, floor, deadline, _changes, tenant, signal, config)
+       when version in [1, 2] do
+    with {:ok, root} <- JournalManifest.convert(flat, tenant, signal, config),
+         do: commit_expiry(root, floor, deadline, [], tenant, signal, config)
+  end
+
+  # Another node converted the prefix to format 3 meanwhile; it owns retention.
+  defp commit_expiry(_root, _floor, _deadline, _changes, _tenant, _signal, _config), do: {:done, %{format: 3}}
+
+  defp write_expiry(current, current, result, _tenant, _signal, _config), do: {:done, result}
+
+  defp write_expiry(updated, _current, result, tenant, signal, config) do
+    with {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
+         do: {:write, sealed, payload, result}
   end
 
   defp advance_step(root, now_ns, now_ms, tenant, signal, config) do
@@ -317,15 +407,43 @@ defmodule Pulso.Storage.S3.Retention do
   defp cleanup_retired_root(%Manifest{version: 3}, now, tenant, signal, config, _opts),
     do: transact(tenant, signal, config, &retired_step(&1, now, tenant, signal, config))
 
-  defp cleanup_retired_root(_legacy, _now, tenant, "logs", config, opts), do: LogCompactor.cleanup(tenant, config, opts)
+  defp cleanup_retired_root(root, _now, tenant, signal, config, opts) do
+    case backup_hold(root, tenant, signal, config, opts) do
+      {:ok, opts} -> compactor_cleanup(tenant, signal, config, opts)
+      error -> error
+    end
+  end
 
-  defp cleanup_retired_root(_legacy, _now, tenant, "metrics", config, opts),
-    do: MetricsCompactor.cleanup(tenant, config, opts)
+  defp compactor_cleanup(tenant, "logs", config, opts), do: LogCompactor.cleanup(tenant, config, opts)
+  defp compactor_cleanup(tenant, "metrics", config, opts), do: MetricsCompactor.cleanup(tenant, config, opts)
+  defp compactor_cleanup(tenant, "traces", config, opts), do: TraceCompactor.cleanup(tenant, config, opts)
+  defp compactor_cleanup(_tenant, _signal, _config, _opts), do: {:ok, 0}
 
-  defp cleanup_retired_root(_legacy, _now, tenant, "traces", config, opts),
-    do: TraceCompactor.cleanup(tenant, config, opts)
+  # With manifest backups on, deletions of a retention-managed format-4
+  # prefix wait for a backup that records each retirement, as compaction
+  # cleanup does, so the newest backup always restores. The retention worker
+  # takes those backups itself: signals without compaction have no other
+  # backup writer. Flat prefixes without retention keep their old behavior.
+  defp backup_hold(%Manifest{version: 4}, tenant, signal, config, opts) do
+    if days(config, signal) > 0 and Map.get(config, :manifest_backup_enabled, true) do
+      with {:ok, taken} <- ManifestBackup.ensure_recent(tenant, signal, config) do
+        hold = ManifestBackup.hold_ms(taken, hold_grace(config, signal))
+        {:ok, Keyword.update(opts, :now_ms, hold, &min(&1, hold))}
+      end
+    else
+      {:ok, opts}
+    end
+  end
 
-  defp cleanup_retired_root(_legacy, _now, _tenant, _signal, _config, _opts), do: {:ok, 0}
+  defp backup_hold(_root, _tenant, _signal, _config, opts), do: {:ok, opts}
+
+  # Every retirement of the prefix used at least this grace: compaction uses
+  # its own, expiry `effective_grace/2`, which is never smaller.
+  defp hold_grace(config, signal) do
+    key = %{"metrics" => :compaction_options, "logs" => :log_compaction_options, "traces" => :trace_compaction_options}
+    compaction = config |> Map.get(key[signal], []) |> Map.new() |> Map.get(:grace_ms, 3_600_000)
+    min(compaction, effective_grace(config, signal))
+  end
 
   defp retired_step(root, now, tenant, signal, config) do
     buckets = Enum.filter(root.paging["buckets"], &(&1["state"] == "live"))

@@ -366,8 +366,18 @@ retention_mode =
     _ -> raise "PULSO_RETENTION_MODE must be one of observe, enforce, paused"
   end
 
+# paged (default): enforced retention keeps format-4 manifests, so manifest
+# backups and hour finalization keep working. bucketed: the older format-3
+# manifest. Prefixes already in format 3 stay there either way.
+retention_manifest_format =
+  case env_var.("PULSO_RETENTION_MANIFEST_FORMAT", "paged") do
+    value when value in ["paged", "bucketed"] -> value
+    _ -> raise "PULSO_RETENTION_MANIFEST_FORMAT must be paged or bucketed"
+  end
+
 retention_config =
   [
+    retention_manifest_format: retention_manifest_format,
     retention_enabled: env_var.("PULSO_RETENTION_ENABLED", "false") in ["1", "true", "yes"],
     logs_retention_days: parse_integer.("PULSO_LOGS_RETENTION_DAYS", 0, 0..3650),
     metrics_retention_days: parse_integer.("PULSO_METRICS_RETENTION_DAYS", 0, 0..3650),

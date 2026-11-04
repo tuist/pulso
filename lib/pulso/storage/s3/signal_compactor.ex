@@ -364,7 +364,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp migration_gate(%{version: 3}, _config), do: :ok
 
   defp migration_gate(_root, config) do
-    if Retention.enforcing?(config, signal_string(config)),
+    if Retention.bucketed?(config, signal_string(config)),
       do: {:error, :retention_migration_required},
       else: :ok
   end

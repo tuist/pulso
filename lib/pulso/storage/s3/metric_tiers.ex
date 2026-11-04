@@ -67,12 +67,14 @@ defmodule Pulso.Storage.S3.MetricTiers do
     settled_before = System.os_time(:nanosecond) - settle
     # Hours that failed recently, so one oversized hour cannot block the rest.
     skip = Keyword.get(opts, :skip_hours, MapSet.new())
+    # Hours wholly below the retention floor are expiring, not worth rewriting.
+    floor = JournalManifest.retention_floor(root) || 0
 
     with {:ok, candidates} <- candidates(root, tenant, config) do
       candidates.segments
       |> Enum.filter(&(Segment.metric_tier(&1) == :raw and is_integer(&1.min_ts) and is_integer(&1.max_ts)))
       |> Enum.flat_map(fn s -> Enum.to_list(hour(s.min_ts)..hour(s.max_ts)//@hour_ns) end)
-      |> Enum.filter(&(&1 + @hour_ns <= settled_before and not MapSet.member?(skip, &1)))
+      |> Enum.filter(&(&1 + @hour_ns <= settled_before and &1 + @hour_ns > floor and not MapSet.member?(skip, &1)))
       |> Enum.min(fn -> nil end)
       |> finalize_oldest(root, tenant, config, opts)
     end

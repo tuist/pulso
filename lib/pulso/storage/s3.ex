@@ -989,6 +989,13 @@ defmodule Pulso.Storage.S3 do
     {:ok, kept, length(expired)}
   end
 
+  defp filter_retained_spans(%Manifest{version: 4} = root, spans, config) do
+    floor = JournalManifest.retention_floor(root) || 0
+    latest = System.system_time(:nanosecond) + Map.get(config, :retention_future_skew_ms, 600_000) * 1_000_000
+    {kept, expired} = Enum.split_with(spans, &(&1.timestamp_ns >= floor and &1.timestamp_ns <= latest))
+    {:ok, kept, length(expired)}
+  end
+
   defp filter_retained_spans(_root, spans, _config), do: {:ok, spans, 0}
 
   defp cached_marker(config, tenant, signal) do
@@ -1028,13 +1035,28 @@ defmodule Pulso.Storage.S3 do
          do: :ok
   end
 
+  # Format-4 retention rejects what the floor already hides, and records too
+  # far in the future, as format 3 does. Publication does not re-check the
+  # floor: anything published below it is hidden and expires on the next pass.
+  defp check_admission(%Manifest{version: 4} = root, records, config) do
+    timestamps = Enum.map(records, &(&1.timestamp_ns || 0))
+    latest = System.system_time(:nanosecond) + Map.get(config, :retention_future_skew_ms, 600_000) * 1_000_000
+
+    cond do
+      timestamps == [] -> :ok
+      Enum.min(timestamps) < (JournalManifest.retention_floor(root) || 0) -> {:error, :retention_expired}
+      Enum.max(timestamps) > latest -> {:error, :timestamp_too_new}
+      true -> :ok
+    end
+  end
+
   defp check_admission(_root, _records, _config), do: :ok
 
   defp ensure_policy(%Manifest{version: 3} = root, _tenant, _signal, _config), do: {:ok, root}
 
   defp ensure_policy(root, tenant, signal, config) do
     cond do
-      not Retention.enforcing?(config, signal) -> {:ok, root}
+      not Retention.bucketed?(config, signal) -> {:ok, root}
       Manifest.empty?(root) -> convert_empty(tenant, signal, config)
       true -> {:error, :retention_migration_required}
     end
@@ -1048,6 +1070,15 @@ defmodule Pulso.Storage.S3 do
 
   defp retained_start(%Manifest{version: 3} = root, nil), do: PagedManifest.floor(root)
   defp retained_start(%Manifest{version: 3} = root, start), do: max(start, PagedManifest.floor(root))
+
+  defp retained_start(%Manifest{version: 4} = root, start) do
+    case {JournalManifest.retention_floor(root), start} do
+      {nil, start} -> start
+      {floor, nil} -> floor
+      {floor, start} -> max(start, floor)
+    end
+  end
+
   defp retained_start(_root, start), do: start
 
   # A limited log query reads segments in its direction and stops once no

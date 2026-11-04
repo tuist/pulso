@@ -59,6 +59,7 @@ defmodule Pulso.Storage.S3.RetentionTest do
       logs_retention_days: 1,
       metrics_retention_days: 1,
       retention_mode: "enforce",
+      retention_manifest_format: "bucketed",
       retention_delete_grace_ms: 5,
       retention_interval_ms: 1,
       retention_tail_entries: 2

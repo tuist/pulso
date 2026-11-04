@@ -264,7 +264,9 @@ defmodule Pulso.Storage.S3.JournalManifestTest do
     {_, paged} = root(ctx)
     assert paged.version == 4 and paged.paging["refs"] != []
 
-    config = Map.merge(ctx.config, %{logs_retention_days: 30, retention_mode: "enforce"})
+    config =
+      Map.merge(ctx.config, %{logs_retention_days: 30, retention_mode: "enforce", retention_manifest_format: "bucketed"})
+
     assert {:ok, %{floor_ns: _}} = Retention.advance(ctx.tenant, "logs", config)
     {_, managed} = root(ctx)
     assert managed.version == 3

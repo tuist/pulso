@@ -184,16 +184,16 @@ logs, 14 days of traces and 90 days of metrics (hourly rollups make long metric
 ranges cheap to read), which caps storage near 3.4 TB ≈ $63/month at that
 volume; metrics dominate, so their retention is the lever.
 
-Two constraints apply on object stores without versioning, such as Tigris:
+Enforced retention keeps the paged (format 4) manifest, so
+[manifest backups](configuration.md#manifest-backups) and hour finalization
+keep working on object stores without versioning, such as Tigris. Expired
+segments are deleted after the grace period and a backup that records their
+retirement; with 7-day soft delete they stay billable for 7 more days, about
+a week of new data (≈ 0.3 TB, $6/month at that volume).
 
-- Enforced [retention](retention.md) switches a prefix to the format-3
-  manifest, which is not backed up by [manifest backups](configuration.md#manifest-backups)
-  and is not finalized into hourly rollups. Until it is, enforcing retention on
-  Tigris trades manifest recoverability for bounded storage; keep it in
-  `observe` mode if recoverability matters more than storage.
-- Trace compaction requires bucket versioning; leave it off on Tigris. Trace
-  segments are then one object per window, which coalescing already keeps
-  small in number.
+Trace compaction requires bucket versioning; leave it off on Tigris. Trace
+segments are then one object per window, which coalescing already keeps small
+in number.
 
 ### Production settings for Tigris
 
@@ -210,6 +210,12 @@ traceCompaction:
   enabled: false               # needs bucket versioning
 manifestBackups:
   enabled: true
+retention:
+  mode: enforce                # after every node runs 1.32 or later
+  manifestFormat: paged
+  logsDays: 30
+  tracesDays: 14
+  metricsDays: 90
 ```
 
 Also give dashboards enough query slots (`PULSO_QUERY_MAX_CONCURRENT`): the

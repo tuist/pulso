@@ -36,10 +36,24 @@ never moves back. Records at exactly the floor are kept.
   manifest page already deleted restarts once against a fresh manifest, then
   fails.
 
-To keep the manifest's size proportional to the retention window rather than to
-the bucket's lifetime, enforcement converts each tenant/signal manifest to a
-paged format (format 3). The root manifest stays the single conditionally written
-authority and holds:
+By default enforcement keeps each prefix's paged (format 4) manifest, see
+[manifest format](configuration.md#manifest-format). The floor is stored in the
+root and moves in whole hours. Each pass retires segments whose newest record is
+older than the floor, rewriting at most 32 manifest leaves, and drops pages that
+only hold forgotten history. Retired segments are deleted by the same cleanup as
+compaction sources: after the grace period, and with
+[manifest backups](configuration.md#manifest-backups) on (the default) only
+once a backup records the retirement, so the newest backup always restores.
+Metric [hour finalization](configuration.md#long-dashboard-and-alert-ranges)
+keeps running and skips expired hours. An existing format-4 or flat prefix needs
+no migration: the first pass sets its floor (a flat root is converted to format 4
+first), and ingest keeps running throughout.
+
+With `PULSO_RETENTION_MANIFEST_FORMAT=bucketed`, enforcement instead converts
+each manifest to the bucketed format 3 described below, which deletes whole time
+buckets but is neither backed up nor finalized. Prefixes already in format 3
+stay in format 3. The rest of this section describes format 3. Its root manifest
+stays the single conditionally written authority and holds:
 
 - the floor, the recorded duration and a fixed bucket width;
 - a small inline list of the most recent segments (at most 256 entries / 64 KiB);
@@ -79,8 +93,8 @@ manifest by listing objects: if the manifest is missing, reads and writes fail
 with an error instead of resurrecting expired or unpublished data.
 
 Prefixes that are not retention-managed keep their flat or paged (format 4,
-see [manifest format](configuration.md#manifest-format)) manifest. Enforcing
-retention on a paged prefix reads its pages into one list under the same 16 MiB
+see [manifest format](configuration.md#manifest-format)) manifest. Converting a
+paged prefix to format 3 reads its pages into one list under the same 16 MiB
 conversion limit as a flat manifest, then converts it to format 3. Ordinary
 queries and appends read their manifests without a size limit in every mode,
 as before. When a node does not yet know a prefix's format (after a restart, for
@@ -96,6 +110,7 @@ legacy manifest costs one extra, unlimited read.
 | `PULSO_METRICS_RETENTION_DAYS` | `0` | Metric retention in whole days, `0..3650`. |
 | `PULSO_TRACES_RETENTION_DAYS` | `0` | Trace retention by span start in whole days, `0..3650`. |
 | `PULSO_RETENTION_MODE` | `observe` | `observe`, `enforce`, or `paused`. See [Modes](#modes). |
+| `PULSO_RETENTION_MANIFEST_FORMAT` | `paged` | Manifest of enforced prefixes: `paged` keeps format 4 (backups, hour finalization), `bucketed` converts to format 3. Prefixes already in format 3 stay there. With `PULSO_MANIFEST_FORMAT=flat`, enforcement uses format 3. |
 | `PULSO_RETENTION_DELETE_GRACE_MS` | `3600000` | Time between expiry being committed and objects being deleted, `60000..2592000000`. |
 | `PULSO_RETENTION_INTERVAL_MS` | `30000` | Maintenance cadence, `1000..3600000`. |
 | `PULSO_RETENTION_DELETE_LIMIT` | `512` | Maximum DELETE attempts per node per `PULSO_RETENTION_INTERVAL_MS`, `1..512`, shared by retention and compaction cleanup of retention-managed prefixes. At most four run at once. |
@@ -116,7 +131,7 @@ node with a positive duration runs the worker.
 | Mode | Floor advancement | Deletes already committed work | Converts manifests |
 | --- | --- | --- | --- |
 | `observe` | No, preview only | Yes | No |
-| `enforce` | Yes, when the duration is positive | Yes | Yes |
+| `enforce` | Yes, when the duration is positive | Yes | Flat roots to format 4 (`paged`), or any root to format 3 (`bucketed`) |
 | `paused` | No | No | No |
 
 A committed floor keeps being enforced on ingest and queries in every mode,
@@ -141,23 +156,25 @@ permission to delete source history or change retry keys. See
 
 ## Enabling retention
 
-1. **Upgrade every Pulso process that touches the bucket to a release with
-   retention, in `observe` mode, and finish the rollout.** Releases without
-   retention cannot read format-3 manifests. Do not enforce while any older
+1. **Upgrade every Pulso process that touches the bucket to the same release,
+   in `observe` mode, and finish the rollout.** Releases before 1.32 ignore a
+   format-4 floor (they would serve and accept expired data), and releases
+   without retention cannot read format-3 manifests. Do not enforce while any older
    reader, writer or compactor can still reach the bucket; stop or fence them
    first. Rolling to a retention release does not by itself make old and new
    versions safe to overlap after enforcement.
-2. **Turn on bucket versioning or another manifest backup**, and decide how long
-   to keep it. See [Recovery](#recovery-and-backups).
+2. **Keep manifest backups on (format 4) or turn on bucket versioning (format
+   3)**, and decide how long to keep them. See [Recovery](#recovery-and-backups).
 3. **Check clocks.** Expiry and the future-skew check use wall-clock time.
    Nodes must agree well within the grace period and the skew allowance.
 4. **Preview.** With durations set and the mode still `observe`, inspect each
    tenant/signal from a running node (see [Operating retention](#operating-retention)).
-5. **Switch to `enforce`.** The worker converts each existing tenant/signal
-   manifest, creates the marker and sets the floor. Expired data stops appearing
+5. **Switch to `enforce`.** The worker sets each tenant/signal's floor (in
+   `bucketed` mode it first converts the manifest and creates the marker). Expired data stops appearing
    in queries right away; objects are deleted after the grace period.
 
-**Ingest pauses for a prefix until it is converted.** In `enforce` mode, an
+**With `bucketed`, ingest pauses for a prefix until it is converted.** In
+`enforce` mode, an
 append to a tenant/signal that already has data in the old format is rejected
 with `:retention_migration_required`, a retryable error, until the worker has
 converted it. Collectors keep retrying and resume once conversion lands. A
@@ -476,7 +493,12 @@ Watch collector drop counters while switching to `enforce`.
 
 ## Recovery and backups
 
-After conversion, the root manifest and the pages it references are the only
+Format-4 prefixes are covered by [manifest backups](configuration.md#manifest-backups):
+the retention worker takes one every 15 minutes, and cleanup deletes an expired
+object only after a backup records its retirement. A restored backup has no
+floor; the next retention pass sets it again and retires anything below it.
+
+For format 3: after conversion, the root manifest and the pages it references are the only
 record of which objects are live, and the floor is irreversible.
 
 - Back up or version the root **and** its pages together. A root restored without

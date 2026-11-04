@@ -324,7 +324,12 @@ defmodule PulsoWeb.MetricsEndToEndTest do
     assert Pulso.JSON.decode!(text)["data"] == ["dev", "prod"]
     assert Req.get!(ctx.url <> "/api/v1/labels", headers: [{"x-scope-orgid", ctx.tenant}]).status == 401
 
-    config = ctx.config |> Map.put(:metrics_retention_days, 1) |> Map.put(:retention_mode, "enforce")
+    config =
+      ctx.config
+      |> Map.put(:metrics_retention_days, 1)
+      |> Map.put(:retention_mode, "enforce")
+      |> Map.put(:retention_manifest_format, "bucketed")
+
     assert {:ok, _} = Retention.advance(ctx.tenant, "metrics", config, now_ns: 3 * 86_400_000_000_000)
     assert Req.get!(ctx.url <> "/api/v1/labels", headers: headers(ctx)).body["data"] == []
   end

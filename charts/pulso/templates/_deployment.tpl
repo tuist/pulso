@@ -224,6 +224,8 @@ spec:
               value: {{ include "pulso.boundedInteger" (list "retention.tracesDays" .Values.retention.tracesDays 0 3650) | quote }}
             - name: PULSO_RETENTION_MODE
               value: {{ .Values.retention.mode | quote }}
+            - name: PULSO_RETENTION_MANIFEST_FORMAT
+              value: {{ .Values.retention.manifestFormat | default "paged" | quote }}
             - name: PULSO_RETENTION_DELETE_GRACE_MS
               value: {{ include "pulso.boundedInteger" (list "retention.deleteGraceMs" .Values.retention.deleteGraceMs 60000 2592000000) | quote }}
             - name: PULSO_RETENTION_INTERVAL_MS

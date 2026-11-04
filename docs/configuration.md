@@ -80,6 +80,7 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_METRICS_RETENTION_DAYS` | `0` | Metric event-time retention in whole days, `0..3650`. `0` stops advancing the floor; without earlier enforcement, metrics are kept indefinitely. |
 | `PULSO_TRACES_RETENTION_DAYS` | `0` | Trace retention by span start in whole days, `0..3650`. Uses the same irreversible floor, paged catalogs, grace and cleanup as other signals. |
 | `PULSO_RETENTION_MODE` | `observe` | `observe` previews, `enforce` converts manifests and expires data (irreversible), `paused` stops all retention work. |
+| `PULSO_RETENTION_MANIFEST_FORMAT` | `paged` | `paged` keeps enforced prefixes in format 4 with manifest backups and hour finalization; `bucketed` converts them to format 3. See [retention](retention.md). |
 | `PULSO_RETENTION_DELETE_GRACE_MS` | `3600000` | Grace between committed expiry and deletion, `60000..2592000000`. |
 | `PULSO_RETENTION_INTERVAL_MS` | `30000` | Retention maintenance cadence, `1000..3600000`. |
 | `PULSO_RETENTION_DELETE_LIMIT` | `512` | Maximum DELETE attempts per node per `PULSO_RETENTION_INTERVAL_MS`, `1..512`, shared by retention and compaction cleanup of retention-managed prefixes. At most four run at once. |
@@ -720,8 +721,9 @@ Cleanup only deletes an object whose retirement is recorded in the newest
 backup, so restoring the newest backup never references a deleted object.
 Deletions therefore lag the grace period by up to one backup interval. Backups
 live in the same bucket: they protect against a lost or corrupted manifest,
-not against losing the bucket. Prefixes with enforced retention are not backed
-up; keep bucket versioning or another backup for them.
+not against losing the bucket. Prefixes with enforced retention are backed up
+too, by the retention worker, unless they use the bucketed format 3
+(`PULSO_RETENTION_MANIFEST_FORMAT=bucketed`); keep bucket versioning for those.
 
 To restore a lost or corrupted manifest, stop ingest for the tenant if you can,
 then run on one instance:

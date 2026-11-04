@@ -97,8 +97,14 @@ fanout-16 binary-counter tree of immutable, nonce-tagged pages under
 history. Flat roots convert on their next publication; pre-1.27 releases reject
 format 4 (fail closed, no overwrite). Keyed lookups descend by `max_ts` ranges;
 compaction/cleanup rewrite one leaf path and supersede pages after the grace;
-enforcing retention materializes format 4 into format 3 within the legacy byte
-limit. `pulso_manifest_commit_duration_seconds{signal,format,root_bytes_le}`,
+enforced retention keeps format 4 by default
+(`PULSO_RETENTION_MANIFEST_FORMAT=paged`): the root's hour-aligned floor `rf`
+hides older data, `JournalManifest.expire_plan/7` (planned outside the owner,
+32 leaves/pass) plus `apply_expiry/7` (owner CAS) retire segments with
+`max_ts < rf` and drop forgotten pages; cleanup waits for
+`ManifestBackup.ensure_recent/3`, and finalization skips expired hours.
+`bucketed` (or flat manifests) still materializes into format 3 within the
+legacy byte limit. `pulso_manifest_commit_duration_seconds{signal,format,root_bytes_le}`,
 `pulso_manifest_roots` and page-cache gauges watch it. Total bucket metadata
 still grows until retention. See `docs/configuration.md#manifest-format`.
 

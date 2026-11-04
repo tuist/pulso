@@ -17,7 +17,10 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   ingested segments written after it (keys a backup does not list). Outputs
   of compaction and finalization written after the backup are not adopted;
   their sources were not deleted, so no acknowledged data is lost or
-  duplicated. Prefixes with enforced retention (format 3) are not backed up.
+  duplicated. Prefixes with bucketed (format-3) retention are not backed up;
+  format-4 prefixes with retention are, and the retention worker takes their
+  backups (`ensure_recent/3`). A backup is a flat copy without the retention
+  floor; the next retention pass sets it again.
   """
 
   alias Pulso.ObjectStore
@@ -25,6 +28,7 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
+  alias Pulso.Storage.S3.MetadataCache
   alias Pulso.Storage.S3.Retention
 
   @width 20
@@ -93,6 +97,53 @@ defmodule Pulso.Storage.S3.ManifestBackup do
       end
     end
   end
+
+  @doc """
+  The newest backup's time (nil without one), first taking a backup when the
+  newest is older than `:manifest_backup_interval_ms` (15 minutes). The time
+  is cached node-locally for a minute so maintenance passes do not LIST the
+  backups each time; a stale value only holds deletions back longer. A failed
+  backup keeps the previous time.
+  """
+  def ensure_recent(tenant, signal, config) do
+    with {:ok, taken} <- cached_latest(tenant, signal, config) do
+      if taken == nil or
+           System.system_time(:millisecond) - taken >= Map.get(config, :manifest_backup_interval_ms, 900_000),
+         do: {:ok, take(tenant, signal, config, taken)},
+         else: {:ok, taken}
+    end
+  end
+
+  defp take(tenant, signal, config, previous) do
+    case backup(tenant, signal, config, keep: Map.get(config, :manifest_backup_keep, 48)) do
+      {:ok, %{taken_ms: taken}} ->
+        remember(tenant, signal, taken)
+        taken
+
+      _not_taken ->
+        previous
+    end
+  end
+
+  defp cache_ref(tenant, signal), do: %{"k" => "backup-cache:" <> prefix(tenant, signal), "b" => 1}
+
+  defp cached_latest(tenant, signal, config) do
+    now = System.monotonic_time(:millisecond)
+
+    case MetadataCache.get(cache_ref(tenant, signal)) do
+      {:ok, {checked, taken}} when now - checked < 60_000 ->
+        {:ok, taken}
+
+      _ ->
+        with {:ok, taken} <- latest(tenant, signal, config) do
+          remember(tenant, signal, taken)
+          {:ok, taken}
+        end
+    end
+  end
+
+  defp remember(tenant, signal, taken),
+    do: MetadataCache.put(cache_ref(tenant, signal), {System.monotonic_time(:millisecond), taken})
 
   @doc """
   The `now` cleanup may use so that it only deletes objects retired before

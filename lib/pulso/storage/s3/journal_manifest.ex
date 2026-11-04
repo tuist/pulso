@@ -62,7 +62,15 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   @doc "Whether new and flat roots of `signal` are written in this format."
   def enabled?(config, signal),
-    do: Map.get(config, :manifest_format, "paged") == "paged" and not Retention.enforcing?(config, signal)
+    do: Map.get(config, :manifest_format, "paged") == "paged" and not Retention.bucketed?(config, signal)
+
+  @doc """
+  The retention floor of a format-4 root, in event-time nanoseconds, or nil.
+  Data whose newest record is older than the floor is expired: hidden from
+  queries, rejected at ingest and retired by `expire_plan/6`.
+  """
+  def retention_floor(%Manifest{version: @version, paging: p}), do: p["rf"]
+  def retention_floor(%Manifest{}), do: nil
 
   @doc "An empty format-4 root."
   def new do
@@ -126,7 +134,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   def validate(%{"nonce" => n, "refs" => refs, "g" => g, "gr" => gr, "cc" => cc} = p) do
     valid =
-      hex?(n, 32) and non_negative?(cc) and valid_cursor?(p["rc"]) and
+      hex?(n, 32) and non_negative?(cc) and valid_cursor?(p["rc"]) and valid_floor?(p["rf"]) and
         bounded_list?(refs, @max_refs, &valid_ref?/1) and heights_ordered?(refs) and
         bounded_list?(g, @gc_inline, &valid_gc_entry?/1) and bounded_list?(gr, @gc_refs, &valid_gc_ref?/1)
 
@@ -135,6 +143,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   def validate(_), do: {:error, :invalid_manifest}
 
+  defp valid_floor?(floor), do: floor == nil or non_negative?(floor)
   defp valid_cursor?(cursor), do: cursor == nil or (is_binary(cursor) and byte_size(cursor) <= 1024)
   defp bounded_list?(list, limit, valid?), do: is_list(list) and length(list) <= limit and Enum.all?(list, valid?)
 
@@ -407,7 +416,9 @@ defmodule Pulso.Storage.S3.JournalManifest do
     do: with_ops(fn -> do_query(root, tenant, signal, opts, config) end)
 
   defp do_query(root, tenant, signal, opts, config) do
-    start_ts = opts[:start_ts]
+    # Segments wholly below the retention floor are expired even before
+    # retention retires them.
+    start_ts = retained_start(opts[:start_ts], retention_floor(root))
     end_ts = opts[:end_ts]
     maximum = query_maximum(signal, opts)
     match = fn s -> Segment.intersects?(s, start_ts, end_ts) and matches?(s, signal, opts) end
@@ -427,6 +438,10 @@ defmodule Pulso.Storage.S3.JournalManifest do
       window -> window(leaves, found, window, read)
     end
   end
+
+  defp retained_start(start, nil), do: start
+  defp retained_start(nil, floor), do: floor
+  defp retained_start(start, floor), do: max(start, floor)
 
   defp plan_window("logs", opts),
     do:
@@ -749,6 +764,155 @@ defmodule Pulso.Storage.S3.JournalManifest do
   defp mark_deleted({key, retirement}, observed) do
     if Map.get(observed, key) == retirement, do: {key, %{retirement | deleted?: true}}, else: {key, retirement}
   end
+
+  # ---- retention -------------------------------------------------------------
+
+  @doc """
+  Plan one bounded expiry pass below `floor` without changing the root. Under
+  each top-level reference it rewrites at most `max_leaves` leaves in total:
+  active segments whose newest record is older than the floor are retired
+  with `deadline` (cleanup deletes them like compaction sources, after the
+  newest manifest backup records the retirement) and deleted retirements
+  below the floor are forgotten. References holding nothing but forgotten
+  history are dropped whole. The new pages are written now; `apply_expiry/7`
+  commits the plan against whatever root is current then.
+
+  Forgetting a tombstone is safe because ingest rejects records below the
+  floor, so an expired keyed retry can no longer be published.
+  """
+  def expire_plan(%Manifest{version: @version} = root, floor, deadline, max_leaves, tenant, signal, config),
+    do: with_ops(fn -> do_expire_plan(root, floor, deadline, max_leaves, tenant, signal, config) end)
+
+  defp do_expire_plan(root, floor, deadline, budget, tenant, signal, config) do
+    {changes, _budget} =
+      Enum.flat_map_reduce(root.paging["refs"], budget, fn ref, budget ->
+        case expire_ref(ref, floor, deadline, budget, tenant, signal, config) do
+          {^ref, _superseded, _written, _retired, budget} ->
+            {[], budget}
+
+          {replacement, superseded, written, retired, budget} ->
+            change = %{key: ref["k"], ref: replacement, superseded: superseded, written: written, retired: retired}
+            {[change], budget}
+        end
+      end)
+
+    changes
+  end
+
+  # `{replacement or nil, superseded page keys, written page keys, retired, budget}`.
+  defp expire_ref(ref, _floor, _deadline, budget, _tenant, _signal, _config) when budget <= 0,
+    do: {ref, [], [], 0, budget}
+
+  defp expire_ref(%{"kn" => kn} = ref, floor, _deadline, budget, _tenant, _signal, _config) when kn >= floor,
+    do: {ref, [], [], 0, budget}
+
+  defp expire_ref(ref, floor, deadline, budget, tenant, signal, config) do
+    cond do
+      ref["n"] == 0 and is_nil(ref["rd"]) and ref["kx"] < floor ->
+        {nil, subtree_keys(ref, tenant, signal, config), [], 0, budget - 1}
+
+      ref["h"] == 0 ->
+        expire_leaf(ref, floor, deadline, budget, tenant, signal, config)
+
+      true ->
+        expire_index(ref, floor, deadline, budget, tenant, signal, config)
+    end
+  end
+
+  defp subtree_keys(%{"h" => 0} = ref, _tenant, _signal, _config), do: [ref["k"]]
+
+  defp subtree_keys(ref, tenant, signal, config),
+    do: [ref["k"] | collect_page_keys(read_index(ref, tenant, signal, config, deadline()), tenant, signal, config)]
+
+  # Only a leaf with an active segment that may end below the floor (its
+  # earliest record is older than it) is read.
+  defp expire_leaf(ref, floor, deadline, budget, tenant, signal, config) do
+    if ref["n"] > 0 and ref["mn"] < floor do
+      leaf = read_leaf(ref, tenant, signal, config, deadline())
+      {expired, kept} = Enum.split_with(leaf.segments, &(&1.max_ts < floor))
+      updated = %{leaf | segments: kept, retired: leaf.retired |> forget(floor) |> retire(expired, deadline)}
+
+      cond do
+        updated == leaf ->
+          {ref, [], [], 0, budget - 1}
+
+        kept == [] and updated.retired == %{} ->
+          {nil, [ref["k"]], [], length(expired), budget - 1}
+
+        true ->
+          new = leaf_ref(updated, tenant, signal, config)
+          {new, [ref["k"]], [new["k"]], length(expired), budget - 1}
+      end
+    else
+      {ref, [], [], 0, budget}
+    end
+  end
+
+  defp expire_index(ref, floor, deadline, budget, tenant, signal, config) do
+    children = read_index(ref, tenant, signal, config, deadline())
+
+    {updated, {superseded, written, retired, budget}} =
+      Enum.flat_map_reduce(children, {[], [], 0, budget}, fn child, {superseded, written, retired, budget} ->
+        {new, s, w, r, budget} = expire_ref(child, floor, deadline, budget, tenant, signal, config)
+        {List.wrap(new), {s ++ superseded, w ++ written, retired + r, budget}}
+      end)
+
+    cond do
+      updated == children ->
+        {ref, [], [], 0, budget}
+
+      updated == [] ->
+        {nil, [ref["k"] | superseded], written, retired, budget}
+
+      true ->
+        new = index_ref(updated, tenant, signal, config)
+        {new, [ref["k"] | superseded], [new["k"] | written], retired, budget}
+    end
+  end
+
+  @doc """
+  Commit an expiry plan: raise the root's floor to `floor` (never lowering
+  it), expire the inline tail the same way, and substitute every planned
+  top-level reference that is still current. A reference that changed since
+  planning (an append spilled into it, compaction rewrote it) keeps its
+  current version; the pages planned for it are superseded instead, and a
+  later pass plans it again. Returns `{root, retired_count}`.
+  """
+  def apply_expiry(%Manifest{version: @version} = root, floor, deadline, changes, tenant, signal, config),
+    do: with_ops(fn -> do_apply_expiry(root, floor, deadline, changes, tenant, signal, config) end)
+
+  defp do_apply_expiry(root, floor, deadline, changes, tenant, signal, config) do
+    floor = max(retention_floor(root) || 0, floor)
+    {expired, kept} = Enum.split_with(root.segments, &(&1.max_ts < floor))
+    present = MapSet.new(root.paging["refs"], & &1["k"])
+    {applied, stale} = Enum.split_with(changes, &MapSet.member?(present, &1.key))
+    replacements = Map.new(applied, &{&1.key, &1.ref})
+
+    refs =
+      Enum.flat_map(root.paging["refs"], fn ref ->
+        case Map.fetch(replacements, ref["k"]) do
+          {:ok, replacement} -> List.wrap(replacement)
+          :error -> [ref]
+        end
+      end)
+
+    root = %{
+      root
+      | segments: kept,
+        retired: root.retired |> forget(floor) |> retire(expired, deadline),
+        paging: root.paging |> Map.put("refs", refs) |> Map.put("rf", floor)
+    }
+
+    superseded = Enum.flat_map(applied, & &1.superseded) ++ Enum.flat_map(stale, & &1.written)
+    grace = Map.get(config, :manifest_page_grace_ms, @default_grace_ms)
+    root = supersede(root, superseded, System.system_time(:millisecond) + grace, tenant, signal, config)
+    {root, length(expired) + Enum.sum_by(applied, & &1.retired)}
+  end
+
+  defp forget(retired, floor), do: Map.reject(retired, fn {key, r} -> r.deleted? and key_max_ts!(key) < floor end)
+
+  defp retire(retired, segments, deadline),
+    do: Enum.reduce(segments, retired, &Map.put(&2, &1.key, Retirement.new(deadline)))
 
   # ---- tree writes -----------------------------------------------------------
 

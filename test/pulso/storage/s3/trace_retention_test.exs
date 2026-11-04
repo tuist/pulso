@@ -61,6 +61,7 @@ defmodule Pulso.Storage.S3.TraceRetentionTest do
       refresh_stale_ms: 0,
       traces_retention_days: 1,
       retention_mode: "observe",
+      retention_manifest_format: "bucketed",
       retention_delete_grace_ms: 5,
       retention_interval_ms: 1,
       retention_tail_entries: 2

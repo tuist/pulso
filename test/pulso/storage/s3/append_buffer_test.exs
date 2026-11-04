@@ -290,7 +290,17 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     test "authority response matrix with managed=#{managed?}", ctx do
       managed? = ctx.matrix_managed
       config = Map.put(ctx.config, :refresh_stale_ms, 60_000)
-      config = if managed?, do: Map.merge(config, %{retention_mode: "enforce", logs_retention_days: 1}), else: config
+
+      config =
+        if managed?,
+          do:
+            Map.merge(config, %{
+              retention_mode: "enforce",
+              retention_manifest_format: "bucketed",
+              logs_retention_days: 1
+            }),
+          else: config
+
       key = Manifest.manifest_key(ctx.tenant, "logs")
       assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
 
@@ -351,7 +361,14 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
   end
 
   test "required-fresh missing managed authority invalidates an unexpired ordinary cache", ctx do
-    config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1, refresh_stale_ms: 60_000})
+    config =
+      Map.merge(ctx.config, %{
+        retention_mode: "enforce",
+        retention_manifest_format: "bucketed",
+        logs_retention_days: 1,
+        refresh_stale_ms: 60_000
+      })
+
     key = Manifest.manifest_key(ctx.tenant, "logs")
     assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
     assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: System.system_time(:nanosecond))
@@ -369,7 +386,9 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
   end
 
   test "a rejected-only flush cannot populate a cold cache from stale private owner state", ctx do
-    config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1})
+    config =
+      Map.merge(ctx.config, %{retention_mode: "enforce", retention_manifest_format: "bucketed", logs_retention_days: 1})
+
     key = Manifest.manifest_key(ctx.tenant, "logs")
     now = System.system_time(:nanosecond)
     assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
@@ -393,7 +412,14 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     test "managed lost-ACK conflict proves publication after another nonce, expired=#{expired?}", ctx do
       day = 86_400_000_000_000
       now = System.system_time(:nanosecond)
-      config = Map.merge(ctx.config, %{retention_mode: "enforce", logs_retention_days: 1})
+
+      config =
+        Map.merge(ctx.config, %{
+          retention_mode: "enforce",
+          retention_manifest_format: "bucketed",
+          logs_retention_days: 1
+        })
+
       key = Manifest.manifest_key(ctx.tenant, "logs")
       assert {:ok, _} = Pulso.ObjectStore.put(config, key, IO.iodata_to_binary(Manifest.encode(Manifest.new())))
       assert {:ok, _} = S3.Retention.advance(ctx.tenant, "logs", config, now_ns: now)
@@ -426,6 +452,7 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
         Map.merge(ctx.config, %{
           retention_enabled: true,
           retention_mode: "enforce",
+          retention_manifest_format: "bucketed",
           logs_retention_days: 1,
           metrics_retention_days: 1
         })

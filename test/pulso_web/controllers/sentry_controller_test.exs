@@ -425,6 +425,7 @@ defmodule PulsoWeb.SentryControllerTest do
         logs_retention_days: 1,
         retention_enabled: true,
         retention_mode: "enforce",
+        retention_manifest_format: "bucketed",
         retention_tail_entries: 1
       })
 

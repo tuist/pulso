@@ -330,7 +330,10 @@ defmodule Pulso.Errors.ProjectionTest do
     assert {:ok, _} = step(ctx)
     assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
     assert :ok = S3.append(:logs, ctx.tenant, [record(2, ctx.now - 5, "unseen")])
-    config = Map.merge(ctx.config, %{logs_retention_days: 1, retention_mode: "enforce"})
+
+    config =
+      Map.merge(ctx.config, %{logs_retention_days: 1, retention_mode: "enforce", retention_manifest_format: "bucketed"})
+
     later = ctx.now + 2 * @day
     assert {:ok, _} = Retention.advance(ctx.tenant, "logs", config, now_ns: later, now_ms: div(later, 1_000_000))
     Runtime.put_env(:pulso, S3, config)
@@ -482,7 +485,10 @@ defmodule Pulso.Errors.ProjectionTest do
     assert {:ok, _} = step(ctx)
     assert {:ok, %{"next_cursor" => cursor}} = changes(ctx)
     assert :ok = S3.append(:logs, ctx.tenant, for(id <- 6..20, do: record(id, finish - id)))
-    config = Map.merge(ctx.config, %{logs_retention_days: 1, retention_mode: "enforce"})
+
+    config =
+      Map.merge(ctx.config, %{logs_retention_days: 1, retention_mode: "enforce", retention_manifest_format: "bucketed"})
+
     clock = ctx.now + @day - 1
     assert {:ok, _} = Retention.advance(ctx.tenant, "logs", config, now_ns: clock, now_ms: div(clock, 1_000_000))
     Runtime.put_env(:pulso, S3, config)

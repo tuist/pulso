@@ -250,10 +250,15 @@ retention:
   # Trace retention uses span START timestamps, not end times or object age.
   tracesDays: 0
   # observe: preview only, but finish cleanup already committed.
-  # enforce: activate the paged manifest format and expire data. Irreversible;
-  #          first finish rolling out this image in observe mode.
+  # enforce: expire data. Irreversible; first finish rolling out this image
+  #          in observe mode.
   # paused:  no floor advancement and no cleanup.
   mode: observe
+  # Manifest format of enforced prefixes. paged keeps the format-4 manifest,
+  # with manifest backups and metric hour finalization; releases before 1.32
+  # must not run in enforce mode against the bucket. bucketed converts to the
+  # older format-3 manifest. Prefixes already in format 3 stay there.
+  manifestFormat: paged
   # Reader grace between a committed expiry and physical deletion,
   # 60000..2592000000 ms. Keep it well above clock skew and query duration; a
   # query that still finds an object or page deleted restarts once, then fails.
