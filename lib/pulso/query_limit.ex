@@ -1,9 +1,11 @@
 defmodule Pulso.QueryLimit do
   @moduledoc """
-  Which query budget a `:query_scan_limit` failure hit, and its value.
+  Which query budget a limit failure hit, and its value.
 
-  Storage keeps returning the bare `:query_scan_limit` reason that every
-  caller matches on; the detail travels beside it in the process dictionary.
+  Storage and evaluators keep returning the bare reasons callers match on
+  (`:query_scan_limit`, `:query_sample_limit`, `:query_work_limit`,
+  `:query_result_limit`, `:query_intermediate_limit`, `:query_resource_limit`,
+  `:query_timeout`); the detail travels beside it in the process dictionary.
   `Pulso.QueryRunner` carries it from the query worker back to the caller,
   where error rendering reads it with `take/0`.
   """
@@ -13,10 +15,32 @@ defmodule Pulso.QueryLimit do
   @env %{
     max_scan_segments: "PULSO_QUERY_MAX_SCAN_SEGMENTS",
     max_scan_bytes: "PULSO_QUERY_MAX_SCAN_BYTES",
-    max_scan_rows: "PULSO_QUERY_MAX_SCAN_ROWS"
+    max_scan_rows: "PULSO_QUERY_MAX_SCAN_ROWS",
+    max_samples: "PULSO_QUERY_MAX_SAMPLES",
+    max_log_samples: "PULSO_QUERY_MAX_LOG_SAMPLES",
+    max_work: "PULSO_QUERY_MAX_WORK",
+    max_result_points: "PULSO_QUERY_MAX_RESULT_POINTS",
+    max_materialized_samples: "PULSO_QUERY_MAX_MATERIALIZED_SAMPLES",
+    timeout_ms: "PULSO_QUERY_TIMEOUT_MS",
+    max_heap_mb: "PULSO_QUERY_MAX_HEAP_MB"
   }
 
-  @hint "narrow the time range or stream selector, or raise"
+  @reasons %{
+    max_scan_segments: :query_scan_limit,
+    max_scan_bytes: :query_scan_limit,
+    max_scan_rows: :query_scan_limit,
+    metadata: :query_scan_limit,
+    max_samples: :query_sample_limit,
+    max_log_samples: :query_sample_limit,
+    max_work: :query_work_limit,
+    max_evaluation_steps: :query_work_limit,
+    max_result_points: :query_result_limit,
+    max_materialized_samples: :query_intermediate_limit,
+    max_heap_mb: :query_resource_limit,
+    timeout_ms: :query_timeout
+  }
+
+  @hint "narrow the time range or selector, or raise"
 
   @type detail :: %{limit: atom(), maximum: integer() | nil, observed: integer() | nil, stage: atom()}
 
@@ -27,6 +51,35 @@ defmodule Pulso.QueryLimit do
   def exceeded(limit, maximum, observed, stage) do
     Process.put(@key, %{limit: limit, maximum: maximum, observed: observed, stage: stage})
     {:error, :query_scan_limit}
+  end
+
+  @doc """
+  Record any limit, for example `:max_samples` from the evaluator, without
+  building an error. `stage` is `:evaluated` unless the limit is a scan budget.
+  """
+  def record(limit, maximum, observed, stage \\ :evaluated) do
+    Process.put(@key, %{limit: limit, maximum: maximum, observed: observed, stage: stage})
+    :ok
+  end
+
+  @doc "The latest recorded detail, without removing it."
+  @spec peek() :: detail() | nil
+  def peek, do: Process.get(@key)
+
+  @doc """
+  The detail as JSON for HTTP error bodies: `reason`, `limit`, `value`,
+  `observed` and the variable (`env`) that sets it.
+  """
+  def to_map(nil), do: nil
+
+  def to_map(%{limit: limit, maximum: maximum, observed: observed}) do
+    %{
+      "reason" => @reasons |> Map.get(limit) |> then(&(&1 && Atom.to_string(&1))),
+      "limit" => Atom.to_string(limit),
+      "value" => maximum,
+      "observed" => if(is_integer(observed), do: observed),
+      "env" => Map.get(@env, limit)
+    }
   end
 
   @doc "The latest recorded detail, removing it."
@@ -64,5 +117,10 @@ defmodule Pulso.QueryLimit do
 
   defp unit(:max_scan_bytes), do: "bytes"
   defp unit(:max_scan_rows), do: "rows"
-  defp unit(_limit), do: "segments"
+  defp unit(limit) when limit in [:max_scan_segments, :metadata], do: "segments"
+  defp unit(limit) when limit in [:max_samples, :max_log_samples, :max_materialized_samples], do: "samples"
+  defp unit(:max_work), do: "work units"
+  defp unit(:max_result_points), do: "points"
+  defp unit(:max_evaluation_steps), do: "steps"
+  defp unit(_limit), do: ""
 end

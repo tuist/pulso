@@ -39,6 +39,16 @@ compaction unions source summaries. Unlimited log scans prefetch up to 32
 segments within 16 MiB. `Pulso.QueryLimit` records which scan budget a
 `:query_scan_limit` hit (reason stays the bare atom); `QueryRunner` carries it
 to the caller for MCP/Loki error text. Line filters have no segment index.
+PromQL plans every selector's storage request before evaluation and loads them
+through `Storage.query_metric_selectors/3`: S3 reads each candidate segment once
+per query, decodes it per selector and folds rows into per-series points, so
+scan budgets charge distinct segments (`PULSO_QUERY_MAX_SCAN_SEGMENTS`, default
+1024) and alert batches split budgets per source, not per selector. The query
+runner answers at the deadline without waiting for a stuck worker, and limit
+errors name the limit and value (`Pulso.QueryLimit`, MCP
+`query_execution_limit: ...`, HTTP `limit`). Long ranges need metrics
+compaction; `test/pulso/promql/query_scale_bench_test.exs` (`--include
+query_bench`) measures a canary-shaped history.
 
 Prefixes without enforced retention now default to format-4 paged manifests
 (`Pulso.Storage.S3.JournalManifest`, `PULSO_MANIFEST_FORMAT=paged|flat`): a

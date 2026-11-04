@@ -2,8 +2,10 @@ defmodule Pulso.PromQL.Evaluator do
   @moduledoc """
   Evaluates float metric selectors, range functions, and vector aggregations.
 
-  Each selector loads its whole evaluation interval once through Pulso.Storage,
-  including the lookback or range window. Series identity is the label map,
+  Before evaluation, every selector's interval (including its lookback or range
+  window, offsets and subquery grids) is planned and loaded in one
+  `Pulso.Storage.query_metric_selectors/3` call, so object storage reads each
+  candidate segment once per query however many selectors need it. Series identity is the label map,
   never the series hash. Rates correct counter resets and extrapolate using
   Prometheus's float-sample algorithm, including the counter's zero boundary.
   Results use Prometheus's envelope with numeric timestamps in seconds.
@@ -24,6 +26,7 @@ defmodule Pulso.PromQL.Evaluator do
   alias Pulso.PromQL.Parser
   alias Pulso.PromQL.RangeMath
   alias Pulso.PromQL.Time
+  alias Pulso.QueryLimit
   alias Pulso.QueryRunner
   alias Pulso.Record.NativeHistogram, as: Histogram
   alias Pulso.Runtime
@@ -74,7 +77,7 @@ defmodule Pulso.PromQL.Evaluator do
     Process.put(:promql_budget, %{samples: 0, work: 0, points: 0, materialized: 0, log_samples: 0})
 
     with {:ok, parsed} <- parse_batch(queries),
-         selectors = Enum.reduce(parsed, 0, fn {_, expr, _}, count -> count + selectors(expr) end),
+         selectors = Enum.reduce(parsed, 0, fn {_, expr, _}, count -> count + storage_reads(expr) end),
          Process.put(:promql_batch_selectors, max(1, selectors)),
          {:ok, results} <- run_batch(parsed, tenant),
          do: finish.(results, deadline)
@@ -128,6 +131,10 @@ defmodule Pulso.PromQL.Evaluator do
   defp log_selectors(term) when is_tuple(term), do: term |> Tuple.to_list() |> log_selectors()
   defp log_selectors(term) when is_list(term), do: Enum.reduce(term, 0, &(log_selectors(&1) + &2))
   defp log_selectors(_), do: 0
+  # Storage reads a batch source makes: one per LogQL selector, one per PromQL
+  # source with any selector (its selectors share one read), sharing the scan budget.
+  defp storage_reads({:logql, expr}), do: log_selectors(expr)
+  defp storage_reads(expr), do: min(1, selectors(expr))
   defp selectors({:logql, expr}), do: log_selectors(expr)
   defp selectors({:selector, _, _}), do: 1
   defp selectors({:range, _, _, _}), do: 1
@@ -173,9 +180,14 @@ defmodule Pulso.PromQL.Evaluator do
     if !Process.get(:promql_batch_selectors),
       do: Process.put(:promql_budget, %{samples: 0, work: 0, points: 0, materialized: 0, log_samples: 0})
 
+    # This source's scan budget, set on its first storage read.
+    Process.delete(:promql_scan_budget)
+    Process.delete(:promql_prefetched)
+
     with :ok <- query_result_type(expr, kind),
          {:ok, expr, work} <- Duration.resolve(expr, Process.get(:promql_query_context)),
          charge(:work, work),
+         :ok <- prefetch(expr, tenant, steps),
          {:ok, series, warnings} <- evaluate(expr, tenant, steps) do
       finish_result(expr, series, warnings, kind, steps)
     end
@@ -196,7 +208,7 @@ defmodule Pulso.PromQL.Evaluator do
       end
 
     points = Enum.reduce(series, 0, fn {_, values}, total -> total + length(values) end)
-    if points > limits().points, do: throw({:promql_error, :query_result_limit})
+    if points > limits().points, do: throw_limit(:query_result_limit, :max_result_points, limits().points, points)
     if Process.get(:promql_batch_selectors), do: charge(:points, points)
 
     if length(Enum.uniq_by(series, &elem(&1, 0))) != length(series),
@@ -269,13 +281,29 @@ defmodule Pulso.PromQL.Evaluator do
   def charge(key, count) do
     budget = Process.get(:promql_budget)
     used = Map.get(budget, key, 0) + count
-    if used > Map.fetch!(limits(), key), do: throw({:promql_error, budget_error(key)})
-
-    if System.monotonic_time(:millisecond) >= Process.get(:promql_deadline_ms),
-      do: throw({:promql_error, :query_timeout})
-
+    maximum = Map.fetch!(limits(), key)
+    if used > maximum, do: throw_limit(budget_error(key), limit_name(key), maximum, used)
+    check_deadline()
     Process.put(:promql_budget, Map.put(budget, key, used))
   end
+
+  # Cheap enough to call per series: the deadline must also stop long
+  # evaluation between storage reads and charges.
+  defp check_deadline do
+    if System.monotonic_time(:millisecond) >= Process.get(:promql_deadline_ms),
+      do: throw({:promql_error, :query_timeout})
+  end
+
+  defp throw_limit(reason, limit, value, observed) do
+    QueryLimit.record(limit, value, observed)
+    throw({:promql_error, reason})
+  end
+
+  defp limit_name(:samples), do: :max_samples
+  defp limit_name(:log_samples), do: :max_log_samples
+  defp limit_name(:work), do: :max_work
+  defp limit_name(:points), do: :max_result_points
+  defp limit_name(:materialized), do: :max_materialized_samples
 
   @doc false
   # What remains of `key`'s budget in the current query.
@@ -302,7 +330,7 @@ defmodule Pulso.PromQL.Evaluator do
       work: Keyword.get(config, :max_work, 5_000_000),
       points: Keyword.get(config, :max_result_points, 100_000),
       materialized: Keyword.get(config, :max_materialized_samples, 100_000),
-      segments: Keyword.get(config, :max_scan_segments, 1024),
+      segments: Keyword.get(config, :max_scan_segments, QueryRunner.max_scan_segments()),
       bytes: Keyword.get(config, :max_scan_bytes, 134_217_728),
       rows: Keyword.get(config, :max_scan_rows, 1_000_000)
     }
@@ -491,7 +519,7 @@ defmodule Pulso.PromQL.Evaluator do
     first = (Integer.floor_div(source_time(hd(steps), offset) - window, resolution) + 1) * resolution
     last = Integer.floor_div(source_time(List.last(steps), offset), resolution) * resolution
     count = max(0, div(last - first, resolution) + 1)
-    if count > @max_steps, do: throw({:promql_error, :query_work_limit})
+    if count > @max_steps, do: throw_limit(:query_work_limit, :max_evaluation_steps, @max_steps, count)
 
     if count > 0 and not (timestamp?(first) and timestamp?(last)),
       do: throw({:promql_error, :invalid_evaluation_time_or_step})
@@ -536,30 +564,97 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp select(tenant, matchers, offset, window, steps, op) do
-    limits = selector_limits()
+    {_matchers, start, finish} = request = selector_request(matchers, offset, window, steps)
 
-    opts = [
-      start_ts: max(-9_223_372_036_854_775_808, source_time(hd(steps), offset) - window + 1),
-      end_ts: min(9_223_372_036_854_775_807, source_time(List.last(steps), offset)),
-      matchers: Enum.map(matchers, &anchored_matcher/1),
-      max_records: limits.samples,
-      max_scan_segments: limits.segments,
-      max_scan_bytes: limits.bytes,
-      max_scan_rows: limits.rows,
-      deadline_ms: Process.get(:promql_deadline_ms),
-      require_fresh_manifest: Process.get(:pulso_require_fresh_manifest, false)
-    ]
-
-    if opts[:start_ts] > opts[:end_ts] do
+    if start > finish do
       {:ok, [], []}
     else
-      with {:ok, samples} <- query_samples(tenant, opts),
-           {:ok, groups, warnings} <- prepare_series(samples),
-           {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits) do
+      with {:ok, groups, warnings} <- selector_series(tenant, request),
+           {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits()) do
         {:ok, Operations.coalesce(result), warnings}
       end
     end
   end
+
+  # The exact storage request select/6 makes for a selector at these steps.
+  defp selector_request(matchers, offset, window, steps) do
+    {Enum.map(matchers, &anchored_matcher/1),
+     max(-9_223_372_036_854_775_808, source_time(hd(steps), offset) - window + 1),
+     min(9_223_372_036_854_775_807, source_time(List.last(steps), offset))}
+  end
+
+  # Planned requests were loaded by prefetch/3 and charged there. A selector
+  # the plan did not predict still reads on its own, under what remains.
+  defp selector_series(tenant, request) do
+    prefetched = Process.get(:promql_prefetched, %{})
+
+    case Map.fetch(prefetched, request) do
+      {:ok, {series, 1}} ->
+        Process.put(:promql_prefetched, Map.delete(prefetched, request))
+        series
+
+      {:ok, {series, uses}} ->
+        Process.put(:promql_prefetched, Map.put(prefetched, request, {series, uses - 1}))
+        series
+
+      :error ->
+        with {:ok, [samples]} <- read_selectors(tenant, [request]), do: prepare_series(samples)
+    end
+  end
+
+  # Load every selector the expression will evaluate in one storage call. The
+  # plan mirrors evaluate/3's step arithmetic; it is only an optimization, so
+  # anything it cannot predict is read when evaluated.
+  defp prefetch(expr, tenant, steps) do
+    planned =
+      try do
+        plan(expr, hd(steps), List.last(steps), [])
+      rescue
+        _ -> []
+      catch
+        _, _ -> []
+      end
+
+    uses = Enum.frequencies(for {_, start, finish} = request <- planned, start <= finish, do: request)
+    requests = Map.keys(uses)
+
+    if requests == [] do
+      :ok
+    else
+      with {:ok, results} <- read_selectors(tenant, requests), do: store_prefetched(requests, results, uses)
+    end
+  end
+
+  # Keep each selector's prepared series, not its decoded records, so
+  # selectors waiting their turn hold only timestamps and values.
+  defp store_prefetched(requests, results, uses) do
+    prefetched =
+      requests
+      |> Enum.zip(results)
+      |> Map.new(fn {request, series} -> {request, {prepare_series(series), uses[request]}} end)
+
+    Process.put(:promql_prefetched, prefetched)
+    :ok
+  end
+
+  defp plan({:selector, matchers, offset}, first, last, acc),
+    do: [selector_request(matchers, offset, Process.get(:promql_lookback_ns), [first, last]) | acc]
+
+  defp plan({:range, matchers, window, offset}, first, last, acc),
+    do: [selector_request(matchers, offset, window, [first, last]) | acc]
+
+  defp plan({:subquery, inner, window, resolution, offset}, first, last, acc) do
+    inner_first = (Integer.floor_div(source_time(first, offset) - window, resolution) + 1) * resolution
+    inner_last = Integer.floor_div(source_time(last, offset), resolution) * resolution
+
+    if inner_last >= inner_first and div(inner_last - inner_first, resolution) + 1 <= @max_steps,
+      do: plan(inner, inner_first, inner_last, acc),
+      else: acc
+  end
+
+  defp plan(term, first, last, acc) when is_tuple(term), do: plan(Tuple.to_list(term), first, last, acc)
+  defp plan(terms, first, last, acc) when is_list(terms), do: Enum.reduce(terms, acc, &plan(&1, first, last, &2))
+  defp plan(_term, _first, _last, acc), do: acc
 
   defp source_time(_step, {:at, anchor, shift}) do
     anchor = if is_binary(anchor), do: Map.fetch!(Process.get(:promql_query_context), anchor <> "_ts_ns"), else: anchor
@@ -584,9 +679,14 @@ defmodule Pulso.PromQL.Evaluator do
     runner = QueryRunner.storage_opts(Process.get(:promql_deadline_ms))
     keys = %{segments: :max_scan_segments, bytes: :max_scan_bytes, rows: :max_scan_rows}
     scans = Map.new(keys, fn {key, option} -> {key, div(min(Map.fetch!(limits, key), runner[option]), divisor)} end)
-    if Enum.any?(scans, fn {_, value} -> value < 1 end), do: throw({:promql_error, :query_scan_limit})
+
+    case Enum.find(scans, fn {_, value} -> value < 1 end) do
+      nil -> :ok
+      {key, value} -> throw_limit(:query_scan_limit, Map.fetch!(keys, key), value, 1)
+    end
+
     remaining = limits.samples - Process.get(:promql_budget).samples
-    if remaining < 1, do: throw({:promql_error, :query_sample_limit})
+    if remaining < 1, do: throw_limit(:query_sample_limit, :max_samples, limits.samples, limits.samples + 1)
     limits |> Map.merge(scans) |> Map.put(:samples, remaining)
   end
 
@@ -608,12 +708,63 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp query_samples(tenant, opts) do
-    case Storage.query(:metrics, tenant, opts) do
-      {:ok, samples} ->
-        charge(:samples, length(samples))
-        {:ok, samples}
+  # One storage call for `requests`, under the source's remaining scan budget
+  # and the query's remaining sample budget; charges what it read.
+  defp read_selectors(tenant, requests) do
+    limits = selector_limits()
+    scan = Process.get(:promql_scan_budget) || Map.take(limits, [:segments, :bytes, :rows])
+    samples = limits.samples
 
+    if Enum.any?(scan, fn {_, value} -> value < 1 end) do
+      {key, _} = Enum.find(scan, fn {_, value} -> value < 1 end)
+      QueryLimit.exceeded(scan_option(key), Map.fetch!(limits, key), nil, :candidates)
+    else
+      opts = [
+        max_records: samples,
+        metric_fold: {&fold_points/2, %{}},
+        max_scan_segments: scan.segments,
+        max_scan_bytes: scan.bytes,
+        max_scan_rows: scan.rows,
+        deadline_ms: Process.get(:promql_deadline_ms),
+        require_fresh_manifest: Process.get(:pulso_require_fresh_manifest, false)
+      ]
+
+      tenant |> Storage.query_metric_selectors(requests, opts) |> charge_read(scan, samples)
+    end
+  end
+
+  defp scan_option(:segments), do: :max_scan_segments
+  defp scan_option(:bytes), do: :max_scan_bytes
+  defp scan_option(:rows), do: :max_scan_rows
+
+  defp charge_read({:ok, results, consumed}, scan, _samples) do
+    scan =
+      Map.new(scan, fn {key, remaining} -> {key, remaining - Map.get(consumed, scan_option(key), 0)} end)
+
+    Process.put(:promql_scan_budget, scan)
+    charge(:samples, Map.fetch!(consumed, :records))
+    {:ok, results}
+  end
+
+  defp charge_read({:error, :query_sample_limit}, _scan, _samples) do
+    QueryLimit.record(:max_samples, limits().samples, nil)
+    {:error, :query_sample_limit}
+  end
+
+  defp charge_read(error, _scan, _samples), do: query_error(error)
+
+  # Group each decoded batch by series as it arrives, keeping one label map
+  # per series and only time and value per sample. Rows carrying only
+  # exemplars have no value to query.
+  defp fold_points(batch, series) do
+    Enum.reduce(batch, series, fn
+      %{value: nil, histogram: nil}, series -> series
+      sample, series -> Map.update(series, sample.labels, [point(sample)], &[point(sample) | &1])
+    end)
+  end
+
+  defp query_error(result) do
+    case result do
       {:error, reason}
       when reason in [
              :query_sample_limit,
@@ -647,12 +798,15 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp evaluate_group(group, {:ok, result, work, points}, steps, offset, window, op, limits) do
+    check_deadline()
+
     case evaluate_series(group, steps, offset, window, op, work, limits.work) do
       {:ok, {labels, values}, work} when points + length(values) <= limits.points ->
         result = if values == [], do: result, else: [{labels, values} | result]
         {:cont, {:ok, result, work, points + length(values)}}
 
-      {:ok, _, _} ->
+      {:ok, {_, values}, _} ->
+        QueryLimit.record(:max_result_points, limits.points, points + length(values))
         {:halt, {:error, :query_result_limit}}
 
       error ->
@@ -665,6 +819,7 @@ defmodule Pulso.PromQL.Evaluator do
     work = work + length(ordered)
 
     if work > max_work do
+      QueryLimit.record(:max_work, max_work, work)
       {:error, :query_work_limit}
     else
       points =
@@ -707,6 +862,7 @@ defmodule Pulso.PromQL.Evaluator do
     work = state.work + length(arrivals) + if(op in [:latest, :timestamp], do: 1, else: max(1, :queue.len(bucket)))
 
     if work > max_work do
+      QueryLimit.record(:max_work, max_work, work)
       {:halt, {:error, :query_work_limit}}
     else
       # Pin only the data window. Scalar parameters and prediction reference
@@ -764,17 +920,9 @@ defmodule Pulso.PromQL.Evaluator do
   defp anchored_matcher({name, op, pattern}) when op in [:re, :nre], do: {name, op, Pulso.QueryRegex.anchor(pattern)}
   defp anchored_matcher(matcher), do: matcher
 
-  # Rows that only carry exemplars have no value to query.
-  defp prepare_series(samples) do
-    samples
-    |> Enum.reject(&(is_nil(&1.value) and is_nil(&1.histogram)))
-    |> Enum.group_by(& &1.labels)
-    |> Enum.reduce_while({:ok, [], []}, &prepare_group/2)
-  end
+  defp prepare_series(series), do: Enum.reduce_while(series, {:ok, [], []}, &prepare_group/2)
 
   defp prepare_group({labels, group}, {:ok, acc, warnings}) do
-    group = Enum.map(group, &point/1)
-
     if Enum.any?(group, &(not is_integer(&1.timestamp_ns) or not point_value?(&1.value))) do
       {:halt, {:error, :unsupported_sample_value}}
     else
@@ -800,9 +948,11 @@ defmodule Pulso.PromQL.Evaluator do
 
   # Staleness is carried in a native histogram's Sum, not its scalar column.
   # Normalize before ordering/windowing so existing stale precedence applies.
-  defp point(%{histogram: %Histogram{sum: :stale}} = sample), do: %{sample | value: :stale}
-  defp point(%{histogram: %Histogram{} = h} = sample), do: %{sample | value: h}
-  defp point(sample), do: sample
+  # Evaluation needs only time and value; dropping the decoded record (and its
+  # own copy of the label map) here bounds what a selected series retains.
+  defp point(%{histogram: %Histogram{sum: :stale}} = sample), do: %{timestamp_ns: sample.timestamp_ns, value: :stale}
+  defp point(%{histogram: %Histogram{} = h} = sample), do: %{timestamp_ns: sample.timestamp_ns, value: h}
+  defp point(sample), do: %{timestamp_ns: sample.timestamp_ns, value: sample.value}
 
   defp point_value?(%Histogram{}), do: true
   defp point_value?(value), do: Number.valid?(value)

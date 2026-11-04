@@ -387,8 +387,10 @@ query_budgets =
         {:max_samples, "PULSO_QUERY_MAX_SAMPLES", 100_000, 1..1_000_000_000},
         {:max_log_samples, "PULSO_QUERY_MAX_LOG_SAMPLES", 5_000_000, 1..1_000_000_000},
         {:max_work, "PULSO_QUERY_MAX_WORK", 5_000_000, 1..10_000_000_000},
-        {:max_scan_rows, "PULSO_QUERY_MAX_SCAN_ROWS", 1_000_000, 1..1_000_000_000},
+        {:max_result_points, "PULSO_QUERY_MAX_RESULT_POINTS", 100_000, 1..1_000_000_000},
+        {:max_materialized_samples, "PULSO_QUERY_MAX_MATERIALIZED_SAMPLES", 100_000, 1..1_000_000_000},
         {:max_scan_segments, "PULSO_QUERY_MAX_SCAN_SEGMENTS", 1024, 1..1_000_000},
+        {:max_scan_rows, "PULSO_QUERY_MAX_SCAN_ROWS", 1_000_000, 1..1_000_000_000},
         {:max_scan_bytes, "PULSO_QUERY_MAX_SCAN_BYTES", 134_217_728, 1..1_099_511_627_776}
       ],
       env_var.(name, nil) not in [nil, ""],

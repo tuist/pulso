@@ -5,6 +5,7 @@ defmodule Pulso.Runtime.Task do
   def yield(task, timeout \\ 5000), do: Task.yield(task, timeout)
   def await(task, timeout \\ 5000), do: Task.await(task, timeout)
   def shutdown(task, reason \\ 5000), do: Task.shutdown(task, reason)
+  def ignore(task), do: Task.ignore(task)
   def async(fun), do: Task.async(Pulso.Runtime.capture(fun))
 
   def async_stream(collection, fun, opts) do

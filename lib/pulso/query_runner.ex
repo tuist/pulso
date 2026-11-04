@@ -2,6 +2,11 @@ defmodule Pulso.QueryRunner do
   @moduledoc """
   Runs public queries in supervised, bounded tasks. Registry ownership stays with
   the worker, including when a native call outlives the request deadline.
+
+  The caller returns at the deadline: a worker still running is killed, but the
+  caller does not wait for it to exit, so a native call that cannot be
+  preempted holds its slot, never the response. The limit a query hit
+  (`Pulso.QueryLimit`) is carried back into the calling process.
   """
 
   alias Pulso.PromQL.Evaluator
@@ -48,7 +53,7 @@ defmodule Pulso.QueryRunner do
           RuntimeError -> nil
         end
 
-      result = task |> await(max(1, deadline - System.monotonic_time(:millisecond))) |> unwrap()
+      result = task |> await(max(1, deadline - System.monotonic_time(:millisecond)), timeout, class) |> unwrap(timeout)
       # Refused queries are not metered; everything admitted is, whatever its outcome.
       if result != {:error, :query_overloaded},
         do: Pulso.Usage.query(tenant, System.monotonic_time(:millisecond) - started)
@@ -60,38 +65,50 @@ defmodule Pulso.QueryRunner do
   def storage_opts(deadline, max_records \\ 100_000) do
     [
       max_records: max_records,
-      max_scan_segments: config(:max_scan_segments, 1024),
+      max_scan_segments: max_scan_segments(),
       max_scan_bytes: config(:max_scan_bytes, 134_217_728),
       max_scan_rows: config(:max_scan_rows, 1_000_000),
       deadline_ms: deadline
     ]
   end
 
-  defp unwrap({__MODULE__, result, detail}) do
+  @doc "Stored segments one query may read; `PULSO_QUERY_MAX_SCAN_SEGMENTS`."
+  def max_scan_segments, do: config(:max_scan_segments, 1024)
+
+  # Storage reports its own deadline checks only as :query_timeout.
+  defp unwrap({__MODULE__, {:error, :query_timeout} = result, nil}, timeout) do
+    QueryLimit.record(:timeout_ms, timeout, nil)
+    result
+  end
+
+  defp unwrap({__MODULE__, result, detail}, _timeout) do
     QueryLimit.put(detail)
     result
   end
 
-  defp unwrap(result), do: result
+  defp unwrap(result, _timeout), do: result
 
-  defp await(nil, _timeout), do: {:error, :query_overloaded}
+  defp await(nil, _wait, _timeout, _class), do: {:error, :query_overloaded}
 
-  defp await(task, timeout) do
-    case Task.yield(task, timeout) do
+  defp await(task, wait, timeout, class) do
+    case Task.yield(task, wait) do
       {:ok, result} ->
         result
 
       {:exit, :killed} ->
+        QueryLimit.record(:max_heap_mb, div(heap_words(class) * 8, 1_048_576), nil)
         {:error, :query_resource_limit}
 
       {:exit, _} ->
         {:error, :query_execution_failed}
 
       nil ->
-        case Task.shutdown(task, :brutal_kill) do
-          {:ok, result} -> result
-          _ -> {:error, :query_timeout}
-        end
+        # Task.shutdown/2 waits for the worker to exit, which a long native call
+        # delays well past the deadline. Kill it and answer now instead.
+        Process.exit(task.pid, :kill)
+        Task.ignore(task)
+        QueryLimit.record(:timeout_ms, timeout, nil)
+        {:error, :query_timeout}
     end
   end
 

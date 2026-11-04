@@ -231,6 +231,67 @@ defmodule Pulso.Storage do
     Pulso.SelfMetrics.track(:query, dimension, fn -> adapter().query(signal, tenant, opts) end)
   end
 
+  @doc """
+  Samples for several metric selectors, each `{matchers, start_ts, end_ts}`,
+  returned in selector order with the scan cost charged
+  (`%{max_scan_segments: n, max_scan_bytes: n, max_scan_rows: n}`). S3 reads
+  every candidate segment once for all selectors and charges scan budgets on
+  the distinct segments read. Other adapters run one query per selector, each
+  under an equal share of the scan budget, and report no scan cost. `:max_records` bounds
+  the total. The cost also counts the `records` selected. With
+  `metric_fold: {fun, initial}`, each selector's result is
+  `fun.(batch, acc)` folded over its decoded batches instead of a list.
+  """
+  def query_metric_selectors(tenant, selectors, opts) when is_binary(tenant) and is_list(selectors) do
+    Pulso.SelfMetrics.track(:query, :storage_metrics, fn ->
+      backend = adapter()
+      Code.ensure_loaded!(backend)
+
+      if function_exported?(backend, :query_metric_selectors, 3),
+        do: backend.query_metric_selectors(tenant, selectors, opts),
+        else: query_each_selector(backend, tenant, selectors, opts)
+    end)
+  end
+
+  defp query_each_selector(backend, tenant, selectors, opts) do
+    shares =
+      for key <- [:max_scan_segments, :max_scan_bytes, :max_scan_rows],
+          is_integer(opts[key]),
+          do: {key, div(opts[key], length(selectors))}
+
+    if Enum.any?(shares, fn {_, share} -> share < 1 end),
+      do: {:error, :query_scan_limit},
+      else: query_each_selector(backend, tenant, selectors, Keyword.merge(opts, shares), :shared)
+  end
+
+  defp query_each_selector(backend, tenant, selectors, opts, :shared) do
+    selectors
+    |> Enum.reduce_while({:ok, [], opts[:max_records]}, fn {matchers, start, finish}, {:ok, acc, remaining} ->
+      query_opts =
+        opts |> Keyword.delete(:metric_fold) |> Keyword.merge(matchers: matchers, start_ts: start, end_ts: finish)
+
+      query_opts = if remaining, do: Keyword.put(query_opts, :max_records, remaining), else: query_opts
+
+      case backend.query(:metrics, tenant, query_opts) do
+        {:ok, samples} -> {:cont, {:ok, [samples | acc], remaining && remaining - length(samples)}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, results, _} ->
+        results = Enum.reverse(results)
+        records = Enum.sum_by(results, &length/1)
+
+        case opts[:metric_fold] do
+          nil -> {:ok, results, %{records: records}}
+          {fun, initial} -> {:ok, Enum.map(results, &fun.(&1, initial)), %{records: records}}
+        end
+
+      error ->
+        error
+    end
+  end
+
   @doc "Complete metric label/series dictionaries; old adapters use a bounded sample-backed reference."
   def metric_discovery_json(tenant, mode, key, selectors, opts) do
     Pulso.SelfMetrics.track(:query, :storage_metrics, fn ->

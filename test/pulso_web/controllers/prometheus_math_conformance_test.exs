@@ -2809,7 +2809,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
 
@@ -3362,7 +3362,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
 
@@ -3572,7 +3572,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } =
                  json_response(conn, 422)
       end
@@ -3663,11 +3663,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "presence-control")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
     end
   end
@@ -3798,11 +3798,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "last-control")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
     end
   end
@@ -3940,11 +3940,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "endpoint-timestamps")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
     end
   end
@@ -4052,11 +4052,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "transitions")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
     end
   end
@@ -4245,11 +4245,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "regressions")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
     end
   end
@@ -4393,11 +4393,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           |> put_req_header("x-scope-orgid", "deviations")
           |> get("/api/v1/query", query: query, time: "20")
 
-        assert json_response(conn, 422) == %{
+        assert %{
                  "status" => "error",
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
-               }
+                 "error" => "query exceeded " <> _
+               } = json_response(conn, 422)
       end
 
       expression = ~s|mad_over_time(deviation{kind="odd"}[10s])|
@@ -4413,7 +4413,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
       assert %{
                "errorType" => "execution",
-               "error" => "Query exceeded its resource budget; narrow the selector or time range."
+               "error" => "query exceeded " <> _
              } =
                json_response(conn, 422)
 
@@ -4615,7 +4615,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
     end
@@ -4701,7 +4701,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
     end
@@ -4748,7 +4748,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
     end
@@ -4900,7 +4900,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
 
@@ -5074,7 +5074,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
 
@@ -5286,7 +5286,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
           assert %{
                    "errorType" => "execution",
-                   "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                   "error" => "query exceeded " <> _
                  } = json_response(conn, 422)
         end
 
@@ -5314,7 +5314,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
       assert %{
                "errorType" => "execution",
-               "error" => "Query exceeded its resource budget; narrow the selector or time range."
+               "error" => "query exceeded " <> _
              } = json_response(conn, 422)
     end
   end
@@ -6096,7 +6096,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
 
         assert %{
                  "errorType" => "execution",
-                 "error" => "Query exceeded its resource budget; narrow the selector or time range."
+                 "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
 

@@ -527,6 +527,202 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
+  @doc """
+  Metric samples for several selectors, each `{matchers, start_ts, end_ts}`,
+  from one pass over their candidate segments: every segment any selector
+  needs is fetched once and decoded natively for each selector that needs it.
+  Scan budgets apply to the distinct segments, bytes and rows read, and
+  `:max_records` to all selectors' samples together. Returns the samples in
+  selector order and the scan cost actually charged. With
+  `metric_fold: {fun, initial}`, each selector's result is instead
+  `fun.(batch, acc)` folded over its decoded batches, one segment at a time.
+  """
+  def query_metric_selectors(tenant, selectors, opts) when is_binary(tenant) and is_list(selectors) do
+    with :ok <- validate_tenant(tenant),
+         :ok <- check_deadline(opts[:deadline_ms]) do
+      config = config!()
+
+      case selectors do
+        # Footer-first reads prune by one selector's matchers; keep them for
+        # single-selector queries. The cost is charged inside that query.
+        [selector] when config.metric_footer_pruning_enabled == true -> query_footer_selector(tenant, selector, opts)
+        _ -> query_selectors(tenant, selectors, opts, config)
+      end
+    end
+  end
+
+  defp query_selectors(tenant, selectors, opts, config) do
+    timeout =
+      if opts[:deadline_ms],
+        do: max(0, opts[:deadline_ms] - System.monotonic_time(:millisecond)),
+        else: Map.get(config, :retention_timeout_ms, 30_000)
+
+    config
+    |> Map.put(:retention_timeout_ms, timeout)
+    |> PagedManifest.with_budget(fn -> query_selectors(tenant, selectors, opts, config, :cached) end)
+    |> budget_result(opts)
+  end
+
+  defp query_footer_selector(tenant, {matchers, start, finish}, opts) do
+    with {:ok, samples} <-
+           query(:metrics, tenant, Keyword.merge(opts, matchers: matchers, start_ts: start, end_ts: finish)),
+         do: {:ok, [fold_selector(samples, opts[:metric_fold])], %{records: length(samples)}}
+  end
+
+  defp query_selectors(tenant, selectors, opts, config, source) do
+    with :ok <- check_deadline(opts[:deadline_ms]),
+         {:ok, manifest} <- selector_manifest(tenant, config, opts, source),
+         :ok <- check_deadline(opts[:deadline_ms]),
+         {:ok, wanted} <- selector_candidates(manifest, selectors, opts, tenant, config),
+         union = wanted |> Enum.flat_map(&elem(&1, 1)) |> Enum.uniq_by(& &1.key) |> Enum.sort_by(& &1.max_ts, :desc),
+         :ok <- check_scan_budget(union, opts) do
+      scan_selector_segments(union, wanted, config, opts)
+    end
+    |> case do
+      {:error, reason} when source == :cached and reason == :manifest_page_missing ->
+        query_selectors(tenant, selectors, opts, config, :fresh)
+
+      {:error, {:segment_missing, consumed}} when source == :cached ->
+        # Cleanup can overtake a cached snapshot or an in-flight query. Restart
+        # once against a fresh manifest, keeping what was already charged.
+        query_selectors(tenant, selectors, remaining_budget(opts, consumed), config, :fresh)
+
+      {:error, {:segment_missing, _}} ->
+        {:error, :not_found}
+
+      result ->
+        result
+    end
+  end
+
+  defp selector_manifest(tenant, config, opts, :cached) do
+    with {:ok, entry} <- query_manifest(tenant, "metrics", config, opts), do: {:ok, entry.manifest}
+  end
+
+  defp selector_manifest(tenant, config, _opts, :fresh) do
+    with {:ok, manifest, _etag} <- Retention.load(tenant, "metrics", config), do: {:ok, manifest}
+  end
+
+  # Each selector keeps its own matchers and time bounds, so its decode and
+  # manifest pruning are exactly those of a single-selector query.
+  defp selector_candidates(manifest, selectors, opts, tenant, config) do
+    Enum.reduce_while(selectors, {:ok, []}, fn {matchers, start, finish}, {:ok, acc} ->
+      start = retained_start(manifest, start)
+      selector_opts = Keyword.put(opts, :matchers, matchers)
+
+      case query_segments(manifest, :metrics, start, finish, selector_opts, tenant, config) do
+        {:ok, segments} -> {:cont, {:ok, [{{matchers, start, finish}, segments} | acc]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, wanted} -> {:ok, Enum.reverse(wanted)}
+      error -> error
+    end
+  end
+
+  defp scan_selector_segments(union, wanted, config, opts) do
+    # Per segment, the selectors (by position) that need it.
+    needs =
+      wanted
+      |> Enum.with_index()
+      |> Enum.reduce(%{}, fn {{_selector, segments}, index}, acc ->
+        Enum.reduce(segments, acc, fn segment, acc -> Map.update(acc, segment.key, [index], &[index | &1]) end)
+      end)
+
+    selectors = wanted |> Enum.map(&elem(&1, 0)) |> List.to_tuple()
+    state = %{bytes: 0, rows: 0, segments: 0, count: 0, batches: %{}}
+    items = Enum.with_index(union)
+    concurrency = Map.get(config, :query_prefetch, 1)
+    visit = &visit_selector_segment(&1, &2, &3, {needs, selectors, config, opts})
+
+    result =
+      if concurrency > 1 and length(items) > 1 do
+        limit = opts[:max_scan_bytes]
+
+        items
+        |> Stream.map(fn {segment, _} -> segment.key end)
+        |> Pulso.Runtime.Task.async_stream(&prefetch(config, limit, &1),
+          max_concurrency: concurrency,
+          ordered: true,
+          timeout: :infinity
+        )
+        |> Stream.zip(items)
+        |> Enum.reduce_while({:ok, state}, fn {{:ok, fetched}, item}, acc -> visit.(item, acc, fetched) end)
+      else
+        Enum.reduce_while(items, {:ok, state}, &visit.(&1, &2, nil))
+      end
+
+    with {:ok, state} <- result do
+      samples =
+        for index <- 0..(tuple_size(selectors) - 1)//1, do: selector_result(state.batches, index, opts[:metric_fold])
+
+      {:ok, samples,
+       %{
+         max_scan_segments: state.segments,
+         max_scan_bytes: state.bytes,
+         max_scan_rows: state.rows,
+         records: state.count
+       }}
+    end
+  end
+
+  defp selector_result(batches, index, nil),
+    do: batches |> Map.get(index, []) |> Enum.reverse() |> List.flatten() |> SortOrder.sort(:metrics)
+
+  defp selector_result(batches, index, {_fun, initial}), do: Map.get(batches, index, initial)
+
+  defp add_selector_batch(batches, index, batch, nil), do: Map.update(batches, index, [batch], &[batch | &1])
+
+  defp add_selector_batch(batches, index, batch, {fun, initial}),
+    do: Map.put(batches, index, fun.(batch, Map.get(batches, index, initial)))
+
+  defp fold_selector(samples, nil), do: samples
+  defp fold_selector(samples, {fun, initial}), do: fun.(samples, initial)
+
+  defp visit_selector_segment({segment, index}, {:ok, state}, fetched, {needs, selectors, config, opts}) do
+    ctx = %{opts: opts}
+
+    with :ok <- check_visited_budget(index + 1, state.rows + (segment.row_count || 0), ctx),
+         :ok <- check_read_bytes(state.bytes + (segment.byte_size || 0), opts),
+         :ok <- check_deadline(opts[:deadline_ms]),
+         {:ok, blob} <- fetched || read_segment(%{config: config, opts: opts, signal: :metrics}, segment.key, state),
+         :ok <- check_deadline(opts[:deadline_ms]),
+         bytes = state.bytes + byte_size(blob),
+         :ok <- check_read_bytes(bytes, opts),
+         # Charge the footer's actual rows: a manifest can undercount them.
+         {:ok, actual} <- native_result(NIF.metric_segment_parquet_row_count(blob)),
+         rows = state.rows + actual,
+         :ok <- check_visited_budget(index + 1, rows, ctx),
+         state = %{state | bytes: bytes, rows: rows, segments: index + 1},
+         {:ok, state} <- decode_for_selectors(blob, Map.fetch!(needs, segment.key), selectors, opts, state) do
+      {:cont, {:ok, state}}
+    else
+      {:error, :not_found} ->
+        consumed = %{max_scan_bytes: state.bytes, max_scan_segments: index + 1, max_scan_rows: state.rows}
+        {:halt, {:error, {:segment_missing, consumed}}}
+
+      {:error, _} = error ->
+        {:halt, error}
+    end
+  end
+
+  defp decode_for_selectors(blob, indexes, selectors, opts, state) do
+    Enum.reduce_while(indexes, {:ok, state}, fn index, {:ok, state} ->
+      {matchers, start, finish} = elem(selectors, index)
+      decode_opts = Keyword.put(remaining_budget(opts, %{max_records: state.count}), :matchers, matchers)
+
+      case decode_segment(:metrics, blob, start, finish, decode_opts) do
+        {:ok, batch} ->
+          batches = add_selector_batch(state.batches, index, batch, opts[:metric_fold])
+          {:cont, {:ok, %{state | batches: batches, count: state.count + length(batch)}}}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
   # The metadata budget shares the caller's deadline, so exhausting it after
   # that deadline is a timeout rather than an oversized query.
   defp budget_result({:ok, {:error, :metadata_scan_limit}}, opts), do: metadata_limit(opts)

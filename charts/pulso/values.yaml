@@ -139,7 +139,9 @@ metricsCompaction:
   # Merges small metrics segments in the background. Enable it only once every
   # Pulso version writing to the bucket supports compaction, and turn on
   # bucket versioning first: after compaction the manifest is the only record
-  # of which objects are live. See docs/configuration.md.
+  # of which objects are live. Without it every remote-write batch stays its
+  # own segment, so ranges beyond about 20 minutes exceed the default query
+  # segment budget. See docs/configuration.md#long-dashboard-and-alert-ranges.
   enabled: false
 
 # Experimental Tempo search recovers complete retained candidate context. Exact

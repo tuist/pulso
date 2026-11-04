@@ -6,6 +6,7 @@ defmodule PulsoWeb.PrometheusQueryController do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Parser
   alias Pulso.PromQL.Time
+  alias Pulso.QueryLimit
 
   def query(conn, params), do: run(conn, params, :instant)
   def query_range(conn, params), do: run(conn, params, :range)
@@ -111,12 +112,18 @@ defmodule PulsoWeb.PrometheusQueryController do
              :query_resource_limit,
              :query_timeout
            ] ->
-        error(
-          conn,
-          :unprocessable_entity,
-          "execution",
-          "Query exceeded its resource budget; narrow the selector or time range."
-        )
+        # Name the limit and its value, so dashboards and agents can tell a
+        # scan budget from a deadline. The limit also comes back structured.
+        detail = QueryLimit.take()
+
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          "status" => "error",
+          "errorType" => "execution",
+          "error" => "query exceeded " <> (QueryLimit.describe(detail) || "its resource budget (#{reason})"),
+          "limit" => QueryLimit.to_map(detail)
+        })
 
       {:error, _} ->
         error(conn, :bad_request, "bad_data", "Invalid or unsupported query parameters.")

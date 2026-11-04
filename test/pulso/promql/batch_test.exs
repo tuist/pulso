@@ -147,7 +147,7 @@ defmodule Pulso.PromQL.BatchTest do
     assert {:ok, _} = Evaluator.query("two", "acme", %{end_ts_ns: 10})
   end
 
-  test "one slot covers all sources; aggregate scan ceilings are divided across every selector" do
+  test "one slot covers all sources; aggregate scan ceilings are divided across every storage read" do
     Runtime.put_env(:pulso, Storage, adapter: BatchQueryStorage)
     Runtime.put_env(:pulso, BatchQueryStorage, self())
     Runtime.put_env(:pulso, Pulso.QueryRunner, max_per_tenant: 1, class_limits: %{promql: 1})
@@ -168,17 +168,19 @@ defmodule Pulso.PromQL.BatchTest do
         )
       end)
 
+    # Each source is one shared read (9 / 2 sources); an adapter without
+    # multi-selector reads splits a source's share across its selectors.
     assert_receive {:batch_query, worker, "acme", first}, 5000
     ref = Process.monitor(worker)
-    assert first[:max_scan_segments] == 3
-    assert first[:max_scan_bytes] == 33
-    assert first[:max_scan_rows] == 333
+    assert first[:max_scan_segments] == 2
+    assert first[:max_scan_bytes] == 25
+    assert first[:max_scan_rows] == 249
     send(worker, {:release_batch, {:ok, []}})
     assert_receive {:batch_query, ^worker, "acme", second}, 5000
     assert second[:deadline_ms] == first[:deadline_ms]
     send(worker, {:release_batch, {:ok, []}})
     assert_receive {:batch_query, ^worker, "acme", third}, 5000
-    assert third[:max_scan_bytes] == 33
+    assert third[:max_scan_bytes] == 50
     send(worker, {:release_batch, {:ok, []}})
     assert_receive {:batch_result, {:ok, _}}, 5000
     assert_receive {:DOWN, ^ref, :process, ^worker, :normal}, 5000

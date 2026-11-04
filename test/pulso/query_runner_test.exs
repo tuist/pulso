@@ -45,4 +45,16 @@ defmodule Pulso.QueryRunnerTest do
     assert_receive {:finished, {:ok, :logql}}
     assert {:ok, :released} = QueryRunner.run("shared", :raw, fn _ -> {:ok, :released} end)
   end
+
+  test "the limit a worker hit is reported to the calling process" do
+    assert {:error, :query_scan_limit} =
+             QueryRunner.run("limits", :promql, fn _ ->
+               Pulso.QueryLimit.exceeded(:max_scan_segments, 1024, 3100, :visited)
+             end)
+
+    assert %{limit: :max_scan_segments, maximum: 1024, observed: 3100} = Pulso.QueryLimit.take()
+
+    assert {:ok, :fine} = QueryRunner.run("limits", :promql, fn _ -> {:ok, :fine} end)
+    assert Pulso.QueryLimit.take() == nil
+  end
 end

@@ -574,6 +574,87 @@ Before enabling it:
 - **Keep node clocks synchronized.** The deletion grace period assumes clocks
   agree to well within an hour.
 
+Without compaction nothing bounds the number of metric segments: every
+remote-write batch stays its own object forever, with or without retention.
+Remote write shards series across batches, so almost every segment of a window
+holds some series of any given metric and metric-name pruning cannot skip them.
+At 55 segments a minute a 20-minute range already exceeds the default
+1,024-segment budget, and an hour reads about 3,300 objects.
+
+Compaction merges up to 32 small segments (1 MiB or less, at most 8 MiB and
+100,000 rows per merge) from the same hour, and merges the results again while
+they stay small, so an hour converges to a little more than its row count
+divided by 100,000 segments (9.8 segments an hour at 720,000 rows an hour in
+the benchmark below). Each maintenance pass (every minute) runs up to 32 merges per
+tenant, so it keeps up with ingest and works through existing history four
+manifest pages at a time.
+
+## Long dashboard and alert ranges
+
+Compacted segments hold all series of their hour, so a query over a window
+reads every stored row of that window, whatever its matchers. The row budget,
+not the segment budget, then decides how long a range can be. Measured with
+`test/pulso/promql/query_scale_bench_test.exs` on 3,000 series scraped every
+15 s (720,000 rows an hour), 18 ms per object GET and four segments of
+prefetch on one node:
+
+| History | Query | Segments read | Time |
+| --- | --- | --- | --- |
+| 6 h uncompacted, 18,720 segments | any 1 h range | over 1,024 | refused (`max_scan_segments`) |
+| same, segment budget raised | 1 h range | 2,020 of about 3,300 | timed out at 10 s |
+| 6 h compacted, 59 segments | 1 h range, default budgets | 12 | 0.1 s |
+| same | 6 h dashboards, `and on`, ratio | 59 | 0.4 to 0.6 s with raised budgets |
+| same | 6 h `rate` over 400 series | 59 | 2.8 s with raised budgets |
+| 7 days compacted, 1,690 segments | 24 h dashboards | 241 | 1.4 to 2.2 s |
+| same | `increase(x[1d])` | 240 | 2.0 s |
+| same | `[3d:30m]` subquery | 717 | 4.6 s |
+| same | `[7d:5m]` subquery | 1,681 | 11.4 s |
+| same | `offset 168h` over `[1h]` | 20 | 0.2 s |
+
+To serve 1-hour to 24-hour dashboards and 1-hour to 7-day alert windows:
+
+1. Turn on bucket versioning, then enable metrics compaction
+   (`metricsCompaction.enabled: true`), after every writer runs the same release.
+2. Raise the scan budgets to cover the longest window: rows an hour times hours
+   (17 million rows for a day and 121 million for a week at the rate above) and
+   segments an hour times hours (about 10 an hour once compacted). A query
+   over a budget reports what it needed, for example `max_scan_rows = 1000000,
+   needed 17352000`, which sizes the budget for your own ingest rate.
+3. Raise `PULSO_QUERY_MAX_SAMPLES`, `PULSO_QUERY_MAX_RESULT_POINTS`,
+   `PULSO_QUERY_MAX_MATERIALIZED_SAMPLES`, `PULSO_QUERY_MAX_WORK` and
+   `PULSO_QUERY_MAX_HEAP_MB` for
+   ranges over hundreds of series (see [Query budgets](#query-budgets)), and give the
+   container enough memory for (`PULSO_QUERY_MAX_CONCURRENT` + 2) query heaps.
+4. Raise `PULSO_QUERY_TIMEOUT_MS` above the slowest window you need, below
+   Grafana's 30 s datasource timeout. A 7-day window took 11 s above.
+
+```yaml
+metricsCompaction:
+  enabled: true
+resources:
+  limits:
+    memory: 6Gi
+extraEnv:
+  - {name: PULSO_QUERY_MAX_SCAN_ROWS, value: "200000000"}
+  - {name: PULSO_QUERY_MAX_SCAN_SEGMENTS, value: "4096"}
+  - {name: PULSO_QUERY_MAX_SCAN_BYTES, value: "4294967296"}
+  - {name: PULSO_QUERY_MAX_SAMPLES, value: "1000000"}
+  - {name: PULSO_QUERY_MAX_RESULT_POINTS, value: "1000000"}
+  - {name: PULSO_QUERY_MAX_MATERIALIZED_SAMPLES, value: "1000000"}
+  - {name: PULSO_QUERY_MAX_WORK, value: "50000000"}
+  - {name: PULSO_QUERY_MAX_HEAP_MB, value: "512"}
+  - {name: PULSO_QUERY_MAX_CONCURRENT, value: "3"}
+  - {name: PULSO_QUERY_TIMEOUT_MS, value: "25000"}
+  - {name: PULSO_QUERY_PREFETCH, value: "8"}
+```
+
+Compaction catches up on existing history gradually; until it has, long
+ranges over older hours still fail on the segment budget, and the error says
+so. Long windows read every row of the window on every evaluation, so a 7-day
+alert evaluated every minute reads the whole week each minute. Pulso has no
+downsampled rollups or per-series index yet; prefer recording rules or shorter
+windows where they answer the same question.
+
 ## Log compaction
 
 With `PULSO_LOG_COMPACTION_ENABLED=true` (chart: `logCompaction.enabled`),
@@ -613,9 +694,11 @@ these variables (through `extraEnv` in the Helm chart):
 | `PULSO_QUERY_MAX_SAMPLES` | `100000` | Samples a PromQL query may select. |
 | `PULSO_QUERY_MAX_LOG_SAMPLES` | `5000000` | Per-line samples a LogQL metric query may retain (one per line its pipeline keeps). |
 | `PULSO_QUERY_MAX_WORK` | `5000000` | Evaluation work units per query. |
-| `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read. |
+| `PULSO_QUERY_MAX_RESULT_POINTS` | `100000` | Points a PromQL query may return, also the points each selector's intermediate series may hold: a range of 721 steps fits about 138 series. |
+| `PULSO_QUERY_MAX_MATERIALIZED_SAMPLES` | `100000` | Points PromQL subqueries may materialize per query. |
+| `PULSO_QUERY_MAX_SCAN_SEGMENTS` | `1024` | Stored segment objects a query may read, `1..1000000`. Every segment costs one object GET, so this mostly bounds query latency. A PromQL query reads each candidate segment once, however many selectors need it, and charges this budget once per segment. |
+| `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read, counted from each segment's footer, including rows its matchers then discard. |
 | `PULSO_QUERY_MAX_SCAN_BYTES` | `134217728` | Stored bytes a query may read. |
-| `PULSO_QUERY_MAX_SCAN_SEGMENTS` | `1024` | Stored segment objects a query may read, `1..1000000`. Every segment costs one object GET, so this mostly bounds query latency. |
 | `PULSO_QUERY_TIMEOUT_MS` | `10000` | Wall-clock limit for one query, including object-store reads (1000 to 300000). Queries past it fail with a timeout. Keep it below the client's own timeout (Grafana's datasource default is 30 s). |
 | `PULSO_QUERY_MAX_CONCURRENT` | derived, else `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
 | `PULSO_QUERY_MAX_HEAP_MB` | derived, else `128` | Process heap ceiling of one query worker, `16..16384`. A query past it fails with a resource-limit error. Off-heap segment reads (up to the prefetch depth) and native accumulators come on top, so size memory for about (`PULSO_QUERY_MAX_CONCURRENT` + 2) × this plus prefetched segments, and lower both on small nodes. |
@@ -631,6 +714,25 @@ size memory for four concurrent queries. PromQL
 queries still materialize their samples and remain bounded by each query's
 memory ceiling as well. A query over a budget fails with HTTP 422 rather than
 returning a partial result.
+
+The error names the limit, the value that applied and, when known, what the
+query needed, for example `max_scan_segments=1024 exceeded: candidates in the
+time range total at least 1025 segments; narrow the time range or selector, or
+raise PULSO_QUERY_MAX_SCAN_SEGMENTS`. The Prometheus HTTP API returns it in
+`error` (prefixed with `query exceeded `) and as a `limit` object (`reason`,
+`limit`, `value`, `observed`, `env`); MCP returns `:query_execution_limit: ` (or
+`:query_scan_limit: ` for log and trace tools) followed by the same text. In alert batches the value
+is the source's share of the batch's scan budget. A timeout answers at
+`PULSO_QUERY_TIMEOUT_MS` even if the query's worker is still inside a native
+call; that worker keeps its query slot until it stops.
+
+PromQL memory grows with the samples a query selects. Each segment's decoded
+rows are folded into per-series time/value points as it is read, but evaluation
+peaks at about 450 bytes of worker heap per selected sample: in our benchmark a
+6-hour range over 400 series (576,000 samples) needed between 192 and 256 MiB.
+The default 128 MiB heap fits the default 100,000 samples with headroom. Raise
+`PULSO_QUERY_MAX_SAMPLES` and `PULSO_QUERY_MAX_HEAP_MB` together, about 512 MiB
+per million samples.
 
 ## Fixed limits
 

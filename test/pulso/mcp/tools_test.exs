@@ -4,6 +4,7 @@ defmodule Pulso.MCP.ToolsTest do
   alias Pulso.Auth.SharedSecret
   alias Pulso.Codec.NIF
   alias Pulso.MCP.Tools
+  alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Storage
@@ -49,6 +50,27 @@ defmodule Pulso.MCP.ToolsTest do
 
     assert [entry] = Pulso.JSON.decode!(evaluated)["data"]["result"]
     assert Enum.at(entry["value"], 1) == "+Inf"
+  end
+
+  test "PromQL limit errors name the limit and its value" do
+    samples = for ts <- 1..3, do: %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => "busy"}}
+    :ok = Storage.append(:metrics, "acme", samples)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 2)
+
+    assert {:error, :query_execution_limit} =
+             Tools.call("query_promql", %{"tenant" => "acme", "query" => "busy", "end_ts_ns" => 3})
+
+    assert %{limit: :max_samples, maximum: 2} = Pulso.QueryLimit.take()
+
+    arguments = %{"tenant" => "acme", "query" => "busy", "end_ts_ns" => 3}
+
+    assert {:reply, %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}}} =
+             Pulso.MCP.dispatch(
+               MCPMessages.request(1, "tools/call", %{"name" => "query_promql", "arguments" => arguments})
+             )
+
+    assert text =~ ":query_execution_limit: max_samples=2 exceeded"
+    assert text =~ "PULSO_QUERY_MAX_SAMPLES"
   end
 
   test "lists log, metric, trace and error query tools" do
