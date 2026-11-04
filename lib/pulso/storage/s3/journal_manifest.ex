@@ -369,17 +369,58 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
     leaves = collect_leaves(root.paging["refs"], select, tenant, signal, config, deadline)
     found = Enum.filter(root.segments, match)
-    if maximum != nil and length(found) > maximum, do: fail(:query_scan_limit)
+
+    read = &stream_leaves(&1, tenant, signal, config, deadline, fn leaf -> Enum.filter(leaf.segments, match) end)
+
+    case opts[:log_window] do
+      {order, n} when signal == "logs" and is_integer(n) -> window(leaves, found, {order, n}, read)
+      _ -> all_candidates(leaves, found, maximum, read)
+    end
+  end
+
+  defp all_candidates(leaves, found, maximum, read) do
+    if maximum != nil and length(found) > maximum, do: too_many(maximum, length(found))
 
     leaves
-    |> stream_leaves(tenant, signal, config, deadline, &Enum.filter(&1.segments, match))
+    |> read.()
     |> Enum.reduce({found, length(found)}, fn found_in_leaf, {acc, count} ->
       count = count + length(found_in_leaf)
-      if maximum != nil and count > maximum, do: fail(:query_scan_limit)
+      if maximum != nil and count > maximum, do: too_many(maximum, count)
       {found_in_leaf ++ acc, count}
     end)
     |> elem(0)
     |> Enum.sort_by(& &1.max_ts, :desc)
+  end
+
+  defp too_many(maximum, count) do
+    Pulso.QueryLimit.exceeded(:max_scan_segments, maximum, count, :candidates)
+    fail(:query_scan_limit)
+  end
+
+  # The first `n` candidates in a limited log query's scan order: newest
+  # `max_ts` first (backward) or oldest `min_ts` first (forward). Leaves are
+  # read in the order of their bound on that key, eight at a time, and reading
+  # stops once `n` candidates are held and no unread leaf can order before
+  # the last of them. Candidates beyond `n` are never visited by the scan.
+  defp window(leaves, found, {order, n}, read) do
+    {bound, rank} =
+      case order do
+        :backward -> {&(-&1["mx"]), &{-&1.max_ts, &1.key}}
+        :forward -> {& &1["mn"], &{&1.min_ts, &1.key}}
+      end
+
+    leaves
+    |> Enum.sort_by(bound)
+    |> Enum.chunk_every(8)
+    |> Enum.reduce_while(found |> Enum.sort_by(rank) |> Enum.take(n), fn chunk, held ->
+      chunk = if length(held) < n, do: chunk, else: Enum.filter(chunk, &(bound.(&1) <= elem(rank.(List.last(held)), 0)))
+
+      if chunk == [] do
+        {:halt, held}
+      else
+        {:cont, (held ++ Enum.concat(read.(chunk))) |> Enum.sort_by(rank) |> Enum.take(n)}
+      end
+    end)
   end
 
   defp limited_trace_scan?("traces", opts),

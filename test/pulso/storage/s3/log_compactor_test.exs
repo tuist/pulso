@@ -130,7 +130,11 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       assert {:ok, before} = S3.query(:logs, ctx.tenant, [])
 
       assert {:ok, %{merged: 3, replacement: replacement}} = LogCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
-      assert [%Segment{key: ^replacement, row_count: 4, log_services: ["api", "web"]}] = segments(ctx)
+      assert [%Segment{key: ^replacement, row_count: 4, log_services: ["api", "web"]} = merged] = segments(ctx)
+      # The sources' complete stream-label sets union into the replacement's.
+      assert merged.log_labels["pod"] == ["a", "b", "c"]
+      assert merged.log_labels["namespace"] == [""]
+      refute Segment.matches_log_service?(merged, matchers: [{"pod", :eq, "d"}])
 
       assert :ok = stop_supervised(ManifestSupervision)
       start_supervised!(ManifestSupervision)

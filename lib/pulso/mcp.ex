@@ -19,6 +19,7 @@ defmodule Pulso.MCP do
 
   alias Pulso.Alerting.{Resources, Subscriptions}
   alias Pulso.MCP.Tools
+  alias Pulso.QueryLimit
 
   @protocol_version "2026-07-28"
   @supported_versions [@protocol_version]
@@ -301,9 +302,10 @@ defmodule Pulso.MCP do
   }
 
   defp error_text(name, reason) do
-    case Map.fetch(@trace_hints, {name, reason}) do
-      {:ok, hint} -> "#{inspect(reason)}: #{hint}"
-      :error -> inspect(reason)
-    end
+    # Which scan budget fired and its value, recorded by the query that failed.
+    detail = if reason in [:query_scan_limit, :query_execution_limit], do: QueryLimit.describe(QueryLimit.take())
+    hints = Enum.reject([Map.get(@trace_hints, {name, reason}), detail], &is_nil/1)
+
+    if hints == [], do: inspect(reason), else: "#{inspect(reason)}: #{Enum.join(hints, "; ")}"
   end
 end

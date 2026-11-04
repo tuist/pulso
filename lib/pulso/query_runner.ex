@@ -7,6 +7,7 @@ defmodule Pulso.QueryRunner do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.QuerySlots
   alias Pulso.PromQL.TaskSupervisor
+  alias Pulso.QueryLimit
   alias Pulso.Runtime
   alias Pulso.Runtime.Registry
   alias Pulso.Runtime.Task
@@ -15,6 +16,8 @@ defmodule Pulso.QueryRunner do
     with {:ok, timeout} <- timeout(opts) do
       started = System.monotonic_time(:millisecond)
       deadline = started + timeout
+      # A limit detail belongs to the query that recorded it.
+      _ = QueryLimit.take()
 
       task =
         try do
@@ -31,17 +34,21 @@ defmodule Pulso.QueryRunner do
 
             per_tenant = Pulso.TenantLimits.get(tenant, :query_max_concurrent) || config(:max_per_tenant, 2)
 
-            with :ok <- acquire({scope}, per_tenant),
-                 :ok <- acquire_interactive(class),
-                 :ok <- acquire({:class, class}, class_limit(class)) do
-              fun.(deadline)
-            end
+            result =
+              with :ok <- acquire({scope}, per_tenant),
+                   :ok <- acquire_interactive(class),
+                   :ok <- acquire({:class, class}, class_limit(class)) do
+                fun.(deadline)
+              end
+
+            # Hand which budget failed back to the caller with the result.
+            {__MODULE__, result, QueryLimit.take()}
           end)
         rescue
           RuntimeError -> nil
         end
 
-      result = await(task, max(1, deadline - System.monotonic_time(:millisecond)))
+      result = task |> await(max(1, deadline - System.monotonic_time(:millisecond))) |> unwrap()
       # Refused queries are not metered; everything admitted is, whatever its outcome.
       if result != {:error, :query_overloaded},
         do: Pulso.Usage.query(tenant, System.monotonic_time(:millisecond) - started)
@@ -59,6 +66,13 @@ defmodule Pulso.QueryRunner do
       deadline_ms: deadline
     ]
   end
+
+  defp unwrap({__MODULE__, result, detail}) do
+    QueryLimit.put(detail)
+    result
+  end
+
+  defp unwrap(result), do: result
 
   defp await(nil, _timeout), do: {:error, :query_overloaded}
 

@@ -152,7 +152,7 @@ defmodule Pulso.LogQL.Evaluator do
 
   defp do_select_entries(query, tenant, %{limit: limit} = opts, project) do
     direction = Map.get(opts, :direction, :backward)
-    stop = if direction == :backward, do: &newest_complete?(&1, &2, limit)
+    stop = {direction, &complete?(&1, &2, limit, direction)}
     retain = &retain(&1, &2, &3, limit, direction, project)
 
     with {:ok, {retained, _size}} <- fold_log(query, tenant, opts, {:gb_sets.empty(), 0}, retain, stop) do
@@ -198,6 +198,11 @@ defmodule Pulso.LogQL.Evaluator do
   `fun.(entry, record, acc)`. Validation, pushdown and the pipeline are those
   of `evaluate_log_raw/3`, but no complete result is materialized, so memory
   follows one batch plus the accumulator. Entries arrive in no defined order.
+
+  `stop`, when given, is `{direction, fun}`: storage visits segments newest
+  first (`:backward`) or oldest first (`:forward`) and ends the fold once
+  `fun.(acc, next)` is true, where `next` is the next segment's
+  `{min_ts, max_ts}` bounds or `nil`.
   """
   @spec fold_log(AST.LogQuery.t(), Storage.tenant(), opts(), acc, (Entry.t(), Log.t(), acc -> acc)) ::
           {:ok, acc} | {:error, term()}
@@ -207,7 +212,12 @@ defmodule Pulso.LogQL.Evaluator do
          {storage_opts, remaining_stages} <- push_down(query, opts) do
       compiled = compile_metric_pipeline(query, remaining_stages, opts)
 
-      storage_opts = if stop, do: Keyword.put(storage_opts, :log_fold_stop, stop), else: storage_opts
+      storage_opts =
+        case stop do
+          {order, fun} -> Keyword.merge(storage_opts, log_fold_stop: fun, log_fold_order: order)
+          nil -> storage_opts
+        end
+
       categorize_labels? = Map.get(opts, :categorize_labels, false)
 
       storage_result(
@@ -392,8 +402,16 @@ defmodule Pulso.LogQL.Evaluator do
   # Retained values are copied so they never keep a decoded chunk alive.
   defp retainable(key, value), do: Tuple.insert_at(Pulso.JSON.detach(key), tuple_size(key), Pulso.JSON.detach(value))
 
-  defp newest_complete?({set, size}, next_max_ts, limit),
-    do: size >= limit and is_integer(next_max_ts) and next_max_ts < elem(:gb_sets.smallest(set), 0)
+  # Strict bounds: an entry at the worst retained timestamp can still win on
+  # the tie-breakers, so a segment reaching that timestamp must be read.
+  defp complete?({_set, size}, _next, limit, _direction) when size < limit, do: false
+  defp complete?(_acc, nil, _limit, _direction), do: true
+
+  defp complete?({set, _size}, {_min_ts, max_ts}, _limit, :backward),
+    do: is_integer(max_ts) and max_ts < elem(:gb_sets.smallest(set), 0)
+
+  defp complete?({set, _size}, {min_ts, _max_ts}, _limit, :forward),
+    do: is_integer(min_ts) and min_ts > elem(:gb_sets.largest(set), 0)
 
   defp group_streams(entries, true) do
     entries

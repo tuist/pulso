@@ -26,6 +26,20 @@ requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
 16 per tenant/signal) so uploads overlap the serialized manifest CAS.
 
+Limited LogQL log queries (no `interval`) plan only the first
+`max_scan_segments + 1` candidates in their direction (`log_window`: newest
+`max_ts` backward, oldest `min_ts` forward; format 4 reads leaves in bound
+order and stops), skip the upfront scan-budget check and stop folding once the
+next segment cannot improve the kept entries. Log segment summaries (`el`) now
+hold complete bounded value sets for `error_source error_project cluster
+namespace container service_name env job pod` (effective promoted
+`service_name`); `Segment.matches_log_service?/2` prunes `=`/`!=` and, with
+`compile_log_matchers/1` (native `compile_log_regex`), `=~`/`!~`. Log
+compaction unions source summaries. Unlimited log scans prefetch up to 32
+segments within 16 MiB. `Pulso.QueryLimit` records which scan budget a
+`:query_scan_limit` hit (reason stays the bare atom); `QueryRunner` carries it
+to the caller for MCP/Loki error text. Line filters have no segment index.
+
 Prefixes without enforced retention now default to format-4 paged manifests
 (`Pulso.Storage.S3.JournalManifest`, `PULSO_MANIFEST_FORMAT=paged|flat`): a
 bounded `root_sha` root with an inline tail (spill at 512 entries/128 KiB) and a

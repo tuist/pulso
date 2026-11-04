@@ -1,6 +1,7 @@
 defmodule Pulso.Storage.S3.LogSummaryTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.LogQL.StreamMatchers
   alias Pulso.Record.Log
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
@@ -55,14 +56,20 @@ defmodule Pulso.Storage.S3.LogSummaryTest do
     ]
 
     summary = segment(records)
-    assert summary.log_labels == %{"error_source" => ["", "sentry"], "error_project" => ["", "42"]}
+
+    assert Map.take(summary.log_labels, ~w(error_source error_project)) ==
+             %{"error_source" => ["", "sentry"], "error_project" => ["", "42"]}
+
+    # Stream labels no record carries are complete too: every value is absent.
+    assert summary.log_labels["namespace"] == [""]
     manifest = Manifest.merge(Manifest.new(), [summary])
     assert {:ok, ^manifest} = manifest |> Manifest.encode() |> IO.iodata_to_binary() |> Manifest.decode()
     refute Segment.matches_log_service?(summary, matchers: [{"error_project", :eq, "43"}])
     assert Segment.matches_log_service?(summary, matchers: [{"error_source", :eq, ""}])
 
     summary = segment(for i <- 1..33, do: %Log{resource: %{"error_source" => "sentry", "error_project" => "#{i}"}})
-    assert summary.log_labels == %{"error_source" => ["sentry"]}
+    assert summary.log_labels["error_source"] == ["sentry"]
+    refute Map.has_key?(summary.log_labels, "error_project")
     assert Segment.matches_log_service?(summary, matchers: [{"error_project", :eq, "unknown"}])
     refute Segment.matches_log_service?(summary, matchers: [{"error_source", :eq, "other"}])
 
@@ -87,7 +94,8 @@ defmodule Pulso.Storage.S3.LogSummaryTest do
     assert Segment.matches_log_service?(segment(records), opts)
 
     # Unknown fields do not discard independently complete project sets.
-    assert segment(records).log_labels == %{"error_project" => ["42"]}
+    assert segment(records).log_labels["error_project"] == ["42"]
+    refute Map.has_key?(segment(records).log_labels, "error_source")
   end
 
   test "bounded native log decoding counts only matching rows and rejects overflow rather than truncating" do
@@ -149,5 +157,98 @@ defmodule Pulso.Storage.S3.LogSummaryTest do
         assert found == [] or Segment.matches_log_service?(summary, opts)
       end
     end
+  end
+
+  test "stream-label summaries cover Alloy labels, effective service_name and every matcher operator" do
+    records = [
+      %Log{service: "kura", resource: %{"cluster" => "canary", "namespace" => "kura", "pod" => "kura-0"}},
+      %Log{resource: %{"cluster" => "canary", "namespace" => "tuist", "service_name" => "server"}}
+    ]
+
+    summary = segment(records)
+    assert summary.log_labels["cluster"] == ["canary"]
+    assert summary.log_labels["namespace"] == ["kura", "tuist"]
+    assert summary.log_labels["pod"] == ["", "kura-0"]
+    assert summary.log_labels["service_name"] == ["kura", "server"]
+
+    keep? = fn matchers ->
+      Segment.matches_log_service?(summary, Segment.compile_log_matchers(matchers: matchers))
+    end
+
+    refute keep?.([{"cluster", :eq, "prod"}])
+    refute keep?.([{"cluster", :neq, "canary"}])
+    assert keep?.([{"namespace", :neq, "kura"}])
+    refute keep?.([{"namespace", :re, StreamMatchers.anchor("prod.*|staging")}])
+    assert keep?.([{"namespace", :re, StreamMatchers.anchor("tuist.*")}])
+    refute keep?.([{"cluster", :nre, StreamMatchers.anchor("can.*")}])
+    assert keep?.([{"pod", :re, StreamMatchers.anchor(".*")}])
+    refute keep?.([{"pod", :re, StreamMatchers.anchor(".+-1")}])
+    refute keep?.([{"service_name", :eq, "worker"}])
+    # Each matcher must be satisfiable on its own; the summary does not prove
+    # that values of different labels share a row, so this conjunction stays.
+    assert keep?.([{"namespace", :eq, "kura"}, {"service_name", :eq, "server"}])
+    # Without compiled regexes, or for a pattern the engine rejects, a regex never prunes.
+    assert Segment.matches_log_service?(summary, matchers: [{"cluster", :re, StreamMatchers.anchor("prod")}])
+    assert keep?.([{"cluster", :re, StreamMatchers.anchor("(")}])
+    # Unsummarized names never prune.
+    assert keep?.([{"app", :eq, "anything"}])
+  end
+
+  test "randomized stream-label pruning never excludes a segment whose native decoder returns matching rows" do
+    :rand.seed(:exsss, {11, 22, 33})
+    names = ~w(cluster namespace container pod service_name job env)
+    values = ["", "canary", "tuist", "tuist-prod", "kura", "server", "postgres", "kura-0", "kura-1", "Tuist"]
+    patterns = ["", ".*", ".+", "tuist.*", "kura|server", "(?i)TUIST", "kura-[0-9]", "can.ry", "(", "[^t].*"]
+
+    pruned =
+      for iteration <- 1..60, reduce: 0 do
+        pruned ->
+          records =
+            for i <- 1..12 do
+              resource =
+                for name <- names, :rand.uniform(3) > 1, into: %{} do
+                  value =
+                    case :rand.uniform(12) do
+                      12 when rem(iteration, 4) == 0 -> 7
+                      11 when rem(iteration, 5) == 0 -> nil
+                      _ -> Enum.random(values)
+                    end
+
+                  {name, value}
+                end
+
+              service = Enum.random([nil, "", "kura", "server"])
+              %Log{timestamp_ns: i, service: service, resource: resource, body: "line #{i}"}
+            end
+
+          summary = segment(records)
+          {:ok, payload, _, _} = S3.encode_segment(:logs, records)
+
+          for _ <- 1..40, reduce: pruned do
+            pruned ->
+              matchers =
+                for _ <- 1..Enum.random(1..2) do
+                  case Enum.random([:eq, :neq, :re, :nre]) do
+                    op when op in [:eq, :neq] -> {Enum.random(names), op, Enum.random(values)}
+                    op -> {Enum.random(names), op, StreamMatchers.anchor(Enum.random(patterns))}
+                  end
+                end
+
+              opts = Segment.compile_log_matchers(matchers: matchers)
+
+              if Segment.matches_log_service?(summary, opts) do
+                pruned
+              else
+                # An invalid pattern fails the query before storage; it only must not match.
+                refute match?({:ok, [_ | _]}, S3.decode_segment(:logs, payload, nil, nil, matchers: matchers)),
+                       "pruned #{inspect(matchers)} for #{inspect(records)}"
+
+                pruned + 1
+              end
+          end
+      end
+
+    # The property is not vacuous: many random selectors do prune.
+    assert pruned > 200
   end
 end

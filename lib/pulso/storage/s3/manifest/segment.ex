@@ -11,6 +11,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
+  alias Pulso.Codec.NIF
   alias Pulso.Storage.S3.MetricLabelSummary
   alias Pulso.Storage.S3.TraceSummary
 
@@ -200,6 +201,11 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   defp valid_services(_), do: nil
 
+  # Stream labels summarized per log segment, in priority order: the label
+  # summary's byte budget drops later names first. These are the labels Loki
+  # pushes from Alloy/Promtail commonly carry, plus Pulso's error labels.
+  @log_label_names ~w(error_source error_project cluster namespace container service_name env job pod)
+
   @doc "Attach a complete bounded set of nonempty promoted log services, or leave it unknown."
   def summarize_logs(segment, records) do
     services = Enum.reduce_while(records, MapSet.new(), &collect_log_service/2)
@@ -214,19 +220,26 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
       end)
 
     labels =
-      Enum.map(records, fn record ->
-        labels =
-          Map.new(~w(error_source error_project), fn name ->
-            # Non-string values stay unknown independently: atoms in
-            # particular become strings at the JSON/native boundary.
-            {name, Map.get(record.resource || %{}, name, "")}
-          end)
+      if valid_resources? do
+        records
+        |> Enum.map(&%{labels: Map.new(@log_label_names, fn name -> {name, log_label_value(&1, name)} end)})
+        |> MetricLabelSummary.build(@log_label_names)
+      end
 
-        %{labels: labels}
-      end)
-
-    %{segment | log_services: services, log_labels: if(valid_resources?, do: MetricLabelSummary.build(labels))}
+    %{segment | log_services: services, log_labels: labels}
   end
+
+  @doc "Stream-label summary of a segment holding exactly the rows of segments with `summaries`."
+  def merge_log_labels(summaries), do: MetricLabelSummary.union(summaries, @log_label_names)
+
+  # The value the native matcher sees for `name` (`matchers_pass` in
+  # segment_parquet.rs): `service_name` prefers a nonempty promoted service,
+  # every other summarized name reads the top-level resource string. A missing
+  # label is "", as in LogQL. Non-string values stay unknown independently:
+  # atoms in particular become strings at the JSON/native boundary.
+  # A non-string promoted service is returned as is, so the label stays unknown.
+  defp log_label_value(%{service: service}, "service_name") when service not in [nil, ""], do: service
+  defp log_label_value(record, name), do: Map.get(record.resource || %{}, name, "")
 
   defp collect_log_service(%{service: service}, services) when is_binary(service) and byte_size(service) in 1..256 do
     services = MapSet.put(services, service)
@@ -235,10 +248,75 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   defp collect_log_service(_record, _services), do: {:halt, nil}
 
-  @doc "Prune exact service and error-label selectors only with complete summaries."
+  @doc """
+  Prune service and stream-label selectors only with complete summaries.
+
+  Equality and inequality matchers compare against the summarized values.
+  Regex matchers need `opts[:log_label_regexes]` from `compile_log_matchers/1`
+  (the native matcher's own regex engine); without it they never prune.
+  """
   def matches_log_service?(%__MODULE__{} = segment, opts) do
     service_matches?(segment.log_services, opts) and
-      MetricLabelSummary.matches?(segment.log_labels, Keyword.get(opts, :matchers, []))
+      log_labels_match?(segment.log_labels, Keyword.get(opts, :matchers, []), opts[:log_label_regexes] || %{})
+  end
+
+  @doc """
+  Compile the regex stream matchers of a log query once per query, with the
+  regex engine the native segment matcher uses, for `matches_log_service?/2`.
+  Patterns that do not compile are left out and so never prune.
+  """
+  def compile_log_matchers(opts) do
+    regexes =
+      for {name, op, pattern} <- Keyword.get(opts, :matchers, []),
+          op in [:re, :nre],
+          name in @log_label_names,
+          into: %{} do
+        case NIF.compile_log_regex(pattern) do
+          {:ok, regex} -> {pattern, regex}
+          _ -> {pattern, nil}
+        end
+      end
+
+    if map_size(regexes) == 0, do: opts, else: Keyword.put(opts, :log_label_regexes, regexes)
+  end
+
+  defp log_labels_match?(nil, _matchers, _regexes), do: true
+
+  defp log_labels_match?(summary, matchers, regexes) do
+    Enum.all?(matchers, fn {name, op, value} ->
+      case Map.fetch(summary, name) do
+        {:ok, values} -> Enum.any?(values, &label_value_matches?(op, value, &1, regexes))
+        :error -> true
+      end
+    end)
+  end
+
+  defp label_value_matches?(:eq, expected, value, _regexes), do: value == expected
+  defp label_value_matches?(:neq, expected, value, _regexes), do: value != expected
+
+  defp label_value_matches?(op, pattern, value, regexes) do
+    case Map.get(regexes, pattern) do
+      nil -> true
+      regex -> regex_matches?(pattern, regex, value) == (op == :re)
+    end
+  end
+
+  # Summaries repeat the same few values across thousands of segments; one
+  # native call per distinct pattern/value pair, bounded per process. A
+  # pattern always compiles to the same program, so entries never go stale.
+  @regex_memo {__MODULE__, :regex_memo}
+  defp regex_matches?(pattern, regex, value) do
+    memo = Process.get(@regex_memo, %{})
+
+    case memo do
+      %{{^pattern, ^value} => matched} ->
+        matched
+
+      _ ->
+        matched = NIF.match_log_regex(regex, value)
+        if map_size(memo) < 4096, do: Process.put(@regex_memo, Map.put(memo, {pattern, value}, matched))
+        matched
+    end
   end
 
   defp service_matches?(nil, _opts), do: true

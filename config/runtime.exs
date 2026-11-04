@@ -387,6 +387,7 @@ query_budgets =
         {:max_log_samples, "PULSO_QUERY_MAX_LOG_SAMPLES", 5_000_000, 1..1_000_000_000},
         {:max_work, "PULSO_QUERY_MAX_WORK", 5_000_000, 1..10_000_000_000},
         {:max_scan_rows, "PULSO_QUERY_MAX_SCAN_ROWS", 1_000_000, 1..1_000_000_000},
+        {:max_scan_segments, "PULSO_QUERY_MAX_SCAN_SEGMENTS", 1024, 1..1_000_000},
         {:max_scan_bytes, "PULSO_QUERY_MAX_SCAN_BYTES", 134_217_728, 1..1_099_511_627_776}
       ],
       env_var.(name, nil) not in [nil, ""],
@@ -472,7 +473,7 @@ config :pulso, Tail,
 
 if query_budgets != [] do
   config :pulso, Evaluator, query_budgets
-  config :pulso, Pulso.QueryRunner, Keyword.take(query_budgets, [:max_scan_rows, :max_scan_bytes])
+  config :pulso, Pulso.QueryRunner, Keyword.take(query_budgets, [:max_scan_rows, :max_scan_bytes, :max_scan_segments])
 end
 
 # OTLP/gRPC receiver for logs, metrics and traces. Disabled unless a port is

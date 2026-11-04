@@ -31,6 +31,67 @@ defmodule Pulso.Storage.S3.MetricLabelSummary do
     end
   end
 
+  @doc """
+  Summarize exactly `names`, in priority order: when the byte budget is
+  exhausted, later names are omitted (unknown) rather than earlier ones.
+  """
+  def build([], _names), do: nil
+
+  def build(records, names) do
+    names = Enum.take(names, @max_names)
+    sets = Map.new(names, &{&1, MapSet.new()})
+    sets = Enum.reduce_while(records, sets, &collect_record/2)
+
+    {summary, _bytes} =
+      names
+      |> Enum.flat_map(fn name -> if values = Map.get(sets, name), do: [{name, values}], else: [] end)
+      |> Enum.reduce({%{}, 2}, &add_label/2)
+
+    if map_size(summary) > 0, do: summary
+  end
+
+  @doc """
+  The summary of the union of the rows `summaries` describe: a name is kept
+  only when every summary has it, with the union of their values, within the
+  same bounds and in `names` priority order. Any unknown summary makes the
+  union unknown.
+  """
+  def union(summaries, names) do
+    if summaries != [] and Enum.all?(summaries, &is_map/1) do
+      {summary, _bytes} =
+        names
+        |> Enum.take(@max_names)
+        |> Enum.filter(fn name -> Enum.all?(summaries, &Map.has_key?(&1, name)) end)
+        |> Enum.flat_map(&union_values(summaries, &1))
+        |> Enum.reduce({%{}, 2}, &add_label/2)
+
+      if map_size(summary) > 0, do: summary
+    end
+  end
+
+  defp union_values(summaries, name) do
+    values = summaries |> Enum.flat_map(&Map.fetch!(&1, name)) |> MapSet.new()
+    if MapSet.size(values) <= @max_values, do: [{name, values}], else: []
+  end
+
+  defp collect_record(record, sets) do
+    if Enum.all?(Map.keys(record.labels), &valid_utf8?/1) do
+      # An overflowed (nil) set never recovers, so drop it; once none remain,
+      # later records cannot add anything.
+      sets =
+        for {name, values} <- sets,
+            values = collect(values, Map.get(record.labels, name, "")),
+            into: %{},
+            do: {name, values}
+
+      if map_size(sets) == 0, do: {:halt, sets}, else: {:cont, sets}
+    else
+      # Native JSON materialization normalizes invalid UTF-8 keys, which
+      # could collide with a selected name. Never summarize that case.
+      {:halt, %{}}
+    end
+  end
+
   # A name absent from some records also has the value "".
   defp complete_set({_name, {_present, nil}}, _count), do: []
   defp complete_set({name, {present, values}}, count) when present == count, do: [{name, values}]

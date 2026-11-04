@@ -78,6 +78,7 @@ defmodule Pulso.Storage.S3 do
 
   alias Pulso.Codec.NIF
   alias Pulso.ObjectStore
+  alias Pulso.QueryLimit
   alias Pulso.Record.Log
   alias Pulso.Record.MetricSample
   alias Pulso.Record.Span
@@ -534,7 +535,7 @@ defmodule Pulso.Storage.S3 do
   defp budget_result(error, _opts), do: error
 
   defp metadata_limit(opts) do
-    with :ok <- check_deadline(opts[:deadline_ms]), do: {:error, :query_scan_limit}
+    with :ok <- check_deadline(opts[:deadline_ms]), do: QueryLimit.exceeded(:metadata, nil, nil, :planned)
   end
 
   @doc """
@@ -575,6 +576,7 @@ defmodule Pulso.Storage.S3 do
     end_ts = Keyword.get(opts, :end_ts)
     limit = Keyword.get(opts, :limit)
     native? = opts[:log_metric] != nil or opts[:trace_metrics] != nil
+    opts = put_log_window(signal, opts)
 
     with :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, entry} <- query_manifest(tenant, signal_string(signal), config, opts),
@@ -743,17 +745,62 @@ defmodule Pulso.Storage.S3 do
   defp retained_start(%Manifest{version: 3} = root, start), do: max(start, PagedManifest.floor(root))
   defp retained_start(_root, start), do: start
 
-  defp query_segments(%Manifest{version: 3} = root, signal, start_ts, end_ts, opts, tenant, config) do
+  # A limited log query reads segments in its direction and stops once no
+  # further segment can improve its `limit` entries: newest `max_ts` first
+  # for backward folds and limited raw queries, oldest `min_ts` first for
+  # forward folds. Only the first `max_scan_segments + 1` candidates in that
+  # order are planned: a scan that needs the last one exceeds the segment
+  # budget anyway, and every unplanned candidate orders after it.
+  defp put_log_window(:logs, opts) do
+    # Folds, native scans and discovery drop `:limit`; only a fold with a
+    # stop condition or a limited raw query can end early.
+    order =
+      cond do
+        opts[:log_fold_stop] -> Keyword.get(opts, :log_fold_order, :backward)
+        is_integer(opts[:limit]) and opts[:limit] > 0 -> :backward
+        true -> nil
+      end
+
+    cond do
+      is_nil(order) -> opts
+      is_integer(opts[:max_scan_segments]) -> Keyword.put(opts, :log_window, {order, opts[:max_scan_segments] + 1})
+      true -> Keyword.put(opts, :log_window, {order, nil})
+    end
+  end
+
+  defp put_log_window(_signal, opts), do: opts
+
+  defp query_segments(manifest, :logs, start_ts, end_ts, opts, tenant, config) do
+    opts = Segment.compile_log_matchers(opts)
+
+    with {:ok, segments} <- manifest_segments(manifest, :logs, start_ts, end_ts, opts, tenant, config),
+         do: {:ok, window_segments(segments, opts[:log_window])}
+  end
+
+  defp query_segments(manifest, signal, start_ts, end_ts, opts, tenant, config),
+    do: manifest_segments(manifest, signal, start_ts, end_ts, opts, tenant, config)
+
+  defp window_segments(segments, nil), do: segments
+  defp window_segments(segments, {:backward, nil}), do: segments
+  defp window_segments(segments, {:backward, n}), do: Enum.take(segments, n)
+
+  # Unknown bounds sort first, so an early stop never skips them.
+  defp window_segments(segments, {:forward, n}) do
+    segments = Enum.sort_by(segments, &{&1.min_ts != nil, &1.min_ts, &1.key})
+    if n, do: Enum.take(segments, n), else: segments
+  end
+
+  defp manifest_segments(%Manifest{version: 3} = root, signal, start_ts, end_ts, opts, tenant, config) do
     opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts) |> metrics_filter(signal)
     PagedManifest.query(root, tenant, signal_string(signal), opts, config)
   end
 
-  defp query_segments(%Manifest{version: 4} = root, signal, start_ts, end_ts, opts, tenant, config) do
+  defp manifest_segments(%Manifest{version: 4} = root, signal, start_ts, end_ts, opts, tenant, config) do
     opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts) |> metrics_filter(signal)
     JournalManifest.query(root, tenant, signal_string(signal), opts, config)
   end
 
-  defp query_segments(manifest, signal, start_ts, end_ts, opts, _tenant, _config) do
+  defp manifest_segments(manifest, signal, start_ts, end_ts, opts, _tenant, _config) do
     segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
     opts = metrics_filter(opts, signal)
 
@@ -805,7 +852,13 @@ defmodule Pulso.Storage.S3 do
     cond do
       is_binary(service) ->
         if length(segments) > TraceSummary.plan_catalog_limit(),
-          do: {:error, :query_scan_limit},
+          do:
+            QueryLimit.exceeded(
+              :trace_catalog_segments,
+              TraceSummary.plan_catalog_limit(),
+              length(segments),
+              :candidates
+            ),
           else: check_scan_budget(candidate_segments(segments, service), opts)
 
       limited_span_query?(opts) ->
@@ -814,6 +867,11 @@ defmodule Pulso.Storage.S3 do
       true ->
         check_scan_budget(segments, opts)
     end
+  end
+
+  # Limited log queries charge only the segments they actually visit.
+  defp check_scan_budget(:logs, segments, opts) do
+    if opts[:log_window], do: :ok, else: check_scan_budget(segments, opts)
   end
 
   defp check_scan_budget(_signal, segments, opts), do: check_scan_budget(segments, opts)
@@ -827,10 +885,19 @@ defmodule Pulso.Storage.S3 do
     bytes = Enum.sum(Enum.map(segments, &(&1.byte_size || 0)))
     rows = Enum.sum(Enum.map(segments, &(&1.row_count || 0)))
 
-    if exceeds_budget?(length(segments), opts[:max_scan_segments]) or
-         exceeds_budget?(bytes, opts[:max_scan_bytes]) or exceeds_budget?(rows, opts[:max_scan_rows]),
-       do: {:error, :query_scan_limit},
-       else: :ok
+    cond do
+      exceeds_budget?(length(segments), opts[:max_scan_segments]) ->
+        QueryLimit.exceeded(:max_scan_segments, opts[:max_scan_segments], length(segments), :candidates)
+
+      exceeds_budget?(bytes, opts[:max_scan_bytes]) ->
+        QueryLimit.exceeded(:max_scan_bytes, opts[:max_scan_bytes], bytes, :candidates)
+
+      exceeds_budget?(rows, opts[:max_scan_rows]) ->
+        QueryLimit.exceeded(:max_scan_rows, opts[:max_scan_rows], rows, :candidates)
+
+      true ->
+        :ok
+    end
   end
 
   defp exceeds_budget?(_, nil), do: false
@@ -1082,12 +1149,14 @@ defmodule Pulso.Storage.S3 do
   defp fold_acc({_fun, acc}), do: acc
   defp fold_acc(nil), do: nil
 
-  # Segments are visited newest first. A fold may stop once the next segment
-  # cannot contribute, judged from that segment's newest timestamp.
+  # Segments are visited in the fold's order (`:log_fold_order`): newest
+  # `max_ts` first by default, oldest `min_ts` first forward. A fold may stop
+  # once the next segment cannot contribute, judged from its `{min_ts, max_ts}`
+  # bounds (`nil` when no segment remains).
   defp fold_done?(%{opts: opts} = ctx, acc, index) do
     case opts[:log_fold_stop] do
       nil -> false
-      stop -> stop.(acc, ctx |> next_segment(index) |> then(&(&1 && &1.max_ts)))
+      stop -> stop.(acc, ctx |> next_segment(index) |> then(&(&1 && {&1.min_ts, &1.max_ts})))
     end
   end
 
@@ -1128,7 +1197,7 @@ defmodule Pulso.Storage.S3 do
   # early stop. The default reads strictly one segment at a time.
   defp scan_sources(sources, ctx, state) do
     items = Enum.with_index(sources)
-    concurrency = Map.get(ctx.config, :query_prefetch, 1)
+    concurrency = prefetch_depth(ctx, sources, Map.get(ctx.config, :query_prefetch, 1))
 
     if concurrency > 1 and length(items) > 1 and prefetchable?(ctx) do
       # Each task copies its closure: capture only the config, the byte limit
@@ -1149,6 +1218,24 @@ defmodule Pulso.Storage.S3 do
       Enum.reduce_while(items, {:ok, state}, &visit_segment(&1, &2, ctx))
     end
   end
+
+  # Small uncompacted log segments make full log scans latency-bound: one
+  # GET per push. Unlimited log scans read further ahead while the candidates'
+  # sizes keep at most @prefetch_bytes in flight. Limited queries keep the
+  # configured depth, since they usually stop after a few segments and every
+  # prefetched read past the stop is wasted.
+  @prefetch_bytes 16 * 1024 * 1024
+  @max_prefetch 32
+  defp prefetch_depth(%{signal: :logs, opts: opts}, sources, configured) when configured > 1 do
+    if opts[:log_window] do
+      configured
+    else
+      largest = sources |> Enum.map(&(&1.byte_size || @prefetch_bytes)) |> Enum.max(fn -> @prefetch_bytes end)
+      max(configured, min(@max_prefetch, div(@prefetch_bytes, max(largest, 1))))
+    end
+  end
+
+  defp prefetch_depth(_ctx, _sources, configured), do: configured
 
   # Footer-first metric reads issue their own ranged requests.
   defp prefetchable?(%{signal: :metrics, metric_discovery?: false, config: %{metric_footer_pruning_enabled: true}}),
@@ -1445,7 +1532,10 @@ defmodule Pulso.Storage.S3 do
     case ctx.opts[:max_scan_bytes] do
       limit when is_integer(limit) ->
         remaining = limit - consumed
-        if remaining > 0, do: read_bounded_segment(ctx.config, key, remaining), else: {:error, :query_scan_limit}
+
+        if remaining > 0,
+          do: read_bounded_segment(ctx.config, key, remaining),
+          else: QueryLimit.exceeded(:max_scan_bytes, limit, consumed, :visited)
 
       _ ->
         ObjectStore.get(ctx.config, key)
@@ -1455,19 +1545,28 @@ defmodule Pulso.Storage.S3 do
   defp read_bounded_segment(config, key, remaining) do
     case ObjectStore.get_bounded(config, key, nil, remaining) do
       {:ok, _etag, body} -> {:ok, body}
-      {:error, :response_too_large} -> {:error, :query_scan_limit}
+      {:error, :response_too_large} -> QueryLimit.exceeded(:max_scan_bytes, remaining, nil, :object)
       error -> error
     end
   end
 
   defp check_read_bytes(bytes, opts) do
-    if exceeds_budget?(bytes, opts[:max_scan_bytes]), do: {:error, :query_scan_limit}, else: :ok
+    if exceeds_budget?(bytes, opts[:max_scan_bytes]),
+      do: QueryLimit.exceeded(:max_scan_bytes, opts[:max_scan_bytes], bytes, :visited),
+      else: :ok
   end
 
   defp check_visited_budget(count, rows, ctx) do
-    if exceeds_budget?(count, ctx.opts[:max_scan_segments]) or exceeds_budget?(rows, ctx.opts[:max_scan_rows]),
-      do: {:error, :query_scan_limit},
-      else: :ok
+    cond do
+      exceeds_budget?(count, ctx.opts[:max_scan_segments]) ->
+        QueryLimit.exceeded(:max_scan_segments, ctx.opts[:max_scan_segments], count, :visited)
+
+      exceeds_budget?(rows, ctx.opts[:max_scan_rows]) ->
+        QueryLimit.exceeded(:max_scan_rows, ctx.opts[:max_scan_rows], rows, :visited)
+
+      true ->
+        :ok
+    end
   end
 
   defp scan_row_count(_ctx, _segment, %MetricFooterReader{rows: rows}), do: {:ok, rows}

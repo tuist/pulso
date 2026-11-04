@@ -433,6 +433,11 @@ defmodule Pulso.Storage.S3.PagedManifest do
       limited_trace_scan?(signal, opts) ->
         nil
 
+      # Limited log queries plan their window in the storage adapter and
+      # charge only the segments they visit.
+      signal == "logs" and opts[:log_window] != nil ->
+        nil
+
       true ->
         opts[:max_scan_segments] || 1024
     end
@@ -458,7 +463,7 @@ defmodule Pulso.Storage.S3.PagedManifest do
       |> Enum.filter(&(&1["state"] == "live" and intersects?(&1, scan.start_ts, scan.end_ts)))
       |> Enum.reduce(Enum.filter(root.segments, scan.match), &scan_bucket(&1, &2, scan, tenant, signal, config))
 
-    if scan.maximum != nil and length(result) > scan.maximum, do: fail(:query_scan_limit)
+    if scan.maximum != nil and length(result) > scan.maximum, do: too_many(scan.maximum, length(result))
     Enum.sort_by(result, & &1.max_ts, :desc)
   end
 
@@ -467,9 +472,17 @@ defmodule Pulso.Storage.S3.PagedManifest do
     |> Enum.filter(&(intersects?(&1, scan.start_ts, scan.end_ts) and leaf_matches?(&1, signal, scan.opts)))
     |> Enum.reduce(rows, fn ref, rows ->
       found = ref |> page_segments(bucket, tenant, signal, config) |> Enum.filter(scan.match)
-      if scan.maximum != nil and length(rows) + length(found) > scan.maximum, do: fail(:query_scan_limit)
+
+      if scan.maximum != nil and length(rows) + length(found) > scan.maximum,
+        do: too_many(scan.maximum, length(rows) + length(found))
+
       found ++ rows
     end)
+  end
+
+  defp too_many(maximum, count) do
+    Pulso.QueryLimit.exceeded(:max_scan_segments, maximum, count, :candidates)
+    fail(:query_scan_limit)
   end
 
   defp page_segments(ref, bucket, tenant, signal, config),

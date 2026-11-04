@@ -2132,6 +2132,42 @@ collision, logfmt, quantity and filter-error semantics. The required log codec
 tuple is `{1,1,18}`; older artifacts fail startup. They do not change stored
 records or keyed encoder bytes.
 
+### How log queries choose segments
+
+Each log push becomes one stored segment, so query cost is mostly one object
+GET per segment read. Pulso reads fewer segments in three ways:
+
+- **Limited log queries stop early.** A log query with a `limit` (no
+  `interval`) reads segments newest first for `direction=backward` and oldest
+  first for `direction=forward`, and stops once no unread segment can hold an
+  entry that would replace one of the `limit` it already has. The scan budgets
+  count only segments actually read, so a long range no longer fails just
+  because it contains many segments.
+- **Stream labels prune segments.** Each new segment records the complete set
+  of values of `cluster`, `namespace`, `container`, `service_name`, `env`,
+  `job` and `pod` (plus `error_source`/`error_project`) in the manifest, when
+  there are at most 32 values per label and they fit a 4 KiB summary; labels
+  past that bound are omitted, and later names go first. A segment is skipped
+  when a `=`, `!=`, `=~` or `!~` matcher on one of those labels matches none of
+  its values (regex matchers use the same engine as row matching). A missing
+  label counts as the empty value, as in LogQL. Segments written before this
+  release, and labels a summary omits, are always read. Log compaction keeps the
+  summaries of the segments it merges.
+- **Full log scans read ahead.** Metric queries and unlimited log queries read
+  up to 32 segments ahead while those segments keep at most 16 MiB in flight
+  (see `PULSO_QUERY_PREFETCH` in [configuration](configuration.md#query-budgets)).
+
+Line filters do not prune segments; they are evaluated natively on every row
+of every segment the selector keeps. For alert rules over many uncompacted
+segments, enable [log compaction](configuration.md#log-compaction) and
+[ingest coalescing](configuration.md#ingest-coalescing) to reduce how many
+objects a range covers.
+
+A query over a scan budget fails whole with HTTP 422 `query_limit` (MCP:
+`:query_scan_limit`) and names the budget, its value and what the query
+reached, for example `max_scan_segments=1024 exceeded: candidates in the time
+range total at least 2400 segments`.
+
 ### Limits and metric evaluation
 
 Send `X-Loki-Query-Limits: {"maxQueryLength":"1m"}` to add a request-local

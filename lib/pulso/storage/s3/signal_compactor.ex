@@ -125,6 +125,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
         key
         |> Segment.build(min_ts, max_ts, row_count, byte_size(payload))
         |> summarize_replacement(config, records, summary)
+        |> merge_log_labels(config, sources)
 
       source_keys = Enum.map(sources, & &1.key)
       grace = Keyword.get(opts, :grace_ms, 3_600_000)
@@ -259,6 +260,13 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     do: %{segment | log_services: services}
 
   defp summarize_replacement(segment, _config, records, _summary), do: Segment.summarize_metrics(segment, records)
+
+  # A replacement holds exactly its sources' rows, so the union of their
+  # complete stream-label sets is complete for it too.
+  defp merge_log_labels(segment, %{compaction_signal: :logs}, sources),
+    do: %{segment | log_labels: Segment.merge_log_labels(Enum.map(sources, & &1.log_labels))}
+
+  defp merge_log_labels(segment, _config, _sources), do: segment
 
   defp publish(tenant, config, _sources, replacement, _grace, 0) do
     # The last conditional response can also have been lost after success.
