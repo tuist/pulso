@@ -167,22 +167,30 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     end
   end
 
-  @doc "Keep unknown summaries and segments that could satisfy all exact name matchers."
-  def matches_metric_name?(%__MODULE__{metric_names: nil}, _matchers), do: true
+  @doc "Keep unknown summaries and segments whose name set could satisfy every name matcher."
+  def matches_metric_name?(segment, matchers) do
+    matchers = Enum.filter(matchers, &match?({"__name__", _, _}, &1))
+    matches_metrics?(segment, metrics_filter(matchers))
+  end
 
-  def matches_metric_name?(%__MODULE__{metric_names: names}, matchers) do
-    Enum.all?(matchers, fn
-      {"__name__", :eq, value} -> value in names
-      _ -> true
+  @doc "Compile storage matchers once per query for `matches_metrics?/2`."
+  def metrics_filter({:metric_plan, _} = plan), do: plan
+  def metrics_filter(matchers), do: {:metric_plan, MetricLabelSummary.plan(matchers)}
+
+  @doc """
+  Prune metrics only when a complete name or label value set proves that some
+  matcher (equality, inequality, or a recognized regex shape) cannot match.
+  """
+  def matches_metrics?(segment, {:metric_plan, plan}) do
+    MetricLabelSummary.satisfiable?(plan, fn
+      "__name__" when is_list(segment.metric_names) -> {:ok, segment.metric_names}
+      "__name__" -> :error
+      _name when segment.metric_labels == nil -> :error
+      name -> Map.fetch(segment.metric_labels, name)
     end)
   end
 
-  # Only nonempty promoted fields are summarized: null/empty services fall
-  # back to resource labels in the native matcher, so they remain unknown.
-  @doc "Prune metrics only when a complete name or label value set proves an exact mismatch."
-  def matches_metrics?(segment, matchers) do
-    matches_metric_name?(segment, matchers) and MetricLabelSummary.matches?(segment.metric_labels, matchers)
-  end
+  def matches_metrics?(segment, matchers), do: matches_metrics?(segment, metrics_filter(matchers))
 
   defp valid_services([_ | _] = services) do
     if length(services) <= 128 and

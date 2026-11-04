@@ -1,6 +1,7 @@
 defmodule Pulso.Storage.S3.MetricLabelSummaryTest do
   use Pulso.Test.Case, async: true
 
+  alias Pulso.Codec.NIF
   alias Pulso.Record.MetricSample
   alias Pulso.Storage.S3
   alias Pulso.Storage.S3.Manifest
@@ -13,7 +14,7 @@ defmodule Pulso.Storage.S3.MetricLabelSummaryTest do
     records = for i <- 1..100, do: sample(%{"job" => "api", "instance" => "node-#{i}", "__name__" => "up"}, i)
     assert MetricLabelSummary.build(records) == %{"job" => ["api"]}
     assert MetricLabelSummary.build([sample(%{"job" => "api"}), sample(%{})]) == %{"job" => ["", "api"]}
-    assert MetricLabelSummary.build([sample(%{}), sample(%{"later" => "x"})]) == nil
+    assert MetricLabelSummary.build([sample(%{}), sample(%{"later" => "x"})]) == %{"later" => ["", "x"]}
     assert MetricLabelSummary.matches?(%{"job" => ["api"]}, [{"instance", :eq, "unknown"}])
     refute MetricLabelSummary.matches?(%{"job" => ["api"]}, [{"job", :eq, "absent"}])
     assert MetricLabelSummary.matches?(%{"job" => ["api"]}, [{"job", :re, "absent"}])
@@ -74,6 +75,112 @@ defmodule Pulso.Storage.S3.MetricLabelSummaryTest do
     assert length(decoded.segments) == length(segments)
     assert Enum.any?(decoded.segments, &is_nil(&1.metric_labels))
   end
+
+  test "labels are chosen across mixed records, fewest values first" do
+    records = [
+      sample(%{"__name__" => "node_cpu", "cpu" => "0"}),
+      sample(%{"namespace" => "tuist-canary", "pod" => "kura-1"})
+    ]
+
+    summary = MetricLabelSummary.build(records)
+    assert summary == %{"cpu" => ["", "0"], "namespace" => ["", "tuist-canary"], "pod" => ["", "kura-1"]}
+
+    records = for i <- 1..40, do: sample(Map.put(Map.new(1..20, &{"a#{&1}", "#{i}"}), "job", "otel"))
+    assert MetricLabelSummary.build(records) == %{"job" => ["otel"]}
+  end
+
+  # Values and patterns chosen to catch anchoring, quantifier, escaping,
+  # empty-value and flag mistakes. Each pattern is anchored as PromQL does.
+  @values ["api", "ap", "api-1", "apix", "", "kura-a-1", "kura-", "a.b", "axb", "a|b", "line\nbreak", "ünï", "API"]
+  @patterns [
+    "api",
+    "ap",
+    "api|web",
+    "(api|ap)",
+    "(?:api-1|)",
+    "|api",
+    "",
+    "ap.*",
+    "api-.*",
+    "kura-(.*)-.*",
+    ".*",
+    ".+",
+    "a.b",
+    "a\\.b",
+    "a\\|b",
+    "api*",
+    "api+",
+    "api?",
+    "ap{2}",
+    "ap[i]",
+    "[a]pi",
+    "(?i)API",
+    "\\Qa.b\\E",
+    "line.*",
+    "ün.*",
+    "(api)|(kura-.*)",
+    "(ap)i",
+    "api-\\d",
+    "\\x61pi",
+    "ap(i|x)",
+    "(a|b)(c|d)",
+    "a.*|b",
+    "[|]"
+  ]
+
+  test "regex and inequality pruning equals native matching on complete value sets" do
+    :rand.seed(:exsss, {42, 7, 2026})
+
+    # Dashboard variable expansions must stay decidable, not merely safe.
+    for pattern <- ["tuist-canary", "a|b|c", "(a|b)", "(?:a|b)", ".*", "kura-.*", "process_xcresult|process_build", ""] do
+      assert {_, prefixes} =
+               MetricLabelSummary.regex_shape(Pulso.QueryRegex.anchor(pattern))
+               |> then(&if(&1 == :any, do: {nil, []}, else: &1))
+
+      assert Enum.all?(prefixes, &elem(&1, 1)), pattern
+    end
+
+    for _ <- 1..60 do
+      records =
+        for i <- 1..Enum.random(1..6) do
+          labels = %{"__name__" => Enum.random(@values), "job" => Enum.random(@values)}
+          labels = if Enum.random(1..4) == 1, do: Map.delete(labels, "job"), else: labels
+          labels = if Enum.random(1..4) == 1, do: Map.delete(labels, "__name__"), else: labels
+          sample(labels, i)
+        end
+
+      segment = Segment.build("x", 1, 10, length(records)) |> Segment.summarize_metrics(records)
+      {:ok, payload, _, _} = S3.encode_segment(:metrics, records)
+
+      for name <- ["job", "__name__"],
+          op <- [:re, :nre, :eq, :neq],
+          value <- if(op in [:re, :nre], do: @patterns, else: @values) do
+        pattern = if op in [:re, :nre], do: Pulso.QueryRegex.anchor(value), else: value
+        matchers = [{name, op, pattern}]
+        {:ok, found} = S3.decode_segment(:metrics, payload, nil, nil, matchers: matchers)
+        kept? = Segment.matches_metrics?(segment, matchers)
+        assert found == [] or kept?, inspect({records, matchers})
+
+        # With a complete set, a decidable shape keeps exactly the segments
+        # holding at least one matching value.
+        values = if name == "__name__", do: segment.metric_names, else: segment.metric_labels[name]
+        shape = if op in [:re, :nre], do: MetricLabelSummary.regex_shape(pattern), else: :any
+
+        decidable? =
+          shape == :any or (shape != :unknown and Enum.all?(elem(shape, 1), &elem(&1, 1)))
+
+        if values != nil and decidable? do
+          ideal? = Enum.any?(values, &value_matches?(op, pattern, &1))
+          assert kept? == ideal?, inspect({values, matchers})
+        end
+      end
+    end
+  end
+
+  defp value_matches?(:eq, expected, value), do: value == expected
+  defp value_matches?(:neq, expected, value), do: value != expected
+  defp value_matches?(:re, pattern, value), do: NIF.match_metric_regex(pattern, value)
+  defp value_matches?(:nre, pattern, value), do: not NIF.match_metric_regex(pattern, value)
 
   test "randomized exact-label pruning never excludes native matches" do
     :rand.seed(:exsss, {42, 103, 7})

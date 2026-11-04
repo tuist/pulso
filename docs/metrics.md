@@ -129,6 +129,33 @@ before switching an existing dashboard. Keep a remote-write pipeline when its
 Collector translation is required; direct OTLP ingestion does not promise the
 same names as Prometheus's OTLP receiver.
 
+## Manifest segment pruning
+
+Before any object is downloaded, each metric segment's manifest entry can carry
+complete value sets for its metric names (up to 128) and for up to 16 other
+labels (up to 32 values each, `""` for samples that lack the label). Labels are
+chosen across every sample in the segment, fewest distinct values first, so
+mixed remote-write batches keep selective labels such as `job`, `namespace` or
+`env`. A segment is skipped only when one of these complete sets proves that a
+selector matcher cannot match:
+
+- `=` and `!=`.
+- `=~` and `!~` with literal values, alternations of literals (`a|b|c`,
+  `(a|b)`, `(?:a|b)`) and empty alternatives, such as Grafana variable
+  expansions. Matching is fully anchored as in Prometheus, so `=~"api"` does not
+  match `api-1`.
+- Literal prefixes. `=~"tuist-macos-.*"` is decided exactly. For other suffixes,
+  such as `=~"kura-(.*)-.*"`, the literal prefix still excludes segments with no
+  value starting with `kura-`.
+- `=~".*"` adds no constraint. `!~".*"` matches nothing.
+- `__name__` regex and prefix matchers, such as `{__name__=~"prefix_.*"}`.
+
+Flags such as `(?i)`, `\Q...\E`, and patterns with no literal prefix (such as
+`.+suffix`) never prune. Segments without summaries (older writers, high
+cardinality, long values) are always scanned. Every selector still filters
+rows after download. Pruning only avoids reading segments that cannot match.
+The segments that remain count against the per-query budget of 1,024 segments.
+
 ## Bounded native query acceleration
 
 New **unkeyed** metric segments and fresh compaction outputs can contain an

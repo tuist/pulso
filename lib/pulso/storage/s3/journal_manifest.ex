@@ -404,7 +404,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
     end
   end
 
-  defp matches?(s, "metrics", opts), do: Segment.matches_metrics?(s, Keyword.get(opts, :matchers, []))
+  defp matches?(s, "metrics", opts), do: Segment.matches_metrics?(s, opts[:metrics_filter] || opts[:matchers] || [])
   defp matches?(s, "logs", opts), do: Segment.matches_log_service?(s, opts)
   defp matches?(s, "traces", opts), do: TraceSummary.matches?(s.trace_summary, opts)
   defp leaf_matches?(ref, "traces", opts), do: TraceSummary.page_matches?(ref["q"], opts)

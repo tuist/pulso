@@ -744,27 +744,34 @@ defmodule Pulso.Storage.S3 do
   defp retained_start(_root, start), do: start
 
   defp query_segments(%Manifest{version: 3} = root, signal, start_ts, end_ts, opts, tenant, config) do
-    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts)
+    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts) |> metrics_filter(signal)
     PagedManifest.query(root, tenant, signal_string(signal), opts, config)
   end
 
   defp query_segments(%Manifest{version: 4} = root, signal, start_ts, end_ts, opts, tenant, config) do
-    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts)
+    opts = opts |> Keyword.put(:start_ts, start_ts) |> Keyword.put(:end_ts, end_ts) |> metrics_filter(signal)
     JournalManifest.query(root, tenant, signal_string(signal), opts, config)
   end
 
   defp query_segments(manifest, signal, start_ts, end_ts, opts, _tenant, _config) do
     segments = Manifest.prune_by_time(manifest, start_ts, end_ts)
+    opts = metrics_filter(opts, signal)
 
     filtered =
       case signal do
-        :metrics -> Enum.filter(segments, &Segment.matches_metrics?(&1, Keyword.get(opts, :matchers, [])))
+        :metrics -> Enum.filter(segments, &Segment.matches_metrics?(&1, opts[:metrics_filter]))
         :logs -> Enum.filter(segments, &Segment.matches_log_service?(&1, opts))
         :traces -> Enum.filter(segments, &TraceSummary.matches?(&1.trace_summary, opts))
       end
 
     {:ok, filtered}
   end
+
+  # Compile matcher pruning once per query, not once per manifest entry.
+  defp metrics_filter(opts, :metrics),
+    do: Keyword.put(opts, :metrics_filter, Segment.metrics_filter(Keyword.get(opts, :matchers, [])))
+
+  defp metrics_filter(opts, _signal), do: opts
 
   defp remaining_budget(opts, consumed) do
     Enum.reduce(consumed, opts, fn {key, used}, acc ->
