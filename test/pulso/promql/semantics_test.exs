@@ -264,7 +264,11 @@ defmodule Pulso.PromQL.SemanticsTest do
     assert Enum.all?(entries("a > on(job) group_left b"), &(&1["metric"]["__name__"] == "a"))
     assert Enum.all?(entries("a == on(__name__,job,instance) a"), &(&1["metric"]["__name__"] == "a"))
 
-    for k <- ["NaN", "Inf", "1e30", "scalar(a)"] do
+    for op <- ["topk", "bottomk"], k <- ["NaN", "scalar(a)"] do
+      assert {:error, {:invalid_ranking_parameter, ^op, :nan}} = query("#{op}(#{k}, a)")
+    end
+
+    for k <- ["Inf", "1e30"] do
       assert {:error, :invalid_aggregation_parameter} = query("topk(#{k}, a)")
       assert {:error, :invalid_aggregation_parameter} = query("bottomk(#{k}, a)")
     end

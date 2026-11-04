@@ -4531,3 +4531,58 @@ These tests do not establish general parser diagnostics or Loki wire parity.
 | Complete pinned `pkg/logql/internal/logqltest/testdata/vector_aggregations.logqltest` | `215a8a4297575f6d2bbc2befe0765e10d008b576ecc14e386744438221142369` |
 | Frozen complete lines 898–939 including final newline | `ccefc4098de08103c8bd55f3938912de4233e862a22e09f44fc179be0563e14d` |
 | Complete pinned `pkg/logql/syntax/ast.go` | `87eb6811c68654e2b2f7d629d799d215dc79fb549e0f9d71a805a46bd51e1e69` |
+
+### Dispersion missing-unwrap diagnostic continuation
+
+[`range-aggregations-dispersion.logqltest`](range-aggregations-dispersion.logqltest)
+freezes the complete active
+[`range_aggregations.logqltest:1558–1619`](https://github.com/grafana/loki/blob/5aa4b9212d64d723f63b2770452054aa23df114d/pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest#L1558-L1619)
+block verbatim under the existing AGPL-3.0-only attribution. All thirteen
+original inputs, including noise, and all twelve evaluations remain: ten
+successful instant/range/offset dispersion oracles and two literal missing-
+unwrap substring oracles. This does not import or count the separate repeated-
+nonexact-float block at lines 1657–1671, which previously matched unchanged.
+
+**HTTP adaptation:** the `dispersion_unwrap_batch` tests translate only the
+relative epoch into past nanosecond timestamps and batch all original inputs
+through one authenticated push/native Parquet object in owned S3 per test.
+Every original evaluation replays over GET and form POST. The original
+overlapping, non-overlapping and offset grids retain absent samples and NaNs.
+Raw reads check exact original lines, timestamps and labels. Range placements
+of the two instant rejection queries are separately authored controls.
+
+The pre-fix public probe on local revision `6c8e134` matched all ten successful
+evaluations but both rejection queries returned HTTP 400 / `evaluation_failed`
+with `message=":invalid_range_aggregation"`, missing the original substrings
+`invalid aggregation stdvar_over_time without unwrap` and
+`invalid aggregation stddev_over_time without unwrap`. Eight rejected GET/form
+instant/range attempts made no provider requests. That disposable probe made
+47 HTTP attempts including push, raw reads, auth and budget controls; it is
+pre-fix evidence, not a claim that this continuation has passed after applying.
+
+Validation now consults the existing unwrap-operation source of truth after
+excluding supported log observations. Supported unwrap-only operations retain
+their operation in `{:missing_unwrap, operation}`; unknown operations retain
+`:invalid_range_aggregation`. No supported-operation list is duplicated and
+this is not a two-name exception. HTTP rendering preserves 400 and the current
+`evaluation_failed` envelope, not upstream parse-error wire exactness. Other
+validation precedence, arithmetic, native/storage bytes and budgets are unchanged.
+
+Authored controls cover nested missing unwrap, other supported unwrap-only
+operations, parameter/grouping precedence, invalid bytes unwrap, unknown AST
+operations with/without unwrap, supported count/bytes observations, wrong auth,
+owned admission and fail-whole scan/work ceilings. Invalid queries and denied
+auth/admission make no provider requests. These controls are not more upstream
+rows. Runtime, endpoint, provider and tenant state remain test-owned.
+
+The pinned Go test/server was not executed. This is a bounded public-result
+and diagnostic-substring selection, not general parser or numerical parity.
+Both focused HTTP tests pass against persisted application artifacts, including
+all original oracles and the separate admission/budget controls. Combined
+parser/evaluator/native-reference and neighboring HTTP regressions are checked
+separately; no whole-repository post-change pass is implied.
+
+| Source | SHA-256 |
+| --- | --- |
+| Complete pinned `pkg/logql/internal/logqltest/testdata/range_aggregations.logqltest` | `980fd537de60238fa05d50d7bed25848b36dc5e4628685ddbccfaa4122ab83af` |
+| Frozen complete lines 1558–1619 including final newline | `330973461407db6b7ef06fc9ded0a6cd333efd28cd0ee5ffefc92252172d7691` |

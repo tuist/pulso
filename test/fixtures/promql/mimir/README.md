@@ -1,6 +1,6 @@
 # Grafana Mimir math and range-function integration cases
 
-These are **1798 selected query-engine integration cases in 106 fixture files**, copied without
+These are **1800 selected query-engine integration cases in 107 fixture files**, copied without
 changing their input samples, expressions or expected values from
 [grafana/mimir at dd039cdd4ba466adb5d28280bf1b8a374a98432e](https://github.com/grafana/mimir/tree/dd039cdd4ba466adb5d28280bf1b8a374a98432e).
 This is not Mimir's complete test suite or its Docker/service integration suite.
@@ -347,6 +347,7 @@ Pulso.
 | `upstream-absence-over-time.test` | `upstream/functions.test` | 1–5, 2127–2210 | 27 |
 | `upstream-label-replace.test` | `upstream/functions.test` | 1–5, 476–536 | 11 |
 | `mimir-label-replace-regex-error.test` | `ours/functions.test` | 1–2, 343–353, 363–366, 383 | 2 |
+| `mimir-nan-ranking.test` | `ours/aggregators.test` | 1–2, 411–420, 605–609 | 2 |
 | `upstream-staleness.test` | `upstream/staleness.test` | 1–63 (complete) | 17 |
 | `mimir-math.test` | `ours/functions.test` | 1–2, 74–77, 90–92, 96–97, 406–412, 437–439, 452–454, 476–484, 503–504 | 7 |
 | `collision.test` | `ours/collision.test` | 1–25 (complete) | 4 |
@@ -1572,6 +1573,7 @@ newlines in `mimir-limit.test` (342 logical lines, 341 newline bytes) and
 | `upstream-label-join.test` | `7327afb5243aa0e73093b680632751e3c02ed63dea64853d0ceb4a72ac9588eb` |
 | `mimir-label-join.test` | `b34987b98d5e19ad6b1e6085c2f6195e334a38a046f1f5d97fd09572edf4faf3` |
 | `mimir-label-replace-regex-error.test` | `ea317be818a1d7c3d1f485df188278e07b1ca6f20a45dd238ee47347b909b274` |
+| `mimir-nan-ranking.test` | `fbee90b9438e72d5fc52895ac52a8a9eda0d1b21d372ae635b8b4782f5a188f1` |
 | `upstream-range-quantile.test` | `d9359dcfda4548e775939917b05498ea7cd5890c3d4eeba95c1b50fe7d839c49` |
 | `mimir-range-quantile.test` | `f28effeb7c332397c9c934825ef02d243229e09c9b4539eb8b15d3d4b0582144` |
 | `upstream-smoothing.test` | `f8ff38c664b8ad3028d611f3bcc59dd1407f04f32c74afbcb28866a68c5dd507` |
@@ -1667,9 +1669,9 @@ range replays compare label identities and samples without imposing vector order
 on a matrix. Unsupported syntax fails rather than being silently skipped.
 Every evaluation runs through Pulso's HTTP instant/range query endpoints, using
 both memory storage and the real native S3/Parquet adapter against an owned
-loopback S3 stub. The corpus has 1471 instant evaluations, each also replayed as
-a one-step range, and 327 range evaluations, each requested once: 3269 HTTP
-requests per adapter, 6538 total across 212 fixture wrappers (106 files per
+loopback S3 stub. The corpus has 1472 instant evaluations, each also replayed as
+a one-step range, and 328 range evaluations, each requested once: 3272 HTTP
+requests per adapter, 6544 total across 214 fixture wrappers (107 files per
 adapter). The three-file scalar-context/extrema batch contributes 51 evaluations
 and 72 requests per adapter; the five-file aggregation batch contributes 88
 evaluations (59 instant, 29 range) and 147 requests per adapter. The four-file
@@ -2157,6 +2159,47 @@ hashes and independent corpus counts are retained in
 `.amp/in/artifacts/compatibility-selector-subquery-source-audit.txt`.
 These local loopback-provider checks do not establish deployed-client,
 production-provider or representative-load acceptance.
+
+## NaN ranking diagnostic selection
+
+`mimir-nan-ranking.test` retains the source header, complete successful setup
+and range evaluation, original NaN failure regex, and trailing `clear` from
+[`ours/aggregators.test:411–420,605–609`](https://github.com/grafana/mimir/blob/dd039cdd4ba466adb5d28280bf1b8a374a98432e/pkg/streamingpromql/testdata/ours/aggregators.test#L411-L420).
+The selection contains three series, eleven actual samples, one range evaluation
+and one instant failure evaluation. No input, expression or oracle is rewritten.
+The instant failure additionally replays as a one-step range, adding six fixture
+HTTP requests across both adapters and two fixture wrappers.
+
+Reproduce the byte-exact extraction from the pinned source with:
+
+```sh
+git show dd039cdd4ba466adb5d28280bf1b8a374a98432e:pkg/streamingpromql/testdata/ours/aggregators.test |
+  sed -n '1,2p;411,420p;605,609p'
+```
+
+The full source SHA-256 is
+`4a7dcceca5973f90cb2e930902546f33174965b1c1e0f23632ab467c63142792`;
+the extracted fixture SHA-256 is
+`fbee90b9438e72d5fc52895ac52a8a9eda0d1b21d372ae635b8b4782f5a188f1`.
+The existing source-error whitelist accepts only this exact NaN directive and
+asserts the full HTTP 422 execution envelope with `parameter value is NaN for
+topk`, which satisfies the unchanged upstream regex. It does not accept arbitrary
+422 responses. Mimir's instant and range ranking implementations distinguish NaN
+from int64 overflow before converting the parameter.
+
+Separate authored controls use two float samples, both endpoints and both
+adapters. Their asymmetric NaN matrix is `topk(0 / 0, ranking)`,
+`bottomk(NaN, missing_ranking)` and `bottomk(scalar(ranking), ranking)`.
+They also retain one generic sampling NaN diagnostic, one positive-infinity
+ranking overflow diagnostic, successful nonempty ranking after errors, and
+authenticated success versus unauthenticated rejection without provider requests.
+These four authored wrappers add 28 HTTP requests, counted separately from the
+imported corpus; their queries are not additional upstream oracles. Existing
+sampling, semantics and ranking fixtures retain negative/zero/large-value policy
+coverage. Both source selection and authored controls carry `nan_ranking: true`.
+The change distinguishes only NaN in topk/bottomk; sampling diagnostics, int64
+overflow, negative/zero behavior, ranking arithmetic, resource budgets and the
+separately documented post-filter grouped-output uniqueness policy are unchanged.
 
 ## License and attribution
 

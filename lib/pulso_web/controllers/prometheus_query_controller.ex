@@ -66,6 +66,9 @@ defmodule PulsoWeb.PrometheusQueryController do
       {:error, reason} when reason in [:many_to_many_matching, :duplicate_result_label_sets] ->
         error(conn, :unprocessable_entity, "execution", "Vector matching produced ambiguous or duplicate series.")
 
+      {:error, {:invalid_ranking_parameter, op, :nan}} when op in ["topk", "bottomk"] ->
+        error(conn, :unprocessable_entity, "execution", "parameter value is NaN for " <> op)
+
       {:error, :invalid_aggregation_parameter} ->
         error(
           conn,

@@ -1583,6 +1583,130 @@ defmodule PulsoWeb.SentryControllerTest do
   end
 
   @tag :s3
+  @tag :sentry_event_uuid
+  test "all pinned UUID valid inputs retain canonical event identities through cold reads", %{config: config} do
+    # Relay EventId delegates to uuid 1.28.0 through FromStr at Relay pin
+    # a68f1dbec05258cfa27b01059e1c1816d10c7257. Preserve all seventeen literal
+    # parse_str calls in uuid/src/parser.rs::test_parse_valid, including repeats.
+    inputs = [
+      {"67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"67e5504410b1426f9247bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"{67e55044-10b1-426f-9247-bb680e5fe0c8}", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"00000000000000000000000000000000", "00000000000000000000000000000000"},
+      {"67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"F9168C5E-CEB2-4faa-B6BF-329BF39FA1E4", "f9168c5eceb24faab6bf329bf39fa1e4"},
+      {"67e5504410b1426f9247bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"01020304-1112-2122-3132-414243444546", "01020304111221223132414243444546"},
+      {"urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"URN:UUID:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"Urn:Uuid:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"{6d93bade-bd9f-4e13-8914-9474e1e3567b}", "6d93badebd9f4e1389149474e1e3567b"},
+      {"URN:UUID:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"urn:UUID:67e55044-10b1-426f-9247-bb680e5fe0c8", "67e5504410b1426f9247bb680e5fe0c8"},
+      {"00000000000000000000000000000000", "00000000000000000000000000000000"},
+      {"00000000-0000-0000-0000-000000000000", "00000000000000000000000000000000"}
+    ]
+
+    for {input, canonical} <- inputs, route <- ["store", "envelope"] do
+      payload = event(%{"event_id" => input})
+      body = if route == "store", do: Pulso.JSON.encode!(payload), else: envelope(payload)
+
+      assert %{"id" => ^canonical, "discarded_items" => %{}} =
+               :post
+               |> Plug.Test.conn("/api/42/#{route}/?sentry_key=#{@key}", body)
+               |> PulsoWeb.Endpoint.call([])
+               |> json_response(200)
+    end
+
+    {:ok, owner} = ManifestOwner.ensure_started("acme", "logs", config)
+    :ok = GenServer.stop(owner)
+    ManifestCache.drop("acme", "logs")
+
+    assert {:ok, stored} = Storage.query(:logs, "acme", fresh: true)
+    assert length(stored) == 34
+
+    expected = inputs |> Enum.flat_map(fn {_, id} -> [id, id] end) |> Enum.frequencies()
+    assert Enum.frequencies_by(stored, & &1.resource["error_event_id"]) == expected
+
+    for record <- stored do
+      assert record.body == event(%{"event_id" => record.resource["error_event_id"]})
+    end
+
+    # MCP intentionally deduplicates repeated project/event identities.
+    assert %{"matched_events" => 5, "results" => results} = query("query_errors")
+    assert Enum.sort(Enum.map(results, & &1["event_id"])) == Enum.sort(Map.keys(expected))
+  end
+
+  @tag :s3
+  @tag :sentry_event_uuid
+  test "event UUID wrappers keep strict grammar and envelope-header precedence", %{agent: agent} do
+    dashed = "67e55044-10b1-426f-9247-bb680e5fe0c8"
+    canonical = "67e5504410b1426f9247bb680e5fe0c8"
+
+    # Authored grammar boundaries, not additional upstream acceptance rows.
+    for input <- [
+          "{" <> canonical <> "}",
+          "urn:uuid:" <> canonical,
+          "urn:uuid:{" <> dashed <> "}",
+          "{{" <> dashed <> "}}",
+          "urn:uuid:urn:uuid:" <> dashed,
+          "{67e550441-0b1-426f-9247-bb680e5fe0c8}",
+          "urn:uuid:g7e55044-10b1-426f-9247-bb680e5fe0c8",
+          "uuid:urn:" <> dashed,
+          " " <> dashed,
+          "{" <> dashed <> "}\n"
+        ],
+        route <- ["store", "envelope"] do
+      payload = event(%{"event_id" => input})
+      body = if route == "store", do: Pulso.JSON.encode!(payload), else: envelope(payload)
+      before = Agent.get(agent, & &1.requests)
+
+      assert %{"error" => "invalid_event_id"} =
+               :post
+               |> Plug.Test.conn("/api/42/#{route}/?sentry_key=#{@key}", body)
+               |> PulsoWeb.Endpoint.call([])
+               |> json_response(400)
+
+      assert Agent.get(agent, & &1.requests) == before
+    end
+
+    before = Agent.get(agent, & &1.requests)
+
+    for route <- ["store", "envelope"] do
+      payload = event(%{"event_id" => "urn:uuid:" <> dashed})
+      body = if route == "store", do: Pulso.JSON.encode!(payload), else: envelope(payload)
+
+      assert :post
+             |> Plug.Test.conn("/api/42/#{route}/?sentry_key=wrong", body)
+             |> PulsoWeb.Endpoint.call([])
+             |> json_response(403)
+
+      assert Agent.get(agent, & &1.requests) == before
+    end
+
+    assert %{"error" => "invalid_event_id"} =
+             event() |> envelope(%{"event_id" => "invalid"}) |> send_envelope() |> json_response(400)
+
+    assert Agent.get(agent, & &1.requests) == before
+
+    trace = %{"trace_id" => "urn:uuid:" <> dashed, "span_id" => dashed}
+
+    assert %{"id" => ^canonical} =
+             event(%{"event_id" => "invalid", "contexts" => %{"trace" => trace}})
+             |> envelope(%{"event_id" => "Urn:Uuid:" <> dashed})
+             |> send_envelope()
+             |> json_response(200)
+
+    assert {:ok, [record]} = Storage.query(:logs, "acme", fresh: true)
+    assert record.body["event_id"] == canonical
+    assert record.resource["error_event_id"] == canonical
+    assert record.body["contexts"] == %{"trace" => trace}
+    assert record.trace_id == nil
+    assert record.span_id == nil
+  end
+
+  @tag :s3
   @tag :sentry_trace_uuid
   test "trace correlation normalizes canonical UUID and hex IDs through cold reads", %{config: config} do
     # Independently authored interoperability cases. Relay's active formatting

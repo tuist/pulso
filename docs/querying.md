@@ -287,6 +287,8 @@ Pulso implements a subset of the
   `quantile(q, vector)` and `count_values(label, vector)` aggregations with
   `by` and `without` grouping; `topk` and `bottomk` reject NaN and ranking
   parameters at or above the signed int64 maximum; values below one yield no results.
+  NaN ranking reports HTTP 422/`execution` with `parameter value is NaN for topk`
+  or `bottomk`; sampling and overflow diagnostics are unchanged.
   Positive-`k` ranking ignores native histograms with query-local info notices;
   unexecuted zero-`k` filters emit none (a remaining range-query difference from Mimir)
 - `min`, `max`, `stddev` and `stdvar` aggregations ignore native histograms with
@@ -2641,6 +2643,12 @@ parameter reports `parameter required`, while a fractional parameter reports
 `invalid parameter`. These remain HTTP 400/`evaluation_failed`; valid ranking
 results, integer admission, zero-rank policy and budgets are unchanged.
 Upgrade query-serving applications; no native or storage change is required.
+
+Supported unwrap-only range aggregations, including `stdvar_over_time` and
+`stddev_over_time`, report `invalid aggregation <operation> without unwrap`
+when `unwrap` is absent, before storage reads. HTTP 400/`evaluation_failed`,
+parameter/grouping validation precedence and successful arithmetic are unchanged.
+Upgrade query-serving applications; native artifacts and storage are unchanged.
 
 LogQL `sort` and `sort_desc` reject nonempty `by` or `without` grouping,
 including nested aggregations, before reading storage. Empty `by ()` and

@@ -87,6 +87,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         {"mimir-regression.test", 1},
         {"mimir-rate-name-annotations.test", 3},
         {"mimir-prefilter-cardinality.test", 2},
+        {"mimir-nan-ranking.test", 2},
         {"upstream-mad.test", 7},
         {"mimir-mad.test", 8},
         {"upstream-extremum-timestamps.test", 2},
@@ -182,6 +183,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
     @tag aggregation_extrema: file == "upstream-aggregation-extrema.test"
     @tag rate_name_annotations: file == "mimir-rate-name-annotations.test"
     @tag prefilter_cardinality: file == "mimir-prefilter-cardinality.test"
+    @tag nan_ranking: file == "mimir-nan-ranking.test"
     @tag range_sort_histograms: file == "mimir-sort-histograms.test"
     @tag range_sort_affected: file in ~w(upstream-sort-warnings.test upstream-label-sort.test mimir-label-sort.test)
     @tag omitted_repetitions: file == "upstream-float-delta-boundaries.test"
@@ -253,6 +255,82 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         end)
 
       assert count == unquote(count)
+    end
+  end
+
+  for adapter <- [Memory, S3], path <- ["/api/v1/query", "/api/v1/query_range"] do
+    @tag adapter: adapter, nan_ranking: true
+    test "NaN ranking and sampling isolation through authenticated #{path} and #{inspect(adapter)}",
+         %{store: store} do
+      Runtime.put_env(:pulso, Pulso.Auth,
+        module: SharedSecret,
+        tokens: %{
+          "nan-ranking" => "sha256$" <> Base.encode16(:crypto.hash(:sha256, "ranking-token"), case: :lower)
+        }
+      )
+
+      source = [~s(ranking{id="one"} 1), ~s(ranking{id="two"} 2)]
+      assert :ok = Storage.append(:metrics, "nan-ranking", Enum.flat_map(source, &records(&1, 1_000_000_000)))
+
+      params =
+        if unquote(path) == "/api/v1/query",
+          do: %{time: "0"},
+          else: %{start: "0", end: "0", step: "1s"}
+
+      before_requests = if store, do: Agent.get(store, & &1.requests)
+
+      denied =
+        build_conn()
+        |> put_req_header("x-scope-orgid", "nan-ranking")
+        |> get(unquote(path), Map.put(params, :query, "topk(NaN, ranking)"))
+
+      assert %{"status" => "error", "errorType" => "unauthorized", "error" => "unauthorized"} ==
+               json_response(denied, 401)
+
+      if store, do: assert(Agent.get(store, & &1.requests) == before_requests)
+
+      for {query, op} <- [
+            {"topk(0 / 0, ranking)", "topk"},
+            {"bottomk(NaN, missing_ranking)", "bottomk"},
+            {"bottomk(scalar(ranking), ranking)", "bottomk"}
+          ] do
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "nan-ranking")
+          |> put_req_header("authorization", "Bearer ranking-token")
+          |> get(unquote(path), Map.put(params, :query, query))
+
+        assert %{
+                 "status" => "error",
+                 "errorType" => "execution",
+                 "error" => "parameter value is NaN for " <> op
+               } == json_response(conn, 422)
+      end
+
+      for query <- ["limitk(NaN, ranking)", "topk(Inf, ranking)"] do
+        conn =
+          build_conn()
+          |> put_req_header("x-scope-orgid", "nan-ranking")
+          |> put_req_header("authorization", "Bearer ranking-token")
+          |> get(unquote(path), Map.put(params, :query, query))
+
+        assert %{
+                 "status" => "error",
+                 "errorType" => "execution",
+                 "error" => "Ranking requires a scalar other than NaN and below the signed int64 maximum."
+               } == json_response(conn, 422)
+      end
+
+      query = "topk(1, ranking)"
+
+      conn =
+        build_conn()
+        |> put_req_header("x-scope-orgid", "nan-ranking")
+        |> put_req_header("authorization", "Bearer ranking-token")
+        |> get(unquote(path), Map.put(params, :query, query))
+
+      expected = [~s(ranking{id="two"} 2), "expect no_warn", "expect no_info"]
+      assert_success(conn, expected, unquote(path), query, 0, 1)
     end
   end
 
@@ -6749,6 +6827,7 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
           ["expect fail"] => matching_error,
           ["expected_fail_message vector cannot contain metrics with the same labelset"] => matching_error,
           ["expect fail msg:vector cannot contain metrics with the same labelset"] => matching_error,
+          ["expected_fail_regexp (P|p)arameter value is NaN( for topk)?"] => "parameter value is NaN for topk",
           [
             ~S"expected_fail_regexp (multiple matches for labels: many-to-one matching must be explicit|found duplicate series for the match group .* on the left (hand-)?side of the operation)"
           ] => matching_error,

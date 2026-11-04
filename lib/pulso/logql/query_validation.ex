@@ -171,7 +171,12 @@ defmodule Pulso.LogQL.QueryValidation do
        when op in [:bytes_over_time, :bytes_rate, :count_over_time, :rate, :absent_over_time, :approx_count_distinct],
        do: :ok
 
-  defp log_op(_), do: {:error, :invalid_range_aggregation}
+  defp log_op(op) do
+    case unwrap_op(op) do
+      :ok -> {:error, {:missing_unwrap, op}}
+      error -> error
+    end
+  end
 
   defp validate_selector(%AST.Selector{matchers: matchers}) do
     Enum.reduce_while(matchers, :ok, fn m, :ok ->

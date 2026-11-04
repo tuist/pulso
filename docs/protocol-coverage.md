@@ -352,6 +352,16 @@ Raw contexts and issue groups stay unchanged; old absent projections are not
 backfilled. This is not complete TraceId grammar, nil-ID repair or cross-signal
 automatic correlation parity. No native/storage-format or resource-limit change.
 
+Sentry event IDs also accept braced dashed UUIDs and case-insensitive `urn:uuid:`
+prefixes, matching Relay's locked uuid 1.28.0 `test_parse_valid` contract. All
+seventeen literal inputs, including repetitions, replay as 34 store/envelope
+publications with canonical lowercase IDs: direct cold Parquet/S3 reads retain
+all 34 records and MCP retains five unique identities. Separately authored
+controls reject malformed/nested wrappers without provider work and retain
+authentication, envelope-header precedence and strict trace/span-ID grammar.
+This does not execute Relay or establish general event-normalization parity;
+upgrade ingress applications, without changing existing IDs or stored bytes.
+
 PromQL, LogQL and trace predicates share a bounded regex profile accepting
 braced hexadecimal escapes followed by repetition, literal quoting (`\Q...\E`,
 including an omitted terminal `\E`) and Unicode-valued octal escapes. Quoting
@@ -1278,8 +1288,12 @@ hints to unknown, preserving gauges, floats and stored/direct-selector metadata.
 This follows pinned Mimir `operators/subquery.go:89–95`, not a test-producer
 adjustment. Existing work/sample/materialization limits remain authoritative;
 upgrade query applications without rewriting stored data or native formats.
-The complete selected corpus now contains 1798 evaluations in 106 files, replayed
-through 6538 HTTP requests across both adapters. Two unchanged empty-`le`
+The complete selected corpus now contains 1800 evaluations in 107 files, replayed
+through 6544 HTTP requests across both adapters. The original NaN-ranking regex
+and complete eleven-sample successful setup from `ours/aggregators.test`
+retain HTTP 422/`execution` while reporting `parameter value is NaN for topk`.
+Bottom-k/computed-NaN controls preserve sampling/overflow diagnostics and ranking
+arithmetic. Two unchanged empty-`le`
 histogram evaluations retain all fourteen input samples and original warning/
 no-info directives. The test load producer now removes empty-valued labels as
 the pinned upstream TSDB does, while expected output labels stay untouched.
@@ -1364,6 +1378,15 @@ raw-input checks, auth/no-provider, admission/no-provider and fail-whole scan
 controls through native-Parquet/owned-S3. Ranking, integer admission, zero-rank
 policy and native/storage/budget contracts are unchanged. These are source
 substring oracles, not exact upstream HTTP-envelope or Go-suite parity.
+
+The complete `range_aggregations.logqltest:1558–1619` dispersion block retains
+thirteen inputs and twelve evaluations. All ten successful variance/deviation/
+offset oracles already matched. Missing `unwrap` now reports the original
+`invalid aggregation <operation> without unwrap` substrings, still HTTP 400/
+`evaluation_failed`, before storage reads. GET/form POST, raw-input, nested-query,
+validation-precedence, auth/admission and fail-whole scan/work controls retain
+arithmetic, native/storage formats and budgets. Unknown operations keep their
+generic error; supported log observations remain accepted without unwrap.
 
 Loki's complete two-row `Test_SampleExpr_Sort_Fail` at `ast_test.go:219–230`
 now rejects named grouping on `sort`/`sort_desc` before provider work, instead

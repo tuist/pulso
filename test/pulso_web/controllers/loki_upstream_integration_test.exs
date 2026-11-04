@@ -19,6 +19,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
   alias Pulso.LogQL.AST.RangeAgg
   alias Pulso.LogQL.MetricEval
   alias Pulso.LogQL.Parser
+  alias Pulso.LogQL.QueryValidation
   alias Pulso.Loki.FieldType
   alias Pulso.Loki.PushProto
   alias Pulso.Loki.Tail
@@ -8212,6 +8213,170 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
     assert_parquet_read(ctx)
   end
 
+  # Complete range_aggregations.logqltest:1558-1619: all thirteen original
+  # inputs and twelve evaluations. Only the relative epoch translates.
+  @tag :dispersion_unwrap_batch
+  test "complete Loki dispersion block retains values and missing-unwrap diagnostics", ctx do
+    fixture = File.read!("test/fixtures/logs/loki-upstream/range-aggregations-dispersion.logqltest")
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "330973461407db6b7ef06fc9ded0a6cd333efd28cd0ee5ffefc92252172d7691"
+
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    streams = push_dispersion_fixture(ctx)
+
+    for {operation, varied, late} <- [
+          {"stdvar_over_time", "4", "100"},
+          {"stddev_over_time", "2", "10"}
+        ] do
+      query = operation <> ~s/({app="a"} | logfmt | unwrap v [1m])/
+
+      for {time, selected_times, late_points} <- [
+            {60, [60], []},
+            {{40, 60, 20}, [40, 60], []},
+            {{60, 130, 70}, [60], [{130, late}]}
+          ] do
+        expected =
+          Map.new(
+            for {name, value} <- [{"single", "0"}, {"constant", "0"}, {"vary", varied}, {"nan", "NaN"}] do
+              {%{"app" => "a", "c" => name}, for(at <- selected_times, do: {at, value})}
+            end
+          )
+
+        expected = Map.put(expected, %{"app" => "a", "c" => "late"}, late_points)
+        assert_metric(ctx, query, time, expected)
+      end
+
+      offset = operation <> ~s/({app="a"} | logfmt | unwrap v [20s] offset 20s)/
+
+      for time <- [110, {110, 150, 20}] do
+        assert_metric(ctx, offset, time, %{%{"app" => "a", "c" => "late"} => [{110, late}]})
+      end
+    end
+
+    # The instant rows are original; range placements are authored controls.
+    # Collect both complete rejection oracles before asserting substrings.
+    responses =
+      for {query, expected} <- [
+            {~s/stdvar_over_time({app="a"}[1m])/, "invalid aggregation stdvar_over_time without unwrap"},
+            {~s/stddev_over_time({app="a"}[1m])/, "invalid aggregation stddev_over_time without unwrap"}
+          ],
+          {path, bounds} <- [
+            {"/query", [time: to_string(ctx.now + 60 * @second)]},
+            {"/query_range",
+             [start: to_string(ctx.now + 40 * @second), end: to_string(ctx.now + 60 * @second), step: "20"]}
+          ],
+          method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+        response = method.(ctx, path, [query: query] ++ bounds, 400)
+        assert Agent.get(ctx.store, & &1.requests) == before
+        {expected, response}
+      end
+
+    # Authored raw-byte control retains every original input, including noise.
+    for method <- [&request/4, &request_form/4] do
+      response =
+        method.(
+          ctx,
+          "/query_range",
+          [
+            query: ~s/{app=~"a|noise"}/,
+            start: to_string(ctx.now),
+            end: to_string(ctx.now + 131 * @second),
+            direction: "forward",
+            limit: "50"
+          ],
+          200
+        )
+
+      assert Map.new(response["data"]["result"], &{&1["stream"], &1["values"]}) ==
+               Map.new(streams, &{&1["stream"], &1["values"]})
+    end
+
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+
+    for {expected, response} <- responses do
+      assert response["error"] == "evaluation_failed"
+      assert response["message"] =~ expected
+    end
+  end
+
+  @tag :dispersion_unwrap_batch
+  test "missing-unwrap diagnostics preserve admission, fail-whole budgets and neighboring contracts", ctx do
+    ctx = %{ctx | now: (div(ctx.now, @second) - 400) * @second}
+    push_dispersion_fixture(ctx)
+
+    endpoints = [
+      {"/query", [time: to_string(ctx.now + 60 * @second)]},
+      {"/query_range", [start: to_string(ctx.now + 40 * @second), end: to_string(ctx.now + 60 * @second), step: "20"]}
+    ]
+
+    # Authored controls below are not additional upstream source rows.
+    for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+      before = Agent.get(ctx.store, & &1.requests)
+
+      response =
+        method.(%{ctx | token: "wrong-token"}, path, [query: ~s/stdvar_over_time({app="a"}[1m])/] ++ bounds, 401)
+
+      assert response["error"] == "invalid_token"
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    for {module, config, status, error} <- [
+          {Pulso.QueryRunner, [max_per_tenant: 0], 429, "query_overloaded"},
+          {Pulso.QueryRunner, [max_scan_rows: 1], 422, "query_limit"},
+          {Evaluator, [max_work: 1], 422, "query_limit"}
+        ] do
+      original = Runtime.get_env(:pulso, module, [])
+      Runtime.put_env(:pulso, module, Keyword.merge(original, config))
+
+      for {path, bounds} <- endpoints, method <- [&request/4, &request_form/4] do
+        before = Agent.get(ctx.store, & &1.requests)
+
+        response =
+          method.(ctx, path, [query: ~s/stdvar_over_time({app="a"} | logfmt | unwrap v [1m])/] ++ bounds, status)
+
+        assert response["error"] == error
+        refute Map.has_key?(response, "data")
+        if status == 429, do: assert(Agent.get(ctx.store, & &1.requests) == before)
+      end
+
+      Runtime.put_env(:pulso, module, original)
+    end
+
+    for {query, expected} <- [
+          {~s/sum(stdvar_over_time({app="a"}[1m]))/, "invalid aggregation stdvar_over_time without unwrap"},
+          {~s/vector(1) + stddev_over_time({app="a"}[1m])/, "invalid aggregation stddev_over_time without unwrap"},
+          {~s/sum_over_time({app="a"}[1m])/, "invalid aggregation sum_over_time without unwrap"},
+          {~s/rate_counter({app="a"}[1m])/, "invalid aggregation rate_counter without unwrap"},
+          {~s/quantile_over_time({app="a"}[1m])/, ":invalid_range_parameter"},
+          {~s/count_over_time({app="a"}[1m]) by (app)/, ":unsupported_range_grouping"},
+          {~s/bytes_over_time({app="a"} | unwrap v [1m])/, ":invalid_range_aggregation"}
+        ],
+        {path, bounds} <- endpoints,
+        method <- [&request/4, &request_form/4] do
+      before = Agent.get(ctx.store, & &1.requests)
+      response = method.(ctx, path, [query: query] ++ bounds, 400)
+      assert response["error"] == "evaluation_failed"
+      assert response["message"] =~ expected
+      assert Agent.get(ctx.store, & &1.requests) == before
+    end
+
+    # Unknown operations must retain the generic atom, with or without unwrap.
+    for query <- [~s/sum_over_time({app="a"}[1m])/, ~s/sum_over_time({app="a"} | unwrap v [1m])/] do
+      assert {:ok, %RangeAgg{} = ast} = Parser.parse(query)
+      assert {:error, :invalid_range_aggregation} = QueryValidation.validate(%{ast | op: :unknown_range_operation})
+    end
+
+    # Supported log observations remain accepted without unwrap.
+    labels = %{"app" => "a", "c" => "single"}
+    assert_metric(ctx, ~s/count_over_time({app="a",c="single"}[1m])/, 60, %{labels => [{60, "1"}]})
+    assert_metric(ctx, ~s/bytes_over_time({app="a",c="single"}[1m])/, 60, %{labels => [{60, "3"}]})
+    assert_parquet(ctx, 1)
+    assert_parquet_read(ctx)
+  end
+
   # Complete vector_aggregations.logqltest:898-939: eight original schedules,
   # all 378 entries and nine evaluations. Only the relative epoch translates.
   @tag :topk_parameter_batch
@@ -12112,6 +12277,32 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     assert_parquet(ctx, 1)
     rows
+  end
+
+  defp push_dispersion_fixture(ctx) do
+    streams =
+      for {name, observations} <- [
+            {"single", [{30, "v=5"}]},
+            {"constant", [{20, "v=4"}, {30, "v=4"}, {40, "v=4"}]},
+            {"vary", [{20, "v=2"}, {40, "v=6"}]},
+            {"nan", [{20, "v=5"}, {40, "v=NaN"}]},
+            {"late", [{80, "v=10"}, {90, "v=30"}]}
+          ] do
+        %{
+          "stream" => %{"app" => "a", "c" => name},
+          "values" => for({time, line} <- observations, do: [to_string(ctx.now + time * @second), line])
+        }
+      end
+
+    noise = %{
+      "stream" => %{"app" => "noise"},
+      "values" => for(time <- [20, 30, 40], do: [to_string(ctx.now + time * @second), "noise"])
+    }
+
+    streams = streams ++ [noise]
+    assert Enum.sum(Enum.map(streams, &length(&1["values"]))) == 13
+    push_streams(ctx, streams)
+    streams
   end
 
   defp push_topk_parameter_fixture(ctx) do

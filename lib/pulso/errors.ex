@@ -370,6 +370,12 @@ defmodule Pulso.Errors do
 
   defp event_id(nil), do: {:ok, Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)}
 
+  defp event_id(<<"{", value::binary-size(36), "}">>), do: event_id(value)
+
+  defp event_id(<<prefix::binary-size(9), value::binary-size(36)>>) do
+    if String.downcase(prefix) == "urn:uuid:", do: event_id(value), else: {:error, :invalid_event_id}
+  end
+
   defp event_id(value) when is_binary(value) do
     if Regex.match?(
          ~r/\A(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\z/,

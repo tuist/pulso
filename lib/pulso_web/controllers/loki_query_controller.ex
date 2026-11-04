@@ -949,6 +949,9 @@ defmodule PulsoWeb.LokiQueryController do
   defp render_query_error(conn, :invalid_aggregation_parameter),
     do: error_json(conn, :bad_request, "evaluation_failed", "invalid parameter")
 
+  defp render_query_error(conn, {:missing_unwrap, operation}),
+    do: error_json(conn, :bad_request, "evaluation_failed", "invalid aggregation #{operation} without unwrap")
+
   defp render_query_error(conn, :many_to_many_matching) do
     error_json(
       conn,

@@ -631,7 +631,7 @@ quantile repair uses the upstream strict tolerance, minimum-normal absolute
 floor and maximum-float-capped relative scale; large finite counts no longer
 fail arithmetic and subnormals normalize correctly. Six public HTTP controls
 and 10,030 actual pinned Go quantile/repair comparisons cover the extremes.
-Selected Mimir engine corpus is now 1798 evaluations/106 files/6538 memory/S3 HTTP
+Selected Mimir engine corpus is now 1800 evaluations/107 files/6544 memory/S3 HTTP
 requests. Two unchanged histogram-subquery evaluations retain twelve samples
 and one explicit reset hint. Subqueries clear only explicit reset/no-reset hints
 on resampled points, preserving gauges/floats and direct selectors; repeated or

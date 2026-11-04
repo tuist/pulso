@@ -773,6 +773,10 @@ defmodule Pulso.PromQL.Operations do
 
   defp value_text(value), do: Number.format(value, :fixed)
 
+  defp topk_step(op, _grouping, :nan, _vector) when op in ["topk", "bottomk"] do
+    throw({:promql_error, {:invalid_ranking_parameter, op, :nan}})
+  end
+
   defp topk_step(op, grouping, k, vector) do
     k = rank_count(k)
 

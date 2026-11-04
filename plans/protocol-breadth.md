@@ -579,6 +579,38 @@ overlapping focused runs. Warnings-as-errors compilation, strict Credo across
 `.amp/in/artifacts/four-surfaces-sixteenth-{compile-final,http-final,shared-final,credo-final}.log`.
 All work remains local and uncommitted; this is not the complete repository suite.
 
+The nineteenth pass follows the full-suite-verified main push of the accumulated
+eighteen batches. It closes three independently reproduced public gaps:
+
+- Sentry EventId uses Relay's locked uuid 1.28.0 parser contract: all seventeen
+  literal `test_parse_valid` calls, including repeats, replay through store and
+  envelope. Braced/URN forms formerly rejected with `invalid_event_id`; they now
+  normalize to lowercase hex, with all 34 raw records and five unique cold MCP
+  identities retained. Authored malformed/nested-wrapper and auth controls make
+  no provider requests, and envelope-header precedence stays intact. The crate
+  archive SHA-256 matches Relay's lock:
+  `7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606`.
+  Correlation-field grammar, existing IDs, stored bytes and budgets do not change.
+- Mimir's original `ours/aggregators.test:411–420,605–609` keeps all eleven samples,
+  successful ranking and the original NaN regex. Only topk/bottomk NaN errors gain
+  operation-specific diagnostics; HTTP 422/execution, sampling, overflow and rank
+  policies remain. The fixture adds two evaluations, one file, six fixture HTTP
+  requests and two wrappers: current corpus 1800/107/6544/214. Four separate
+  asymmetric authored wrappers add 28 requests, not upstream evaluations.
+- Loki's complete `range_aggregations.logqltest:1558–1619` retains thirteen inputs
+  and twelve evaluations. All ten numeric/offset oracles already matched; only
+  two missing-unwrap diagnostics failed. Validation reuses supported unwrap
+  operations to retain their names, preserving HTTP 400/evaluation_failed and
+  parameter/grouping precedence. Native/arithmetic/storage/budgets stay unchanged.
+
+Tempo's complete grouped attribute-average case at
+`engine_metrics_test.go:2552–2629` matched unchanged: all sixteen zero-duration
+spans across two retained sources yield bar `[260,200,100]` and baz only final
+`300`. It warrants neither a correction nor a fixture import. These are Pulso
+public-interface replays against source contracts, not execution of upstream
+servers or deployed-provider/client acceptance. The nineteenth pass remains
+local and uncommitted; its delivery is separate from the preceding main push.
+
 ## Full-surface acceptance gate
 
 The requested target is now every public surface and error contract before a
@@ -806,9 +838,9 @@ not from regenerating answers with Pulso.
 | Tempo | [Selected service entry points plus public engine rows](../test/fixtures/traces/tempo_integration/README.md): discovery/special-character batches, basic search, V2 filtering, metric/step/cardinality selections and all ten original rich traces from `TestTraceByIDandTraceQL` for exact-ID retrieval. Multi-root search failures are explicitly separate incompatibility controls | `test/pulso_web/controllers/tempo_upstream_integration_test.exs`; independent native/reference/MCP replay in `search_expression_test.exs` |
 
 The separate [Mimir query-engine corpus](../test/fixtures/promql/mimir/README.md)
-now replays 1798 verbatim math, range-function, label, calendar, scalar-context,
+now replays 1800 verbatim math, range-function, label, calendar, scalar-context,
 operator, histogram, aggregation, time-modifier, sampling and duration-expression
-evaluations through 212 memory/S3 HTTP fixture checks (6538 requests), plus
+evaluations through 214 memory/S3 HTTP fixture checks (6544 requests), plus
 separately labelled local controls.
 Two empty-`le` histogram evaluations from complete active `ours/histograms.test`
 cases at lines 149–186 preserve both clears, seven samples per load, classic/
