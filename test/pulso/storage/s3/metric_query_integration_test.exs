@@ -123,9 +123,13 @@ defmodule Pulso.Storage.S3.MetricQueryIntegrationTest do
     assert {:ok, found} = S3.query(:metrics, tenant, max_records: 4)
     assert length(found) == 4
 
-    for budget <- [[max_scan_segments: 1], [max_scan_bytes: 1], [max_scan_rows: 3]] do
+    for budget <- [[max_scan_segments: 1], [max_scan_bytes: 1]] do
       assert {:error, :query_scan_limit} = S3.query(:metrics, tenant, [{:matchers, [{"job", :re, "absent"}]} | budget])
     end
+
+    # The rows budget counts matched rows: none here, four without matchers.
+    assert {:ok, []} = S3.query(:metrics, tenant, matchers: [{"job", :re, "absent"}], max_scan_rows: 3)
+    assert {:error, :query_scan_limit} = S3.query(:metrics, tenant, max_scan_rows: 3)
 
     assert {:error, :query_timeout} = S3.query(:metrics, tenant, deadline_ms: System.monotonic_time(:millisecond) - 1)
   end

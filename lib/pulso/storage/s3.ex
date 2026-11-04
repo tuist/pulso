@@ -575,7 +575,7 @@ defmodule Pulso.Storage.S3 do
          :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, wanted} <- selector_candidates(manifest, selectors, opts, tenant, config),
          union = wanted |> Enum.flat_map(&elem(&1, 1)) |> Enum.uniq_by(& &1.key) |> Enum.sort_by(& &1.max_ts, :desc),
-         :ok <- check_scan_budget(union, opts) do
+         :ok <- check_scan_budget(:metrics, union, opts) do
       scan_selector_segments(union, wanted, config, opts)
     end
     |> case do
@@ -686,19 +686,16 @@ defmodule Pulso.Storage.S3 do
   defp visit_selector_segment({segment, index}, {:ok, state}, fetched, {needs, selectors, config, opts}) do
     ctx = %{opts: opts}
 
-    with :ok <- check_visited_budget(index + 1, state.rows + (segment.row_count || 0), ctx),
+    with :ok <- check_visited_budget(index + 1, state.rows, ctx),
          :ok <- check_read_bytes(state.bytes + (segment.byte_size || 0), opts),
          :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, blob} <- fetched || read_segment(%{config: config, opts: opts, signal: :metrics}, segment.key, state),
          :ok <- check_deadline(opts[:deadline_ms]),
          bytes = state.bytes + byte_size(blob),
          :ok <- check_read_bytes(bytes, opts),
-         # Charge the footer's actual rows: a manifest can undercount them.
-         {:ok, actual} <- native_result(NIF.metric_segment_parquet_row_count(blob)),
-         rows = state.rows + actual,
-         :ok <- check_visited_budget(index + 1, rows, ctx),
-         state = %{state | bytes: bytes, rows: rows, segments: index + 1},
-         {:ok, state} <- decode_for_selectors(blob, Map.fetch!(needs, segment.key), selectors, opts, state) do
+         state = %{state | bytes: bytes, segments: index + 1},
+         {:ok, decoded} <- decode_for_selectors(blob, Map.fetch!(needs, segment.key), selectors, opts, state),
+         {:ok, state} <- charge_matched_rows(decoded, decoded.count - state.count, opts) do
       {:cont, {:ok, state}}
     else
       {:error, :not_found} ->
@@ -708,6 +705,17 @@ defmodule Pulso.Storage.S3 do
       {:error, _} = error ->
         {:halt, error}
     end
+  end
+
+  # Rows of other series in the same segment are skipped natively by their
+  # dictionary-encoded labels; the bytes and segments budgets bound reading
+  # them. The rows budget counts the rows a selector matched and decoded.
+  defp charge_matched_rows(state, matched, opts) do
+    rows = state.rows + matched
+
+    if exceeds_budget?(rows, opts[:max_scan_rows]),
+      do: QueryLimit.exceeded(:max_scan_rows, opts[:max_scan_rows], rows, :visited),
+      else: {:ok, %{state | rows: rows}}
   end
 
   defp decode_for_selectors(blob, indexes, selectors, opts, state) do
@@ -1073,7 +1081,14 @@ defmodule Pulso.Storage.S3 do
     if opts[:log_window], do: :ok, else: check_scan_budget(segments, opts)
   end
 
-  defp check_scan_budget(_signal, segments, opts), do: check_scan_budget(segments, opts)
+  # Metric sample reads charge max_scan_rows with the rows their selectors
+  # match, known only once decoded (see charge_matched_rows/3). Discovery
+  # keeps every stored row it reads.
+  defp check_scan_budget(:metrics, segments, opts) do
+    if opts[:metric_discovery],
+      do: check_scan_budget(segments, opts),
+      else: check_scan_budget(segments, Keyword.delete(opts, :max_scan_rows))
+  end
 
   defp limited_span_query?(opts),
     do:
@@ -1703,7 +1718,7 @@ defmodule Pulso.Storage.S3 do
   defp finish_scan({:error, _} = error, _native, _limit, _trace_id), do: error
 
   defp visit_segment({segment, index}, {:ok, state}, ctx, fetched \\ nil) do
-    with :ok <- check_visited_budget(index + 1, state.rows + (segment.row_count || 0), ctx),
+    with :ok <- check_visited_budget(index + 1, state.rows + stored_rows(ctx, segment), ctx),
          :ok <- check_read_bytes(state.bytes + (segment.byte_size || 0), ctx.opts),
          :ok <- check_deadline(ctx.opts[:deadline_ms]),
          {:ok, blob} <- fetched || read_segment(ctx, segment.key, state),
@@ -1740,6 +1755,9 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
+  defp stored_rows(%{signal: :metrics, metric_discovery?: false}, _segment), do: 0
+  defp stored_rows(_ctx, segment), do: segment.row_count || 0
+
   defp scan_bytes(%MetricFooterReader{charge: cost}), do: cost
   defp scan_bytes(blob), do: byte_size(blob)
 
@@ -1748,10 +1766,14 @@ defmodule Pulso.Storage.S3 do
          key,
          state
        ) do
+    # The query's rows budget counts matched rows (charged after decoding), so
+    # only the reader's own per-source footer row ceiling applies here.
+    opts = Keyword.delete(ctx.opts, :max_scan_rows)
+
     opts =
-      Enum.reduce([max_scan_bytes: state.bytes, max_scan_rows: state.rows], ctx.opts, fn {key, used}, opts ->
-        if is_integer(opts[key]), do: Keyword.put(opts, key, opts[key] - used), else: opts
-      end)
+      if is_integer(opts[:max_scan_bytes]),
+        do: Keyword.put(opts, :max_scan_bytes, opts[:max_scan_bytes] - state.bytes),
+        else: opts
 
     MetricFooterReader.read(ctx.config, key, ctx.start_ts, ctx.end_ts, ctx.opts[:matchers] || [], opts)
   end
@@ -1797,7 +1819,7 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp scan_row_count(_ctx, _segment, %MetricFooterReader{rows: rows}), do: {:ok, rows}
+  defp scan_row_count(%{signal: :metrics, metric_discovery?: false}, _segment, _blob), do: {:ok, 0}
 
   defp scan_row_count(%{signal: :traces} = ctx, segment, blob) do
     # Whole-trace assembly and grouping cannot trust an undercounted manifest.
@@ -1928,11 +1950,12 @@ defmodule Pulso.Storage.S3 do
     opts = remaining_budget(ctx.opts, %{max_records: state.count, max_decoded_bytes: state.decoded_bytes})
 
     with {:ok, batch, decoded_bytes} <- decode_batch(ctx.signal, blob, trace_start_floor(state, ctx), ctx.end_ts, opts),
+         {:ok, %{rows: rows}} <- matched_rows(ctx.signal, state, batch, ctx.opts),
          {:ok, batches} <- retain_batches(ctx.signal, [batch | state.batches], ctx.limit) do
       new_state = %{
         bytes: state.bytes,
         decoded_bytes: state.decoded_bytes + decoded_bytes,
-        rows: state.rows,
+        rows: rows,
         batches: batches,
         count: state.count + length(batch),
         top: top_timestamps(state.top, batch, ctx.limit)
@@ -1945,6 +1968,9 @@ defmodule Pulso.Storage.S3 do
       {:error, _} = err -> {:halt, err}
     end
   end
+
+  defp matched_rows(:metrics, state, batch, opts), do: charge_matched_rows(state, length(batch), opts)
+  defp matched_rows(_signal, state, _batch, _opts), do: {:ok, state}
 
   defp trace_start_floor(state, %{signal: :traces, limit: limit, start_ts: start_ts})
        when is_integer(limit) and limit > 0 and state.count >= limit do

@@ -274,6 +274,32 @@ defmodule Pulso.PromQL.EvaluatorTest do
     end
   end
 
+  test "result points count only the returned points; intermediates bound the points held at once" do
+    # Ten counters c_i = i * t, so each rate is i/s and their sum is 55.
+    for i <- 1..10, do: append("c", Enum.map(0..9, &{&1 * 10, &1 * 10 * i}), %{"i" => "#{i}"})
+    opts = %{start_ts_ns: 30_000_000_000, end_ts_ns: 90_000_000_000, step_ns: 10_000_000_000}
+
+    # rate() holds 10 series x 7 steps = 70 points; sum() returns 7 of them.
+    # Counting every point produced would need 77, and counting intermediates
+    # as results 70.
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 70)
+    assert {:ok, result} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
+    assert [%{"values" => values}] = result["data"]["result"]
+    assert Enum.map(values, &List.last/1) == List.duplicate("55", 7)
+
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 6, max_materialized_samples: 70)
+    assert {:error, :query_result_limit} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
+
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 69)
+    assert {:error, :query_intermediate_limit} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
+
+    # Both operands of a binary operation are held at once: 70 + 70.
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 70, max_materialized_samples: 139)
+    assert {:error, :query_intermediate_limit} = Evaluator.query("rate(c[30s]) + rate(c[20s])", "acme", opts)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 70, max_materialized_samples: 140)
+    assert {:ok, _} = Evaluator.query("rate(c[30s]) + rate(c[20s])", "acme", opts)
+  end
+
   test "sample, work, and result limits return errors instead of partial aggregates" do
     append("gauge", [{10, 1}, {20, 2}, {30, 3}])
     Pulso.Runtime.put_env(:pulso, Evaluator, max_samples: 2)

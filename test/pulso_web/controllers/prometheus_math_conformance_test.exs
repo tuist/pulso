@@ -401,8 +401,9 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
         assert [%{"value" => [2.0, "0"]}] = results["subquery"]["data"]["result"]
       end
 
-      # Five inner points fit once, but two sources share the materialization cap.
-      Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 5)
+      # Five inner points and the one-point result they produce fit once, but
+      # two sources share the cap: the first result stays held for the batch.
+      Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 6)
       assert {:ok, _} = Evaluator.query_batch([subquery], "subquery-budget", fn result, _ -> {:ok, result} end)
 
       assert {:error, :query_intermediate_limit} =
@@ -3352,7 +3353,8 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
       assert :ok = Storage.append(:metrics, "aggregate-cost", samples)
       queries = ["stddev(cost)", "stdvar(cost)", "quantile(0.25,cost)", ~s|count_values("v",cost)|]
 
-      for query <- queries, limits <- [[max_samples: 1], [max_work: 1], [max_result_points: 1]] do
+      # The selector holds eight points; most results are one.
+      for query <- queries, limits <- [[max_samples: 1], [max_work: 1], [max_materialized_samples: 7]] do
         Runtime.put_env(:pulso, Evaluator, limits)
 
         conn =

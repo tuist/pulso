@@ -161,10 +161,11 @@ defmodule PulsoWeb.AlertingControllerTest do
            })
            |> json_response(200)
 
-    Pulso.Runtime.put_env(:pulso, Pulso.PromQL.Evaluator, max_result_points: 1)
+    # Each operand of vector(1)+vector(2) holds one point; the result is one.
+    Pulso.Runtime.put_env(:pulso, Pulso.PromQL.Evaluator, max_materialized_samples: 1)
 
     assert request(:post, "/api/v1/alerting/rules/bounded/preview") |> json_response(422) == %{
-             "error" => "query_result_limit"
+             "error" => "query_intermediate_limit"
            }
 
     Pulso.Runtime.put_env(:pulso, Pulso.PromQL.Evaluator, [])

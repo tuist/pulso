@@ -888,7 +888,6 @@ defmodule Pulso.PromQL.Operations do
 
     # Preserve operation ordering for instant topk/sort results.
     order = rows |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
-    Evaluator.charge(:points, length(rows))
     groups = Enum.group_by(rows, &elem(&1, 0), &elem(&1, 1))
     Enum.map(order, &{&1, Map.fetch!(groups, &1)})
   end

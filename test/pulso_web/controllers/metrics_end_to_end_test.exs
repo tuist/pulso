@@ -355,6 +355,45 @@ defmodule PulsoWeb.MetricsEndToEndTest do
     assert Req.get!(ctx.url <> "/api/v1/labels", headers: headers(ctx)).status == 422
   end
 
+  test "PromQL charges the scan-row budget with the rows its selectors match, not whole segments", ctx do
+    # Each remote-write-like batch holds one sample of a small metric among
+    # many rows of another, so every segment is a candidate for both.
+    for batch <- 1..4 do
+      ts = batch * 15_000_000_000
+      wanted = %MetricSample{timestamp_ns: ts, value: batch * 1.0, labels: %{"__name__" => "wanted"}}
+
+      noise =
+        for i <- 1..499,
+            do: %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => "noise", "i" => "#{i}"}}
+
+      assert :ok = Storage.append(:metrics, ctx.tenant, [wanted | noise])
+    end
+
+    # 2,000 stored rows in candidate segments, four of them matched.
+    Runtime.put_env(:pulso, Evaluator, max_scan_rows: 1000)
+    opts = %{start_ts_ns: 15_000_000_000, end_ts_ns: 60_000_000_000, step_ns: 15_000_000_000}
+
+    # One selector (footer-first reads) and two selectors (one shared pass).
+    for query <- ["wanted", "wanted unless on () absent_metric"] do
+      assert {:ok, result} = Evaluator.query(query, ctx.tenant, opts)
+      assert [%{"values" => values}] = result["data"]["result"]
+      assert Enum.map(values, &List.last/1) == ["1", "2", "3", "4"]
+    end
+
+    # Matched rows still bind: this selector matches 1,996 rows.
+    for query <- ["count(noise)", "count(noise unless on () absent_metric)"] do
+      response =
+        Req.get!(ctx.url <> "/api/v1/query_range",
+          headers: headers(ctx),
+          params: [query: query, start: "15", end: "60", step: "15"]
+        )
+
+      assert response.status == 422
+      assert %{"limit" => "max_scan_rows", "value" => 1000, "observed" => observed} = response.body["limit"]
+      assert observed in 1001..1996
+    end
+  end
+
   test "a conflicting existing object is permanent HTTP409 and is never overwritten or republished", ctx do
     headers = headers(ctx) ++ [{"content-type", "application/x-protobuf"}, {"idempotency-key", "conflict"}]
     assert Req.post!(ctx.url <> "/v1/metrics", headers: headers, body: Fixture.protobuf(), retry: false).status == 200

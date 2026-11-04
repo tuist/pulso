@@ -2806,13 +2806,19 @@ Out-of-order samples are sorted before evaluation. This is deterministic query
 resolution, not ingest-time duplicate rejection.
 
 Selected-sample and evaluation-work budgets cover all selectors and operations
-in one expression. Binary/function intermediate output points also share a
-bounded budget. Subqueries additionally share an independent materialized-sample
-budget (100,000 by default); exhaustion returns `query_intermediate_limit`, not
-an output-size error. Every outer query and inner subquery grid caps at 11,000
+in one expression. The result-point budget counts only the points a query
+returns. Intermediate results (selector, function, subquery and operator
+outputs) are bounded by the materialized-sample budget (250,000 by default),
+which, like Prometheus's `query.max-samples`, counts the points held at once:
+a result is released when the operation that consumes it finishes, so both
+operands of a binary operation count together, but a `rate` and the `sum` over
+it do not. Exhaustion returns `query_intermediate_limit`, not an output-size
+error. Every outer query and inner subquery grid caps at 11,000
 steps, independently of its series count. Nested subqueries share the sample,
 work, materialized, deadline and heap ceilings. These can reject a supported
 expression at a wide window or high cardinality; they never clip its answer.
 Expressions have at most 256 nodes and 64 levels of AST depth.
-Object scan budgets still apply independently to each selector; indexed scans
-and aggregate object-byte accounting remain follow-up work.
+All selectors of a query share one scan of their candidate segments. The
+scan-row budget counts the rows the selectors match in the time range, not
+the other series stored in the same segments; the segment and byte budgets
+bound those reads.

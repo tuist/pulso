@@ -50,7 +50,12 @@ PromQL plans every selector's storage request before evaluation and loads them
 through `Storage.query_metric_selectors/3`: S3 reads each candidate segment once
 per query, decodes it per selector and folds rows into per-series points, so
 scan budgets charge distinct segments (`PULSO_QUERY_MAX_SCAN_SEGMENTS`, default
-1024) and alert batches split budgets per source, not per selector. The query
+1024) and alert batches split budgets per source, not per selector. Metric
+sample scans charge `max_scan_rows` with rows selectors match after decoding
+(no row preflight; discovery still charges footer rows). `max_result_points`
+counts only returned points; intermediates count the points held at once
+against `max_materialized_samples` (default 250,000, `query.max-samples`-like:
+each node's result until its parent returns). The query
 runner answers at the deadline without waiting for a stuck worker, and limit
 errors name the limit and value (`Pulso.QueryLimit`, MCP
 `query_execution_limit: ...`, HTTP `limit`). Long ranges need metrics

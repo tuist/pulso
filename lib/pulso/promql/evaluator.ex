@@ -329,7 +329,7 @@ defmodule Pulso.PromQL.Evaluator do
       log_samples: Keyword.get(config, :max_log_samples, 5_000_000),
       work: Keyword.get(config, :max_work, 5_000_000),
       points: Keyword.get(config, :max_result_points, 100_000),
-      materialized: Keyword.get(config, :max_materialized_samples, 100_000),
+      materialized: Keyword.get(config, :max_materialized_samples, 250_000),
       segments: Keyword.get(config, :max_scan_segments, QueryRunner.max_scan_segments()),
       bytes: Keyword.get(config, :max_scan_bytes, 134_217_728),
       rows: Keyword.get(config, :max_scan_rows, 1_000_000)
@@ -372,10 +372,38 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp range_steps(_, _, _), do: {:error, :invalid_range_or_too_many_steps}
 
-  defp evaluate({:scalar, value}, _tenant, steps), do: {:ok, [{%{}, Enum.map(steps, &{&1, value})}], []}
-  defp evaluate({:string, _} = string, _tenant, _steps), do: {:ok, string, []}
+  # Every operation's result is held until its parent has consumed it, so
+  # the points held at once are those of the results still waiting for a
+  # parent. Like Prometheus's query.max-samples this bounds that peak, not
+  # the total ever produced, against max_materialized_samples. Points the
+  # query returns are bounded separately by max_result_points. Literal
+  # parameters such as quantiles and label names are not counted.
+  defp evaluate(expr, tenant, steps) when elem(expr, 0) in [:scalar, :string], do: evaluate_node(expr, tenant, steps)
 
-  defp evaluate({:unary, op, inner}, tenant, steps) do
+  defp evaluate(expr, tenant, steps) do
+    held = Map.get(Process.get(:promql_budget), :held, 0)
+
+    with {:ok, value, warnings} <- evaluate_node(expr, tenant, steps) do
+      hold(held + held_points(value))
+      {:ok, value, warnings}
+    end
+  end
+
+  defp held_points(series), do: Enum.reduce(series, 0, fn {_, values}, total -> total + length(values) end)
+
+  defp hold(points) do
+    maximum = limits().materialized
+
+    if points > maximum,
+      do: throw_limit(:query_intermediate_limit, :max_materialized_samples, maximum, points)
+
+    Process.put(:promql_budget, Map.put(Process.get(:promql_budget), :held, points))
+  end
+
+  defp evaluate_node({:scalar, value}, _tenant, steps), do: {:ok, [{%{}, Enum.map(steps, &{&1, value})}], []}
+  defp evaluate_node({:string, _} = string, _tenant, _steps), do: {:ok, string, []}
+
+  defp evaluate_node({:unary, op, inner}, tenant, steps) do
     with {:ok, series, warnings} <- evaluate(inner, tenant, steps) do
       result =
         Enum.map(series, fn {labels, samples} ->
@@ -387,22 +415,22 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:binary, op, modifiers, left, right}, tenant, steps) do
+  defp evaluate_node({:binary, op, modifiers, left, right}, tenant, steps) do
     with {:ok, lhs, lw} <- evaluate(left, tenant, steps), {:ok, rhs, rw} <- evaluate(right, tenant, steps) do
       {:ok, Operations.binary(op, modifiers, lhs, rhs, Parser.type(left), Parser.type(right), steps), lw ++ rw}
     end
   end
 
-  defp evaluate({:call, "timestamp", [{:selector, matchers, offset}]}, tenant, steps),
+  defp evaluate_node({:call, "timestamp", [{:selector, matchers, offset}]}, tenant, steps),
     do: select(tenant, matchers, offset, Process.get(:promql_lookback_ns), steps, :timestamp)
 
-  defp evaluate({:call, "absent", [inner]}, tenant, steps) do
+  defp evaluate_node({:call, "absent", [inner]}, tenant, steps) do
     with {:ok, vector, warnings} <- evaluate(inner, tenant, steps) do
       {:ok, Operations.absent(vector, absent_labels(inner), steps), warnings}
     end
   end
 
-  defp evaluate({:call, "predict_linear", [range, parameter]}, tenant, steps) do
+  defp evaluate_node({:call, "predict_linear", [range, parameter]}, tenant, steps) do
     offset = elem(range, tuple_size(range) - 1)
 
     with {:ok, [{_, values}], warnings} <- evaluate(parameter, tenant, steps),
@@ -412,7 +440,7 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:call, "quantile_over_time", [parameter, range]}, tenant, steps) do
+  defp evaluate_node({:call, "quantile_over_time", [parameter, range]}, tenant, steps) do
     offset = elem(range, tuple_size(range) - 1)
 
     with {:ok, [{_, values}], warnings} <- evaluate(parameter, tenant, steps),
@@ -422,7 +450,7 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:call, name, [range, smoothing, trend]}, tenant, steps)
+  defp evaluate_node({:call, name, [range, smoothing, trend]}, tenant, steps)
        when name in ["double_exponential_smoothing", "holt_winters"] do
     offset = elem(range, tuple_size(range) - 1)
 
@@ -435,10 +463,10 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:call, name, [range]}, tenant, steps) when is_map_key(@range_functions, name),
-    do: evaluate({:function, Map.fetch!(@range_functions, name), range}, tenant, steps)
+  defp evaluate_node({:call, name, [range]}, tenant, steps) when is_map_key(@range_functions, name),
+    do: evaluate_node({:function, Map.fetch!(@range_functions, name), range}, tenant, steps)
 
-  defp evaluate({:call, name, args}, tenant, steps)
+  defp evaluate_node({:call, name, args}, tenant, steps)
        when name in ["sort", "sort_desc", "sort_by_label", "sort_by_label_desc"] do
     with {:ok, [vector | _] = values, warnings} <- evaluate_args(args, tenant, steps) do
       if Process.get(:promql_range_sort_warning) do
@@ -461,20 +489,20 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:call, name, args}, tenant, steps) do
+  defp evaluate_node({:call, name, args}, tenant, steps) do
     with {:ok, values, warnings} <- evaluate_args(args, tenant, steps) do
       {:ok, Operations.call(name, values, steps), warnings}
     end
   end
 
-  defp evaluate({:parameter_aggregate, op, grouping, parameter, inner}, tenant, steps) do
+  defp evaluate_node({:parameter_aggregate, op, grouping, parameter, inner}, tenant, steps) do
     with {:ok, k, kw} <- evaluate(parameter, tenant, steps),
          {:ok, vector, warnings} <- evaluate(inner, tenant, steps) do
       {:ok, Operations.parameter_aggregate(op, grouping, k, vector, steps), kw ++ warnings}
     end
   end
 
-  defp evaluate({:aggregate, op, grouping, inner}, tenant, steps) do
+  defp evaluate_node({:aggregate, op, grouping, inner}, tenant, steps) do
     with {:ok, series, warnings} <- evaluate(inner, tenant, steps) do
       grouped =
         for {labels, samples} <- series,
@@ -494,14 +522,14 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:selector, matchers, offset}, tenant, steps) do
+  defp evaluate_node({:selector, matchers, offset}, tenant, steps) do
     select(tenant, matchers, offset, Process.get(:promql_lookback_ns), steps, :latest)
   end
 
-  defp evaluate(expr, tenant, steps) when elem(expr, 0) in [:range, :subquery],
+  defp evaluate_node(expr, tenant, steps) when elem(expr, 0) in [:range, :subquery],
     do: evaluate_range(expr, tenant, steps, :raw_range)
 
-  defp evaluate({:function, :absent_over_time, inner}, tenant, steps) do
+  defp evaluate_node({:function, :absent_over_time, inner}, tenant, steps) do
     # Presence must retain source identities: removing metric names can make
     # distinct selected metrics collide before we test whether any exists.
     with {:ok, vector, warnings} <- evaluate_range(inner, tenant, steps, :last_over_time) do
@@ -509,7 +537,7 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate({:function, op, range}, tenant, steps), do: evaluate_range(range, tenant, steps, op)
+  defp evaluate_node({:function, op, range}, tenant, steps), do: evaluate_range(range, tenant, steps, op)
 
   defp evaluate_range({:range, matchers, window, offset}, tenant, steps, op),
     do: select(tenant, matchers, offset, window, steps, op)
@@ -533,9 +561,8 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp subquery_groups(inner, tenant, inner_steps, {steps, offset, window, op}) do
     with {:ok, series, warnings} <- evaluate(inner, tenant, inner_steps) do
-      count = Enum.sum(Enum.map(series, fn {_, points} -> length(points) end))
-      charge(:work, count)
-      charge(:materialized, count)
+      # The inner result is already held under max_materialized_samples.
+      charge(:work, Enum.sum(Enum.map(series, fn {_, points} -> length(points) end)))
 
       groups =
         Enum.map(series, fn {labels, points} ->
@@ -783,8 +810,14 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
+  # The points produced here are an intermediate result, held under
+  # max_materialized_samples while they wait for their parent (see
+  # evaluate/3). Charge them as they grow so one selector cannot build an
+  # unbounded result before its parent sees it.
   defp evaluate_groups(groups, steps, offset, window, op, limits) do
-    Enum.reduce_while(groups, {:ok, [], 0, 0}, fn group, acc ->
+    held = Map.get(Process.get(:promql_budget), :held, 0)
+
+    Enum.reduce_while(groups, {:ok, [], 0, held}, fn group, acc ->
       evaluate_group(group, acc, steps, offset, window, op, limits)
     end)
     |> case do
@@ -797,17 +830,17 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate_group(group, {:ok, result, work, points}, steps, offset, window, op, limits) do
+  defp evaluate_group(group, {:ok, result, work, held}, steps, offset, window, op, limits) do
     check_deadline()
 
     case evaluate_series(group, steps, offset, window, op, work, limits.work) do
-      {:ok, {labels, values}, work} when points + length(values) <= limits.points ->
+      {:ok, {labels, values}, work} when held + length(values) <= limits.materialized ->
         result = if values == [], do: result, else: [{labels, values} | result]
-        {:cont, {:ok, result, work, points + length(values)}}
+        {:cont, {:ok, result, work, held + length(values)}}
 
       {:ok, {_, values}, _} ->
-        QueryLimit.record(:max_result_points, limits.points, points + length(values))
-        {:halt, {:error, :query_result_limit}}
+        QueryLimit.record(:max_materialized_samples, limits.materialized, held + length(values))
+        {:halt, {:error, :query_intermediate_limit}}
 
       error ->
         {:halt, error}

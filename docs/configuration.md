@@ -593,8 +593,9 @@ manifest pages at a time.
 ## Long dashboard and alert ranges
 
 Compacted segments hold all series of their hour, so a query over a window
-reads every stored row of that window, whatever its matchers. The row budget,
-not the segment budget, then decides how long a range can be. Measured with
+downloads every stored row of that window, whatever its matchers, and skips
+the series it does not select. The byte and segment budgets bound that
+reading; the row budget counts only the rows the selectors match. Measured with
 `test/pulso/promql/query_scale_bench_test.exs` on 3,000 series scraped every
 15 s (720,000 rows an hour), 18 ms per object GET and four segments of
 prefetch on one node:
@@ -616,9 +617,11 @@ To serve 1-hour to 24-hour dashboards and 1-hour to 7-day alert windows:
 
 1. Turn on bucket versioning, then enable metrics compaction
    (`metricsCompaction.enabled: true`), after every writer runs the same release.
-2. Raise the scan budgets to cover the longest window: rows an hour times hours
-   (17 million rows for a day and 121 million for a week at the rate above) and
-   segments an hour times hours (about 10 an hour once compacted). A query
+2. Raise the scan budgets to cover the longest window: bytes and segments an
+   hour times hours (about 10 segments an hour once compacted), and rows the
+   broadest selector matches an hour times hours (up to 17 million rows for a
+   day and 121 million for a week at the rate above, when one selector matches
+   every series). A query
    over a budget reports what it needed, for example `max_scan_rows = 1000000,
    needed 17352000`, which sizes the budget for your own ingest rate.
 3. Raise `PULSO_QUERY_MAX_SAMPLES`, `PULSO_QUERY_MAX_RESULT_POINTS`,
@@ -698,10 +701,10 @@ these variables (through `extraEnv` in the Helm chart):
 | `PULSO_QUERY_MAX_SAMPLES` | `100000` | Samples a PromQL query may select. |
 | `PULSO_QUERY_MAX_LOG_SAMPLES` | `5000000` | Per-line samples a LogQL metric query may retain (one per line its pipeline keeps). |
 | `PULSO_QUERY_MAX_WORK` | `5000000` | Evaluation work units per query. |
-| `PULSO_QUERY_MAX_RESULT_POINTS` | `100000` | Points a PromQL query may return, also the points each selector's intermediate series may hold: a range of 721 steps fits about 138 series. |
-| `PULSO_QUERY_MAX_MATERIALIZED_SAMPLES` | `100000` | Points PromQL subqueries may materialize per query. |
+| `PULSO_QUERY_MAX_RESULT_POINTS` | `100000` | Points a PromQL query may return: a range of 721 steps fits about 138 result series. Intermediate results, such as the per-series `rate` under a `sum`, do not count here. |
+| `PULSO_QUERY_MAX_MATERIALIZED_SAMPLES` | `250000` | Points a PromQL query may hold in intermediate results at once, like Prometheus's `query.max-samples`: the outputs of selectors, functions, subqueries and operators that are still waiting for the operation that consumes them. A result is released once its parent has been computed, so `histogram_quantile(0.99, sum by (le) (rate(x[5m])))` holds the `rate` output, not the sum of every stage. Each held point takes about 75 bytes of query heap, plus transient copies while an operation runs. LogQL metric queries count retained series and distinct values against the same value. |
 | `PULSO_QUERY_MAX_SCAN_SEGMENTS` | `1024` | Stored segment objects a query may read, `1..1000000`. Every segment costs one object GET, so this mostly bounds query latency. A PromQL query reads each candidate segment once, however many selectors need it, and charges this budget once per segment. |
-| `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read, counted from each segment's footer, including rows its matchers then discard. |
+| `PULSO_QUERY_MAX_SCAN_ROWS` | `1000000` | Stored rows a query may read. PromQL and other metric sample queries count the rows their selectors match in the time range: rows of other series in the same segment are skipped by their labels without being decoded into samples, and the segment and byte budgets bound reading them. Log, trace and metric discovery queries count every row of each segment they read, from its footer. |
 | `PULSO_QUERY_MAX_SCAN_BYTES` | `134217728` | Stored bytes a query may read. |
 | `PULSO_QUERY_TIMEOUT_MS` | `10000` | Wall-clock limit for one query, including object-store reads (1000 to 300000). Queries past it fail with a timeout. Keep it below the client's own timeout (Grafana's datasource default is 30 s). |
 | `PULSO_QUERY_MAX_CONCURRENT` | derived, else `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
