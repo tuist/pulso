@@ -252,16 +252,26 @@ defmodule Pulso.Storage.S3.Manifest do
   @doc "Replace active sources atomically, retaining durable deletion deadlines."
   @spec replace(t(), [String.t()], Segment.t(), non_neg_integer()) :: {:ok, t()} | {:error, term()}
   def replace(manifest, source_keys, replacement, delete_after) do
+    if MapSet.size(MapSet.new(source_keys)) >= 2,
+      do: replace_all(manifest, source_keys, [replacement], delete_after),
+      else: {:error, :compaction_conflict}
+  end
+
+  @doc """
+  Retire every active source and add `replacements` in one transition, as
+  hour finalization does. Fails with `:compaction_conflict` unless every source
+  is still active and no replacement is known.
+  """
+  def replace_all(manifest, source_keys, replacements, delete_after) do
     sources = MapSet.new(source_keys)
     active = MapSet.new(manifest.segments, & &1.key)
 
-    if MapSet.size(sources) >= 2 and MapSet.subset?(sources, active) and
-         not MapSet.member?(active, replacement.key) and
-         not Map.has_key?(manifest.retired, replacement.key) do
+    if MapSet.size(sources) >= 1 and MapSet.subset?(sources, active) and
+         Enum.all?(replacements, &(not MapSet.member?(active, &1.key) and not Map.has_key?(manifest.retired, &1.key))) do
       retired = Enum.reduce(source_keys, manifest.retired, &Map.put(&2, &1, Retirement.new(delete_after)))
       remaining = Enum.reject(manifest.segments, &MapSet.member?(sources, &1.key))
 
-      {:ok, merge(%{manifest | version: 2, segments: remaining, retired: retired}, [replacement])}
+      {:ok, merge(%{manifest | version: 2, segments: remaining, retired: retired}, replacements)}
     else
       {:error, :compaction_conflict}
     end

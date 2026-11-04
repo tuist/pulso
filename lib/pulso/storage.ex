@@ -241,6 +241,12 @@ defmodule Pulso.Storage do
   the total. The cost also counts the `records` selected. With
   `metric_fold: {fun, initial}`, each selector's result is
   `fun.(batch, acc)` folded over its decoded batches instead of a list.
+
+  A selector `{matchers, start_ts, end_ts, {from, to}}` also accepts hourly
+  rollups for whole hours in `[from, to)`. An adapter that has them answers
+  `{:tiered, samples, rollups}`: samples outside the hours it served from
+  rollups and one rollup tuple per series and served hour (see
+  `Pulso.Storage.S3.MetricTiers`). Others answer with samples only.
   """
   def query_metric_selectors(tenant, selectors, opts) when is_binary(tenant) and is_list(selectors) do
     Pulso.SelfMetrics.track(:query, :storage_metrics, fn ->
@@ -266,7 +272,10 @@ defmodule Pulso.Storage do
 
   defp query_each_selector(backend, tenant, selectors, opts, :shared) do
     selectors
-    |> Enum.reduce_while({:ok, [], opts[:max_records]}, fn {matchers, start, finish}, {:ok, acc, remaining} ->
+    # Adapters without rollups answer rollup-eligible selectors from samples.
+    |> Enum.reduce_while({:ok, [], opts[:max_records]}, fn selector, {:ok, acc, remaining} ->
+      [matchers, start, finish | _] = Tuple.to_list(selector)
+
       query_opts =
         opts |> Keyword.delete(:metric_fold) |> Keyword.merge(matchers: matchers, start_ts: start, end_ts: finish)
 

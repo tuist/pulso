@@ -198,6 +198,17 @@ defmodule Pulso.Storage.S3.JournalManifest do
     end
   end
 
+  @doc "Keys of every index and leaf page a root references, for manifest backups."
+  def page_keys(%Manifest{version: @version} = root, tenant, signal, config),
+    do: with_ops(fn -> collect_page_keys(root.paging["refs"], tenant, signal, config) end)
+
+  defp collect_page_keys(refs, tenant, signal, config) do
+    Enum.flat_map(refs, fn
+      %{"h" => 0} = ref -> [ref["k"]]
+      ref -> [ref["k"] | collect_page_keys(read_index(ref, tenant, signal, config, nil), tenant, signal, config)]
+    end)
+  end
+
   @doc "Read every page into one flat format-2 manifest, bounded by `max_bytes` of pages."
   def materialize(%Manifest{version: @version} = root, tenant, signal, config, max_bytes),
     do: with_ops(fn -> do_materialize(root, tenant, signal, config, max_bytes) end)
@@ -531,14 +542,18 @@ defmodule Pulso.Storage.S3.JournalManifest do
   the replacement is unknown.
   """
   def replace(%Manifest{version: @version} = root, source_keys, replacement, deadline, tenant, signal, config),
-    do: with_ops(fn -> do_replace(root, source_keys, replacement, deadline, tenant, signal, config) end)
+    do: with_ops(fn -> do_replace(root, source_keys, [replacement], 2, deadline, tenant, signal, config) end)
 
-  defp do_replace(root, source_keys, replacement, deadline, tenant, signal, config) do
+  @doc "Like `replace/7` with any number of replacements and at least one source, for hour finalization."
+  def replace_all(%Manifest{version: @version} = root, source_keys, replacements, deadline, tenant, signal, config),
+    do: with_ops(fn -> do_replace(root, source_keys, replacements, 1, deadline, tenant, signal, config) end)
+
+  defp do_replace(root, source_keys, replacements, minimum, deadline, tenant, signal, config) do
     keys = Enum.uniq(source_keys)
-    validate_segment!(replacement, tenant, signal)
-    if length(keys) < 2, do: fail(:compaction_conflict)
+    Enum.each(replacements, &validate_segment!(&1, tenant, signal))
+    if length(keys) < minimum, do: fail(:compaction_conflict)
 
-    if lookup!(root, replacement.key, replacement.max_ts, tenant, signal, config) != :absent,
+    if Enum.any?(replacements, &(lookup!(root, &1.key, &1.max_ts, tenant, signal, config) != :absent)),
       do: fail(:compaction_conflict)
 
     tail = MapSet.new(root.segments, & &1.key)
@@ -558,7 +573,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
     }
 
     root = retire_paged(root, paged, deadline, tenant, signal, config)
-    root |> Manifest.merge([replacement]) |> touch()
+    root |> Manifest.merge(replacements) |> touch()
   end
 
   defp lookup!(root, key, max_ts, tenant, signal, config) do

@@ -1120,8 +1120,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   # Also fence dev buckets that exercised the unreleased trace receipt/marker
   # layout. Removing obsolete code must never authorize LIST resurrection.
   defp authoritative_manifest_required?(key) do
-    String.contains?(Path.basename(key), "-compact-") or String.contains?(key, "/retirements/") or
-      Path.basename(key) == "retention.marker.json"
+    base = Path.basename(key)
+
+    Enum.any?(["-compact-", "-final-", "-rollup-", "-edge-"], &String.contains?(base, &1)) or
+      String.contains?(key, "/retirements/") or String.contains?(key, "/backups/") or
+      base == "retention.marker.json"
   end
 
   defp publish_legacy_manifest(state, manifest) do

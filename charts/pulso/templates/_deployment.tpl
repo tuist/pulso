@@ -126,6 +126,12 @@ spec:
               value: {{ include "pulso.manifestFormat" . | quote }}
             - name: PULSO_METRICS_COMPACTION_ENABLED
               value: {{ .Values.metricsCompaction.enabled | quote }}
+            - name: PULSO_METRICS_FINALIZE_ENABLED
+              value: {{ .Values.metricsCompaction.finalize | quote }}
+            - name: PULSO_MANIFEST_BACKUP_ENABLED
+              value: {{ .Values.manifestBackups.enabled | quote }}
+            - name: PULSO_MANIFEST_BACKUP_INTERVAL_MS
+              value: {{ .Values.manifestBackups.intervalMs | int64 | quote }}
             {{- if and .Values.otlpGrpc.enabled (ne $pool "query") (ne $pool "maintenance") }}
             - name: PULSO_OTLP_GRPC_PORT
               value: {{ .Values.otlpGrpc.port | int64 | quote }}

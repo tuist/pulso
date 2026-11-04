@@ -240,10 +240,31 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     matches_metrics?(segment, metrics_filter(matchers))
   end
 
-  @doc "Compile storage matchers once per query for `matches_metrics?/2`."
-  def metrics_filter({:metric_plan, _, _} = plan), do: plan
+  @doc """
+  Storage tier of a metric segment, from its key: `:rollup` for hourly
+  rollup objects, `:final` for segments of a finalized hour, else `:raw`
+  (ingested, compacted, or the out-of-hour `-edge-` rows of a finalization).
+  """
+  def metric_tier(%__MODULE__{key: key}), do: key_tier(key)
 
-  def metrics_filter(matchers) do
+  def key_tier(key) do
+    base = Path.basename(key)
+
+    cond do
+      String.contains?(base, "-rollup-") -> :rollup
+      String.contains?(base, "-final-") -> :final
+      true -> :raw
+    end
+  end
+
+  @doc """
+  Compile storage matchers once per query for `matches_metrics?/2`. Sample
+  queries never see rollup objects; `tier: :rollup` selects only them.
+  """
+  def metrics_filter(matchers, tier \\ :samples)
+  def metrics_filter({:metric_plan, _, _, _} = plan, _tier), do: plan
+
+  def metrics_filter(matchers, tier) do
     plan = MetricLabelSummary.plan(matchers)
 
     # Name matchers a bloom can decide: each needs one of these names present.
@@ -253,7 +274,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           alternatives != nil,
           do: Enum.map(alternatives, &name_hash/1)
 
-    {:metric_plan, plan, names}
+    {:metric_plan, plan, names, tier}
   end
 
   defp bloom_names(:eq, ""), do: nil
@@ -271,7 +292,13 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   a name bloom proves that no name an equality or literal alternation accepts
   is present.
   """
-  def matches_metrics?(segment, {:metric_plan, plan, names}) do
+  def matches_metrics?(segment, {:metric_plan, plan, names, tier}) do
+    metric_tier(segment) == :rollup == (tier == :rollup) and matches_plan?(segment, plan, names)
+  end
+
+  def matches_metrics?(segment, matchers), do: matches_metrics?(segment, metrics_filter(matchers))
+
+  defp matches_plan?(segment, plan, names) do
     MetricLabelSummary.satisfiable?(plan, fn
       "__name__" when is_list(segment.metric_names) -> {:ok, segment.metric_names}
       "__name__" -> :error
@@ -279,8 +306,6 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
       name -> Map.fetch(segment.metric_labels, name)
     end) and bloom_may_match?(segment, names)
   end
-
-  def matches_metrics?(segment, matchers), do: matches_metrics?(segment, metrics_filter(matchers))
 
   defp bloom_may_match?(%__MODULE__{metric_names: nil, metric_name_bloom: bits}, names) when is_binary(bits),
     do: Enum.all?(names, fn hashes -> Enum.any?(hashes, &bloom_member?(bits, &1)) end)

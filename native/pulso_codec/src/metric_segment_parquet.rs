@@ -49,7 +49,6 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnPath;
 use rustler::{Binary, Encoder, Env, ListIterator, MapIterator, NewBinary, Term};
-use std::rc::Rc;
 use std::sync::Arc;
 
 mod atoms {
@@ -102,22 +101,49 @@ pub struct Filter<'f> {
     pub exemplars_only: bool,
 }
 
-struct Row {
-    series_id: i64,
-    timestamp_ns: i64,
-    start_timestamp_ms: Option<i64>,
-    value: f64,
-    labels: Rc<EncodedLabels>,
-    otlp: Option<Vec<u8>>,
-    histogram: Option<Vec<u8>>,
-    exemplars: Option<Vec<u8>>,
+pub(crate) struct Row {
+    pub(crate) series_id: i64,
+    pub(crate) timestamp_ns: i64,
+    pub(crate) start_timestamp_ms: Option<i64>,
+    pub(crate) value: f64,
+    pub(crate) labels: Arc<EncodedLabels>,
+    pub(crate) otlp: Option<Vec<u8>>,
+    pub(crate) histogram: Option<Vec<u8>>,
+    pub(crate) exemplars: Option<Vec<u8>>,
 }
 
-struct EncodedLabels {
-    series_hash: i64,
-    metric_name: Vec<u8>,
-    canonical: Vec<u8>,
-    json: Vec<u8>,
+pub(crate) struct EncodedLabels {
+    pub(crate) series_hash: i64,
+    pub(crate) metric_name: Vec<u8>,
+    pub(crate) canonical: Vec<u8>,
+    pub(crate) json: Vec<u8>,
+}
+
+impl EncodedLabels {
+    /// Labels of a stored row from its canonical bytes, deriving the same
+    /// name, JSON and hash the term encoder writes for that label map.
+    pub(crate) fn from_canonical(canonical: &[u8]) -> Option<Self> {
+        let mut pairs = Vec::new();
+        parse_canonical_pairs(canonical, &mut pairs).ok()?;
+        if pairs.windows(2).any(|w| w[0].0 >= w[1].0)
+            || pairs.iter().any(|(n, v)| {
+                simdutf8::basic::from_utf8(n).is_err() || simdutf8::basic::from_utf8(v).is_err()
+            })
+        {
+            return None;
+        }
+        let metric_name = pairs
+            .iter()
+            .find(|(name, _)| *name == b"__name__")
+            .map(|(_, value)| value.to_vec())
+            .unwrap_or_default();
+        Some(EncodedLabels {
+            series_hash: stable_hash::stable_hash(pairs.iter().copied()) as i64,
+            metric_name,
+            canonical: canonical.to_vec(),
+            json: labels_as_json(&pairs),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -146,7 +172,7 @@ pub fn encode<'a>(
     let expected = atoms::metric_sample().encode(env);
 
     let mut rows: Vec<Row> = Vec::with_capacity(len);
-    let mut previous_labels: Option<(Term<'a>, Rc<EncodedLabels>)> = None;
+    let mut previous_labels: Option<(Term<'a>, Arc<EncodedLabels>)> = None;
     let mut bounds = Bounds {
         min_ts: i128::MAX,
         max_ts: i128::MIN,
@@ -179,10 +205,22 @@ pub fn encode<'a>(
             .then(a.timestamp_ns.cmp(&b.timestamp_ns))
     });
 
+    drop(previous_labels);
+    let payload = write_rows(env, rows, indexed)?;
+    Ok((payload, bounds))
+}
+
+/// Write rows, in their given order, as one segment. Keyed appends retain
+/// the byte-stable v2 encoder; unkeyed and compaction outputs opt into
+/// additive footer postings (`indexed`) under fresh keys.
+pub(crate) fn write_rows<'a>(
+    env: Env<'a>,
+    rows: Vec<Row>,
+    indexed: bool,
+) -> Result<Binary<'a>, EncodeError> {
+    let len = rows.len();
     let batch = build_batch(&rows).map_err(|_| EncodeError::BadInput)?;
     let group_size = row_group_size(&rows);
-    // Keyed appends retain the byte-stable v2 encoder. Only unkeyed and
-    // compaction outputs opt into additive footer bytes under fresh keys.
     let postings = if indexed {
         crate::metric_postings::build(
             rows.iter().map(|row| row.labels.canonical.as_slice()),
@@ -195,14 +233,12 @@ pub fn encode<'a>(
     // Arrow owns the finished columns now. Do not retain the input row
     // metadata through compression, when writer buffers are at their peak.
     drop(rows);
-    drop(previous_labels);
     let mut buf = crate::out::BinaryWriter(crate::out::BinSink::with_capacity(64 + len * 32));
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .map_err(|_| EncodeError::Writer)?;
     writer.write(&batch).map_err(|_| EncodeError::Writer)?;
     writer.close().map_err(|_| EncodeError::Writer)?;
-
-    Ok((buf.0.finish(env), bounds))
+    Ok(buf.0.finish(env))
 }
 
 // Bound only the additive envelope column, not existing label/scalar rows.
@@ -239,7 +275,7 @@ fn extract_row<'a>(
     env: Env<'a>,
     sample: Term<'a>,
     bounds: &mut Bounds,
-    previous_labels: &mut Option<(Term<'a>, Rc<EncodedLabels>)>,
+    previous_labels: &mut Option<(Term<'a>, Arc<EncodedLabels>)>,
 ) -> Result<Row, EncodeError> {
     let nil = atoms::nil().encode(env);
 
@@ -251,10 +287,10 @@ fn extract_row<'a>(
     // consecutive run even when equivalent maps are separate Erlang terms.
     // Only one lookup entry is retained; rows share immutable metadata.
     let labels = match previous_labels.as_ref() {
-        Some((previous, labels)) if *previous == labels_term => Rc::clone(labels),
+        Some((previous, labels)) if *previous == labels_term => Arc::clone(labels),
         _ => {
-            let labels = Rc::new(encode_labels(labels_term)?);
-            *previous_labels = Some((labels_term, Rc::clone(&labels)));
+            let labels = Arc::new(encode_labels(labels_term)?);
+            *previous_labels = Some((labels_term, Arc::clone(&labels)));
             labels
         }
     };
@@ -1196,7 +1232,7 @@ pub(super) fn matches_canonical_for_test(bytes: &[u8], matchers: &[Matcher<'_>])
     labels_match(&labels, matchers, &regex_cache)
 }
 
-fn labels_match(
+pub(crate) fn labels_match(
     labels: &[(&[u8], &[u8])],
     matchers: &[Matcher<'_>],
     regex_cache: &[Option<regex::Regex>],
@@ -1242,7 +1278,7 @@ mod tests {
             otlp: None,
             histogram: None,
             exemplars: None,
-            labels: Rc::new(EncodedLabels {
+            labels: Arc::new(EncodedLabels {
                 series_hash: stable_hash::stable_hash([(b"host".as_slice(), b"node".as_slice())])
                     as i64,
                 metric_name: b"work".to_vec(),
@@ -1276,14 +1312,14 @@ mod tests {
             .map(|i| {
                 let mut row = row(1, i);
                 if (8192..16384).contains(&i) {
-                    row.labels = Rc::new(EncodedLabels {
+                    row.labels = Arc::new(EncodedLabels {
                         series_hash: 1,
                         metric_name: vec![],
                         canonical: b"env\xffdev\xffhost\xffother\xff".to_vec(),
                         json: b"{}".to_vec(),
                     });
                 } else {
-                    row.labels = Rc::new(EncodedLabels {
+                    row.labels = Arc::new(EncodedLabels {
                         series_hash: 1,
                         metric_name: vec![],
                         canonical: b"env\xffprod\xffhost\xffnode\xff".to_vec(),

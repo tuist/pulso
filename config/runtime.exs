@@ -243,6 +243,12 @@ metrics_compaction_enabled = env_var.("PULSO_METRICS_COMPACTION_ENABLED", "false
 trace_compaction_enabled = env_var.("PULSO_TRACE_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 log_compaction_enabled = env_var.("PULSO_LOG_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 metric_footer_pruning_enabled = env_var.("PULSO_METRICS_FOOTER_PRUNING_ENABLED", "false") in ["1", "true", "yes"]
+# With metrics compaction, settled hours are rewritten into metric-grouped
+# segments plus hourly rollups for long range functions.
+metric_finalize_enabled = env_var.("PULSO_METRICS_FINALIZE_ENABLED", "true") in ["1", "true", "yes"]
+# Pulso-side manifest backups for buckets without versioning; maintenance
+# cleanup waits for a backup that records each retirement.
+manifest_backup_enabled = env_var.("PULSO_MANIFEST_BACKUP_ENABLED", "true") in ["1", "true", "yes"]
 
 # paged (default): manifests without retention keep a bounded root and
 # immutable pages, converting flat roots on their next publication. Releases
@@ -524,6 +530,9 @@ case config_env() do
       compaction_enabled: metrics_compaction_enabled,
       trace_compaction_enabled: trace_compaction_enabled,
       log_compaction_enabled: log_compaction_enabled,
+      metric_finalize_enabled: metric_finalize_enabled,
+      manifest_backup_enabled: manifest_backup_enabled,
+      manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
       metric_footer_pruning_enabled: metric_footer_pruning_enabled,
@@ -592,6 +601,9 @@ case config_env() do
       compaction_enabled: metrics_compaction_enabled,
       trace_compaction_enabled: trace_compaction_enabled,
       log_compaction_enabled: log_compaction_enabled,
+      metric_finalize_enabled: metric_finalize_enabled,
+      manifest_backup_enabled: manifest_backup_enabled,
+      manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
       ingest_flush_interval_ms: ingest_flush_interval_ms,
       metric_footer_pruning_enabled: metric_footer_pruning_enabled,

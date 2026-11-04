@@ -172,6 +172,34 @@ defmodule Pulso.Codec.NIF do
   def metric_discovery_abort(_state), do: :erlang.nif_error(:nif_not_loaded)
   def metric_segment_parquet_row_count(_blob), do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc false
+  # Hour finalization and rollups (`Pulso.Storage.S3.MetricTiers`).
+  def ensure_metric_tier_api! do
+    version =
+      try do
+        metric_tier_api_version()
+      rescue
+        ErlangError -> :unavailable
+      end
+
+    if version != 1,
+      do:
+        raise(
+          "codec native artifact cannot finalize metric hours or read metric rollups; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+        )
+
+    :ok
+  end
+
+  def metric_tier_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def metric_finalize_new(_start, _end, _max_rows, _expected_rows), do: :erlang.nif_error(:nif_not_loaded)
+  def metric_finalize_add(_finalizer, _blob), do: :erlang.nif_error(:nif_not_loaded)
+
+  def metric_finalize_finish(_finalizer, _target_rows, _rollup_target_rows, _max_names),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def decode_metric_rollups(_blob, _start, _finish, _matchers), do: :erlang.nif_error(:nif_not_loaded)
+
   def decode_loki_push(_compressed, _max_decompressed_bytes), do: :erlang.nif_error(:nif_not_loaded)
 
   def decode_loki_push_limited(_compressed, _max_decompressed_bytes, _limits), do: :erlang.nif_error(:nif_not_loaded)

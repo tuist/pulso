@@ -137,12 +137,23 @@ manifestFormat: paged
 
 metricsCompaction:
   # Merges small metrics segments in the background. Enable it only once every
-  # Pulso version writing to the bucket supports compaction, and turn on
-  # bucket versioning first: after compaction the manifest is the only record
-  # of which objects are live. Without it every remote-write batch stays its
-  # own segment, so ranges beyond about 20 minutes exceed the default query
+  # Pulso version writing to the bucket supports compaction (1.30 or later
+  # for finalized hours). Without it every remote-write batch stays its own
+  # segment, so ranges beyond about 20 minutes exceed the default query
   # segment budget. See docs/configuration.md#long-dashboard-and-alert-ranges.
   enabled: false
+  # With compaction, rewrite each settled hour into segments grouped by metric
+  # name plus hourly rollups, so long ranges read only their metric's rows and
+  # 1-day to 7-day range functions read one rollup row per series and hour.
+  finalize: true
+
+manifestBackups:
+  # Copies of each compacted prefix's manifest under .../backups/, for buckets
+  # without versioning (Tigris, for example). Maintenance deletes a retired
+  # object only once a backup records its retirement, so the newest backup
+  # always restores. See docs/configuration.md#manifest-backups.
+  enabled: true
+  intervalMs: 900000
 
 # Experimental Tempo search recovers complete retained candidate context. Exact
 # resource.service.name equality may use publication-proven service/ID summaries;

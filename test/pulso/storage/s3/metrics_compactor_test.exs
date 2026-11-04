@@ -19,6 +19,7 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
   alias Pulso.Storage.S3.CompactionWorker
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
+  alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestRegistry
@@ -59,7 +60,11 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
       access_key_id: "test-#{System.unique_integer([:positive])}",
       secret_access_key: "test",
       allow_http: true,
-      refresh_stale_ms: 0
+      refresh_stale_ms: 0,
+      # These tests count compaction's own merges, reads and deletions; hour
+      # finalization and manifest backups have their own worker test.
+      metric_finalize_enabled: false,
+      manifest_backup_enabled: false
     }
 
     # Tests of the flat format's own behaviour opt out of paged manifests.
@@ -573,6 +578,36 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert Agent.get(ctx.agent, fn state ->
              Enum.count(state.objects, fn {key, _} -> String.ends_with?(key, ".parquet") end)
            end) == 1
+  end
+
+  test "background worker finalizes settled hours, backs up the manifest and holds cleanup for it", ctx do
+    for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts * 1.0)]))
+    before = S3.query(:metrics, ctx.tenant, [])
+
+    config =
+      ctx.config
+      |> Map.merge(%{metric_finalize_enabled: true, manifest_backup_enabled: true})
+      |> Map.put(:compaction_options, grace_ms: 0)
+      |> Map.put(:metric_finalize_options, grace_ms: 0)
+
+    worker = start_supervised!({CompactionWorker, config})
+    send(worker, :compact)
+    _ = :sys.get_state(worker, 60_000)
+
+    tiers = load(ctx).segments |> Enum.map(&Segment.metric_tier/1) |> Enum.sort()
+    assert tiers == [:final, :rollup]
+    assert S3.query(:metrics, ctx.tenant, []) == before
+    assert {:ok, [backup]} = ObjectStore.list(ctx.config, ManifestBackup.prefix(ctx.tenant, "metrics"))
+    assert {:ok, body} = ObjectStore.get(ctx.config, backup)
+    assert {:ok, %Manifest{segments: backed_up}} = Manifest.decode(body)
+    assert backed_up |> Enum.map(&Segment.metric_tier/1) |> Enum.sort() == [:final, :rollup]
+
+    # The backup records every retirement, so cleanup could delete them all:
+    # only the finalized segment and its rollup remain.
+    parquet =
+      Agent.get(ctx.agent, fn state -> Enum.filter(Map.keys(state.objects), &String.ends_with?(&1, ".parquet")) end)
+
+    assert parquet |> Enum.map(&Segment.key_tier/1) |> Enum.sort() == [:final, :rollup]
   end
 
   test "missing input fails before publication and cleanup never removes active segments", ctx do

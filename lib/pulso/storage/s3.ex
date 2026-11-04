@@ -94,6 +94,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.Storage.S3.MetadataCache
   alias Pulso.Storage.S3.MetricFooterReader
   alias Pulso.Storage.S3.MetricMetadataStore
+  alias Pulso.Storage.S3.MetricTiers
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.TraceSummary
@@ -545,8 +546,11 @@ defmodule Pulso.Storage.S3 do
       case selectors do
         # Footer-first reads prune by one selector's matchers; keep them for
         # single-selector queries. The cost is charged inside that query.
-        [selector] when config.metric_footer_pruning_enabled == true -> query_footer_selector(tenant, selector, opts)
-        _ -> query_selectors(tenant, selectors, opts, config)
+        [{_, _, _} = selector] when config.metric_footer_pruning_enabled == true ->
+          query_footer_selector(tenant, selector, opts)
+
+        _ ->
+          query_selectors(tenant, selectors, opts, config)
       end
     end
   end
@@ -574,7 +578,11 @@ defmodule Pulso.Storage.S3 do
          {:ok, manifest} <- selector_manifest(tenant, config, opts, source),
          :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, wanted} <- selector_candidates(manifest, selectors, opts, tenant, config),
-         union = wanted |> Enum.flat_map(&elem(&1, 1)) |> Enum.uniq_by(& &1.key) |> Enum.sort_by(& &1.max_ts, :desc),
+         union =
+           wanted
+           |> Enum.flat_map(&(&1.samples ++ &1.rollups))
+           |> Enum.uniq_by(& &1.key)
+           |> Enum.sort_by(& &1.max_ts, :desc),
          :ok <- check_scan_budget(:metrics, union, opts) do
       scan_selector_segments(union, wanted, config, opts)
     end
@@ -606,12 +614,9 @@ defmodule Pulso.Storage.S3 do
   # Each selector keeps its own matchers and time bounds, so its decode and
   # manifest pruning are exactly those of a single-selector query.
   defp selector_candidates(manifest, selectors, opts, tenant, config) do
-    Enum.reduce_while(selectors, {:ok, []}, fn {matchers, start, finish}, {:ok, acc} ->
-      start = retained_start(manifest, start)
-      selector_opts = Keyword.put(opts, :matchers, matchers)
-
-      case query_segments(manifest, :metrics, start, finish, selector_opts, tenant, config) do
-        {:ok, segments} -> {:cont, {:ok, [{{matchers, start, finish}, segments} | acc]}}
+    Enum.reduce_while(selectors, {:ok, []}, fn selector, {:ok, acc} ->
+      case selector_wanted(manifest, selector, opts, tenant, config) do
+        {:ok, wanted} -> {:cont, {:ok, [wanted | acc]}}
         error -> {:halt, error}
       end
     end)
@@ -621,17 +626,78 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
+  defp selector_wanted(manifest, selector, opts, tenant, config) do
+    [matchers, start, finish | tiers] = Tuple.to_list(selector)
+    start = retained_start(manifest, start)
+    selector_opts = Keyword.put(opts, :matchers, matchers)
+
+    with {:ok, samples} <- query_segments(manifest, :metrics, start, finish, selector_opts, tenant, config) do
+      wanted = %{selector: {matchers, start, finish}, samples: samples, rollups: [], served: nil}
+
+      case tiers do
+        [{from, to}] when is_integer(from) and is_integer(to) and to > from and manifest.version != 3 ->
+          tier_candidates(wanted, manifest, {from, to}, selector_opts, tenant, config)
+
+        _ ->
+          {:ok, wanted}
+      end
+    end
+  end
+
+  # Whole hours in [from, to) answered from hourly rollups: those with a
+  # matching rollup object and no matching raw segment (a write that arrived
+  # after finalization). Their finalized segments are not read.
+  defp tier_candidates(wanted, manifest, {from, to}, opts, tenant, config) do
+    rollup_opts = Keyword.put(opts, :metric_tier, :rollup)
+
+    with {:ok, rollups} <- query_segments(manifest, :metrics, from, to - 1, rollup_opts, tenant, config) do
+      blocked =
+        for s <- wanted.samples,
+            Segment.metric_tier(s) == :raw,
+            hour <- raw_hours(s, from, to),
+            into: MapSet.new(),
+            do: hour
+
+      rollups =
+        Enum.filter(rollups, fn r ->
+          r.min_ts == r.max_ts and r.min_ts >= from and r.min_ts < to and not MapSet.member?(blocked, r.min_ts)
+        end)
+
+      served = MapSet.new(rollups, & &1.min_ts)
+
+      samples =
+        Enum.reject(wanted.samples, fn s ->
+          Segment.metric_tier(s) == :final and MetricTiers.hour(s.min_ts) == MetricTiers.hour(s.max_ts) and
+            MapSet.member?(served, MetricTiers.hour(s.min_ts))
+        end)
+
+      {:ok, %{wanted | samples: samples, rollups: rollups, served: served}}
+    end
+  end
+
+  # Hours in [from, to) a raw segment can hold rows of; unknown bounds block all.
+  defp raw_hours(%{min_ts: min, max_ts: max}, from, to) when is_integer(min) and is_integer(max),
+    do: Enum.to_list(max(MetricTiers.hour(min), from)..min(MetricTiers.hour(max), to - 1)//MetricTiers.hour_ns())
+
+  defp raw_hours(_segment, from, to), do: Enum.to_list(from..(to - 1)//MetricTiers.hour_ns())
+
   defp scan_selector_segments(union, wanted, config, opts) do
     # Per segment, the selectors (by position) that need it.
     needs =
       wanted
       |> Enum.with_index()
-      |> Enum.reduce(%{}, fn {{_selector, segments}, index}, acc ->
-        Enum.reduce(segments, acc, fn segment, acc -> Map.update(acc, segment.key, [index], &[index | &1]) end)
+      |> Enum.reduce(%{}, fn {selector, index}, acc ->
+        acc = Enum.reduce(selector.samples, acc, &Map.update(&2, &1.key, [index], fn i -> [index | i] end))
+
+        Enum.reduce(
+          selector.rollups,
+          acc,
+          &Map.update(&2, &1.key, [{:rollups, index}], fn i -> [{:rollups, index} | i] end)
+        )
       end)
 
-    selectors = wanted |> Enum.map(&elem(&1, 0)) |> List.to_tuple()
-    state = %{bytes: 0, rows: 0, segments: 0, count: 0, batches: %{}}
+    selectors = List.to_tuple(wanted)
+    state = %{bytes: 0, rows: 0, segments: 0, count: 0, batches: %{}, rollups: %{}}
     items = Enum.with_index(union)
 
     {_initial, concurrency} =
@@ -657,8 +723,7 @@ defmodule Pulso.Storage.S3 do
       end
 
     with {:ok, state} <- result do
-      samples =
-        for index <- 0..(tuple_size(selectors) - 1)//1, do: selector_result(state.batches, index, opts[:metric_fold])
+      samples = for index <- 0..(tuple_size(selectors) - 1)//1, do: tiered_result(state, selectors, index, opts)
 
       {:ok, samples,
        %{
@@ -668,6 +733,11 @@ defmodule Pulso.Storage.S3 do
          records: state.count
        }}
     end
+  end
+
+  defp tiered_result(state, selectors, index, opts) do
+    result = selector_result(state.batches, index, opts[:metric_fold])
+    if elem(selectors, index).served, do: {:tiered, result, Map.get(state.rollups, index, [])}, else: result
   end
 
   defp selector_result(batches, index, nil),
@@ -719,19 +789,44 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp decode_for_selectors(blob, indexes, selectors, opts, state) do
-    Enum.reduce_while(indexes, {:ok, state}, fn index, {:ok, state} ->
-      {matchers, start, finish} = elem(selectors, index)
-      decode_opts = Keyword.put(remaining_budget(opts, %{max_records: state.count}), :matchers, matchers)
+    Enum.reduce_while(indexes, {:ok, state}, fn
+      {:rollups, index}, {:ok, state} ->
+        %{selector: {matchers, _, _}, served: served} = elem(selectors, index)
 
-      case decode_segment(:metrics, blob, start, finish, decode_opts) do
-        {:ok, batch} ->
-          batches = add_selector_batch(state.batches, index, batch, opts[:metric_fold])
-          {:cont, {:ok, %{state | batches: batches, count: state.count + length(batch)}}}
+        case decode_rollups(blob, served, matchers, opts, state) do
+          {:ok, rows} ->
+            rollups = Map.update(state.rollups, index, rows, &(rows ++ &1))
+            {:cont, {:ok, %{state | rollups: rollups, count: state.count + length(rows)}}}
 
-        {:error, _} = error ->
-          {:halt, error}
-      end
+          {:error, _} = error ->
+            {:halt, error}
+        end
+
+      index, {:ok, state} ->
+        %{selector: {matchers, start, finish}} = elem(selectors, index)
+        decode_opts = Keyword.put(remaining_budget(opts, %{max_records: state.count}), :matchers, matchers)
+
+        case decode_segment(:metrics, blob, start, finish, decode_opts) do
+          {:ok, batch} ->
+            batches = add_selector_batch(state.batches, index, batch, opts[:metric_fold])
+            {:cont, {:ok, %{state | batches: batches, count: state.count + length(batch)}}}
+
+          {:error, _} = error ->
+            {:halt, error}
+        end
     end)
+  end
+
+  defp decode_rollups(blob, served, matchers, opts, state) do
+    case NIF.decode_metric_rollups(blob, Enum.min(served), Enum.max(served), matchers) do
+      {:ok, rows} ->
+        rows = Enum.filter(rows, &MapSet.member?(served, elem(&1, 1)))
+        max = opts[:max_records]
+        if max && state.count + length(rows) > max, do: {:error, :query_sample_limit}, else: {:ok, rows}
+
+      _ ->
+        {:error, {:decode_failed, :metric_rollup_rejected}}
+    end
   end
 
   # The metadata budget shares the caller's deadline, so exhausting it after
@@ -1045,7 +1140,12 @@ defmodule Pulso.Storage.S3 do
 
   # Compile matcher pruning once per query, not once per manifest entry.
   defp metrics_filter(opts, :metrics),
-    do: Keyword.put(opts, :metrics_filter, Segment.metrics_filter(Keyword.get(opts, :matchers, [])))
+    do:
+      Keyword.put(
+        opts,
+        :metrics_filter,
+        Segment.metrics_filter(Keyword.get(opts, :matchers, []), Keyword.get(opts, :metric_tier, :samples))
+      )
 
   defp metrics_filter(opts, _signal), do: opts
 

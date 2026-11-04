@@ -34,6 +34,7 @@ defmodule Pulso.PromQL.QueryScaleBenchTest do
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.MetricsCompactor
+  alias Pulso.Storage.S3.MetricTiers
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Test.CompactionStore
 
@@ -67,6 +68,23 @@ defmodule Pulso.PromQL.QueryScaleBenchTest do
     max_scan_bytes: 4_294_967_296,
     max_heap_words: div(512 * 1_048_576, 8)
   ]
+
+  # Budgets docs/configuration.md recommends once hours are finalized, for a
+  # node of about 1.5 GiB: rows scanned are not retained, samples are.
+  @finalized [
+    max_samples: 500_000,
+    max_result_points: 500_000,
+    max_materialized_samples: 500_000,
+    max_work: 50_000_000,
+    max_scan_segments: 2048,
+    max_scan_rows: 20_000_000,
+    max_scan_bytes: 1_073_741_824,
+    max_heap_words: div(256 * 1_048_576, 8)
+  ]
+
+  # The documented profile for week-long subqueries over raw samples, run with
+  # PULSO_QUERY_MAX_CONCURRENT=1 on the same node size.
+  @week_subquery [max_samples: 1_000_000, max_heap_words: div(384 * 1_048_576, 8)]
 
   defp env_int(name, default), do: name |> System.get_env(Integer.to_string(default)) |> String.to_integer()
 
@@ -264,7 +282,10 @@ defmodule Pulso.PromQL.QueryScaleBenchTest do
       {"alert increase(up[1d])", ~s|sum(increase(up[1d]))|, instant},
       {"alert [3d:30m] subquery", ~s|max(max_over_time(sum by (queue) (oban_queue_length)[3d:30m]))|, instant},
       {"alert [7d:5m] subquery", ~s|max(max_over_time(sum by (queue) (oban_queue_length)[7d:5m]))|, instant},
-      {"alert offset 168h", ~s|sum(increase(up[1h])) - sum(increase(up[1h] offset 168h))|, instant}
+      {"alert offset 168h", ~s|sum(increase(up[1h])) - sum(increase(up[1h] offset 168h))|, instant},
+      {"alert increase(up[7d])", ~s|sum(increase(up[7d]))|, instant},
+      {"alert max_over_time(oban[3d])", ~s|max(max_over_time(oban_queue_length[3d]))|, instant},
+      {"alert changes(up[7d])", ~s|sum(changes(up[7d]))|, instant}
     ]
   end
 
@@ -385,6 +406,43 @@ defmodule Pulso.PromQL.QueryScaleBenchTest do
     Runtime.put_env(:pulso, Pulso.QueryRunner, timeout_ms: env_int("PULSO_BENCH_LONG_TIMEOUT_MS", 30_000))
     results = run_queries(ctx, finish, "compacted, long-window budgets", latency, long_queries(finish))
 
-    for {name, result, _gets} <- results, do: assert({:ok, _} = result, "#{name} failed: #{inspect(result)}")
+    # Week-long range functions select every sample of the week: without
+    # rollups they exceed the sample budget, which is what finalization fixes.
+    for {name, result, _gets} <- results,
+        not String.ends_with?(name, ["up[7d])", "oban[3d])"]),
+        do: assert({:ok, _} = result, "#{name} failed: #{inspect(result)}")
+
+    # Finalize every settled hour into metric-grouped segments and rollups.
+    :atomics.put(ctx.latency, 1, 0)
+    Runtime.put_env(:pulso, Evaluator, [])
+    started = System.monotonic_time(:millisecond)
+
+    for hour <- 0..(days * 24) do
+      assert {:ok, _} = MetricTiers.finalize_hour(ctx.tenant, @t0 + hour * 3_600_000_000_000, ctx.config, [])
+      trim(ctx.store)
+    end
+
+    elapsed = System.monotonic_time(:millisecond) - started
+    IO.puts("finalized #{days * 24 + 1} hours in #{elapsed} ms: #{segment_count(ctx)} sample segments")
+
+    run_queries(ctx, finish, "finalized, default budgets", latency, long_queries(finish))
+    Runtime.put_env(:pulso, Evaluator, @finalized)
+    finalized = run_queries(ctx, finish, "finalized, 1.5 GiB budgets", latency, long_queries(finish))
+
+    # A week of 5-minute subquery steps reads raw samples (rollups cannot serve
+    # it) and needs the larger sample profile docs/configuration.md describes.
+    {subquery, rest} = Enum.split_with(finalized, fn {name, _, _} -> name == "alert [7d:5m] subquery" end)
+    assert [{_, {:error, :query_sample_limit}, _}] = subquery
+    Runtime.put_env(:pulso, Evaluator, Keyword.merge(@finalized, @week_subquery))
+    weekly = Enum.filter(long_queries(finish), fn {name, _, _} -> name == "alert [7d:5m] subquery" end)
+    finalized = rest ++ run_queries(ctx, finish, "finalized, week-subquery budgets", latency, weekly)
+    raw = Map.new(results, fn {name, _, _} = row -> {name, row} end)
+
+    for {name, tiered, gets} <- finalized do
+      {^name, raw, raw_gets} = raw[name]
+      assert {:ok, _} = tiered, "#{name} failed: #{inspect(tiered)}"
+      assert gets < raw_gets
+      if match?({:ok, _}, raw), do: assert(tiered == raw, name)
+    end
   end
 end

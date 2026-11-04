@@ -591,24 +591,55 @@ defmodule Pulso.PromQL.Evaluator do
   end
 
   defp select(tenant, matchers, offset, window, steps, op) do
-    {_matchers, start, finish} = request = selector_request(matchers, offset, window, steps)
+    request = selector_request(matchers, offset, window, steps, op)
 
-    if start > finish do
+    if elem(request, 1) > elem(request, 2) do
       {:ok, [], []}
     else
       with {:ok, groups, warnings} <- selector_series(tenant, request),
-           {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits()) do
-        {:ok, Operations.coalesce(result), warnings}
+           {:ok, result, extra} <- evaluate_selected(groups, tenant, request, {steps, offset, window, op}) do
+        {:ok, Operations.coalesce(result), warnings ++ extra}
       end
     end
   end
 
+  # Range functions whose value composes exactly from hourly rollups
+  # (`Pulso.Storage.S3.MetricTiers`): counts, extrema, first/last, transitions
+  # and the inputs of rate/increase/delta. Sums, averages, quantiles and
+  # deviations do not compose bit-identically and always read samples.
+  @tier_ops [
+    :rate,
+    :increase,
+    :delta,
+    :count_over_time,
+    :present_over_time,
+    :min_over_time,
+    :max_over_time,
+    :first_over_time,
+    :last_over_time,
+    :changes,
+    :resets
+  ]
+  @hour_ns 3_600_000_000_000
+
   # The exact storage request select/6 makes for a selector at these steps.
-  defp selector_request(matchers, offset, window, steps) do
-    {Enum.map(matchers, &anchored_matcher/1),
-     max(-9_223_372_036_854_775_808, source_time(hd(steps), offset) - window + 1),
-     min(9_223_372_036_854_775_807, source_time(List.last(steps), offset))}
+  # Tier-eligible range functions also name the whole hours that lie inside
+  # every step's window, which storage may answer from rollups.
+  defp selector_request(matchers, offset, window, steps, op \\ nil) do
+    first = source_time(hd(steps), offset)
+    last = source_time(List.last(steps), offset)
+
+    request =
+      {Enum.map(matchers, &anchored_matcher/1), max(-9_223_372_036_854_775_808, first - window + 1),
+       min(9_223_372_036_854_775_807, last)}
+
+    from = (Integer.floor_div(last - window, @hour_ns) + 1) * @hour_ns
+    to = Integer.floor_div(first + 1, @hour_ns) * @hour_ns
+
+    if op in @tier_ops and to > from, do: Tuple.insert_at(request, 3, {from, to}), else: request
   end
+
+  defp raw_request(request), do: {elem(request, 0), elem(request, 1), elem(request, 2)}
 
   # Planned requests were loaded by prefetch/3 and charged there. A selector
   # the plan did not predict still reads on its own, under what remains.
@@ -625,8 +656,207 @@ defmodule Pulso.PromQL.Evaluator do
         series
 
       :error ->
-        with {:ok, [samples]} <- read_selectors(tenant, [request]), do: prepare_series(samples)
+        with {:ok, [samples]} <- read_selectors(tenant, [request]), do: prepare_result(samples)
     end
+  end
+
+  defp prepare_result({:tiered, series, rollups}) do
+    with {:ok, groups, warnings} <- prepare_series(series), do: {:ok, {:tiered, groups, rollups}, warnings}
+  end
+
+  defp prepare_result(series), do: prepare_series(series)
+
+  defp evaluate_selected({:tiered, groups, rollups}, tenant, request, {steps, offset, window, op} = context) do
+    if Enum.any?(rollups, &(elem(&1, 12) != 0)) do
+      raw_selected(tenant, request, context)
+    else
+      try do
+        with {:ok, result} <- evaluate_tiered(groups, rollups, steps, offset, window, op), do: {:ok, result, []}
+      catch
+        :tier_fallback -> raw_selected(tenant, request, context)
+      end
+    end
+  end
+
+  defp evaluate_selected(groups, _tenant, _request, {steps, offset, window, op}) do
+    with {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits()), do: {:ok, result, []}
+  end
+
+  # Rollups the evaluator cannot compose exactly (native histograms,
+  # conflicting samples, negative-zero resets): read the samples instead.
+  defp raw_selected(tenant, request, {steps, offset, window, op}) do
+    with {:ok, [samples]} <- read_selectors(tenant, [raw_request(request)]),
+         {:ok, groups, warnings} <- prepare_series(samples),
+         {:ok, result} <- evaluate_groups(groups, steps, offset, window, op, limits()),
+         do: {:ok, result, warnings}
+  end
+
+  # Each step's window is its samples before, between and after the served
+  # hours, plus one rollup per served hour, composed in time order.
+  defp evaluate_tiered(groups, rollups, steps, offset, window, op) do
+    by_labels = Enum.group_by(rollups, &elem(&1, 0))
+    samples = Map.new(groups)
+    labels = Enum.uniq(Map.keys(samples) ++ Map.keys(by_labels))
+    max = limits()
+
+    Enum.reduce_while(labels, {:ok, [], 0}, fn series_labels, {:ok, acc, points} ->
+      check_deadline()
+      series_rollups = by_labels |> Map.get(series_labels, []) |> Enum.sort_by(&elem(&1, 1))
+      ordered = Map.get(samples, series_labels, [])
+      {values, work} = tiered_series(ordered, series_rollups, steps, offset, window, op, series_labels)
+      charge(:work, work)
+      points = points + length(values)
+
+      add_tiered_series(acc, series_labels, values, points, max.points, op)
+    end)
+    |> case do
+      {:ok, result, _points} -> {:ok, result}
+      error -> error
+    end
+  end
+
+  defp add_tiered_series(_acc, _labels, _values, points, max, _op) when points > max do
+    QueryLimit.record(:max_result_points, max, points)
+    {:halt, {:error, :query_result_limit}}
+  end
+
+  defp add_tiered_series(acc, _labels, [], points, _max, _op), do: {:cont, {:ok, acc, points}}
+
+  defp add_tiered_series(acc, labels, values, points, _max, op) do
+    labels = if op in [:first_over_time, :last_over_time], do: labels, else: Map.delete(labels, "__name__")
+    {:cont, {:ok, [{labels, values} | acc], points}}
+  end
+
+  defp tiered_series(ordered, rollups, steps, offset, window, op, labels) do
+    metric_name = Map.get(labels, "__name__", "")
+
+    Enum.reduce(steps, {[], 0}, fn ts, {values, work} ->
+      finish = source_time(ts, offset)
+      start = finish - window
+      in_window = Enum.filter(ordered, &(&1.timestamp_ns > start and &1.timestamp_ns <= finish and &1.value != :stale))
+      if Enum.any?(in_window, &histogram?/1), do: throw(:tier_fallback)
+      hours = Enum.filter(rollups, &(elem(&1, 1) > start and elem(&1, 1) + @hour_ns - 1 <= finish))
+
+      items =
+        Enum.sort_by(
+          Enum.map(in_window, &{&1.timestamp_ns, &1}) ++ Enum.map(hours, &{elem(&1, 1), &1}),
+          &elem(&1, 0)
+        )
+
+      summary = Enum.reduce(items, nil, fn {_, item}, acc -> add_tier_item(acc, item) end)
+      value = tier_value(op, summary, start, finish)
+      counter_name_info(op, value, metric_name)
+      values = if is_nil(value), do: values, else: [{ts, value} | values]
+      {values, work + length(ordered) + length(rollups) + 1}
+    end)
+    |> then(fn {values, work} -> {Enum.reverse(values), work} end)
+  end
+
+  # Summaries compose in time order exactly as the raw folds iterate samples:
+  # min keeps the earliest, max the latest of equal values; a transition is
+  # counted between the last value of one part and the first of the next.
+  defp add_tier_item(nil, %{timestamp_ns: ts, value: v}),
+    do: %{
+      count: 1,
+      first_ts: ts,
+      first: v,
+      last_ts: ts,
+      last: v,
+      min: Number.min(v, :nan),
+      max: Number.max(v, :nan),
+      changes: 0,
+      resets: 0,
+      reset_values: [],
+      zero: false
+    }
+
+  defp add_tier_item(nil, {_labels, _bucket, count, first_ts, first, last_ts, last, min, max, changes, resets, rv, _}),
+    do: %{
+      count: count,
+      first_ts: first_ts,
+      first: first,
+      last_ts: last_ts,
+      last: last,
+      min: min,
+      max: max,
+      changes: changes,
+      resets: resets,
+      reset_values: Enum.reverse(rv),
+      zero: count - 1 - resets > 0
+    }
+
+  defp add_tier_item(acc, %{timestamp_ns: ts, value: v}) do
+    acc = transition(acc, v)
+    %{acc | count: acc.count + 1, last_ts: ts, last: v, min: Number.min(v, acc.min), max: Number.max(v, acc.max)}
+  end
+
+  defp add_tier_item(acc, {_labels, _bucket, count, _first_ts, first, last_ts, last, min, max, changes, resets, rv, _}) do
+    acc = transition(acc, first)
+
+    %{
+      acc
+      | count: acc.count + count,
+        last_ts: last_ts,
+        last: last,
+        min: Number.min(min, acc.min),
+        max: Number.max(max, acc.max),
+        changes: acc.changes + changes,
+        resets: acc.resets + resets,
+        reset_values: Enum.reverse(rv, acc.reset_values),
+        zero: acc.zero or count - 1 - resets > 0
+    }
+  end
+
+  defp transition(acc, value) do
+    changes = if counted_transition?(:changes, acc.last, value), do: acc.changes + 1, else: acc.changes
+
+    if counted_transition?(:resets, acc.last, value) do
+      # Where a -0.0 reset lands among the zero additions changes the result's sign.
+      if negative_zero?(acc.last), do: throw(:tier_fallback)
+      %{acc | changes: changes, resets: acc.resets + 1, reset_values: [acc.last | acc.reset_values]}
+    else
+      %{acc | changes: changes, zero: true}
+    end
+  end
+
+  defp negative_zero?(value) when is_float(value) and value == 0, do: <<value::float>> == <<-0.0::float>>
+  defp negative_zero?(_value), do: false
+
+  defp tier_value(_op, nil, _start, _finish), do: nil
+  defp tier_value(:count_over_time, s, _, _), do: s.count * 1.0
+  defp tier_value(:present_over_time, _s, _, _), do: 1.0
+  defp tier_value(:first_over_time, s, _, _), do: s.first
+  defp tier_value(:last_over_time, s, _, _), do: s.last
+  defp tier_value(:min_over_time, s, _, _), do: s.min
+  defp tier_value(:max_over_time, s, _, _), do: s.max
+  defp tier_value(:changes, s, _, _), do: s.changes * 1.0
+  defp tier_value(:resets, s, _, _), do: s.resets * 1.0
+  defp tier_value(_op, %{count: count}, _, _) when count < 2, do: nil
+
+  defp tier_value(op, s, start, finish) when op in [:rate, :increase, :delta] do
+    change = Number.binary("-", s.last, s.first)
+
+    # The raw fold adds each reset's previous value in order and 0 for every
+    # other step. Adding 0 only turns -0.0 into 0.0, which commutes with the
+    # other additions, so one trailing 0 reproduces it exactly.
+    change =
+      if op == :delta,
+        do: Number.add(change, 0),
+        else:
+          s.reset_values
+          |> Enum.reverse()
+          |> Enum.reduce(change, &Number.add(&2, &1))
+          |> then(&if(s.zero, do: Number.add(&1, 0), else: &1))
+
+    extrapolate(
+      op,
+      change,
+      %{timestamp_ns: s.first_ts, value: s.first},
+      %{timestamp_ns: s.last_ts, value: s.last},
+      s.count,
+      start,
+      finish
+    )
   end
 
   # Load every selector the expression will evaluate in one storage call. The
@@ -658,7 +888,7 @@ defmodule Pulso.PromQL.Evaluator do
     prefetched =
       requests
       |> Enum.zip(results)
-      |> Map.new(fn {request, series} -> {request, {prepare_series(series), uses[request]}} end)
+      |> Map.new(fn {request, series} -> {request, {prepare_result(series), uses[request]}} end)
 
     Process.put(:promql_prefetched, prefetched)
     :ok
@@ -669,6 +899,16 @@ defmodule Pulso.PromQL.Evaluator do
 
   defp plan({:range, matchers, window, offset}, first, last, acc),
     do: [selector_request(matchers, offset, window, [first, last]) | acc]
+
+  # The same request select/6 makes for this function's range.
+  defp plan({:function, op, {:range, matchers, window, offset}}, first, last, acc),
+    do: [selector_request(matchers, offset, window, [first, last], tier_op(op)) | acc]
+
+  defp plan({:call, name, [{:range, matchers, window, offset}]}, first, last, acc)
+       when is_map_key(@range_functions, name),
+       do: [
+         selector_request(matchers, offset, window, [first, last], tier_op(Map.fetch!(@range_functions, name))) | acc
+       ]
 
   defp plan({:subquery, inner, window, resolution, offset}, first, last, acc) do
     inner_first = (Integer.floor_div(source_time(first, offset) - window, resolution) + 1) * resolution
@@ -682,6 +922,9 @@ defmodule Pulso.PromQL.Evaluator do
   defp plan(term, first, last, acc) when is_tuple(term), do: plan(Tuple.to_list(term), first, last, acc)
   defp plan(terms, first, last, acc) when is_list(terms), do: Enum.reduce(terms, acc, &plan(&1, first, last, &2))
   defp plan(_term, _first, _last, acc), do: acc
+
+  defp tier_op(:absent_over_time), do: :last_over_time
+  defp tier_op(op), do: op
 
   defp source_time(_step, {:at, anchor, shift}) do
     anchor = if is_binary(anchor), do: Map.fetch!(Process.get(:promql_query_context), anchor <> "_ts_ns"), else: anchor
@@ -936,6 +1179,11 @@ defmodule Pulso.PromQL.Evaluator do
         do: NativeRange.value(op, samples, start, finish, &note_histogram_counter(&1, metric_name)),
         else: value(op, samples, start, finish)
 
+    counter_name_info(op, result, metric_name)
+    result
+  end
+
+  defp counter_name_info(op, result, metric_name) do
     if op in [:rate, :increase] and
          (is_number(result) or result in [:nan, :infinity, :negative_infinity]) and
          metric_name != "" and not String.ends_with?(metric_name, ["_total", "_sum", "_count", "_bucket"]) do
@@ -944,8 +1192,6 @@ defmodule Pulso.PromQL.Evaluator do
           Pulso.JSON.encode!(metric_name)
       )
     end
-
-    result
   end
 
   # Both storage adapters use unanchored matching; Prometheus selectors anchor
@@ -1349,8 +1595,12 @@ defmodule Pulso.PromQL.Evaluator do
         {Number.add(delta, reset), sample.value}
       end)
 
+    extrapolate(op, change, first, last, length(samples), start, finish)
+  end
+
+  defp extrapolate(op, change, first, last, count, start, finish) do
     interval = Time.seconds(last.timestamp_ns - first.timestamp_ns)
-    average = interval / (length(samples) - 1)
+    average = interval / (count - 1)
     left = boundary_duration(Time.seconds(first.timestamp_ns - start), average)
     right = boundary_duration(Time.seconds(finish - last.timestamp_ns), average)
 

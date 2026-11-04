@@ -16,7 +16,15 @@ defmodule Pulso.SelfMetrics do
     ingest: [:otlp, :otlp_traces, :otlp_metrics, :loki, :remote_write, :sentry],
     query: [:storage_logs, :storage_metrics, :storage_traces, :promql, :logql_log, :logql_metric, :mcp, :http],
     object: [:put, :put_if_match, :put_if_none_match, :get, :get_if_none_match, :delete, :list, :list_prefixes],
-    compaction: [:compact, :cleanup, :worker_merge, :worker_cleanup, :worker_discovery]
+    compaction: [
+      :compact,
+      :cleanup,
+      :worker_merge,
+      :worker_cleanup,
+      :worker_discovery,
+      :worker_finalize,
+      :worker_backup
+    ]
   }
   @alert_skip_reasons [:authority_missing, :freshness_unavailable, :capacity, :timeout, :budget, :overrun]
   @definitions [

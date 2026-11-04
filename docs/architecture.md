@@ -1497,8 +1497,15 @@ The manifest becomes indispensable after compaction. Prefix reconstruction
 cannot distinguish published replacements from orphan uploads or retired sources.
 If a manifest is missing and compacted objects exist, reads and ingest return
 `:compacted_manifest_missing` rather than reconstructing incomplete or duplicate
-data. Recovery requires restoring the manifest from object-store version history
-or a backup. Legacy prefixes without compaction retain their listing-based
+data. Recovery restores the manifest from object-store version history or from
+Pulso's own backups (`Pulso.Storage.S3.ManifestBackup`): the maintenance owner
+writes a flat copy under `.../backups/` every interval, and cleanup passes
+`now_ms = backup_time + grace - 1`, so it only deletes objects retired before
+the newest backup. Restoring that backup therefore never references a deleted
+object; ingested segments written after it are adopted by key (`-rand-`/`-idem-`
+only), and later compaction or finalization outputs are left orphaned because
+their sources still exist. `-final-`, `-rollup-`, `-edge-` keys and a `backups/`
+prefix also fence listing reconstruction. Legacy prefixes without compaction retain their listing-based
 migration path unless they carry the retention `.managed` marker.
 
 Queries that lose a segment or format-3 metadata page to cleanup restart their
@@ -1510,6 +1517,38 @@ even after extended refresh failures; the grace period alone cannot bound every
 snapshot's lifetime.
 
 The next metrics work is label posting indexes, followed by OpenTelemetry metrics ingestion and then alert evaluation.
+
+## Metric hour finalization and rollups
+
+Compaction bounds segment counts but not rows: compacted segments hold every
+series of their hour. With metrics compaction enabled, `Pulso.Storage.S3.MetricTiers`
+finalizes each settled UTC hour in one conditional manifest transition. The
+native `metric_tiers.rs` builder reads every segment overlapping the hour
+without creating BEAM terms and writes:
+
+- `-final-` segments of the hour's rows, sorted by (metric name, labels) and
+  grouped by metric, so existing manifest name summaries prune other metrics;
+- `-edge-` raw segments for rows of straddling sources outside the hour;
+- `-rollup-` objects: per series and hour, count, first/last timestamp and
+  value, min, max, changes, resets with the pre-reset values, and flags for
+  native histograms, conflicting duplicate samples and negative-zero resets.
+  Rollup Parquet starts with a string column, so older metric readers reject
+  rather than misread it; sample queries exclude rollups by key tier.
+
+Every source is retired with the normal grace; every row is kept. Late raw
+segments overlapping a finalized hour block its rollups for queries and make it
+a finalization candidate again (the rewrite takes the old finals and rollups as
+sources).
+
+PromQL plans range functions whose float results compose exactly
+(rate/increase/delta inputs, counts, extrema, first/last, changes, resets,
+presence) with the whole hours inside every step window. S3 returns samples
+outside served hours plus rollup tuples; the evaluator folds samples and
+rollups in time order with the same comparison and addition order as its raw
+folds (resets add pre-reset values in order and one trailing zero reproduces
+the raw sign behaviour). Flags or histogram samples fall back to a raw read.
+Other functions read finalized samples. Retention-managed (format 3) prefixes
+are not finalized yet.
 
 ## Format 4 manifests
 

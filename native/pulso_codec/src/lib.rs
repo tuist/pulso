@@ -31,6 +31,7 @@ mod metric_json;
 mod metric_postings;
 mod metric_regex;
 mod metric_segment_parquet;
+mod metric_tiers;
 mod metric_value;
 mod native_histogram;
 mod otlp_json;
@@ -155,6 +156,8 @@ mod atoms {
         invalid_protobuf,
         payload_too_large,
         too_many_records,
+        invalid_segment,
+        too_large,
         too_many_trace_nodes,
         too_many_otlp_nodes,
         invalid_otlp,
@@ -1478,6 +1481,234 @@ fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
     match metric_json::encode(env, samples, metric_json::MAX_PAYLOAD) {
         Ok(buf) => (atoms::ok(), buf).encode(env),
         Err(crate::term_json::EncodeError::TooBig) => error(env, atoms::query_result_limit()),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+// ---- metric hour finalization and rollups ---------------------------------
+
+#[rustler::nif]
+fn metric_tier_api_version() -> u32 {
+    1
+}
+
+/// Rows of the segments overlapping one hour, accumulated natively one
+/// segment at a time by `metric_finalize_add` and encoded by
+/// `metric_finalize_finish`. Records never become Erlang terms.
+pub struct MetricFinalizer(std::sync::Mutex<Option<metric_tiers::Builder>>);
+
+#[rustler::resource_impl]
+impl rustler::Resource for MetricFinalizer {}
+
+#[rustler::nif]
+fn metric_finalize_new<'a>(
+    env: Env<'a>,
+    start: i64,
+    end: i64,
+    max_rows: usize,
+    expected_rows: usize,
+) -> Term<'a> {
+    if start >= end || max_rows == 0 {
+        return atoms::fallback().encode(env);
+    }
+    let builder = metric_tiers::Builder::new(start, end, max_rows, expected_rows);
+    (
+        atoms::ok(),
+        rustler::ResourceArc::new(MetricFinalizer(std::sync::Mutex::new(Some(builder)))),
+    )
+        .encode(env)
+}
+
+fn tier_error<'a>(env: Env<'a>, reason: metric_tiers::TierError) -> Term<'a> {
+    match reason {
+        metric_tiers::TierError::TooLarge => error(env, atoms::too_large()),
+        metric_tiers::TierError::Invalid => error(env, atoms::invalid_segment()),
+        metric_tiers::TierError::Encode => atoms::fallback().encode(env),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn metric_finalize_add<'a>(
+    env: Env<'a>,
+    finalizer: rustler::ResourceArc<MetricFinalizer>,
+    blob: Binary<'a>,
+) -> Term<'a> {
+    let Ok(mut guard) = finalizer.0.lock() else {
+        return atoms::fallback().encode(env);
+    };
+    let Some(builder) = guard.as_mut() else {
+        return atoms::fallback().encode(env);
+    };
+    match builder.add(erlang_bytes::from_binary(blob)) {
+        Ok(rows) => (atoms::ok(), rows).encode(env),
+        Err(reason) => {
+            // A failed add leaves a partial hour: it can never be finished.
+            guard.take();
+            tier_error(env, reason)
+        }
+    }
+}
+
+/// `{:ok, finals, before | nil, after | nil, rollups}`, each output
+/// `{payload, min_ts, max_ts, rows, [labels]}` with one label map per series.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn metric_finalize_finish<'a>(
+    env: Env<'a>,
+    finalizer: rustler::ResourceArc<MetricFinalizer>,
+    target_rows: usize,
+    rollup_target_rows: usize,
+    max_names: usize,
+) -> Term<'a> {
+    let Some(builder) = finalizer.0.lock().ok().and_then(|mut guard| guard.take()) else {
+        return atoms::fallback().encode(env);
+    };
+    match builder.finish(
+        env,
+        target_rows,
+        rollup_target_rows,
+        max_names.clamp(1, 128),
+    ) {
+        Ok((finished, series)) => {
+            let mut cache = Vec::new();
+            let mut output = |o: metric_tiers::Output<'a>| tier_output(env, o, &series, &mut cache);
+            let finals: Vec<Term> = finished.finals.into_iter().map(&mut output).collect();
+            let before = finished.before.map(&mut output);
+            let after = finished.after.map(&mut output);
+            let rollups: Vec<Term> = finished.rollups.into_iter().map(&mut output).collect();
+            (atoms::ok(), finals, before, after, rollups).encode(env)
+        }
+        Err(reason) => tier_error(env, reason),
+    }
+}
+
+fn tier_output<'a>(
+    env: Env<'a>,
+    output: metric_tiers::Output<'a>,
+    series: &metric_tiers::Series,
+    cache: &mut Vec<Option<Term<'a>>>,
+) -> Term<'a> {
+    let labels: Vec<Term> = output
+        .series
+        .iter()
+        .map(|index| series_labels(env, series, *index, cache))
+        .collect();
+    (
+        output.payload,
+        output.min_ts,
+        output.max_ts,
+        output.rows,
+        labels,
+    )
+        .encode(env)
+}
+
+// One label map per series, built once per call from its canonical bytes.
+fn series_labels<'a>(
+    env: Env<'a>,
+    series: &metric_tiers::Series,
+    index: u32,
+    cache: &mut Vec<Option<Term<'a>>>,
+) -> Term<'a> {
+    let index = index as usize;
+    if cache.len() <= index {
+        cache.resize(index + 1, None);
+    }
+    if let Some(term) = cache[index] {
+        return term;
+    }
+    let mut pairs = Vec::new();
+    let _ =
+        metric_segment_parquet::parse_canonical_pairs(series.canonical(index as u32), &mut pairs);
+    let binary = |bytes: &[u8]| {
+        let mut b = NewBinary::new(env, bytes.len());
+        b.as_mut_slice().copy_from_slice(bytes);
+        Binary::from(b).encode(env)
+    };
+    let names: Vec<Term> = pairs.iter().map(|(n, _)| binary(n)).collect();
+    let values: Vec<Term> = pairs.iter().map(|(_, v)| binary(v)).collect();
+    let term =
+        Term::map_from_arrays(env, &names, &values).unwrap_or_else(|_| atoms::nil().encode(env));
+    cache[index] = Some(term);
+    term
+}
+
+fn metric_matchers<'a>(
+    matchers: Term<'a>,
+) -> Option<Vec<(Binary<'a>, Binary<'a>, metric_segment_parquet::MatcherOp)>> {
+    let mut owners = Vec::new();
+    for term in matchers.decode::<ListIterator>().ok()? {
+        let (name, op, value): (Binary, rustler::Atom, Binary) = term.decode().ok()?;
+        let op = if op == atoms::eq() {
+            metric_segment_parquet::MatcherOp::Eq
+        } else if op == atoms::neq() {
+            metric_segment_parquet::MatcherOp::Neq
+        } else if op == atoms::re() {
+            metric_segment_parquet::MatcherOp::Re
+        } else if op == atoms::nre() {
+            metric_segment_parquet::MatcherOp::Nre
+        } else {
+            return None;
+        };
+        owners.push((name, value, op));
+    }
+    Some(owners)
+}
+
+/// Rollup rows with buckets in `[start, end]` whose labels match:
+/// `{:ok, [{labels, bucket, count, first_ts, first, last_ts, last, min, max,
+/// changes, resets, reset_values, flags}]}`. Values use the sample encoding
+/// of metric segments (`:nan`, `:infinity`, `:negative_infinity`).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_metric_rollups<'a>(
+    env: Env<'a>,
+    blob: Binary<'a>,
+    start_ts: Term<'a>,
+    end_ts: Term<'a>,
+    matchers: Term<'a>,
+) -> Term<'a> {
+    let (Ok(start), Ok(end), Some(owners)) = (
+        optional_int(start_ts),
+        optional_int(end_ts),
+        metric_matchers(matchers),
+    ) else {
+        return atoms::fallback().encode(env);
+    };
+    let views: Vec<metric_segment_parquet::Matcher> = owners
+        .iter()
+        .map(|(n, v, op)| metric_segment_parquet::Matcher {
+            name: n.as_slice(),
+            value: v.as_slice(),
+            op: *op,
+        })
+        .collect();
+    match metric_tiers::decode_rollups(erlang_bytes::from_binary(blob), start, end, &views) {
+        Ok((series, rows)) => {
+            let mut cache = Vec::new();
+            let value = |v: f64| metric_value::encode(env, v);
+            let terms: Vec<Term> = rows
+                .iter()
+                .map(|a| {
+                    let resets: Vec<Term> = a.reset_values.iter().map(|v| value(*v)).collect();
+                    let fields = [
+                        series_labels(env, &series, a.series, &mut cache),
+                        a.bucket.encode(env),
+                        a.count.encode(env),
+                        a.first_ts.encode(env),
+                        value(a.first),
+                        a.last_ts.encode(env),
+                        value(a.last),
+                        value(a.min),
+                        value(a.max),
+                        a.changes.encode(env),
+                        a.resets.encode(env),
+                        resets.encode(env),
+                        a.flags.encode(env),
+                    ];
+                    rustler::types::tuple::make_tuple(env, &fields)
+                })
+                .collect();
+            (atoms::ok(), terms).encode(env)
+        }
         Err(_) => atoms::fallback().encode(env),
     }
 }

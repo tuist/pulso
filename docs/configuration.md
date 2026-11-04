@@ -37,6 +37,9 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_METRICS_FOOTER_PRUNING_ENABLED` | `false` | Optional bounded suffix-GET exclusion for ordinary metric queries. Requires strong ETags, suffix Range and GET If-Match; may add GETs/earlier scan rejection. See [provider prerequisites and bounds](metric-footer-pruning.md). |
 | `PULSO_MANIFEST_FORMAT` | `paged` | Manifest format for prefixes without enforced retention. `paged` keeps the conditionally written root bounded and converts flat manifests on their next write, so ingest cost and manifest memory no longer grow with history. `flat` keeps writing flat lists; use it while older releases still write to the bucket. Read [Manifest format](#manifest-format) first. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
+| `PULSO_METRICS_FINALIZE_ENABLED` | `true` | With metrics compaction, rewrite each settled hour into segments grouped by metric name plus hourly rollups. See [Long dashboard and alert ranges](#long-dashboard-and-alert-ranges). |
+| `PULSO_MANIFEST_BACKUP_ENABLED` | `true` | Back up the manifests of compacted prefixes inside the bucket and hold deletions until a backup records them. See [Manifest backups](#manifest-backups). |
+| `PULSO_MANIFEST_BACKUP_INTERVAL_MS` | `900000` | How often each compacted prefix is backed up, `60000..86400000`. |
 | `PULSO_TEMPO_SEARCH_ENABLED` | `false` | Opt in to experimental Tempo `/api/search`, resource/span/instrumentation/event/link tag discovery (names/values optionally filtered on parent-span strings; filtered names are complete conservative hints, not matching-key proofs) and corresponding MCP tools. Complete-context search may use publication-proven exact resource.service.name candidate-source pruning plus conservative trace-ID context selection; unknown/legacy sources still read, without time clipping. Retained catalog metadata/page/heap bounds can bind before the hard 8192-reference ceiling; actual fetched inputs cumulatively cap at 1024 / 32 MiB / 1,000,000 raw rows, plus 65,536 matching-or-legacy-unknown IDs and independent output bounds. Index-probe exhaustion reads conservatively and can fail late; unread irrelevant objects are not scrubbed. Requires metadata2/export3/search5/discovery12, tuple `{2,1,3,5,12}`, on every serving artifact. Representative postings/capacity/client acceptance remains pending. Discovery does not use this service/ID plan. Discovery also caps requested-owner-plus-attribute work at 2,000,000 per scan attempt before filtering, lowering flat-scope capacity as attribute counts grow. Search always returns the most recent matching traces, so `with (most_recent=true)` is optional (Grafana omits it); bounded same-span negated-regex/status/int64 OR/span-duration and unscoped span-first expressions use full-scope admission without the service planner and an additional 20M prefilter work ceiling per scan attempt; see [expression semantics](trace-query-expressions.md). Static intrinsic names/seven v2 enum-or-empty vocabularies require the same gate/admission/auth but read no storage and prove no stored presence. Default names combine all five namespaces plus static v2 suggestions under one 2M-work/5000-scope-name-pair budget (20 intrinsic reservations apply even for v1 flattening), with service.name hints even unfiltered and without original attrs; storage errors fail whole rather than emitting partial suggestions. None values combine resource/span/instrumentation originals, not all name scopes. Bounded resource/span string filters select one parent before three-owner union/work, a complete extension rather than Tempo's ignored-query behavior. Same-key equality, nonstring/nested/intrinsic filters reject; values retain original types, matching complex targets fail, and legacy/corruption fail even on nonmatches. Filtered-none needs query-aware unscoped execution or bounded reference, plus separate explicit windowed-filtered-none support; old unfiltered/window callbacks cannot silently ignore the new mode. Floats (including non-finite classes) and seven stored intrinsic strings and event:timeSinceStart exact signed int nanosecond offsets read bounded data, accepting same-parent string filters; event-time filters are a disclosed complete extension versus upstream's empty path. Effective event time0 may yield negative offsets; no events invent no values. Invalid requested event times fail even on nonmatches and parent+all event attrs charge before filtering. New explicit event-time and separate windowed-event-time execution is required, never old string/window callbacks. These are distinct from storage-free static vocabulary. Paired positive discovery time bounds select retention-visible immutable segment envelopes, not span starts; all raw header/provider costs still apply, no indexed I/O gain or cross-window dictionary cache. Compaction can broaden suggestions, excluded payloads are not integrity-scrubbed. Matching capability-12 artifacts are required on every serving instance; flat/old adapters reject unsupported windows. Root name/service dictionaries select parent trace IDs then recover complete retained context, including roots outside predicate/window. Missing/ambiguous roots or missing original string root service fail409 whole, never default/skip. In-flight children-before-root and retention-straddling/multi-root traces can make broad/recent autocomplete unusable; this is a strict default-off extension, not transparent replacement. Root S3 input is the whole retained tenant, capped1024 objects/32MiB compressed/1M raw rows regardless of window/matches; no service/ID planner, local replay decodes all sources without another GET and cross-checks header/body rows. 65,536 candidates/16MiB bookkeeping,2M resource/span/link owner+attr work plus normal dictionary/result limits; dedicated root/window support required. Canonical trace:duration also measures complete retained max-end/min-start, without requiring roots. It may grow during ingest or shrink with retention, not exporter duration. Unfiltered emits int nanoseconds; any supported parent filter emits Go-style duration strings (including µs); both sort lexically. Do not cache across filter/type changes. Root capture/input/replay limits remain; duration work is2 resource/span owners+attrs,65,536 groups/80B per-summary charge within16MiB charged bookkeeping (not total native memory),5000 values/independent1MiB dictionaries/results. Broad nanosecond dictionaries commonly fail422. Dedicated duration/window support fences old root/string callbacks. Static duration/span:duration/traceDuration empty vocabularies remain unchanged. Zero/partial discovery windows, stored span-duration intrinsics, exact upstream distinct-omission/dynamic dedicated-column parity, full TraceQL and deployed-client parity remain unsupported. HTTP metadata search accepts omitted bounds or paired zeros for all retained context with unchanged ceilings; partial search windows reject. See [Tempo search](traces.md#experimental-tempo-search). |
 | `PULSO_LOG_COMPACTION_ENABLED` | `false` | Merge small log segments natively in the background. Read [Log compaction](#log-compaction) first. |
 | `PULSO_TRACE_COMPACTION_ENABLED` | `false` | Experimental native trace merges and retirement cleanup. Requires all readers/writers/compactors upgraded and bucket versioning; see [trace compaction](traces.md#optional-native-compaction). |
@@ -567,10 +570,11 @@ Before enabling it:
 - **Run the same Pulso version everywhere that writes to the bucket.** Older
   versions do not understand the metadata compaction records, and mixing them
   after compaction has started is unsupported.
-- **Turn on bucket versioning or back up the manifests.** After compaction, the
-  per-tenant manifest is the only record of which objects are live. If it is lost,
-  Pulso returns an error rather than guessing, and recovery means restoring a
-  previous manifest version.
+- **Keep manifest backups on, or turn on bucket versioning.** After compaction,
+  the per-tenant manifest is the only record of which objects are live. If it is
+  lost, Pulso returns an error rather than guessing. Pulso's own
+  [manifest backups](#manifest-backups) (on by default) make it restorable on
+  object stores without versioning, such as Tigris.
 - **Keep node clocks synchronized.** The deletion grace period assumes clocks
   agree to well within an hour.
 
@@ -592,72 +596,134 @@ manifest pages at a time.
 
 ## Long dashboard and alert ranges
 
-Compacted segments hold all series of their hour, so a query over a window
-downloads every stored row of that window, whatever its matchers, and skips
-the series it does not select. The byte and segment budgets bound that
-reading; the row budget counts only the rows the selectors match. Measured with
-`test/pulso/promql/query_scale_bench_test.exs` on 3,000 series scraped every
-15 s (720,000 rows an hour), 18 ms per object GET and four segments of
-prefetch on one node:
+Compaction alone leaves about ten segments an hour, each holding every series
+of its hour, so a query over a window still reads every stored row of that
+window whatever its matchers (the byte and segment budgets bound that reading;
+the row budget counts only the rows the selectors match). With compaction on, Pulso therefore also
+*finalizes* each hour once it has settled (10 minutes after it ends):
 
-| History | Query | Segments read | Time |
-| --- | --- | --- | --- |
-| 6 h uncompacted, 18,720 segments | any 1 h range | over 1,024 | refused (`max_scan_segments`) |
-| same, segment budget raised | 1 h range | 2,020 of about 3,300 | timed out at 10 s |
-| 6 h compacted, 59 segments | 1 h range, default budgets | 12 | 0.1 s |
-| same | 6 h dashboards, `and on`, ratio | 59 | 0.4 to 0.6 s with raised budgets |
-| same | 6 h `rate` over 400 series | 59 | 2.8 s with raised budgets |
-| 7 days compacted, 1,690 segments | 24 h dashboards | 241 | 1.4 to 2.2 s |
-| same | `increase(x[1d])` | 240 | 2.0 s |
-| same | `[3d:30m]` subquery | 717 | 4.6 s |
-| same | `[7d:5m]` subquery | 1,681 | 11.4 s |
-| same | `offset 168h` over `[1h]` | 20 | 0.2 s |
+- The hour's rows are rewritten as segments grouped by metric name (about
+  32,768 rows each). Their manifest name summaries let a selector skip every
+  other metric's rows, so a query reads the rows of its own metric only.
+- Each series' samples of the hour are summarized into one rollup row (count,
+  first and last sample, minimum, maximum, changes and resets). `rate`,
+  `increase`, `delta`, `count_over_time`, `present_over_time`,
+  `absent_over_time`, `min_over_time`, `max_over_time`, `first_over_time`,
+  `last_over_time`, `changes` and `resets` read one rollup row per series for
+  every whole hour inside their window and samples only at the window's edges.
+  Results are identical to reading the samples. Other functions (`sum_over_time`,
+  `avg_over_time`, quantiles, deviations, subqueries) and native histograms read
+  the samples of finalized hours, still only of their own metric.
 
-To serve 1-hour to 24-hour dashboards and 1-hour to 7-day alert windows:
+Every sample is kept; rollups are an index, not downsampling. A sample written
+into an already finalized hour makes queries read that hour's samples until the
+next pass finalizes it again. Prefixes with enforced
+[retention](retention.md) are not finalized yet.
 
-1. Turn on bucket versioning, then enable metrics compaction
-   (`metricsCompaction.enabled: true`), after every writer runs the same release.
-2. Raise the scan budgets to cover the longest window: bytes and segments an
-   hour times hours (about 10 segments an hour once compacted), and rows the
-   broadest selector matches an hour times hours (up to 17 million rows for a
-   day and 121 million for a week at the rate above, when one selector matches
-   every series). A query
-   over a budget reports what it needed, for example `max_scan_rows = 1000000,
-   needed 17352000`, which sizes the budget for your own ingest rate.
-3. Raise `PULSO_QUERY_MAX_SAMPLES`, `PULSO_QUERY_MAX_RESULT_POINTS`,
-   `PULSO_QUERY_MAX_MATERIALIZED_SAMPLES`, `PULSO_QUERY_MAX_WORK` and
-   `PULSO_QUERY_MAX_HEAP_MB` for
-   ranges over hundreds of series (see [Query budgets](#query-budgets)), and give the
-   container enough memory for (`PULSO_QUERY_MAX_CONCURRENT` + 2) query heaps.
-4. Raise `PULSO_QUERY_TIMEOUT_MS` above the slowest window you need, below
-   Grafana's 30 s datasource timeout. A 7-day window took 11 s above.
+Measured with `test/pulso/promql/query_scale_bench_test.exs` (`--include
+query_bench`): 7 days of 3,000 series scraped every 15 s (121 million rows), 18 ms
+per object GET, on one node. Before is the compacted history (ten segments an
+hour of every series), after the same history finalized:
+
+| Query | Before: GETs | MiB | Time | After: GETs | MiB | Time |
+|---|---:|---:|---:|---:|---:|---:|
+| 24-hour dashboard, `sum` by label | 245 | 19.6 | 1.0 s | 25 | 0.4 | 0.1 s |
+| 24-hour dashboard, `and on` join | 241 | 19.2 | 2.2 s | 25 | 0.4 | 0.6 s |
+| `increase(up[1d])` alert | 240 | 19.2 | 1.7 s | 24 | 0.5 | 0.1 s |
+| `max_over_time(…[3d])` alert | 724 | 57.8 | 3.6 s | 72 | 1.6 | 0.2 s |
+| `increase(up[7d])` alert | 722 | 57.6 | `max_samples` exceeded | 168 | 3.7 | 0.4 s |
+| `changes(up[7d])` alert | 721 | 57.5 | `max_samples` exceeded | 168 | 3.7 | 0.5 s |
+| `[3d:30m]` subquery alert | 717 | 57.2 | 3.6 s | 73 | 1.3 | 1.1 s |
+| `[7d:5m]` subquery alert | 1,681 | 134.2 | 9.2 s | 169 | 3.1 | 3.2 s |
+| `offset 168h` alert | 20 | 1.6 | 0.1 s | 2 | 0.0 | 0.1 s |
+
+Before needs budgets of 4,096 segments and a 512 MiB
+query heap; with the default budgets every one of these queries fails. After,
+all of them run within the budgets below except the `[7d:5m]` subquery
+(measured with the larger sample profile described after them), and all but the
+`and on` join and the subqueries within the defaults.
+
+`test/pulso/promql/tiered_reads_test.exs` pins the exact segment and row counts
+of 1-hour, 24-hour and 7-day queries over finalized history.
+
+Recommended budgets for 1-hour to 24-hour dashboards and 1-hour to 7-day alert
+windows on a node of about 1.5 GiB:
 
 ```yaml
 metricsCompaction:
   enabled: true
+  finalize: true
+manifestBackups:
+  enabled: true
 resources:
   limits:
-    memory: 6Gi
+    memory: 1536Mi
 extraEnv:
-  - {name: PULSO_QUERY_MAX_SCAN_ROWS, value: "200000000"}
-  - {name: PULSO_QUERY_MAX_SCAN_SEGMENTS, value: "4096"}
-  - {name: PULSO_QUERY_MAX_SCAN_BYTES, value: "4294967296"}
-  - {name: PULSO_QUERY_MAX_SAMPLES, value: "1000000"}
-  - {name: PULSO_QUERY_MAX_RESULT_POINTS, value: "1000000"}
-  - {name: PULSO_QUERY_MAX_MATERIALIZED_SAMPLES, value: "1000000"}
+  - {name: PULSO_QUERY_MAX_SCAN_SEGMENTS, value: "2048"}
+  - {name: PULSO_QUERY_MAX_SCAN_ROWS, value: "20000000"}
+  - {name: PULSO_QUERY_MAX_SCAN_BYTES, value: "1073741824"}
+  - {name: PULSO_QUERY_MAX_SAMPLES, value: "500000"}
+  - {name: PULSO_QUERY_MAX_RESULT_POINTS, value: "500000"}
+  - {name: PULSO_QUERY_MAX_MATERIALIZED_SAMPLES, value: "500000"}
   - {name: PULSO_QUERY_MAX_WORK, value: "50000000"}
-  - {name: PULSO_QUERY_MAX_HEAP_MB, value: "512"}
-  - {name: PULSO_QUERY_MAX_CONCURRENT, value: "3"}
+  - {name: PULSO_QUERY_MAX_HEAP_MB, value: "256"}
+  - {name: PULSO_QUERY_MAX_CONCURRENT, value: "2"}
   - {name: PULSO_QUERY_TIMEOUT_MS, value: "25000"}
   - {name: PULSO_QUERY_PREFETCH, value: "8"}
 ```
 
-Compaction catches up on existing history gradually; until it has, long
-ranges over older hours still fail on the segment budget, and the error says
-so. Long windows read every row of the window on every evaluation, so a 7-day
-alert evaluated every minute reads the whole week each minute. Pulso has no
-downsampled rollups or per-series index yet; prefer recording rules or shorter
-windows where they answer the same question.
+Rows scanned are not retained; the samples a query selects are (about 450
+bytes of worker heap each), so the heap ceiling follows `PULSO_QUERY_MAX_SAMPLES`.
+500,000 samples need about 225 MiB, within the 256 MiB ceiling. Two
+interactive queries plus two alerting evaluations are at most four such heaps
+(1 GiB), leaving about 500 MiB for ingest, manifest caches and prefetch. A
+query over a budget reports what it needed, for example
+`max_scan_segments=2048 exceeded: candidates in the time range total at least
+2300 segments`.
+
+Finalization catches up on existing history up to six hours per tenant and
+maintenance pass (every minute), oldest first. Until an hour has been
+finalized, ranges over it read every series' rows as before.
+
+Subqueries over days (`[7d:5m]`) evaluate their inner expression at every step
+over samples and cannot use rollups: the week-long subquery in the table selects
+more than 500,000 samples. Prefer a recording rule for the inner expression. If
+you need the subquery itself, set `PULSO_QUERY_MAX_SAMPLES=1000000`,
+`PULSO_QUERY_MAX_HEAP_MB=384` and `PULSO_QUERY_MAX_CONCURRENT=1` (three query
+heaps of 384 MiB), at the cost of serving one interactive query at a time.
+
+## Manifest backups
+
+Once compaction or finalization has run, a prefix's manifest is the only
+record of which objects are live. With `PULSO_MANIFEST_BACKUP_ENABLED=true`
+(default; chart `manifestBackups.enabled`) the maintenance owner of each
+compacted prefix writes a complete copy of its manifest to
+`tenants/<tenant>/v4/signal=<signal>/backups/<unix-ms>.json` every
+`PULSO_MANIFEST_BACKUP_INTERVAL_MS` (15 minutes) and keeps the newest 48.
+
+Cleanup only deletes an object whose retirement is recorded in the newest
+backup, so restoring the newest backup never references a deleted object.
+Deletions therefore lag the grace period by up to one backup interval. Backups
+live in the same bucket: they protect against a lost or corrupted manifest,
+not against losing the bucket. Prefixes with enforced retention are not backed
+up; keep bucket versioning or another backup for them.
+
+To restore a lost or corrupted manifest, stop ingest for the tenant if you can,
+then run on one instance:
+
+```sh
+kubectl -n observability exec deploy/pulso -- /app/bin/pulso rpc '
+  config = Map.new(Application.fetch_env!(:pulso, Pulso.Storage.S3))
+  IO.inspect(Pulso.Storage.S3.ManifestBackup.restore("<tenant>", "metrics", config))'
+```
+
+It refuses to replace an existing manifest unless you pass `force: true` as a
+fourth argument (`[force: true]`), for example to replace a corrupted one. The
+restored manifest is the newest backup plus every ingested segment written
+after it. Compaction outputs written after the backup are not adopted; their
+sources were never deleted, so no acknowledged sample is lost or counted twice,
+and the orphaned outputs are only extra storage. Restart the instances
+afterwards so they drop cached manifests.
 
 ## Log compaction
 

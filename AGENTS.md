@@ -26,6 +26,16 @@ requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
 16 per tenant/signal) so uploads overlap the serialized manifest CAS.
 
+With metrics compaction on, settled hours are finalized
+(`Pulso.Storage.S3.MetricTiers`, native `metric_tiers.rs`, tier API 1): rows
+rewritten into metric-grouped `-final-` segments plus per-series hourly
+`-rollup-` objects. PromQL rate/increase/delta/count/min/max/first/last/changes/
+resets/present/absent read rollups for whole interior hours, samples at edges,
+bit-identical to raw (`test/pulso/promql/tiered_reads_test.exs` pins 1h/24h/7d
+segment and row counts). `Pulso.Storage.S3.ManifestBackup` writes manifest
+copies under `.../backups/` and holds cleanup until a backup records each
+retirement; `restore/4` recovers a lost manifest without bucket versioning.
+
 Limited LogQL log queries (no `interval`) plan only the first
 `max_scan_segments + 1` candidates in their direction (`log_window`: newest
 `max_ts` backward, oldest `min_ts` forward; format 4 reads leaves in bound

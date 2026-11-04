@@ -72,11 +72,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     settled_before = System.os_time(:nanosecond) - settle_ns
 
     manifest.segments
-    |> Enum.filter(fn s ->
-      is_integer(s.byte_size) and s.byte_size > 0 and s.byte_size <= small_bytes and
-        is_integer(s.row_count) and s.row_count > 0 and
-        (settle_ns == 0 or (is_integer(s.max_ts) and s.max_ts <= settled_before))
-    end)
+    |> Enum.filter(&(mergeable?(&1, small_bytes) and settled?(&1, settle_ns, settled_before)))
     |> Enum.group_by(fn s ->
       if manifest.version == 3, do: PagedManifest.bucket_start(manifest.paging, s.max_ts), else: Path.dirname(s.key)
     end)
@@ -87,6 +83,15 @@ defmodule Pulso.Storage.S3.SignalCompactor do
       |> select_group(max_segments, max_bytes, max_rows, 32)
     end)
   end
+
+  # Finalized segments and rollups are rewritten only by hour finalization.
+  defp mergeable?(s, small_bytes) do
+    is_integer(s.byte_size) and s.byte_size > 0 and s.byte_size <= small_bytes and
+      is_integer(s.row_count) and s.row_count > 0 and Segment.key_tier(s.key) == :raw
+  end
+
+  defp settled?(_s, 0, _settled_before), do: true
+  defp settled?(s, _settle_ns, settled_before), do: is_integer(s.max_ts) and s.max_ts <= settled_before
 
   # Try a bounded number of starting points: a full-sized replacement at the
   # front must not prevent smaller original segments from being merged.
@@ -435,7 +440,11 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp prepare_replacement(root, sources, replacement, grace, _tenant, _config),
     do: Manifest.replace(root, sources, replacement, System.system_time(:millisecond) + grace)
 
-  @doc "Delete up to max_deletions (128) expired objects; persist progress and retry failed keys on later passes."
+  @doc """
+  Delete up to max_deletions (128) expired objects; persist progress and retry
+  failed keys on later passes. `:now_ms` overrides the clock deadlines are
+  compared with.
+  """
   def cleanup(tenant, config, opts \\ []) do
     monitor(:cleanup, fn -> do_cleanup(tenant, config, opts) end)
   end
@@ -468,8 +477,8 @@ defmodule Pulso.Storage.S3.SignalCompactor do
          :ok <- migration_gate(manifest, config) do
       case manifest.version do
         3 -> Retention.cleanup_retired(tenant, signal_string(config), config, opts)
-        4 -> cleanup_paged(manifest, tenant, maximum, config)
-        _ -> manifest |> deletion_candidates(tenant, maximum, config) |> delete_candidates(tenant, config)
+        4 -> cleanup_paged(manifest, tenant, maximum, config, now(opts))
+        _ -> manifest |> deletion_candidates(tenant, maximum, config, now(opts)) |> delete_candidates(tenant, config)
       end
     end
   end
@@ -477,9 +486,12 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   # Retired segments as for flat roots, plus manifest pages superseded by
   # compaction once their reader grace has passed. A gc page is deleted only
   # after every page it lists, so a missing gc page means its work is done.
-  defp cleanup_paged(root, tenant, maximum, config) do
+  # `:now_ms` holds deletions back, for example until a manifest backup
+  # records the retirements (`Pulso.Storage.S3.ManifestBackup.hold_ms/2`).
+  defp now(opts), do: Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+
+  defp cleanup_paged(root, tenant, maximum, config, now) do
     signal = signal_string(config)
-    now = System.system_time(:millisecond)
 
     with {:ok, plan} <- JournalManifest.cleanup_plan(root, now, maximum, tenant, signal, config) do
       retired = Enum.filter(plan.retired, fn {key, _} -> valid_segment_key?(tenant, key, config) end)
@@ -545,8 +557,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp validate_cleanup_limit(maximum) when is_integer(maximum) and maximum > 0, do: :ok
   defp validate_cleanup_limit(_), do: {:error, :invalid_cleanup_options}
 
-  defp deletion_candidates(manifest, tenant, maximum, config) do
-    now = System.system_time(:millisecond)
+  defp deletion_candidates(manifest, tenant, maximum, config, now) do
     active = MapSet.new(manifest.segments, & &1.key)
 
     eligible =

@@ -19,7 +19,9 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   alias Pulso.Storage.S3.CompactionSupervision
   alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.LogCompactor
+  alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.MetricsCompactor
+  alias Pulso.Storage.S3.MetricTiers
   alias Pulso.Storage.S3.TraceCompactor
 
   require Logger
@@ -93,11 +95,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
     key = backoff_key(tenant, signal)
 
     case compact_tenant(tenant, signal, config) do
-      {:error, :timeout} ->
+      {{:error, :timeout}, config} ->
         deadline = System.monotonic_time(:millisecond) + Map.get(config, :compaction_retry_ms, 300_000)
         {:halt, Map.put(config, :compaction_backoff, Map.put(backoff, key, deadline))}
 
-      _result ->
+      {_result, config} ->
         {:cont, Map.put(config, :compaction_backoff, Map.delete(backoff, key))}
     end
   end
@@ -116,7 +118,100 @@ defmodule Pulso.Storage.S3.CompactionWorker do
     opts = Map.get(config, option_key, [])
     cleanup_opts = Map.get(config, cleanup_key, [])
     result = merge_while_progressing(module, tenant, config, opts, Map.get(config, :compaction_max_merges, 32))
-    cleanup_if_owner(result, tenant, signal, config, module, cleanup_opts)
+    {result, config} = finalize_hours(result, tenant, signal, config)
+    {hold, config} = back_up(result, tenant, signal, config, Keyword.get(opts, :grace_ms, 3_600_000))
+    cleanup_opts = if hold, do: Keyword.put(cleanup_opts, :now_ms, hold), else: cleanup_opts
+    {cleanup_if_owner(result, tenant, signal, config, module, cleanup_opts), config}
+  end
+
+  # Rewrite settled metric hours into metric-grouped segments and rollups,
+  # oldest first, up to `:metric_finalize_max_hours` per pass. An hour that
+  # fails is skipped for an hour so it cannot block the others.
+  defp finalize_hours({:error, :timeout} = result, _tenant, _signal, config), do: {result, config}
+
+  defp finalize_hours(result, tenant, "metrics", config) do
+    # Metrics maintenance only runs with metrics compaction enabled (CompactionOwnership.signals/1).
+    if Map.get(config, :metric_finalize_enabled, true),
+      do: finalize_next(result, tenant, config, Map.get(config, :metric_finalize_max_hours, 6)),
+      else: {result, config}
+  end
+
+  defp finalize_hours(result, _tenant, _signal, config), do: {result, config}
+
+  defp finalize_next(result, _tenant, config, 0), do: {result, config}
+
+  defp finalize_next(result, tenant, config, remaining) do
+    now = System.monotonic_time(:millisecond)
+    skips = config |> Map.get(:metric_finalize_skip, %{}) |> Map.get(tenant, %{})
+    skips = Map.reject(skips, fn {_hour, until} -> until <= now end)
+    opts = Keyword.put(Map.get(config, :metric_finalize_options, []), :skip_hours, MapSet.new(Map.keys(skips)))
+
+    put_skips =
+      &Map.put(config, :metric_finalize_skip, Map.put(Map.get(config, :metric_finalize_skip, %{}), tenant, &1))
+
+    case run_operation(fn -> MetricTiers.finalize(tenant, config, opts) end, {"metrics", tenant}, "finalize", config) do
+      {:ok, %{hour: nil}} ->
+        {result, put_skips.(skips)}
+
+      {:ok, %{hour: _}} ->
+        if CompactionOwnership.local_owner?(tenant, "metrics", config),
+          do: finalize_next(result, tenant, put_skips.(skips), remaining - 1),
+          else: {result, put_skips.(skips)}
+
+      {:error, {hour, _reason}} when is_integer(hour) ->
+        finalize_next(result, tenant, put_skips.(Map.put(skips, hour, now + 3_600_000)), remaining - 1)
+
+      {:error, :timeout} = timeout ->
+        {timeout, put_skips.(skips)}
+
+      _error ->
+        {result, put_skips.(skips)}
+    end
+  end
+
+  # Back up the manifest every `:manifest_backup_interval_ms` and return the
+  # clock cleanup may use, so the newest backup stays restorable. nil when
+  # backups are off or the prefix is retention-managed.
+  defp back_up({:error, :timeout} = _result, _tenant, _signal, config, _grace), do: {0, config}
+
+  defp back_up(_result, tenant, signal, config, grace) do
+    if Map.get(config, :manifest_backup_enabled, true) do
+      backups = Map.get(config, :manifest_backups, %{})
+      last = backups |> Map.get_lazy({tenant, signal}, fn -> latest_backup(tenant, signal, config) end)
+      last = if backup_due?(last, config), do: run_backup(tenant, signal, config, last), else: last
+      config = Map.put(config, :manifest_backups, Map.put(backups, {tenant, signal}, last))
+      {if(last != :retention_managed, do: ManifestBackup.hold_ms(last, grace)), config}
+    else
+      {nil, config}
+    end
+  end
+
+  defp latest_backup(tenant, signal, config) do
+    case ManifestBackup.latest(tenant, signal, config) do
+      {:ok, taken} -> taken
+      _ -> nil
+    end
+  end
+
+  defp backup_due?(:retention_managed, _config), do: false
+  defp backup_due?(nil, _config), do: true
+
+  defp backup_due?(last, config),
+    do: System.system_time(:millisecond) - last >= Map.get(config, :manifest_backup_interval_ms, 900_000)
+
+  defp run_backup(tenant, signal, config, last) do
+    keep = Map.get(config, :manifest_backup_keep, 48)
+
+    case run_operation(
+           fn -> ManifestBackup.backup(tenant, signal, config, keep: keep) end,
+           {signal, tenant},
+           "backup",
+           config
+         ) do
+      {:ok, %{taken_ms: taken}} -> taken
+      {:ok, :retention_managed} -> :retention_managed
+      _error -> last
+    end
   end
 
   # One merge combines at most 32 segments, while frequent pushers (a log
@@ -184,6 +279,8 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp metric_dimension("merge"), do: :worker_merge
   defp metric_dimension("cleanup"), do: :worker_cleanup
   defp metric_dimension("discovery"), do: :worker_discovery
+  defp metric_dimension("finalize"), do: :worker_finalize
+  defp metric_dimension("backup"), do: :worker_backup
 
   defp do_run_operation(operation, subject, name, config) do
     task =
@@ -211,6 +308,8 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   end
 
   defp operation_timeout(config, "discovery"), do: Map.get(config, :compaction_discovery_timeout_ms, 60_000)
+  defp operation_timeout(config, "finalize"), do: Map.get(config, :metric_finalize_timeout_ms, 120_000)
+  defp operation_timeout(config, "backup"), do: Map.get(config, :manifest_backup_timeout_ms, 120_000)
   defp operation_timeout(config, _operation), do: Map.get(config, :compaction_timeout_ms, 30_000)
 
   defp report_failure(subject, name, reason) do
