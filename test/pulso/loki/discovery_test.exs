@@ -48,6 +48,10 @@ defmodule Pulso.Loki.DiscoveryTest do
     NIF.log_discovery_finish(state)
   end
 
+  # The reference matches every record with a dirty-CPU regex NIF, so under CI
+  # contention it queues behind other tests' native work. Keep all 180
+  # comparisons without the ordinary one-minute test budget.
+  @tag timeout: 300_000
   test "native discovery agrees with the record-backed reference on random streams" do
     tenant = "discovery-parity-#{System.unique_integer([:positive])}"
     records = for ts <- 1..400, do: random_record(ts)

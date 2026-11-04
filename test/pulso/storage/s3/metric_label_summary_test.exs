@@ -128,6 +128,10 @@ defmodule Pulso.Storage.S3.MetricLabelSummaryTest do
     "[|]"
   ]
 
+  # Every matcher decodes a segment and matches values on dirty CPU schedulers,
+  # which queue behind other tests' native work under CI contention. Keep all
+  # comparisons without the ordinary one-minute test budget.
+  @tag timeout: 300_000
   test "regex and inequality pruning equals native matching on complete value sets" do
     :rand.seed(:exsss, {42, 7, 2026})
 

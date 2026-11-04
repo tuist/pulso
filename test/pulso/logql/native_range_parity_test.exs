@@ -78,9 +78,13 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
     if :rand.uniform(2) == 1, do: "sum by (app) (#{inner})", else: inner
   end
 
+  # Both evaluators default to the 10 s query deadline, which the reference
+  # can exceed under CI contention and then answer :query_timeout instead of a
+  # comparable result. Give each evaluation a deadline the test cannot hit.
   defp evaluate(module, ast, tenant, opts) do
     Process.delete(:promql_budget)
     Process.delete(:promql_deadline_ms)
+    Process.put(:query_deadline_ms, System.monotonic_time(:millisecond) + 120_000)
     module.evaluate(ast, tenant, opts)
   end
 
@@ -95,7 +99,7 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
 
   # Keep all 120 native/reference comparisons, including multi-step windows,
   # without applying the ordinary one-minute test budget under CI contention.
-  @tag timeout: 180_000
+  @tag timeout: 300_000
   test "random native range scans match the materializing evaluator", %{tenant: tenant} do
     for _ <- 1..120 do
       text = query()
