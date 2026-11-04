@@ -80,6 +80,41 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   def referenced(%Manifest{} = root), do: length(root.segments)
 
+  @doc """
+  Stored bytes of the active segments a root references, as `{spans, unknown}`:
+  `{min_ts, max_ts, bytes}` spans (each tail segment, each page reference) and
+  the number of referenced segments without a recorded size (pages written
+  before sizes were recorded, legacy segments). Retention-managed roots report
+  only their inline tail.
+  """
+  @day_ns 86_400_000_000_000
+  def referenced_bytes(%Manifest{} = root) do
+    # Listed segments are summed per day of their newest record, so a large
+    # flat root stays a handful of spans.
+    {days, unknown} =
+      Enum.reduce(root.segments, {%{}, 0}, fn
+        %{byte_size: bytes, max_ts: mx}, {days, unknown} when is_integer(bytes) and is_integer(mx) ->
+          {Map.update(days, div(mx, @day_ns), bytes, &(&1 + bytes)), unknown}
+
+        _segment, {days, unknown} ->
+          {days, unknown + 1}
+      end)
+
+    tail = for {day, bytes} <- days, do: {day * @day_ns, day * @day_ns + @day_ns - 1, bytes}
+    refs = if root.version == @version, do: root.paging["refs"], else: []
+
+    Enum.reduce(refs, {tail, unknown}, fn
+      %{"sb" => 0}, acc ->
+        acc
+
+      %{"sb" => bytes} = ref, {spans, unknown} when is_integer(bytes) ->
+        {[{ref["mn"], ref["mx"], bytes} | spans], unknown}
+
+      ref, {spans, unknown} ->
+        {spans, unknown + ref["n"]}
+    end)
+  end
+
   @doc "Whether retired objects or superseded pages may still need deleting."
   def cleanup_pending?(%Manifest{version: @version, paging: p} = root) do
     map_size(root.retired) > 0 or p["g"] != [] or p["gr"] != [] or Enum.any?(p["refs"], &is_integer(&1["rd"]))
@@ -118,7 +153,10 @@ defmodule Pulso.Storage.S3.JournalManifest do
   defp valid_key_range?(%{"kn" => kn, "kx" => kx}), do: is_integer(kn) and is_integer(kx) and kn <= kx
   defp valid_key_range?(_), do: false
 
-  defp valid_summary?(ref), do: (ref["rd"] == nil or non_negative?(ref["rd"])) and (ref["q"] == nil or is_map(ref["q"]))
+  defp valid_summary?(ref),
+    do:
+      (ref["rd"] == nil or non_negative?(ref["rd"])) and (ref["q"] == nil or is_map(ref["q"])) and
+        (ref["sb"] == nil or non_negative?(ref["sb"]))
 
   defp valid_range?(%{"n" => 0} = ref), do: ref["mn"] == nil and ref["mx"] == nil
   defp valid_range?(ref), do: is_integer(ref["mn"]) and is_integer(ref["mx"]) and ref["mn"] <= ref["mx"]
@@ -879,6 +917,11 @@ defmodule Pulso.Storage.S3.JournalManifest do
       "rd" => Enum.min(pending, fn -> nil end)
     }
 
+    # Stored bytes of the active segments, for storage gauges. Omitted when a
+    # legacy segment has no recorded size; readers before 1.30 ignore it.
+    sizes = Enum.map(segments, & &1.byte_size)
+    stats = if Enum.all?(sizes, &is_integer/1), do: Map.put(stats, "sb", Enum.sum(sizes)), else: stats
+
     stats =
       cond do
         segments == [] -> stats
@@ -910,6 +953,11 @@ defmodule Pulso.Storage.S3.JournalManifest do
       "kx" => children |> Enum.map(& &1["kx"]) |> Enum.max(),
       "rd" => children |> Enum.map(& &1["rd"]) |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     })
+    |> then(fn ref ->
+      if Enum.all?(children, &is_integer(&1["sb"])),
+        do: Map.put(ref, "sb", Enum.sum_by(children, & &1["sb"])),
+        else: ref
+    end)
   end
 
   defp put_summary(stats, nil), do: stats

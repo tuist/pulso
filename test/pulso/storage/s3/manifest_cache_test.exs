@@ -48,6 +48,31 @@ defmodule Pulso.Storage.S3.ManifestCacheTest do
     assert %{etag: "fresh"} = ManifestCache.get("tenant", "logs")
   end
 
+  test "stored bytes split by record age, spreading a page reference over its time range" do
+    day = 86_400_000_000_000
+    now = 400 * day
+    seg = fn ts, bytes -> Manifest.Segment.build("k#{ts}", ts - 1, ts, 1, bytes) end
+    unsized = %{seg.(now - day, 0) | byte_size: nil}
+
+    flat = %{
+      Manifest.new()
+      | segments: [seg.(now - 10 * day, 100), seg.(now - 45 * day, 200), seg.(now - 100 * day, 400), unsized]
+    }
+
+    assert :ok = ManifestCache.put("tenant", "logs", flat, "v1")
+
+    # A page reference of 600 bytes over the last 60 days: half is younger than 30 days.
+    ref = %{"n" => 6, "mn" => now - 60 * day, "mx" => now, "sb" => 600}
+    paging = %{"nonce" => String.duplicate("0", 32), "refs" => [ref], "g" => [], "gr" => [], "cc" => 0}
+    paged = %{Manifest.new() | version: 4, paging: paging}
+    assert :ok = ManifestCache.put("tenant", "traces", paged, "v1")
+
+    assert %{
+             "logs" => %{"0-30d" => 100, "30-90d" => 200, "90d+" => 400, unknown: 1},
+             "traces" => %{"0-30d" => 300, "30-90d" => 300, "90d+" => 0, unknown: 0}
+           } = ManifestCache.stored_bytes(now)
+  end
+
   test "cold publication is fenced by the empty generation observed before CAS" do
     manifest = Manifest.new()
     base = ManifestCache.publication_base("tenant", "logs")

@@ -279,13 +279,17 @@ retention:
   sweepHorizonDays: ""
 
 ingestBatching:
-  # Optional node-local coalescing of requests WITHOUT Idempotency-Key.
-  # 0 disables it; 1..1000 adds up to that many ms before durable publication
-  # (20 is a good value). While a manifest write for the same tenant and signal
-  # is in flight, the window stretches (up to 2 s) to meet the next one, which
-  # the batch would wait for anyway. Flushes are pipelined; buffers hold at most 512
-  # callers, 400000 rows and 32 MiB of estimated terms. Overflow uses the
-  # original direct path. Keyed requests always remain direct.
+  # Node-local coalescing window, 0..10000 ms. 0 disables it. Otherwise
+  # requests WITHOUT Idempotency-Key for one tenant and signal share a segment
+  # for up to this long, and each manifest owner publishes at most once per
+  # window (keyed requests share those publications too), so object-store
+  # PUTs follow time, not pushes: about 2 per window per signal per instance.
+  # Acknowledgments still wait for the segment PUT and manifest write, so the
+  # window adds up to its length to ingest latency. 2000 suits object stores
+  # that bill per request (see docs/storage-costs.md); 20 favors latency.
+  # Buffers hold at most 2048 callers, 400000 rows and 32 MiB of estimated
+  # terms and flush early at a quarter of any bound. Overflow uses the
+  # original direct path.
   flushIntervalMs: 0
   # Node-local bound on concurrently processed ingest requests (HTTP and gRPC),
   # 1..100000. Excess requests get a retryable 429 / RESOURCE_EXHAUSTED with a

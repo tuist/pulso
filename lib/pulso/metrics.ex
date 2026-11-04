@@ -92,6 +92,9 @@ defmodule Pulso.Metrics do
      "Known receiver record deliveries accepted or rejected, not unique stored rows."},
     {"pulso_object_bytes_total", "counter",
      "Successful logical object body bytes, excluding native retries and headers."},
+    {"pulso_object_requests_total", "counter",
+     "Logical object requests by billing class (A: PUT/LIST, B: GET; free: DELETE, 304 and 412 responses) " <>
+       "and purpose, excluding native retries."},
     {"pulso_compaction_segments_total", "counter",
      "Source segments merged or retirement deletions confirmed by successful maintenance calls."},
     {"pulso_compaction_timeouts_total", "counter",
@@ -267,6 +270,7 @@ defmodule Pulso.Metrics do
       increment({"pulso_operations_total", labels}, 1)
       record_duration(labels, System.convert_time_unit(measurements.duration, :native, :microsecond))
       record_work(kind, operation, purpose, measurements)
+      if kind == :object, do: increment({"pulso_object_requests_total", request_class(operation, outcome, purpose)}, 1)
     end
   end
 
@@ -317,6 +321,20 @@ defmodule Pulso.Metrics do
     else
       _ -> :ok
     end
+  end
+
+  # S3 request classes as object stores bill them: writes and listings are
+  # Class A, reads Class B. DELETE, 304 Not Modified and 412/409 conflicts are
+  # free on Tigris (and its published list of free error responses).
+  defp request_class(operation, outcome, purpose) do
+    class =
+      cond do
+        operation == "delete" or outcome in ["conflict", "not_modified"] -> "free"
+        operation in ["get", "get_if_none_match"] -> "B"
+        true -> "A"
+      end
+
+    [{"class", class}, {"purpose", purpose}]
   end
 
   defp valid_event?(measurements, kind, operation, purpose, outcome) do
@@ -541,7 +559,35 @@ defmodule Pulso.Metrics do
         ["pulso_manifest_roots{signal=\"", signal, "\",format=\"", format, "\"} ", Integer.to_string(value), "\n"]
       end,
       gauge("pulso_manifest_page_cache_entries", page_entries),
-      gauge("pulso_manifest_page_cache_bytes", page_bytes)
+      gauge("pulso_manifest_page_cache_bytes", page_bytes),
+      stored_bytes_gauges()
+    ]
+  end
+
+  defp stored_bytes_gauges do
+    stored = ManifestCache.stored_bytes()
+    totals = &Map.get(stored, &1, %{"0-30d" => 0, "30-90d" => 0, "90d+" => 0, unknown: 0})
+
+    [
+      metric_header(
+        "pulso_manifest_referenced_bytes",
+        "gauge",
+        "Stored bytes of the active segments cached roots reference, by signal and record age, summed over tenants. " <>
+          "Excludes manifests, pages and retired objects awaiting deletion; retention-managed roots count only their tail."
+      ),
+      for signal <- @signals, age <- ["0-30d", "30-90d", "90d+"] do
+        value = totals.(signal) |> Map.fetch!(age) |> Integer.to_string()
+        ["pulso_manifest_referenced_bytes{signal=\"", signal, "\",age=\"", age, "\"} ", value, "\n"]
+      end,
+      metric_header(
+        "pulso_manifest_referenced_unsized_segments",
+        "gauge",
+        "Referenced segments whose size the cached roots do not record (pages written before 1.30), summed over tenants."
+      ),
+      for signal <- @signals do
+        value = totals.(signal) |> Map.fetch!(:unknown) |> Integer.to_string()
+        ["pulso_manifest_referenced_unsized_segments{signal=\"", signal, "\"} ", value, "\n"]
+      end
     ]
   end
 

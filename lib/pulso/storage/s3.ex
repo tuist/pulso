@@ -188,7 +188,9 @@ defmodule Pulso.Storage.S3 do
 
     with :ok <- Pulso.Runtime.Task.await(upload, :infinity) do
       if on_uploaded = opts[:on_uploaded], do: on_uploaded.()
-      ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config)
+      # The owner may hold a registration for up to one flush interval to share its CAS.
+      timeout = 15_000 + Map.get(config, :ingest_flush_interval_ms, 0)
+      ManifestOwner.register_segments(tenant, signal_string(signal), [segment], config, timeout)
     end
   end
 

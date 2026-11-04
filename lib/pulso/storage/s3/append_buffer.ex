@@ -26,13 +26,14 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   alias Pulso.Storage.S3.AppendSupervisor
   alias Pulso.Storage.S3.ManifestOwner
 
-  @max_callers 512
+  @max_callers 2048
   @max_rows 400_000
   @max_bytes 32 * 1024 * 1024
   # One flush carries at most a quarter of the reservation, so a full buffer
   # always has several uploads in flight rather than one large serialized one.
   @flush_rows div(@max_rows, 4)
   @flush_bytes div(@max_bytes, 4)
+  @flush_callers div(@max_callers, 4)
   @max_flushes 16
   # Upper bound on a window stretched to meet the manifest owner's next CAS.
   @max_adaptive_ms 2_000
@@ -79,7 +80,12 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
       with {:ok, pid, admission} <- ensure_started(signal, tenant, config),
            :ok <- reserve(admission, bytes, rows) do
-        call(pid, {:append, records, bytes, rows, opts}, bytes)
+        call(
+          pid,
+          {:append, records, bytes, rows, opts},
+          bytes,
+          15_000 + 2 * Map.fetch!(config, :ingest_flush_interval_ms)
+        )
       else
         :unbuffered -> {:unbuffered, records}
         other -> other
@@ -106,7 +112,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
   # `GenServer.call/3`, split so the caller can drop its copy of the records
   # once the buffer has it: send, collect garbage, hand the admission slot to
   # the pending budget, then wait. The reply alias discards late replies.
-  defp call(pid, request, bytes) do
+  defp call(pid, request, bytes, timeout) do
     mref = Process.monitor(pid, alias: :demonitor)
     send(pid, {:"$gen_call", {self(), [:alias | mref]}, request})
     # Charge what the waiting caller still retains (its compacted heap and
@@ -122,11 +128,11 @@ defmodule Pulso.Storage.S3.AppendBuffer do
         {:error, :owner_overloaded}
 
       {:DOWN, ^mref, _, _, reason} ->
-        exit({reason, {GenServer, :call, [pid, :append, 15_000]}})
+        exit({reason, {GenServer, :call, [pid, :append, timeout]}})
     after
       # A timed-out caller does NOT release its reservation: its message or
       # native publication can still be in progress. Only the owner releases it.
-      15_000 ->
+      timeout ->
         Process.demonitor(mref, [:flush])
         {:error, :timeout}
     end
@@ -209,9 +215,15 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
     state =
       cond do
-        state.pending_bytes >= @flush_bytes or state.pending_rows >= @flush_rows -> flush(state)
-        state.timer -> state
-        true -> schedule(state)
+        state.pending_bytes >= @flush_bytes or state.pending_rows >= @flush_rows or
+            length(state.pending) >= @flush_callers ->
+          flush(state)
+
+        state.timer ->
+          state
+
+        true ->
+          schedule(state)
       end
 
     {:noreply, state, @idle_ms}

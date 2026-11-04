@@ -261,10 +261,12 @@ manifest_format =
   end
 
 # Optional node-local unkeyed coalescing; disabled unless explicitly enabled.
+# A nonzero window also spaces each manifest owner's publications at least this
+# far apart, so object-store PUTs scale with time, not with pushes.
 ingest_flush_interval_ms =
   case Integer.parse(env_var.("PULSO_INGEST_FLUSH_INTERVAL_MS", "0")) do
-    {value, ""} when value in 0..1000 -> value
-    _ -> raise "PULSO_INGEST_FLUSH_INTERVAL_MS must be an integer in 0..1000"
+    {value, ""} when value in 0..10_000 -> value
+    _ -> raise "PULSO_INGEST_FLUSH_INTERVAL_MS must be an integer in 0..10000"
   end
 
 # One node memory budget sizes ingest and query concurrency (see

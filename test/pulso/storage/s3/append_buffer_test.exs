@@ -495,6 +495,37 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     assert {:ok, [^record]} = S3.query(:logs, ctx.tenant, [])
   end
 
+  # Object stores bill every PUT, so a tenant's ingest cost must follow the
+  # flush interval, not the push rate: unkeyed pushes share segments and
+  # every append, keyed ones included, shares root writes spaced at least one
+  # interval apart. Every push is still acknowledged only once it is visible.
+  @tag flush_interval_ms: 300
+  test "segment and root writes follow the flush interval, not the number of pushes", ctx do
+    root = Manifest.manifest_key(ctx.tenant, "logs")
+    started = System.monotonic_time(:millisecond)
+
+    tasks =
+      for i <- 1..30 do
+        Process.sleep(25)
+        opts = if rem(i, 5) == 0, do: [idempotency_key: "keyed-#{i}"], else: []
+        record = %Log{timestamp_ns: i, service: "api", body: "push #{i}"}
+        Task.Supervisor.async_nolink(ctx.tasks, fn -> S3.append(:logs, ctx.tenant, [record], opts) end)
+      end
+
+    assert Enum.map(tasks, &Task.await(&1, 30_000)) == List.duplicate(:ok, 30)
+    elapsed = System.monotonic_time(:millisecond) - started
+    requests = Agent.get(ctx.agent, & &1.requests)
+    root_puts = Enum.count(requests, &(&1 == {"PUT", root}))
+
+    # Publications start at least 300 ms apart; without spacing each keyed push
+    # and each flush would publish on its own (about nine here).
+    assert root_puts <= div(elapsed, 300) + 1, "#{root_puts} root writes in #{elapsed} ms"
+    # 24 unkeyed pushes over 750 ms fill about three windows; 6 keyed pushes upload alone.
+    assert segment_puts(ctx.agent) <= div(elapsed, 300) + 1 + 6
+    assert {:ok, records} = S3.query(:logs, ctx.tenant, [])
+    assert records |> Enum.map(& &1.timestamp_ns) |> Enum.sort() == Enum.to_list(1..30)
+  end
+
   test "byte, row and caller reservations cannot grow a full mailbox; overflow publishes directly", ctx do
     for counters <- [{:pending, 128, 0, 0}, {:pending, 0, 10 * 1024 * 1024, 0}, {:pending, 0, 0, 100_000}] do
       :ets.insert(ctx.admission, counters)

@@ -111,6 +111,10 @@ defmodule Pulso.Storage.S3.JournalManifestTest do
     {:ok, [new]} = S3.query(:logs, ctx.tenant, start_ts: 9_999_999_999)
     all = converted.segments ++ history
 
+    # Page references carry their subtree's stored bytes, through index pages too.
+    assert {spans, 0} = JournalManifest.referenced_bytes(converted)
+    assert Enum.sum_by(spans, &elem(&1, 2)) == Enum.sum_by(all, & &1.byte_size)
+
     for {start, finish, service} <- [
           {0, 99_999_999_999, nil},
           {2_000_000_000, 2_500_000_000, nil},

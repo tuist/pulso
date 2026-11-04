@@ -22,6 +22,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   an immediate flush without waiting for the timer, so tail latency
   stays bounded.
 
+  With `:ingest_flush_interval_ms` set, publications also start at most once
+  per that interval: a registration arriving sooner after the previous
+  publication started waits for the rest of the interval and shares the next
+  CAS. Every root write is a billed PUT, so this bounds an owner's root writes
+  to one per interval however many requests (keyed, unbuffered or coalesced)
+  arrive. Acknowledgments still wait for that CAS.
+
   ## Conflict recovery
 
   On a `:precondition_failed` from S3 (another node landed a CAS on the
@@ -395,6 +402,9 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       config: Keyword.fetch!(opts, :config),
       flush_interval_ms: Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms),
       flush_batch_max: Keyword.get(opts, :flush_batch_max, @default_flush_batch_max),
+      # Minimum spacing between publication starts (ms) and the last start.
+      commit_interval_ms: opts |> Keyword.fetch!(:config) |> Map.get(:ingest_flush_interval_ms, 0),
+      committed_at: nil,
       manifest: nil,
       etag: nil,
       loaded?: false,
@@ -567,7 +577,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         cancel_timer(state) |> do_flush()
 
       state.timer_ref == nil ->
-        ref = Process.send_after(self(), :flush, state.flush_interval_ms)
+        ref = Process.send_after(self(), :flush, flush_delay(state))
         {:noreply, %{state | timer_ref: ref}}
 
       true ->
@@ -659,7 +669,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp do_flush(state) do
     base = ManifestCache.publication_base(state.tenant, state.signal)
-    state = %{state | timer_ref: nil}
+    state = %{state | timer_ref: nil, committed_at: System.monotonic_time(:millisecond)}
 
     state = adopt_cached_root(state)
 
@@ -782,7 +792,17 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   defp failure_reply(outcome, _error), do: outcome
 
   defp schedule_deferred(%{pending: []} = state), do: state
-  defp schedule_deferred(state), do: %{state | timer_ref: Process.send_after(self(), :flush, state.flush_interval_ms)}
+  defp schedule_deferred(state), do: %{state | timer_ref: Process.send_after(self(), :flush, flush_delay(state))}
+
+  # The flush timer, stretched so publications start at most once per
+  # `commit_interval_ms`. Without an interval this is the plain timer.
+  defp flush_delay(%{committed_at: last, commit_interval_ms: interval} = state)
+       when is_integer(last) and interval > 0 do
+    wait = last + interval - System.monotonic_time(:millisecond)
+    max(state.flush_interval_ms, wait)
+  end
+
+  defp flush_delay(state), do: state.flush_interval_ms
 
   defp partition_waiters(%{manifest: %{version: 3}} = state) do
     {selected, deferred, _, _, _} =

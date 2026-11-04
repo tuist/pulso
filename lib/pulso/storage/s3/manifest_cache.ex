@@ -230,6 +230,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
       # their tail. Paged roots also know every segment their pages reference.
       segments: length(manifest.segments),
       referenced: JournalManifest.referenced(manifest),
+      stored: JournalManifest.referenced_bytes(manifest),
       version: manifest.version,
       etag: etag,
       token: make_ref(),
@@ -290,6 +291,39 @@ defmodule Pulso.Storage.S3.ManifestCache do
     end)
   rescue
     ArgumentError -> %{}
+  end
+
+  @doc """
+  Referenced segment bytes per signal and age bucket (`"0-30d"`, `"30-90d"`,
+  `"90d+"`, by record time), plus segments of unknown size, summed over cached
+  roots without storage I/O. A page reference's bytes are spread evenly over
+  its time range.
+  """
+  def stored_bytes(now_ns \\ System.os_time(:nanosecond)) do
+    :ets.select(table(), [{{{:_, :"$1"}, %{stored: :"$2"}}, [], [{{:"$1", :"$2"}}]}])
+    |> Enum.reduce(%{}, fn {signal, {spans, unknown}}, acc ->
+      totals = Map.get(acc, signal, %{"0-30d" => 0, "30-90d" => 0, "90d+" => 0, unknown: 0})
+      totals = Enum.reduce(spans, %{totals | unknown: totals.unknown + unknown}, &add_span(&1, &2, now_ns))
+      Map.put(acc, signal, totals)
+    end)
+  rescue
+    ArgumentError -> %{}
+  end
+
+  @day_ns 86_400_000_000_000
+  # Walks the span from its newest record down through the buckets. Shares are
+  # differences of cumulative floors, so they always add up to `bytes`.
+  defp add_span({min_ts, max_ts, bytes}, totals, now_ns) do
+    width = max(max_ts - min_ts + 1, 1)
+
+    [{"0-30d", now_ns - 30 * @day_ns}, {"30-90d", now_ns - 90 * @day_ns}, {"90d+", nil}]
+    |> Enum.reduce({totals, max_ts, 0}, fn {bucket, floor}, {totals, upper, covered} ->
+      lower = if floor, do: max(min_ts, floor), else: min_ts
+      covered_after = covered + max(upper - lower + 1, 0)
+      share = div(bytes * covered_after, width) - div(bytes * covered, width)
+      {Map.update!(totals, bucket, &(&1 + share)), min(upper, lower - 1), covered_after}
+    end)
+    |> elem(0)
   end
 
   @doc "Small node-local summaries for fixed-cardinality retention gauges, without storage I/O."

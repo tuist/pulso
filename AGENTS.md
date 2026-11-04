@@ -26,6 +26,18 @@ requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
 16 per tenant/signal) so uploads overlap the serialized manifest CAS.
 
+Object-store cost is a design goal: requests, not bytes, dominate a per-request
+bill (`docs/storage-costs.md#cost-model`). `PULSO_INGEST_FLUSH_INTERVAL_MS`
+(0..10000) is both the unkeyed coalescing window and the minimum spacing between
+a `ManifestOwner`'s publication starts (keyed and overflow segments share the
+spaced CAS), so PUTs follow time, not pushes; buffers flush early at a quarter of
+2048 callers/400k rows/32 MiB. `scripts/production_load.exs` (with
+`Pulso.Test.LatencyStore`) replays Tuist production volume against Tigris
+latency: 2 s took one 2-vCPU node from 58 Class A/s, 429s and failing dashboards
+to 3.2/s with every push acknowledged. `pulso_object_requests_total{class,purpose}`
+counts billing classes (DELETE/304/412 free); format-4 page refs carry `sb`
+(subtree segment bytes) for `pulso_manifest_referenced_bytes{signal,age}`.
+
 With metrics compaction on, settled hours are finalized
 (`Pulso.Storage.S3.MetricTiers`, native `metric_tiers.rs`, tier API 1): rows
 rewritten into metric-grouped `-final-` segments plus per-series hourly

@@ -226,16 +226,22 @@ Ownership is an *optimization*, not a correctness property. It determines which 
 
 Implemented ownership currently covers background metrics merge and cleanup.
 Optional unkeyed append buffers are node-local, not rendezvous-owned. They can
-coalesce concurrent requests within a configured 1–1000 ms window before encoding
-one segment. While the node's manifest coalescer is publishing for that tenant
+coalesce requests within a configured 1–10,000 ms window before encoding
+one segment, and the same window spaces the node's manifest publications for
+that tenant and signal: a publication starts at least one window after the
+previous one, so keyed, overflow and buffered segments share it and the root is
+written at most once per window. Object stores bill per request, so this keeps
+ingest cost proportional to time rather than to pushes, while every
+acknowledgment still waits for both writes. While the node's manifest coalescer is publishing for that tenant
 and signal, the window stretches (up to 2 s) so the batch's encode and PUT finish
 just before that publication ends: requests arriving during a publication would
 wait for it anyway, so they share one segment without a later acknowledgment.
 The coalescer's commit start and moving-average duration are a scheduling hint
 read from its registry value, never a correctness input. Keyed requests stay on
 the original direct path. Admission counters
-reserve at most 128 callers, 100,000 rows and 10 MiB of estimated input terms per
-buffer, including queued and executing work; overflow is processed unbuffered.
+reserve at most 2,048 callers, 400,000 rows and 32 MiB of estimated input terms per
+buffer, including queued and executing work, and a batch flushes early at a
+quarter of any bound; overflow is processed unbuffered.
 Reservations are released by the buffer only after publication finishes, never by
 caller timeouts. Both segment PUT and manifest CAS precede every acknowledgment. If the latest
 floor rejects a combined upload, multiple callers receive retryable

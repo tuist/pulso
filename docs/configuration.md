@@ -72,7 +72,7 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_USAGE_FLUSH_INTERVAL_MS` | `60000` | How often each instance writes its usage, `1000..3600000`; a crash can lose at most this much usage. |
 | `PULSO_ROLES` | `ingest,query,maintenance` | Comma-separated work this instance takes on. Requests for a role it does not run get a retryable `503`; background workers (compaction, retention, alerting, error projection, reliability) run only with `maintenance`. See [scaling](scaling.md#separate-pools). |
 | `DNS_CLUSTER_QUERY` | none | DNS name whose A records list the other instances, to join one Erlang cluster for rendezvous ownership. Set `RELEASE_DISTRIBUTION=name`, `RELEASE_NODE=pulso@<pod IP>` and a shared `RELEASE_COOKIE` too; the chart does this with `clustering.enabled`. |
-| `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Optional coalescing window for concurrent appends without an idempotency key; integer `0..1000`, where `0` disables it. See [Ingest coalescing](#ingest-coalescing). |
+| `PULSO_INGEST_FLUSH_INTERVAL_MS` | `0` | Coalescing window for appends without an idempotency key and minimum spacing of each tenant/signal manifest publication; integer `0..10000`, where `0` disables both. See [Ingest coalescing](#ingest-coalescing). |
 | `PULSO_INGEST_MAX_*` | see [ingest limits](ingest-limits.md) | Per-request source-record, attribute and request-node budgets for ingestion. OTLP distributions also cap expanded float samples at `PULSO_INGEST_MAX_RECORDS`; the separate fixed 16 MiB repeated-source metadata ceiling is unchanged. |
 | `PULSO_INGEST_MAX_OTLP_NODES` | `262144` | Request-wide log/metric JSON-shaped node ceiling, independent of per-set nodes. Applies to JSON/protobuf logs and metrics; see [OTLP logs](logs.md) and [OTLP metrics](metrics.md). |
 | `PULSO_RETENTION_ENABLED` | `false` | Run the experimental retention and cleanup worker even with all durations at `0`; it also runs whenever a duration is positive. See [retention](retention.md). |
@@ -469,11 +469,28 @@ reduce segment counts, and consider [ingest coalescing](#ingest-coalescing).
 
 ## Ingest coalescing
 
-Set `PULSO_INGEST_FLUSH_INTERVAL_MS=20` (chart `ingestBatching.flushIntervalMs: 20`)
-to let concurrent unkeyed requests for the same tenant and signal share a Parquet
-segment and manifest publication. It is disabled by default. Keyed requests
-always use the original direct path, preserving their retry fingerprints.
-Sequential producers cannot share a flush, so they gain no request savings.
+Set `PULSO_INGEST_FLUSH_INTERVAL_MS` (chart `ingestBatching.flushIntervalMs`,
+`0..10000` ms) to let unkeyed requests for the same tenant and signal share a
+Parquet segment for up to that window, and to start each manifest publication
+for that tenant and signal at least one window after the previous one. It is
+disabled by default. Keyed requests still upload their own segment, preserving
+their retry fingerprints, but share the spaced publications.
+
+The window sets the object-store request rate. With it, each instance writes
+about one segment and one manifest root per window per signal, however many
+requests arrive; without it, every request writes its own segment and the roots
+are rewritten back to back. On object stores that bill per request, such as
+Tigris, use `2000`: at Tuist production volume it cut Class A requests from 58
+to 3.2 per second, and let one 2-vCPU node keep up where per-request publication
+saturated it (see [storage costs](storage-costs.md#measured-at-production-volume)).
+Acknowledgments then take about half a window to one window longer, plus the
+segment PUT and root write: about 2 to 3 s at the median and 3 to 5 s at p99
+on Tigris. Collectors must tolerate that latency: keep remote-write shards and
+OTLP exporter consumers concurrent, and make sure a Loki client's batch size
+divided by the acknowledgment time exceeds its log rate, because a Loki client
+sends one batch at a time per endpoint. Longer windows, up to 10 s, cut requests
+further and add latency in proportion. A short window such as `20` favors latency: it
+shares segments only between requests that arrive together.
 
 Flushes are pipelined. A batch is flushed when its window expires or when it
 reaches a quarter of the buffer bounds, whichever comes first. Up to 16 flushes
@@ -489,9 +506,7 @@ its encode and PUT would finish just before that write ends (at most 2 s), then
 flushes in time for the next one. Requests that would have waited anyway now
 share a segment, so fewer segments and manifest entries are written without
 later acknowledgments. The configured window applies when no manifest write is
-in flight. Use 20 ms: a longer fixed window only adds latency when the manifest
-owner is idle, and at a few requests per second per signal it rarely catches a
-second request. In a staging-shaped load test (4 Loki pushes/s from 8 senders,
+in flight; windows of 2 s and more already exceed the adaptive bound. In a staging-shaped load test (4 Loki pushes/s from 8 senders,
 1.5 remote writes/s, 0.5 trace exports/s, flat manifests of 44,000 log and
 25,000 metric segments, S3 at 50–90 ms plus 45 MB/s), a 20 ms adaptive window
 wrote about a third fewer log segments than a fixed 20 ms window (18% fewer
@@ -499,7 +514,7 @@ segments overall) at the same latency. Fixed windows of 100 and 250 ms merged
 less or similar and added 80 to 230 ms to remote-write and trace
 acknowledgments.
 
-Each node-local buffer reserves at most 512 callers, 400,000 rows, and 32 MiB of
+Each node-local buffer reserves at most 2,048 callers, 400,000 rows, and 32 MiB of
 estimated input term bytes, including work already executing. Oversized requests
 and overflow go through the original unbuffered path, not an unbounded queue.
 These bounds are per buffer, not node-wide; node memory is bounded by the

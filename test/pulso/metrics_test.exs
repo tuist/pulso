@@ -549,6 +549,8 @@ defmodule Pulso.MetricsTest do
     conflicts = value("pulso_operations_total", labels("object", "put_if_none_match", "conflict", "manifest"))
     unchanged = value("pulso_operations_total", labels("object", "get_if_none_match", "not_modified", "manifest"))
     missing = value("pulso_operations_total", labels("object", "get_if_none_match", "not_found", "manifest"))
+    class = fn class, purpose -> value("pulso_object_requests_total", [{"class", class}, {"purpose", purpose}]) end
+    billed = for c <- ["A", "B", "free"], p <- ["manifest", "other"], into: %{}, do: {{c, p}, class.(c, p)}
 
     assert {:ok, etag} = ObjectStore.put_if_none_match(config, key, "body")
     assert {:error, :already_exists} = ObjectStore.put_if_none_match(config, key, "body")
@@ -571,6 +573,15 @@ defmodule Pulso.MetricsTest do
     assert {:ok, _} = ObjectStore.list_prefixes(config, "tenants/")
     assert {:ok, "body"} = ObjectStore.get(config, key)
     assert :ok = ObjectStore.delete(config, key)
+
+    # Billing classes: the created PUT and both listings are Class A; the full
+    # read, the 404 and the plain GET are Class B; the 412 conflict, the 304
+    # and the DELETE are free.
+    assert class.("A", "manifest") == billed[{"A", "manifest"}] + 1
+    assert class.("A", "other") == billed[{"A", "other"}] + 2
+    assert class.("B", "manifest") == billed[{"B", "manifest"}] + 3
+    assert class.("free", "manifest") == billed[{"free", "manifest"}] + 3
+    assert Metrics.render() =~ ~s(pulso_object_requests_total{class="free",purpose="manifest"})
 
     byte_labels =
       :ets.tab2list(Pulso.Runtime.table(Metrics))
