@@ -886,12 +886,9 @@ defmodule Pulso.Storage.S3 do
          {:ok, entry} <- query_manifest(tenant, signal_string(signal), config, opts),
          :ok <- check_deadline(opts[:deadline_ms]) do
       start_ts = retained_start(entry.manifest, start_ts)
-      opts = put_trace_window(signal, entry.manifest, start_ts, end_ts, opts, tenant, config)
 
-      with {:ok, segments} <- query_segments(entry.manifest, signal, start_ts, end_ts, opts, tenant, config),
-           :ok <- check_scan_budget(signal, segments, opts) do
-        scan_segments(signal, config, segments, start_ts, end_ts, opts, limit)
-      end
+      entry.manifest
+      |> scan_manifest(signal, start_ts, end_ts, opts, tenant, config, limit)
       |> case do
         {:ok, records} ->
           {:ok, finalize_records(records, signal, limit)}
@@ -1195,11 +1192,7 @@ defmodule Pulso.Storage.S3 do
     with :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, manifest, _etag} <- Retention.load(tenant, signal_string(signal), config),
          start_ts = retained_start(manifest, start_ts),
-         opts = put_trace_window(signal, manifest, start_ts, end_ts, opts, tenant, config),
-         {:ok, segments} <- query_segments(manifest, signal, start_ts, end_ts, opts, tenant, config),
-         :ok <- check_deadline(opts[:deadline_ms]),
-         :ok <- check_scan_budget(signal, segments, opts),
-         {:ok, records} <- scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
+         {:ok, records} <- scan_manifest(manifest, signal, start_ts, end_ts, opts, tenant, config, limit) do
       {:ok, finalize_records(records, signal, limit)}
     else
       {:error, {:segment_missing, _}} -> {:error, :not_found}
@@ -1207,29 +1200,23 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
+  defp scan_manifest(manifest, signal, start_ts, end_ts, opts, tenant, config, limit) do
+    if signal == :traces and opts[:tempo_search] != nil do
+      tempo_search(manifest, start_ts, opts, tenant, config)
+    else
+      opts = put_trace_window(signal, manifest, start_ts, end_ts, opts, tenant, config)
+
+      with {:ok, segments} <- query_segments(manifest, signal, start_ts, end_ts, opts, tenant, config),
+           :ok <- check_deadline(opts[:deadline_ms]),
+           :ok <- check_scan_budget(signal, segments, opts),
+           do: scan_segments(signal, config, segments, start_ts, end_ts, opts, limit)
+    end
+  end
+
   # Limited traces may stop at a strict timestamp boundary. Actual visited
   # objects are still charged for bytes/rows/segments in scan_segments/7.
   defp check_scan_budget(:traces, segments, opts) do
-    service = TraceSummary.service_filter(opts[:tempo_search])
-
-    cond do
-      is_binary(service) ->
-        if length(segments) > TraceSummary.plan_catalog_limit(),
-          do:
-            QueryLimit.exceeded(
-              :trace_catalog_segments,
-              TraceSummary.plan_catalog_limit(),
-              length(segments),
-              :candidates
-            ),
-          else: check_scan_budget(candidate_segments(segments, service), opts)
-
-      limited_span_query?(opts) ->
-        :ok
-
-      true ->
-        check_scan_budget(segments, opts)
-    end
+    if limited_span_query?(opts), do: :ok, else: check_scan_budget(segments, opts)
   end
 
   # Limited log queries charge only the segments they actually visit.
@@ -1464,35 +1451,42 @@ defmodule Pulso.Storage.S3 do
   # positional args here.
   defp scan_segments(signal, config, segments, start_ts, end_ts, opts, limit) do
     with {:ok, native} <- start_native_query(signal, start_ts, end_ts, opts) do
-      ctx = %{
-        signal: signal,
-        config: config,
-        segments: segments,
-        # Early-stop checks look at the next segment after every visit; index a
-        # tuple instead of walking the list, which is quadratic in the scan.
-        indexed: List.to_tuple(segments),
-        # Candidates visited in earlier windows, for the visited budget.
-        offset: 0,
-        start_ts: start_ts,
-        end_ts: end_ts,
-        opts: opts,
-        limit: limit,
-        search?:
-          not is_nil(opts[:trace_search]) or not is_nil(opts[:tempo_search]) or not is_nil(opts[:tempo_discovery]) or
-            not is_nil(opts[:tempo_root_discovery]),
-        metric_discovery?: not is_nil(opts[:metric_discovery]),
-        log_discovery?: not is_nil(opts[:log_discovery]),
-        log_fold: opts[:log_fold],
-        log_metric: opts[:log_metric],
-        trace_metrics: opts[:trace_metrics],
-        discovery?: not is_nil(opts[:tempo_discovery]),
-        tempo?: not is_nil(opts[:tempo_search]) or not is_nil(opts[:tempo_root_discovery]),
-        native: native
-      }
-
-      run_scan(ctx)
+      scan_ctx(signal, config, segments, start_ts, end_ts, opts, limit, native)
+      |> run_scan()
       |> finish_scan(native, limit, scan_mode(opts))
     end
+  end
+
+  defp scan_ctx(signal, config, segments, start_ts, end_ts, opts, limit, native) do
+    %{
+      signal: signal,
+      config: config,
+      segments: segments,
+      # Early-stop checks look at the next segment after every visit; index a
+      # tuple instead of walking the list, which is quadratic in the scan.
+      indexed: List.to_tuple(segments),
+      # Candidates visited in earlier windows, for the visited budget.
+      offset: 0,
+      start_ts: start_ts,
+      end_ts: end_ts,
+      opts: opts,
+      limit: limit,
+      search?:
+        not is_nil(opts[:trace_search]) or not is_nil(opts[:tempo_search]) or not is_nil(opts[:tempo_discovery]) or
+          not is_nil(opts[:tempo_root_discovery]),
+      metric_discovery?: not is_nil(opts[:metric_discovery]),
+      log_discovery?: not is_nil(opts[:log_discovery]),
+      log_fold: opts[:log_fold],
+      log_metric: opts[:log_metric],
+      trace_metrics: opts[:trace_metrics],
+      discovery?: not is_nil(opts[:tempo_discovery]),
+      tempo?: not is_nil(opts[:tempo_search]) or not is_nil(opts[:tempo_root_discovery]),
+      # Tempo search rounds: blobs read by earlier rounds, and whether the
+      # visited source is an older candidate outside this round's window.
+      memo: nil,
+      unplanned?: false,
+      native: native
+    }
   end
 
   # Decode a segment a bounded chunk at a time: a compacted segment can hold
@@ -1535,9 +1529,6 @@ defmodule Pulso.Storage.S3 do
   defp next_segment(%{indexed: indexed}, index) when index + 1 < tuple_size(indexed), do: elem(indexed, index + 1)
   defp next_segment(_ctx, _index), do: nil
 
-  defp candidate_segments(segments, service),
-    do: Enum.filter(segments, &TraceSummary.candidate_source?(&1.trace_summary, service))
-
   defp run_scan(ctx) do
     fold =
       cond do
@@ -1547,18 +1538,7 @@ defmodule Pulso.Storage.S3 do
       end
 
     state = %{batches: [], count: 0, top: [], bytes: 0, decoded_bytes: 0, rows: 0, fold: fold}
-
-    case TraceSummary.service_filter(ctx.opts[:tempo_search]) do
-      nil ->
-        with {:ok, state} <- scan_sources(ctx.segments, ctx, state), do: next_window(ctx, state)
-
-      target ->
-        first = candidate_segments(ctx.segments, target)
-
-        with {:ok, state} <- scan_sources(first, ctx, state),
-             {:ok, ids} <- native_result(NIF.tempo_search_plan_seal(ctx.native)),
-             do: scan_context(ctx, first, state, ids)
-    end
+    with {:ok, state} <- scan_sources(ctx.segments, ctx, state), do: next_window(ctx, state)
   end
 
   # A full window may be followed by older candidates: plan four times as
@@ -1614,12 +1594,7 @@ defmodule Pulso.Storage.S3 do
     {initial, maximum} = prefetch_depth(ctx, sources, Map.get(ctx.config, :query_prefetch, 1))
 
     if maximum > 1 and length(items) > 1 and prefetchable?(ctx) do
-      # Each task copies its closure: capture only the config, the byte limit
-      # and one key, never `ctx` with its candidate segment list and options.
-      config = ctx.config
-      limit = ctx.opts[:max_scan_bytes]
-      fetch = fn key -> prefetch(config, limit, key) end
-      prefetched_scan(items, :queue.new(), 0, {initial, maximum}, fetch, ctx, {:ok, state})
+      prefetched_scan(items, :queue.new(), 0, {initial, maximum}, fetcher(ctx), ctx, {:ok, state})
     else
       Enum.reduce_while(items, {:ok, state}, &visit_segment(&1, &2, ctx))
     end
@@ -1639,23 +1614,51 @@ defmodule Pulso.Storage.S3 do
 
       {{:value, {task, item}}, queue} ->
         item
-        |> visit_segment(acc, ctx, Pulso.Runtime.Task.await(task, :infinity))
+        |> visit_segment(acc, ctx, await_fetch(task))
         |> next_prefetched(items, queue, visited + 1, depth, fetch, ctx)
     end
   end
+
+  defp await_fetch({:fetched, result}), do: result
+  defp await_fetch(task), do: Pulso.Runtime.Task.await(task, :infinity)
 
   defp next_prefetched({:cont, acc}, items, queue, visited, depth, fetch, ctx),
     do: prefetched_scan(items, queue, visited, depth, fetch, ctx, acc)
 
   defp next_prefetched({:halt, acc}, _items, queue, _visited, _depth, _fetch, _ctx) do
-    queue |> :queue.to_list() |> Enum.each(fn {task, _} -> Pulso.Runtime.Task.shutdown(task, :brutal_kill) end)
+    queue
+    |> :queue.to_list()
+    |> Enum.each(fn
+      {{:fetched, _}, _} -> :ok
+      {task, _} -> Pulso.Runtime.Task.shutdown(task, :brutal_kill)
+    end)
+
     acc
+  end
+
+  # Answers a blob an earlier round already read, or the fetch to run. Each
+  # task copies its closure: capture only the config, the byte limit and one
+  # key, never `ctx` with its candidate segment list and options.
+  defp fetcher(ctx) do
+    config = ctx.config
+    limit = ctx.opts[:max_scan_bytes]
+    memo = ctx.memo || %{}
+
+    fn
+      key when is_map_key(memo, key) -> {:fetched, {:ok, Map.fetch!(memo, key)}}
+      key -> fn -> prefetch(config, limit, key) end
+    end
   end
 
   defp fill_prefetch([{segment, _} = item | rest] = items, queue, depth, fetch) do
     if :queue.len(queue) < depth do
-      key = segment.key
-      fill_prefetch(rest, :queue.in({Pulso.Runtime.Task.async(fn -> fetch.(key) end), item}, queue), depth, fetch)
+      pending =
+        case fetch.(segment.key) do
+          {:fetched, _} = fetched -> fetched
+          run -> Pulso.Runtime.Task.async(run)
+        end
+
+      fill_prefetch(rest, :queue.in({pending, item}, queue), depth, fetch)
     else
       {items, queue}
     end
@@ -1691,42 +1694,132 @@ defmodule Pulso.Storage.S3 do
   defp prefetch(config, limit, key) when is_integer(limit), do: read_bounded_segment(config, key, limit)
   defp prefetch(config, _limit, key), do: ObjectStore.get(config, key)
 
-  defp scan_context(_ctx, _first, state, <<>>), do: {:ok, state}
+  # -- Tempo search --------------------------------------------------------------
+  #
+  # The most recent `limit` traces holding a matching span, each with its
+  # complete retained context, planned newest first in rounds. A round
+  # discovers candidate trace IDs in the newest `n` candidate sources (those
+  # whose summaries may hold a matching span: attribute/service sets prune only
+  # publication-proven all-rich sources, so legacy sources always remain), then
+  # reads every other retained source whose trace-ID summary may hold one of
+  # them. A trace a later candidate could still add starts no later than that
+  # source's `max_ts`, so once the round's `limit`th trace starts after the
+  # newest unread candidate its answer is final. Otherwise the next round plans
+  # four times as many; blobs read earlier are reused, not fetched again.
+  @tempo_window 4
+  defp tempo_search(manifest, start_ts, opts, tenant, config) do
+    filters = TraceSummary.tempo_filters(opts[:tempo_search])
 
-  defp scan_context(ctx, first, state, ids) do
-    # Only bounded IDs/hashes cross BEAM, never spans. Native owns the candidate
-    # intersection, bloom work budget and complete-context aggregation.
-    hashes = for <<id::binary-size(32) <- ids>>, into: <<>>, do: :binary.part(:crypto.hash(:sha256, id), 0, 8)
+    plan = %{
+      candidates: tempo_candidates(manifest, start_ts, Keyword.merge(opts, filters), tenant, config),
+      context: tempo_context_plan(manifest, start_ts, opts, tenant, config),
+      candidate?: &TraceSummary.matches?(&1.trace_summary, filters)
+    }
 
-    with {:ok, true} <- native_result(NIF.tempo_search_plan_hashes(ctx.native, hashes)) do
-      fetched = MapSet.new(first, & &1.key)
+    tempo_round(@tempo_window, plan, {%{}, 0}, start_ts, opts, config)
+  end
 
-      ctx.segments
-      |> Enum.reject(&MapSet.member?(fetched, &1.key))
-      |> Enum.reduce_while({:ok, {state, length(first)}}, &visit_context_segment(&1, &2, ctx))
-      |> case do
-        {:ok, {state, _visited}} -> {:ok, state}
-        {:error, _} = error -> error
-      end
+  # Format-4 manifests read only the leaves that can hold the newest `n`.
+  defp tempo_candidates(%Manifest{version: 4} = root, start_ts, opts, tenant, config),
+    do: fn n -> query_segments(root, :traces, start_ts, nil, Keyword.put(opts, :trace_window, n), tenant, config) end
+
+  defp tempo_candidates(manifest, start_ts, opts, tenant, config) do
+    fn n ->
+      with {:ok, segments} <- query_segments(manifest, :traces, start_ts, nil, opts, tenant, config),
+           do: {:ok, segments |> Enum.sort_by(&newest_first/1) |> Enum.take(n)}
     end
   end
 
-  defp visit_context_segment(segment, {:ok, {state, index}} = acc, ctx) do
-    {hashes, bits} = TraceSummary.context_filter(segment.trace_summary)
+  # Unknown bounds sort first, so a round never stops before them.
+  defp newest_first(%{max_ts: nil, key: key}), do: {0, 0, key}
+  defp newest_first(%{max_ts: max_ts, key: key}), do: {1, -max_ts, key}
 
-    case native_result(NIF.tempo_search_plan_may_match(ctx.native, hashes, bits)) do
-      {:ok, false} ->
-        {:cont, acc}
-
-      {:ok, true} ->
-        case visit_segment({segment, index}, {:ok, state}, ctx) do
-          {:cont, {:ok, state}} -> {:cont, {:ok, {state, index + 1}}}
-          {:halt, error} -> {:halt, error}
-        end
-
-      {:error, _} = error ->
-        {:halt, error}
+  # Context needs every retained source that may hold a candidate trace:
+  # format-4 leaves whose ID blooms hold none of them are not read.
+  defp tempo_context_plan(%Manifest{version: 4} = root, start_ts, opts, tenant, config) do
+    fn hashes ->
+      query_segments(root, :traces, start_ts, nil, Keyword.put(opts, :context_hashes, hashes), tenant, config)
     end
+  end
+
+  defp tempo_context_plan(manifest, start_ts, opts, tenant, config),
+    do: fn _hashes -> query_segments(manifest, :traces, start_ts, nil, opts, tenant, config) end
+
+  defp tempo_round(n, plan, {memo, memo_bytes}, start_ts, opts, config) do
+    with {:ok, planned} <- plan.candidates.(n + 1),
+         {window, rest} = Enum.split(planned, n),
+         :ok <- check_scan_budget(window, opts),
+         {:ok, native} <- start_tempo_search(start_ts, opts),
+         ctx = %{scan_ctx(:traces, config, window, start_ts, nil, opts, opts[:limit], native) | memo: memo},
+         state = %{bytes: 0, decoded_bytes: 0, rows: 0, memo: memo, memo_bytes: memo_bytes},
+         {:ok, json, kth, state} <- finish_round(ctx, plan, state) do
+      if rest == [] or older_than?(kth, hd(rest)),
+        do: {:ok, json},
+        else: tempo_round(4 * n, plan, {state.memo, state.memo_bytes}, start_ts, opts, config)
+    end
+  end
+
+  defp finish_round(ctx, plan, state) do
+    with {:ok, state} <- tempo_scan(ctx, plan, state),
+         {:ok, {json, kth}} <- native_result(NIF.tempo_search_finish_window(ctx.native)) do
+      {:ok, json, kth, state}
+    else
+      {:error, _} = error ->
+        _ = NIF.tempo_search_abort(ctx.native)
+        error
+    end
+  end
+
+  defp tempo_scan(ctx, plan, state) do
+    with {:ok, state} <- scan_sources(ctx.segments, ctx, state),
+         {:ok, ids} <- native_result(NIF.tempo_search_plan_seal(ctx.native)),
+         do: tempo_context(ctx, plan, state, ids)
+  end
+
+  defp tempo_context(_ctx, _plan, state, <<>>), do: {:ok, state}
+
+  defp tempo_context(ctx, plan, state, ids) do
+    # Only bounded IDs/hashes cross BEAM, never spans. Native owns the candidate
+    # intersection, bloom work budget and complete-context aggregation.
+    hashes = for <<id::binary-size(32) <- ids>>, into: <<>>, do: :binary.part(:crypto.hash(:sha256, id), 0, 8)
+    fetched = MapSet.new(ctx.segments, & &1.key)
+
+    with {:ok, true} <- native_result(NIF.tempo_search_plan_hashes(ctx.native, hashes)),
+         {:ok, segments} <- plan.context.(for(<<hash::64 <- hashes>>, do: hash)),
+         :ok <- check_catalog(segments),
+         {:ok, hits} <- context_hits(Enum.reject(segments, &MapSet.member?(fetched, &1.key)), ctx.native) do
+      # Pruned sources prove they hold no potential match; unread candidates
+      # may hold older traces, which the round's stop condition accounts for.
+      {unplanned, pruned} = Enum.split_with(hits, plan.candidate?)
+      offset = length(ctx.segments)
+
+      with {:ok, state} <- scan_sources(unplanned, %{ctx | offset: offset, unplanned?: true}, state),
+           do: scan_sources(pruned, %{ctx | offset: offset + length(unplanned)}, state)
+    end
+  end
+
+  defp context_hits(segments, native) do
+    Enum.reduce_while(segments, {:ok, []}, fn segment, {:ok, hits} ->
+      {hashes, bits} = TraceSummary.context_filter(segment.trace_summary)
+
+      case native_result(NIF.tempo_search_plan_may_match(native, hashes, bits)) do
+        {:ok, false} -> {:cont, {:ok, hits}}
+        {:ok, true} -> {:cont, {:ok, [segment | hits]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, hits} -> {:ok, Enum.reverse(hits)}
+      error -> error
+    end
+  end
+
+  defp check_catalog(segments) do
+    limit = TraceSummary.plan_catalog_limit()
+
+    if length(segments) > limit,
+      do: QueryLimit.exceeded(:trace_catalog_segments, limit, length(segments), :candidates),
+      else: :ok
   end
 
   @log_modes [:log_discovery, :log_fold, :log_metric]
@@ -1930,7 +2023,7 @@ defmodule Pulso.Storage.S3 do
          {:ok, row_count} <- scan_row_count(ctx, segment, blob),
          rows = state.rows + row_count,
          :ok <- check_visited_budget(ctx.offset + index + 1, rows, ctx) do
-      continue_or_halt(%{state | bytes: bytes, rows: rows}, blob, index, ctx)
+      continue_or_halt(remember(%{state | bytes: bytes, rows: rows}, segment.key, blob), blob, index, ctx)
     else
       {:error, {:footer_source_missing, cost, rows}} ->
         {:halt,
@@ -1957,11 +2050,26 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
+  # Tempo search rounds keep what they read for later, larger rounds, up to
+  # @memo_bytes; other scans carry no memo.
+  @memo_bytes 64 * 1024 * 1024
+  defp remember(%{memo: memo, memo_bytes: used} = state, key, blob) when is_binary(blob) do
+    cond do
+      is_map_key(memo, key) -> state
+      used + byte_size(blob) > @memo_bytes -> state
+      true -> %{state | memo: Map.put(memo, key, blob), memo_bytes: used + byte_size(blob)}
+    end
+  end
+
+  defp remember(state, _key, _blob), do: state
+
   defp stored_rows(%{signal: :metrics, metric_discovery?: false}, _segment), do: 0
   defp stored_rows(_ctx, segment), do: segment.row_count || 0
 
   defp scan_bytes(%MetricFooterReader{charge: cost}), do: cost
   defp scan_bytes(blob), do: byte_size(blob)
+
+  defp read_segment(%{memo: %{} = memo}, key, _state) when is_map_key(memo, key), do: {:ok, Map.fetch!(memo, key)}
 
   defp read_segment(
          %{signal: :metrics, metric_discovery?: false, config: %{metric_footer_pruning_enabled: true}} = ctx,
@@ -2068,8 +2176,10 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp continue_or_halt(state, blob, _index, %{native: native, tempo?: true}) do
-    case native_result(NIF.tempo_search_add(native, blob)) do
+  defp continue_or_halt(state, blob, _index, %{native: native, tempo?: true} = ctx) do
+    add = if ctx.unplanned?, do: &NIF.tempo_search_add_unplanned/2, else: &NIF.tempo_search_add/2
+
+    case native_result(add.(native, blob)) do
       {:ok, _rows} -> {:cont, {:ok, state}}
       {:error, _} = error -> {:halt, error}
     end

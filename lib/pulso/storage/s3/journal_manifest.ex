@@ -515,7 +515,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
   # cannot succeed stops reading pages early.
   defp query_maximum(signal, opts) do
     cond do
-      signal == "traces" and is_binary(TraceSummary.service_filter(opts[:tempo_search])) ->
+      signal == "traces" and opts[:tempo_search] != nil ->
         TraceSummary.plan_catalog_limit()
 
       limited_trace_scan?(signal, opts) ->

@@ -30,8 +30,8 @@ absent span key falls back to the resource. Event, link and instrumentation
 attributes are not implicit search owners. For example, `.region = "eu"` does
 not match a resource value `eu` when the same span has `region = "us"`.
 This syntax is specific to retained-context search; discovery and window-local
-search filters are unchanged. Unscoped expressions use full-scope admission,
-not the positive scoped-string service planner.
+search filters are unchanged. Expressions never prune sources by
+summaries, but are planned newest first like selectors.
 
 Missing and differently typed attributes **do not match even negative
 predicates**. Integer-literal attribute predicates do not coerce doubles,
@@ -108,8 +108,8 @@ string-AND grammar; this change does **not** widen those APIs.
 
 ## Upgrade and evidence
 
-Require matching application/native search capability **5**, current trace tuple
-**`{2,1,3,5,12}`**, on every serving instance before sending new expressions.
+Require matching application/native search capability **6**, current trace tuple
+**`{2,1,3,6,12}`**, on every serving instance before sending new expressions.
 Startup verifies only the local pair, not an old serving pool. There is no
 Parquet/envelope/idempotency-format change from these operators. Existing rich
 metadata upgrade and retry-draining requirements still apply independently.

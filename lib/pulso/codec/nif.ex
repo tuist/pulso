@@ -98,7 +98,7 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {{2, 1, 3, 5, 12}, 5},
+    if version != {{2, 1, 3, 6, 12}, 5},
       do:
         raise(
           "codec native artifact cannot validate typed OTLP trace metadata and run bounded trace-level search/Tempo trace export/scoped discovery/metrics with shared expression budgets, directional string-group ranking ties and scalar prefilters before ranking; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
@@ -123,10 +123,12 @@ defmodule Pulso.Codec.NIF do
   def tempo_search_new(_floor, _start, _end, _predicates, _limit, _spss), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_expression_search_new(_floor, _start, _end, _program, _limit, _spss), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_search_add(_search, _blob), do: :erlang.nif_error(:nif_not_loaded)
+  def tempo_search_add_unplanned(_search, _blob), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_search_plan_seal(_search), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_search_plan_hashes(_search, _hashes), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_search_plan_may_match(_search, _hashes, _bits), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_search_finish(_search), do: :erlang.nif_error(:nif_not_loaded)
+  def tempo_search_finish_window(_search), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_root_discovery_new(_floor, _key, _predicates, _start, _end), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_root_discovery_finish(_search), do: :erlang.nif_error(:nif_not_loaded)
   def tempo_trace_duration_discovery_new(_floor, _predicates, _start, _end), do: :erlang.nif_error(:nif_not_loaded)

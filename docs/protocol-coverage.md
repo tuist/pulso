@@ -1672,7 +1672,7 @@ not exact status parity. Filtering uses extra bounded query-task heap/CPU withou
 changing storage formats or the native tuple.
 Independent public Tempo engine fixtures cover span-over-resource precedence;
 omitted HTTP bounds search bounded retained context, not an ingester-only tier.
-Tempo requires search capability **5**, tuple `{2,1,3,5,12}`. Remote-write
+Tempo requires search capability **6**, tuple `{2,1,3,6,12}`. Remote-write
 float/histogram timestamp collisions now normalize to the float, and empty-valued
 labels are removed before identity/merging. Invalid label names/duplicates still
 reject before removal; a nonempty reserved RW2 symbol fails the entire request

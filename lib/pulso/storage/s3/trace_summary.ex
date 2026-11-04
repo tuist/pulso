@@ -86,14 +86,29 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
   def plan_catalog_limit, do: 8192
 
-  def service_filter(predicates) when is_list(predicates) do
-    Enum.find_value(predicates, fn
-      {"resource", "service.name", "=", value} when is_binary(value) -> value
-      _ -> nil
+  @doc """
+  `query_traces`-style summary filters for a Tempo selector's AND-ed original
+  string predicates (`[]` for expressions). Projections of original strings
+  equal them, so a source no summary value satisfies holds no match; any
+  subset of the conjuncts prunes soundly, so repeated keys keep the first.
+  `proven_only` limits pruning to all-rich, publication-proven sources:
+  legacy rows always potentially match.
+  """
+  def tempo_filters(predicates) when is_list(predicates) do
+    Enum.reduce(predicates, [proven_only: true], fn {scope, key, op, value}, acc ->
+      field =
+        case {scope, op} do
+          {"resource", "="} -> :resource
+          {"resource", "=~"} -> :resource_regex
+          {"span", "="} -> :attributes
+          {"span", "=~"} -> :attributes_regex
+        end
+
+      Keyword.update(acc, field, %{key => value}, &Map.put_new(&1, key, value))
     end)
   end
 
-  def service_filter(_predicates), do: nil
+  def tempo_filters(_expression), do: []
 
   def to_wire(nil), do: nil
 
@@ -117,11 +132,6 @@ defmodule Pulso.Storage.S3.TraceSummary do
   end
 
   def parse(_), do: nil
-
-  def candidate_source?(%__MODULE__{pruning_safe?: true, services: services}, target) when is_list(services),
-    do: target in services
-
-  def candidate_source?(_summary, _target), do: true
 
   def context_filter(%__MODULE__{lookup_hashes: hashes}) when is_binary(hashes), do: {hashes, nil}
   def context_filter(%__MODULE__{lookup_bits: bits}) when is_binary(bits), do: {nil, bits}
@@ -293,19 +303,33 @@ defmodule Pulso.Storage.S3.TraceSummary do
     id = opts[:trace_id]
 
     (is_nil(service) or is_nil(services) or service in services) and page_id_matches?(bits, id) and
+      page_context_matches?(bits, opts[:context_hashes]) and
       resource_services_match?(wire["k"] == true, services, opts) and
-      TraceAttributeSummary.matches?(TraceAttributeSummary.parse(wire["a"]), opts)
+      attributes_match?(wire["k"] == true, TraceAttributeSummary.parse(wire["a"]), opts)
   end
 
   def page_matches?(_wire, _opts), do: true
   defp page_id_matches?(nil, _id), do: true
   defp page_id_matches?(_bits, nil), do: true
 
-  defp page_id_matches?(bits, id) do
+  defp page_id_matches?(bits, id), do: page_hash_matches?(bits, lookup_hash(id))
+
+  defp page_hash_matches?(bits, hash) do
     size = byte_size(bits) * 8
     <<value::unsigned-size(^size)>> = bits
-    Enum.all?(lookup_positions(lookup_hash(id), size), &(band(value, bsl(1, &1)) != 0))
+    Enum.all?(lookup_positions(hash, size), &(band(value, bsl(1, &1)) != 0))
   end
+
+  # A Tempo search's context plan reads only pages whose ID bloom may hold one
+  # of its candidate traces (64-bit SHA-256 prefixes, as in `lookup_hashes`).
+  # Too many candidates read every page rather than spend unbounded probes.
+  defp page_context_matches?(nil, _hashes), do: true
+  defp page_context_matches?(_bits, nil), do: true
+
+  defp page_context_matches?(bits, hashes) when is_list(hashes) and length(hashes) <= 4096,
+    do: Enum.any?(hashes, &page_hash_matches?(bits, &1))
+
+  defp page_context_matches?(_bits, _hashes), do: true
 
   def matches?(nil, _opts), do: true
 
@@ -315,7 +339,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
     (is_nil(service) or is_nil(services) or service in services) and
       resource_services_match?(summary.pruning_safe?, services, opts) and
-      TraceAttributeSummary.matches?(summary.attributes, opts) and
+      attributes_match?(summary.pruning_safe?, summary.attributes, opts) and
       if(canonical,
         do: page_id_matches?(canonical, trace_id),
         else: is_nil(trace_id) or is_nil(bits) or member?(bits, trace_id)
@@ -339,6 +363,11 @@ defmodule Pulso.Storage.S3.TraceSummary do
   end
 
   defp resource_services_match?(_proven, _services, _opts), do: true
+
+  # Original-string (Tempo) filters prune only proven sources; `query_traces`
+  # compares the projections every row carries.
+  defp attributes_match?(proven?, attributes, opts),
+    do: (opts[:proven_only] == true and proven? != true) or TraceAttributeSummary.matches?(attributes, opts)
 
   defp service_name(%{"service.name" => value}) when is_binary(value), do: value
   defp service_name(_filters), do: nil

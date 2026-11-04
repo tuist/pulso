@@ -95,7 +95,7 @@ defmodule Pulso.Storage.S3.TempoPlannerTest do
     assert {:error, :query_scan_limit} = query(ctx, max_scan_segments: 1)
     assert data_gets(ctx) == []
     assert TraceSummary.parse(%{"v" => 1, "s" => ["noise"], "k" => "true"}).pruning_safe? == false
-    assert TraceSummary.candidate_source?(nil, "api")
+    assert TraceSummary.matches?(nil, proven_only: true, resource: %{"service.name" => "api"})
   end
 
   test "legacy nonmatches remain candidates and fail overlapping searches", ctx do
@@ -116,19 +116,21 @@ defmodule Pulso.Storage.S3.TempoPlannerTest do
     assert data_gets(ctx) == [entry.key]
   end
 
-  test "non-service and regex-only selectors retain conservative full-scan admission", ctx do
+  test "attribute and regex selectors prune proven sources; candidate windows keep scan admission", ctx do
     seed(ctx, for(n <- 1..3, do: [record(ctx.base, "noise", n, n, 10)]))
 
-    for query <- [
-          ~s'{span.request_kind="api"} with (most_recent=true)',
-          ~s'{resource.service.name=~"api"} with (most_recent=true)'
-        ] do
-      {:ok, predicates} = TempoSearch.parse(query)
-
-      assert {:error, :query_scan_limit} =
-               S3.tempo_search_json(ctx.tenant, predicates, trace_start: 1, trace_end: 200, max_scan_segments: 1)
+    search = fn query ->
+      TempoSearch.parse(query)
+      |> elem(1)
+      |> then(&S3.tempo_search_json(ctx.tenant, &1, trace_start: 1, trace_end: 200, max_scan_segments: 1))
     end
 
+    assert {:ok, ~s'{"traces":[]}'} = search.(~s'{resource.service.name=~"api"} with (most_recent=true)')
+    assert {:ok, ~s'{"traces":[]}'} = search.(~s'{span.request_kind="absent"}')
+    assert data_gets(ctx) == []
+
+    # Every source may match: the first window already exceeds the segment budget.
+    assert {:error, :query_scan_limit} = search.(~s'{resource.service.name=~"no.*"}')
     assert data_gets(ctx) == []
   end
 

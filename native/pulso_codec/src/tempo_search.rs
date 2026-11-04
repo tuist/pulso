@@ -1,6 +1,7 @@
 //! Tempo-compatible single-spanset search over a complete retained snapshot.
-//! No time pruning or span top-k precedes aggregation. Proven source-service
-//! pruning may discover candidates first, then recover all ID-selected context.
+//! No time pruning or span top-k precedes aggregation. The caller may discover
+//! candidates in a proven or newest-first subset of sources first, then recover
+//! all ID-selected context.
 //! All input objects, groups, retained strings/samples and rendered bytes are
 //! independently bounded. Legacy uncertainty is checked AFTER trace overlap.
 use crate::json_read::Parser;
@@ -51,6 +52,7 @@ struct State {
     context_phase: bool,
     plan_hashes: Option<Vec<u64>>,
     plan_probes: usize,
+    unplanned: bool,
     retained: usize,
     predicates: Vec<Predicate>,
     expression: Option<crate::tempo_expression::Expression>,
@@ -102,7 +104,7 @@ pub(crate) fn predicates(input: Vec<(String, String, String, String)>) -> Res<Ve
 }
 #[rustler::nif]
 fn tempo_search_api_version() -> u32 {
-    5
+    6
 }
 #[rustler::nif(schedule = "DirtyCpu")]
 fn tempo_search_new<'a>(
@@ -275,7 +277,34 @@ fn tempo_search_add<'a>(env: Env<'a>, search: ResourceArc<Search>, blob: Binary<
         (|| {
             let mut lock = search.0.try_lock().map_err(|_| Error::Budget)?;
             let state = lock.as_mut().ok_or(Error::Invalid)?;
-            let answer = state.capture(blob);
+            let answer = state.capture(blob, false);
+            if answer.is_err() {
+                *lock = None;
+            }
+            answer
+        })(),
+    )
+}
+// Context from a source the plan did not prune but has not discovered yet: an
+// older candidate beyond a newest-first window. Its rows of sealed candidates
+// join their traces; other potentially matching rows belong to traces the
+// caller proves start before the window's kth trace, so they are not errors.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn tempo_search_add_unplanned<'a>(
+    env: Env<'a>,
+    search: ResourceArc<Search>,
+    blob: Binary<'a>,
+) -> Term<'a> {
+    result(
+        env,
+        (|| {
+            let mut lock = search.0.try_lock().map_err(|_| Error::Budget)?;
+            let state = lock.as_mut().ok_or(Error::Invalid)?;
+            let answer = if state.context_phase && state.roots.is_none() {
+                state.capture(blob, true)
+            } else {
+                Err(Error::Invalid)
+            };
             if answer.is_err() {
                 *lock = None;
             }
@@ -379,30 +408,37 @@ fn tempo_search_abort(search: ResourceArc<Search>) -> rustler::Atom {
 }
 #[rustler::nif(schedule = "DirtyCpu")]
 fn tempo_search_finish<'a>(env: Env<'a>, search: ResourceArc<Search>) -> Term<'a> {
-    result(
-        env,
-        (|| {
-            let mut state = search
-                .0
-                .try_lock()
-                .map_err(|_| Error::Budget)?
-                .take()
-                .ok_or(Error::Invalid)?;
-            if state.roots.is_some() {
-                return Err(Error::Invalid);
-            }
-            state.assemble_candidates()?;
-            let rows = state.selected()?;
-            let mut count = Counter::new(MAX);
-            state.write(&mut count, &rows);
-            if count.len() > MAX {
-                return Err(Error::Budget);
-            }
-            let mut out = crate::out::BinSink::with_capacity(count.len());
-            state.write(&mut out, &rows);
-            Ok(out.finish(env))
-        })(),
-    )
+    result(env, finish(env, search).map(|(body, _kth)| body))
+}
+// Also the start of the `limit`th selected trace, when `limit` were selected:
+// a newest-first caller may stop once every unread candidate ends before it.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn tempo_search_finish_window<'a>(env: Env<'a>, search: ResourceArc<Search>) -> Term<'a> {
+    result(env, finish(env, search))
+}
+fn finish<'a>(env: Env<'a>, search: ResourceArc<Search>) -> Res<(Binary<'a>, Option<i64>)> {
+    let mut state = search
+        .0
+        .try_lock()
+        .map_err(|_| Error::Budget)?
+        .take()
+        .ok_or(Error::Invalid)?;
+    if state.roots.is_some() {
+        return Err(Error::Invalid);
+    }
+    state.assemble_candidates()?;
+    let rows = state.selected()?;
+    let kth = (rows.len() == state.limit)
+        .then(|| rows.last().map(|(_, s)| s.start))
+        .flatten();
+    let mut count = Counter::new(MAX);
+    state.write(&mut count, &rows);
+    if count.len() > MAX {
+        return Err(Error::Budget);
+    }
+    let mut out = crate::out::BinSink::with_capacity(count.len());
+    state.write(&mut out, &rows);
+    Ok((out.finish(env), kth))
 }
 pub(crate) fn matches(
     predicates: &[Predicate],
@@ -685,7 +721,7 @@ impl State {
         }
         Ok(())
     }
-    fn capture(&mut self, blob: Binary<'_>) -> Res<usize> {
+    fn capture(&mut self, blob: Binary<'_>, unplanned: bool) -> Res<usize> {
         self.input_bytes = self
             .input_bytes
             .checked_add(blob.len())
@@ -696,7 +732,10 @@ impl State {
         self.input_segments += 1;
         let blob = crate::erlang_bytes::from_binary(blob);
         if self.context_phase {
-            return self.scan(blob, false, true);
+            self.unplanned = unplanned;
+            let rows = self.scan(blob, false, true);
+            self.unplanned = false;
+            return rows;
         }
         let window = self.roots.as_ref().and_then(|q| q.window);
         let header = window
@@ -872,7 +911,11 @@ impl State {
                                 ends.value(i),
                                 payloads.value(i).as_bytes(),
                             )?;
-                            if self.context_phase && !selected && self.potential(&fields)? {
+                            if self.context_phase
+                                && !selected
+                                && !self.unplanned
+                                && self.potential(&fields)?
+                            {
                                 return Err(Error::Invalid);
                             }
                             if selected {

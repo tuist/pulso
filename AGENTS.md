@@ -108,8 +108,14 @@ legacy byte limit. `pulso_manifest_commit_duration_seconds{signal,format,root_by
 `pulso_manifest_roots` and page-cache gauges watch it. Total bucket metadata
 still grows until retention. See `docs/configuration.md#manifest-format`.
 
-Current trace search capability is **5**, tuple `{2,1,3,5,12}`, superseding the
-search4 snapshot references below. Unscoped original-string/int64 search uses
+Current trace search capability is **6**, tuple `{2,1,3,6,12}`, superseding the
+search4/search5 snapshot references below. `/api/search` (`search_trace_metadata`)
+plans candidates newest first in rounds of 4, 16, 64... (`S3.tempo_search/5`),
+prunes proven sources by the `query_traces` service/attribute value sets
+(`TraceSummary.tempo_filters/1`, `proven_only`), selects context by ID summaries
+and leaf ID blooms (`:context_hashes`), and stops once the `limit`th trace starts
+after the newest unread candidate (`tempo_search_finish_window`,
+`tempo_search_add_unplanned`). Unscoped original-string/int64 search uses
 span-key presence before resource fallback; sampled values may include both
 owners. Omitted or paired-zero HTTP search bounds scan bounded retained context,
 not an ingester-only tier; partial bounds reject. Discovery/window-local grammar,
@@ -822,7 +828,7 @@ even logically equivalent ones, fail permanently with HTTP409 `keyed_content_mis
 never overwrite or infer semantic/hash equality. Object-store ABI is `{1,1,1,1}`
 (retention, keyed publication, snapshot GET, async requests); every writer, including recording evaluators,
 must upgrade/drain because local startup does not fence older unconditional
-writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,5,12}` and metric
+writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,6,12}` and metric
 `{2,2,1,1,1}` are the current codec requirements; footer reads do not change keyed encoder bytes.
 Remote-write 2.0 legacy series-created and modern per-point starts retain optional
 signed-int64 `start_timestamp_ms` without synthetic zeros or start-aware rates.

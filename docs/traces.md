@@ -249,7 +249,7 @@ remain unsupported.
 
 ## Typed-metadata upgrade boundary
 
-Current required native trace tuple is `{2,1,3,5,12}`. Before accepting non-finite
+Current required native trace tuple is `{2,1,3,6,12}`. Before accepting non-finite
 values, upgrade all participants; old readers/compactors reject them. NaN
 normalizes by class, not payload bits. Service promotion now requires original
 `stringValue`, also removing prior byte-service promotion; drain those keyed
@@ -368,54 +368,67 @@ comparisons, `status`/`span:status` enum comparisons and own-span
 `duration`/`span:duration` comparisons, combined with `&&`, `||` and parentheses.
 TraceQL gives AND/OR equal precedence and groups left-to-right. Missing or
 mismatched types do not match even negative predicates; no inferred/coerced data.
-Expressions use full-scope admission without the service planner, plus an
+Expressions skip summary pruning but use the same newest-first planning, plus an
 additional 20M prefilter work ceiling per scan attempt. Window-local search and
 discovery retain their narrower grammar. Read [expression semantics, costs and
 upgrade requirements](trace-query-expressions.md) before use.
 
-### Bounded immutable service/ID planning
+### Candidate pruning and newest-first planning
 
-For an original positive-string AND selector with an exact
-`resource.service.name = "..."` predicate, S3 search can omit
-provably nonmatching sources from candidate discovery. New encoders and
-compactors publish an optional proof only when **every row has known typed
-metadata, valid core fields, agreeing payload/columns, and every original string
-service.name is represented by its promoted service column**. A complete service
-set that excludes the requested value then proves the source cannot contribute a
-matching parent. Missing/invalid proofs or service sets, legacy rows and unknown
-summaries always scan; a projected legacy string is never inferred to be an
-original string. Non-string service attributes do not become strings. Compaction
-recomputes the proof from bytes, so it can prove old rich sources but never
-reconstruct missing original types. No compaction is required for correctness.
+Search returns the most recent `limit` matching traces, so S3 search plans
+candidate sources newest first instead of reading every retained source. For an
+original positive-string AND selector, a source is a candidate unless its
+published summary proves it cannot hold a matching span: its complete
+`resource.service.name` set, or its bounded resource/span attribute value sets
+(the same sets `query_traces` uses, see [Query spans](#query-spans)),
+exclude a predicate's value or pattern. Paged-manifest leaves prune the same way
+from their union summaries. New encoders and compactors publish the proof that
+allows this only when **every row has known typed metadata, valid core fields,
+agreeing payload/columns, and every original string service.name is represented
+by its promoted service column**. Unproven sources, legacy rows, unknown
+summaries, keys past the value-set bounds, non-string values and flat manifests
+never prune; a projected legacy string is never inferred to be an original
+string. Compaction recomputes the proof from bytes, so it can prove old rich
+sources but never reconstruct missing original types. No compaction is required
+for correctness. Expressions do not prune but use the same planning.
 
-The first pass collects matching-or-legacy-unknown candidate IDs, including
-matches outside the requested time window. It replays its exact admitted immutable
-bytes locally, without a second GET. Candidate IDs then select additional context
-sources through complete SHA-256-prefix sets or versioned canonical ID blooms,
-**without a service or request-time filter**. Earlier roots, other services and
-nonmatching spans of those IDs are recovered before overlap, order or limit.
+Planning runs in rounds. A round discovers matching-or-legacy-unknown candidate
+IDs in the newest 4 candidates by `max_ts` (including matches outside the
+requested time window), replaying their exact admitted bytes locally without a
+second GET. Candidate IDs then select additional context sources through complete
+SHA-256-prefix sets or versioned canonical ID blooms, and paged-manifest leaves
+through their ID blooms, **without a service or request-time filter**. Earlier
+roots, other services and nonmatching spans of those IDs are recovered before
+overlap, order or limit. A trace that an unread candidate could still add starts
+no later than that candidate's `max_ts`, so when the round's `limit`th trace
+starts after the newest unread candidate, the round's answer is the answer.
+Otherwise the next round plans four times as many candidates, reusing (up to 64
+MiB) the objects earlier rounds read. A search that stops early never reads the
+older candidates, so their legacy rows or root conflicts do not fail it.
 Unknown ID summaries read conservatively; collisions/false positives only add
 reads. A separate **2,000,000 native index-probe ceiling** falls back to reading
 all remaining sources, never clipping IDs or context. Read context validates every
-visible payload; a new potential ID after candidates are sealed rejects the whole
-query rather than silently expanding an incomplete trace. This violation currently
-shares the generic invalid-stored-data error, not a distinct diagnostic metric.
+visible payload; a new potential ID in a pruned source after candidates are
+sealed rejects the whole query rather than silently expanding an incomplete
+trace. This violation currently shares the generic invalid-stored-data error,
+not a distinct diagnostic metric.
 
 This is **not an integrity scrub of pruned objects**: a missing/corrupt object
 proven irrelevant at publication can go unread, unlike an unplanned full scan.
 Keep coherent manifest/page/segment backups and bucket versioning. It is not a
 posting index, a global query cache, full TraceQL or representative workload/deployed
 client acceptance. Discovery and window-local `search_traces` do **not** use this
-service/ID plan; their existing raw source/header costs remain unchanged.
+plan; their existing raw source/header costs remain unchanged.
 
-Planning still inspects the retained catalog, under unchanged metadata byte/page
-bounds (8 MiB default), BEAM query-heap admission and a separate hard **8192-reference
-ceiling**. Metadata or heap bounds can bind well before 8192; it is not a promised
-catalog capacity. Queries without exact service equality retain full-scan admission.
-Old/unproven sources still consume data reads even under highly selective filters.
+Context planning inspects the retained catalog of leaves that may hold a
+candidate ID, under unchanged metadata byte/page bounds (8 MiB default), BEAM
+query-heap admission and a separate hard **8192-reference ceiling**. Metadata or
+heap bounds can bind well before 8192; it is not a promised catalog capacity.
+Old/unproven sources still consume data reads even under highly selective
+filters, and a search with fewer matches than its limit visits every candidate.
 
 Potential matching/legacy IDs count toward **65,536 candidates**. Actual fetched
-sources cumulatively count toward **1024 inputs / 32 MiB compressed input /
+sources of a round cumulatively count toward **1024 inputs / 32 MiB compressed input /
 1,000,000 raw footer rows**, even after captured input memory is freed. Lower caller
 limits remain lower; bounded GETs and actual footer checks cover lying sizes/counts.
 Both native passes independently cap one million rows. Context can consume the
@@ -430,7 +443,7 @@ Record-based reference adapters have no source indexes or native compressed-inpu
 owner caps. Dirty native work can outlive deadlines; exceptions/panics rely on
 resource cleanup and lock contention remains a generic resource error.
 
-Require complete-context search capability **5**, current tuple **`{2,1,3,5,12}`**, on
+Require complete-context search capability **6**, current tuple **`{2,1,3,6,12}`**, on
 all serving application/native artifacts before use; discovery capability is
 **12**. Startup verifies only local artifacts, not other running nodes. Smaller
 windows/result limits do not themselves reduce retained context. Broad, legacy,
@@ -653,7 +666,7 @@ metadata always fails. Empty matches return an empty list only after the admitte
 scan completes. Source routing/windows and raw provider/footer bounds are unchanged;
 this does not use metadata search's service/ID optimizer.
 
-Require discovery capability **12**, tuple **`{2,1,3,5,12}`**, across all serving apps
+Require discovery capability **12**, tuple **`{2,1,3,6,12}`**, across all serving apps
 and native artifacts. Non-window adapters need explicit query-aware unscoped
 execution or a bounded reference scan; old unfiltered callbacks cannot receive
 queries. Windowed filtered-unscoped execution requires separate explicit support,
@@ -757,7 +770,7 @@ Parquet/engine cases cover all five scopes, shared keys with different owners,
 multiple events/links under one parent, typed extremes/empty values and parent
 filters. Actual public protobuf decoders also consumed all 68 current results.
 Install matching native artifacts: discovery capability is **12** (startup
-tuple `{2,1,3,5,12}`); no physical column changes are introduced. Upgrade/drain every
+tuple `{2,1,3,6,12}`); no physical column changes are introduced. Upgrade/drain every
 instance serving discovery before clients use event-time/filtered-unscoped/time-windowed/float/stored-intrinsic values through a shared pool.
 Startup only checks the local artifact; it does not fence older running nodes.
 
@@ -829,7 +842,7 @@ support**; they never pass through that older generic callback. Non-window callb
 support does not establish window support. Flat-record/old adapters reject rather
 than ignore time or invent segment boundaries. There is no storage-format or
 mutable coordination change. Upgrade/drain **every** serving app/native participant
-to capability **12**, tuple **`{2,1,3,5,12}`**, before use.
+to capability **12**, tuple **`{2,1,3,6,12}`**, before use.
 
 ### Stored intrinsic string values
 
@@ -925,7 +938,7 @@ because windows include whole sources and compaction can broaden them. Filters
 reduce returned values but **not** requested-owner work or provider/header costs.
 Inspect the tagged reason: dictionary/row/work exhaustion is not stored corruption.
 
-Requires current discovery **12**, tuple **`{2,1,3,5,12}`**, on every serving app/native
+Requires current discovery **12**, tuple **`{2,1,3,6,12}`**, on every serving app/native
 participant. Explicit event-time execution or a bounded reference is required;
 old stored-string callbacks cannot receive the new target. Windowed event-time
 execution needs separate explicit support and cannot use an old generic window
@@ -1007,7 +1020,7 @@ The global **2M work / 5000 values / independent 1 MiB dictionary and encoded-re
 limits still reject whole requests. Filters do not evade prefilter work or raw I/O.
 No native bound is a node/deployment-wide capacity guarantee.
 
-Requires current discovery **12**, tuple **`{2,1,3,5,12}`**, across every serving
+Requires current discovery **12**, tuple **`{2,1,3,6,12}`**, across every serving
 app/native participant. New explicit root execution or bounded complete reference
 is required; windowed roots need dedicated window-aware support with source
 boundaries. Old span-local string or generic window callbacks never receive
@@ -1074,7 +1087,7 @@ and narrow source windows can help without a guarantee, and do not avoid raw
 provider/header costs or prefilter work. Compaction can broaden candidate sources.
 This is not representative indexed capacity or transparent production autocomplete.
 
-Current discovery **12**, tuple **`{2,1,3,5,12}`**, is required across every serving
+Current discovery **12**, tuple **`{2,1,3,6,12}`**, is required across every serving
 app/native participant. New explicit trace-duration execution or a bounded complete
 sentinel reference is required; windows need dedicated support preserving source
 boundaries. Old root/string/generic-window callbacks never receive this mode.
@@ -1147,7 +1160,7 @@ without backend clients established the seven v2 static shortcuts and public
 protobuf decoders consumed all eight name/value responses. This is not a running
 Grafana/Tempo deployment acceptance result. Upgrade every instance serving
 discovery before clients use the new mode in a shared pool. Matching native
-artifacts require tuple `{2,1,3,5,12}`; static vocabulary itself does not alter
+artifacts require tuple `{2,1,3,6,12}`; static vocabulary itself does not alter
 native or storage formats. Startup does not fence older application nodes.
 
 ### Tempo v1 trace lookup
@@ -1286,7 +1299,7 @@ bytes as empty string, projects nanosecond times to float milliseconds and expos
 large int64s to downstream JavaScript-number limitations. Keep Pulso metadata/wire
 as the fidelity boundary rather than treating a frame as an original OTLP record.
 Install matching native artifacts: complete-context search capability is now 5
-(metadata 2/export 3/discovery 12), tuple `{2,1,3,5,12}`. Startup checks reject
+(metadata 2/export 3/discovery 12), tuple `{2,1,3,6,12}`. Startup checks reject
 previous bindings; unscoped search adds no storage-format change. Upgrade or drain **every node serving
 Tempo endpoints** before pointing Grafana at the pool: a rolling mix with the
 previous exporter can still omit default status and intermittently crash client

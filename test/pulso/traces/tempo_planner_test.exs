@@ -43,7 +43,7 @@ defmodule Pulso.Traces.TempoPlannerTest do
 
     for services <- [nil, [], [String.duplicate("x", 257)], List.duplicate("x", 129)] do
       summary = TraceSummary.parse(%{"v" => 1, "k" => true, "s" => services})
-      assert TraceSummary.candidate_source?(summary, "api")
+      assert candidate?(summary)
     end
 
     wire = row |> List.wrap() |> TraceSummary.build(true) |> TraceSummary.to_wire()
@@ -151,6 +151,12 @@ defmodule Pulso.Traces.TempoPlannerTest do
   end
 
   defp hex(id), do: Base.encode16(<<id::128>>, case: :lower)
+
+  defp candidate?(summary) do
+    {:ok, predicates} = TempoSearch.parse(@query)
+    TraceSummary.matches?(summary, TraceSummary.tempo_filters(predicates))
+  end
+
   defp encode(rows), do: NIF.encode_trace_segment_parquet_v2(Enum.map(rows, &Span.to_map/1))
 
   defp new_state do
@@ -196,7 +202,7 @@ defmodule Pulso.Traces.TempoPlannerTest do
       end)
 
     {first, remaining} =
-      Enum.split_with(sources, fn {_blob, summary} -> TraceSummary.candidate_source?(summary, "api") end)
+      Enum.split_with(sources, fn {_blob, summary} -> candidate?(summary) end)
 
     state = new_state()
     Enum.each(first, fn {blob, _} -> assert {:ok, _} = NIF.tempo_search_add(state, blob) end)

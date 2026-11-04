@@ -249,6 +249,18 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert {%{}, 0} = query.(resource_regex: %{"service.namespace" => "kura"})
     assert {_, 24} = query.(resource: %{"service.namespace" => "tuist"})
 
+    tempo = fn selector ->
+      {:ok, predicates} = TempoSearch.parse(selector)
+      Agent.update(ctx.agent, &%{&1 | reads: []})
+      {:ok, json} = S3.tempo_search_json(ctx.tenant, predicates, trace_start: 0, trace_end: 0, limit: 20, spss: 1)
+      reads = Agent.get(ctx.agent, fn state -> Enum.count(state.reads, &String.ends_with?(&1, ".parquet")) end)
+      {length(Pulso.JSON.decode!(json)["traces"]), reads}
+    end
+
+    # Tempo original-string selectors prune the same proven sources.
+    assert tempo.(~s|{resource.service.namespace=~"kura.*"}|) == {0, 0}
+    assert tempo.(~s|{resource.service.name=~"kura-(.*)-.*" && span.request_kind="api"}|) == {12, 12}
+
     # Without the proof that the promoted service is the original string
     # service.name, or a resource value set, sources are read.
     Agent.update(ctx.agent, fn state ->
@@ -266,6 +278,8 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert :ok = stop_supervised(ManifestSupervision)
     start_supervised!(ManifestSupervision)
     assert query.(resource: %{"service.name" => "noise"}) == {%{"noise" => 6}, 24}
+    # Unproven sources may hold legacy rows: every one is a Tempo candidate.
+    assert tempo.(~s|{resource.service.namespace=~"kura.*"}|) == {0, 24}
   end
 
   @tag timeout: 120_000
@@ -357,6 +371,110 @@ defmodule Pulso.Storage.S3.TracesTest do
     # Visited segments count across windows.
     assert {{:error, :query_scan_limit}, _, _} = query.(name: "oldest", max_scan_segments: 100)
     assert %{limit: :max_scan_segments, observed: 101, stage: :visited} = Pulso.QueryLimit.take()
+  end
+
+  @tag timeout: 120_000
+  test "Tempo searches plan matching sources newest first and read only candidate trace context", ctx do
+    [base | _] = ctx.spans
+
+    # 601 pushes of one root span each; every 50th is a Kura cache request
+    # whose child span arrives with the next push, so complete context lives
+    # in a source the predicates prune.
+    span = fn n, child? ->
+      kura? = rem(n, 2) == 0
+
+      route =
+        cond do
+          child? -> "/internal"
+          rem(n, 50) == 0 -> "/api/cache/cas/{id}"
+          kura? -> "/up"
+          true -> "/api/runs"
+        end
+
+      {service, namespace} = if kura?, do: {"kura-eu-#{rem(n, 3)}", "kura"}, else: {"tuist-server", "tuist"}
+
+      resource =
+        Enum.map(base.otlp["resource"], fn
+          %{"key" => "service.name"} = pair -> %{pair | "value" => %{"stringValue" => service}}
+          %{"key" => "service.namespace"} = pair -> %{pair | "value" => %{"stringValue" => namespace}}
+          pair -> pair
+        end)
+
+      typed = [%{"key" => "http.route", "value" => %{"stringValue" => route}} | base.otlp["attributes"]]
+      ts = n * 1000 + if(child?, do: 1, else: 0)
+
+      %{
+        base
+        | service: service,
+          resource: %{base.resource | "service.name" => service, "service.namespace" => namespace},
+          attributes: Map.put(base.attributes, "http.route", route),
+          trace_id: Base.encode16(<<n::128>>, case: :lower),
+          span_id: Base.encode16(<<n::32, if(child?, do: 2, else: 1)::32>>, case: :lower),
+          parent_span_id: if(child?, do: Base.encode16(<<n::32, 1::32>>, case: :lower)),
+          timestamp_ns: ts,
+          end_timestamp_ns: ts + 10,
+          otlp: %{base.otlp | "resource" => resource, "attributes" => typed}
+      }
+    end
+
+    push = fn n ->
+      if rem(n - 1, 50) == 0 and n > 1, do: [span.(n, false), span.(n - 1, true)], else: [span.(n, false)]
+    end
+
+    1..601
+    |> Task.async_stream(&S3.append(:traces, ctx.tenant, push.(&1)), max_concurrency: 8, timeout: :infinity)
+    |> Enum.each(&assert(&1 == {:ok, :ok}))
+
+    leaves =
+      Agent.get(ctx.agent, fn state ->
+        state.objects |> Map.keys() |> Enum.count(&String.ends_with?(&1, "-leaf.json"))
+      end)
+
+    assert leaves > 0
+
+    search = fn query, limit ->
+      {:ok, predicates} = TempoSearch.parse(query)
+      :ok = S3.MetadataCache.clear()
+      Agent.update(ctx.agent, &%{&1 | reads: []})
+      result = S3.tempo_search_json(ctx.tenant, predicates, trace_start: 0, trace_end: 0, limit: limit, spss: 3)
+      reads = Agent.get(ctx.agent, & &1.reads)
+
+      traces =
+        with {:ok, json} <- result do
+          for trace <- Pulso.JSON.decode!(json)["traces"] do
+            {String.to_integer(trace["traceID"], 16),
+             trace["serviceStats"] |> Map.values() |> Enum.map(& &1["spanCount"])}
+          end
+        end
+
+      # The same answer as the reference search over every stored span.
+      opts = [trace_start: 0, trace_end: 0, limit: limit, spss: 3]
+      {:ok, expected} = TempoSearch.json(Enum.flat_map(1..601, push), predicates, opts)
+      if match?({:ok, _}, result), do: assert(Pulso.JSON.decode!(elem(result, 1)) == Pulso.JSON.decode!(expected))
+
+      {traces, Enum.count(reads, &String.ends_with?(&1, ".parquet")),
+       Enum.count(reads, &String.ends_with?(&1, "-leaf.json"))}
+    end
+
+    kura = ~s|{resource.service.namespace="kura" && span.http.route=~"/api/cache.*"}|
+
+    # The newest four cache sources answer: the fifth ends before the fourth
+    # trace starts. Each trace's child comes from the pruned source after it.
+    assert {[{600, [2]}, {550, [2]}, {500, [2]}, {450, [2]}], 8, pages} = search.(kura, 4)
+    assert pages < leaves
+
+    # Fewer matches than the limit visit every candidate, once: the second
+    # round reuses what the first read.
+    {traces, reads, _pages} = search.(kura, 20)
+    assert traces == Enum.map(600..50//-50, &{&1, [2]})
+    assert reads == 24
+
+    # Values no source holds read neither segments nor leaves.
+    assert {[], 0, 0} = search.(~s|{span.http.route="/v1/cache/{hash}"}|, 20)
+    assert {[], 0, 0} = search.(~s|{resource.service.namespace="missing"}|, 20)
+
+    # Expressions prune nothing but still stop after the newest window.
+    assert {[{601, [1]}, {600, [2]}], 4, _} = search.(~s|{span.http.route!="none"}|, 2)
   end
 
   test "trace search scans every object before limiting traces; one hot trace cannot hide another", ctx do
