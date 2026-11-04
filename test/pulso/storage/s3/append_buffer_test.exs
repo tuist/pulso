@@ -538,11 +538,14 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
                      30_000
     end
 
-    # A first publication that takes 400 ms teaches the owner its commit time.
+    # A first publication that takes 1.2 s teaches the owner its commit time.
+    # The adaptive window is that estimate minus the buffer's measured upload
+    # time and the time already spent in the next commit, both of which grow
+    # under scheduler load, so the estimate must dwarf them.
     hold.()
     first = append.(1)
     assert_receive {:storage_barrier, writer, "PUT", ^key}, 30_000
-    Process.sleep(400)
+    Process.sleep(1200)
     release.(writer)
     assert Task.await(first, 10_000) == :ok
 
@@ -554,6 +557,9 @@ defmodule Pulso.Storage.S3.AppendBufferTest do
     # in-flight write they keep collecting for the next one instead.
     third = append.(3)
     arrived.(3)
+    # The batch waits for the next publication: far longer than three windows.
+    assert {timer, _token} = :sys.get_state(buffer).timer
+    assert Process.read_timer(timer) > 300
     Process.sleep(60)
     fourth = append.(4)
     arrived.(4)
