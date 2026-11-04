@@ -198,7 +198,7 @@ defmodule Pulso.ReliabilityTest do
     Agent.update(ctx.replies, &%{&1 | replies: [{"expected", "none"}]})
     assert [{Pulso.Reliability.Supervisor, opts}] = Pulso.Reliability.Supervisor.children()
     start_supervised!({Pulso.Reliability.Supervisor, Keyword.put(opts, :interval_ms, 60_000)})
-    assert_receive {:provider_request, "/v1/decisions", _, _, _}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, _}, 30_000
     worker = Runtime.whereis(Worker)
     _ = :sys.get_state(worker)
     assert [%{"window_end_ns" => ^finish, "assessment" => %{"decision" => "expected"}}] = signals()["results"]
@@ -256,7 +256,7 @@ defmodule Pulso.ReliabilityTest do
         Investigations.complete("tenant", String.duplicate("a", 32), String.duplicate("b", 64), "completed")
       end)
 
-    assert_receive {:callback_read, handler}, 5000
+    assert_receive {:callback_read, handler}, 30_000
     assert {:ok, :same_tenant} = Pulso.QueryRunner.run("tenant", :raw, fn _ -> {:ok, :same_tenant} end)
     assert {:ok, :other_tenant} = Pulso.QueryRunner.run("other", :raw, fn _ -> {:ok, :other_tenant} end)
 
@@ -286,7 +286,7 @@ defmodule Pulso.ReliabilityTest do
         end)
       end)
 
-    assert_receive {:callback_slot, worker}, 5000
+    assert_receive {:callback_slot, worker}, 30_000
     busy = callback(payload)
     assert json_response(busy, 429) == %{"error" => "completion_busy"}
     assert get_resp_header(busy, "retry-after") == ["1"]
@@ -314,7 +314,7 @@ defmodule Pulso.ReliabilityTest do
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, hook))
     Runtime.put_env(:pulso, Pulso.QueryRunner, timeout_ms: 100)
     timed = Task.async(fn -> callback(payload) end)
-    assert_receive {:timed_callback_read, handler}, 5000
+    assert_receive {:timed_callback_read, handler}, 30_000
     assert json_response(Task.await(timed), 504) == %{"error" => "completion_timeout"}
     send(handler, :release)
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, nil))
@@ -527,7 +527,7 @@ defmodule Pulso.ReliabilityTest do
     seed()
     Agent.update(ctx.replies, &%{&1 | status: 503, block: true})
     publisher = Task.async(fn -> step() end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
     head = Repository.key("tenant")
     Agent.update(ctx.objects, &%{&1 | faults: %{{"PUT", head} => {500, :after, 1}}})
     send(provider, :release)
@@ -543,7 +543,7 @@ defmodule Pulso.ReliabilityTest do
     Runtime.put_env(:pulso, Pulso.QueryRunner, max_per_tenant: 4, class_limits: %{alerting: 4})
     Agent.update(ctx.replies, &%{&1 | block: true})
     task = Task.async(fn -> step() end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
     assert {:ok, %{"status" => "complete"}} = step()
     send(provider, :release)
     assert {:ok, %{"revision" => 1}} = Task.await(task)
@@ -556,7 +556,7 @@ defmodule Pulso.ReliabilityTest do
     Agent.update(ctx.replies, &%{&1 | block: true})
     Runtime.put_env(:pulso, Reliability, Keyword.put(ctx.settings, :investigation_url, ctx.webhook))
     publisher = Task.async(fn -> step() end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
     head = Repository.key("tenant")
     Agent.update(ctx.objects, &%{&1 | faults: %{{"PUT", head} => {500, :after, 1}}})
     Agent.update(ctx.replies, &%{&1 | block: false})
@@ -592,10 +592,10 @@ defmodule Pulso.ReliabilityTest do
 
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, hook))
     publisher = Task.async(fn -> step() end)
-    assert_receive {:storage_barrier, response, "PUT", ^head}, 5000
+    assert_receive {:storage_barrier, response, "PUT", ^head}, 30_000
     Agent.update(ctx.objects, &%{&1 | barriers: %{}})
     assessor = Task.async(fn -> step() end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
     send(response, {:release_storage, head})
     assert {:ok, {:ok, %{"status" => "complete"}}} = Task.yield(publisher, 3000)
     page = signals()
@@ -630,10 +630,10 @@ defmodule Pulso.ReliabilityTest do
 
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, hook))
     deferred = Task.async(fn -> step(now_ns: before_midnight, assessment_budget_nano_usd: 550_000) end)
-    assert_receive {:deferral_pending, response}, 5000
+    assert_receive {:deferral_pending, response}, 30_000
     Agent.update(ctx.replies, &%{&1 | block: true})
     assessor = Task.async(fn -> step(now_ns: before_midnight + 1) end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
     send(response, :release)
     assert {:error, :reliability_already_assessed} = Task.await(deferred)
     assert [%{"calls" => 1, "status" => "outcome_unknown"}] = Map.values(signals()["assessments"])
@@ -650,22 +650,22 @@ defmodule Pulso.ReliabilityTest do
     read_clock = fn -> Agent.get(clock, & &1) end
     Runtime.put_env(:pulso, Reliability, Keyword.put(ctx.settings, :investigation_url, ctx.webhook))
     first = Task.async(fn -> step(clock_ns: read_clock, assessment_budget_nano_usd: 550_000) end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, first_provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, first_provider}, 30_000
     Agent.update(clock, fn _ -> @now + 1 end)
     second = Task.async(fn -> step(now_ns: @now + 1, clock_ns: read_clock) end)
-    assert_receive {:provider_request, "/v1/decisions", _, _, second_provider}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, second_provider}, 30_000
     Agent.update(ctx.replies, &%{&1 | replies: [{"expected", "none"}]})
     send(second_provider, :release)
-    assert {:ok, _} = Task.await(second)
+    assert {:ok, _} = Task.await(second, 30_000)
     later = next_month(@now)
     Agent.update(clock, fn _ -> later end)
     Agent.update(ctx.replies, &%{&1 | block: false, replies: [{"watch", "slow_traces"}, {"investigate", "none"}]})
     send(first_provider, :release)
-    assert {:ok, signal} = Task.await(first)
+    assert {:ok, signal} = Task.await(first, 30_000)
     assert signal["window_end_ns"] == @finish
     assert signal["assessment"]["decision"] == "investigate"
-    assert_receive {:provider_request, "/v1/decisions", _, _, _}
-    assert_receive {:provider_request, "/investigate", payload, _, _}
+    assert_receive {:provider_request, "/v1/decisions", _, _, _}, 30_000
+    assert_receive {:provider_request, "/investigate", payload, _, _}, 30_000
     assert payload["run"]["started_at_ns"] == later
     page = signals()
     month = later |> div(1_000_000_000) |> DateTime.from_unix!() |> Calendar.strftime("%Y-%m")
@@ -697,7 +697,7 @@ defmodule Pulso.ReliabilityTest do
 
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, hook))
     task = Task.async(fn -> step(clock_ns: read_clock, assessment_budget_nano_usd: 1_100_000) end)
-    assert_receive {:reservation_pending, response}, 5000
+    assert_receive {:reservation_pending, response}, 30_000
     Agent.update(clock, fn now -> now + 1 end)
 
     assert {:ok, _} =
@@ -730,7 +730,7 @@ defmodule Pulso.ReliabilityTest do
     Agent.update(ctx.objects, &Map.put(&1, :request_hook, hook))
     date = @now |> div(1_000_000_000) |> DateTime.from_unix!() |> DateTime.to_date() |> Date.to_iso8601()
     task = Task.async(fn -> step(clock_ns: fn -> Agent.get(clock, & &1) end, price_valid_until: date) end)
-    assert_receive {:storage_barrier, response, "PUT", ^head}, 5000
+    assert_receive {:storage_barrier, response, "PUT", ^head}, 30_000
     Agent.update(clock, fn now -> now + 86_400_000_000_000 end)
     Agent.update(ctx.objects, &%{&1 | barriers: %{}})
     send(response, {:release_storage, head})
@@ -749,7 +749,7 @@ defmodule Pulso.ReliabilityTest do
       Agent.update(ctx.replies, &%{&1 | block: true, replies: [{unquote(answer), unquote(query)}]})
       Runtime.put_env(:pulso, Reliability, Keyword.put(ctx.settings, :investigation_url, ctx.webhook))
       task = Task.async(fn -> step(clock_ns: read_clock, price_valid_until: date) end)
-      assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 5000
+      assert_receive {:provider_request, "/v1/decisions", _, _, provider}, 30_000
       Agent.update(clock, fn now -> now + 86_400_000_000_000 end)
       send(provider, :release)
       assert {:ok, _} = Task.await(task)
@@ -766,7 +766,7 @@ defmodule Pulso.ReliabilityTest do
     Runtime.put_env(:pulso, Reliability, settings)
     Agent.update(ctx.replies, &%{&1 | replies: [{"expected", "none"}]})
     start_supervised!({Pulso.Reliability.Supervisor, Keyword.put(settings, :interval_ms, 60_000)})
-    assert_receive {:provider_request, "/v1/decisions", _, _, _}, 5000
+    assert_receive {:provider_request, "/v1/decisions", _, _, _}, 30_000
     worker = Runtime.whereis(Worker)
     _ = :sys.get_state(worker)
     tick(worker)

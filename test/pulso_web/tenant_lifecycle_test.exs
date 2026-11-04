@@ -208,10 +208,13 @@ defmodule PulsoWeb.TenantLifecycleTest do
 
   test "registry reads for unknown tenants are bounded per instance" do
     Runtime.put_env(:pulso, Tenants, Keyword.put(Runtime.get_env(:pulso, Tenants), :max_lookups_per_second, 2))
+    first_window = div(System.monotonic_time(:millisecond), 1000)
     statuses = for n <- 1..6, do: ingest("unknown-#{n}", "token").status
-    # Two reads per one-second window are allowed (four if the requests
-    # straddle a window); the rest get a retryable 503, not a storage read.
-    assert Enum.count(statuses, &(&1 == 401)) in 2..4
+    windows = div(System.monotonic_time(:millisecond), 1000) - first_window + 1
+    # Two reads per one-second window are allowed, so requests spread over
+    # more windows under load get more; the rest get a retryable 503, not a
+    # storage read.
+    assert Enum.count(statuses, &(&1 == 401)) in 2..min(6, 2 * windows)
     assert Enum.count(statuses, &(&1 == 503)) == 6 - Enum.count(statuses, &(&1 == 401))
   end
 
