@@ -31,6 +31,7 @@ defmodule Pulso.Application do
       [
         Pulso.SelfMetrics,
         Pulso.IngestAdmission,
+        Pulso.MemoryPressure,
         Pulso.Tenants,
         Pulso.Usage,
         Pulso.Metrics,

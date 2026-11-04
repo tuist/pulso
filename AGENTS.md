@@ -729,6 +729,13 @@ malloc, RSS), `pulso_memory_ets_bytes{table}` and
 `rel/vm.args.eex` sets `+MMmcs 0` so freed carriers return to the OS; the
 telemetry poller calls `malloc_trim` every 10 s; manifest owners full-sweep
 after heap growth. Sizing formula lives in `docs/scaling.md#sizing-formula`.
+`ManifestCache` is LRU-bounded by payload bytes (`PULSO_MANIFEST_CACHE_MAX_BYTES`,
+evictions leave a generation fence). `Pulso.MemoryPressure` samples RSS each
+second against the budget or cgroup limit (re-read every 15 s); at 85% it refuses
+new interactive queries (`reason="memory"`) and evicts roots idle 30 s, until
+10 s below 75%. Periodic GC under pressure was soak-tested and freed nothing
+measurable (flat-manifest garbage regrows within seconds), so it is absent. Ingest, alerting and
+reliability keep running; hot roots are never evicted (owners republish them).
 
 Scaling: `Pulso.ResourceBudget` derives ingest/query slots from
 `PULSO_MEMORY_BUDGET_MB` or the prod cgroup limit; slot/saturation gauges and

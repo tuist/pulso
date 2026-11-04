@@ -1,6 +1,8 @@
 defmodule Pulso.Storage.S3.ManifestCacheTest do
   use Pulso.Test.Case, async: true
 
+  import Bitwise, only: [<<<: 2]
+
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.ManifestCache
 
@@ -95,5 +97,48 @@ defmodule Pulso.Storage.S3.ManifestCacheTest do
     assert :ok = ManifestCache.put("tenant", "metrics", manifest, "published")
     assert :ok = ManifestCache.put_if_current("tenant", "metrics", manifest, "late-initial", nil)
     assert %{etag: "published"} = ManifestCache.get("tenant", "metrics")
+  end
+
+  test "eviction drops least recently used roots to the byte bound and fences their generation" do
+    manifest = Manifest.new()
+    for tenant <- ~w(a b c), do: ManifestCache.put(tenant, "logs", manifest, "e-" <> tenant)
+    # Reading `a` makes it the most recently used root.
+    assert %{etag: "e-a"} = ManifestCache.get("a", "logs")
+    stale_base = ManifestCache.publication_base("b", "logs")
+    {_, bytes, _} = ManifestCache.sizes()["logs"] |> then(&{&1, &1[1], nil})
+    one = div(bytes, 3)
+
+    assert {2, evicted} = ManifestCache.evict(one)
+    assert evicted == 2 * one
+    assert %{etag: "e-a"} = ManifestCache.get("a", "logs")
+    assert ManifestCache.get("b", "logs") == nil
+    assert ManifestCache.get("c", "logs") == nil
+
+    # A publication that started before eviction cannot install over the fence.
+    ManifestCache.publish("b", "logs", manifest, "late", "e-b", stale_base)
+    assert ManifestCache.get("b", "logs") == nil
+    {nil, token} = ManifestCache.snapshot("b", "logs")
+    ManifestCache.put_snapshot("b", "logs", manifest, "reloaded", token)
+    assert %{etag: "reloaded"} = ManifestCache.get("b", "logs")
+
+    # The most recently used root survives even a zero bound.
+    assert {1, _} = ManifestCache.evict(0)
+    assert %{etag: "reloaded"} = ManifestCache.get("b", "logs")
+  end
+
+  test "pressure eviction drops only roots idle since a cutoff, within the byte bound" do
+    manifest = Manifest.new()
+    ManifestCache.put("idle", "logs", manifest, "e-idle")
+    cutoff = System.monotonic_time(:millisecond) + 1
+    # Wait out the cutoff without sleeping on a fixed duration.
+    Stream.repeatedly(fn -> System.monotonic_time(:millisecond) end) |> Enum.find(&(&1 > cutoff))
+    ManifestCache.put("hot", "logs", manifest, "e-hot")
+    ManifestCache.put("hotter", "logs", manifest, "e-hotter")
+
+    assert {0, 0} = ManifestCache.evict(1 <<< 40)
+    assert {1, _} = ManifestCache.evict(1 <<< 40, cutoff)
+    assert ManifestCache.get("idle", "logs") == nil
+    assert %{etag: "e-hot"} = ManifestCache.get("hot", "logs")
+    assert %{etag: "e-hotter"} = ManifestCache.get("hotter", "logs")
   end
 end

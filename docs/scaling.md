@@ -88,6 +88,44 @@ reliability workers when they are enabled. Enforced retention runs one more
 maintenance worker with a heap ceiling of about 500 MiB while it converts or
 expires a manifest; budget it on maintenance instances.
 
+## Memory pressure
+
+Pulso treats memory in three classes, as other observability backends do:
+
+- **Caches are evicted.** Manifest roots are cached up to
+  `PULSO_MANIFEST_CACHE_MAX_BYTES` (128 MiB) and manifest pages up to 16 MiB,
+  least recently used first. An evicted root is reloaded from object storage on
+  its next use.
+- **In-flight work is admitted or refused.** Ingest and query slots bound
+  concurrent work; excess requests get a retryable `429`.
+- **Runaway work is aborted.** Per-query sample, work and scan budgets and the
+  query heap ceiling fail one query, never the node.
+
+Acknowledged data is never evicted: it is durable in object storage before the
+acknowledgment.
+
+On top of that, each node samples its resident memory every second. At
+`PULSO_MEMORY_PRESSURE_PERCENT` (85%) of its limit it enters memory pressure:
+new interactive queries are refused with a retryable overload error (`429`, MCP
+`query_overloaded`) and manifest roots unused for 30 seconds are evicted. Roots
+in active use are not
+evicted: their owners republish them on every write, so evicting them would
+free nothing and make every reader reload. Ingest keeps its own slots, and
+alerting and reliability workers keep running. Pressure ends once resident
+memory has stayed 10 points below the threshold for 10 seconds, so query bursts
+do not make it flap. The
+limit is `PULSO_MEMORY_BUDGET_MB`, otherwise the container's cgroup limit,
+re-read every 15 seconds so an in-place resize takes effect; slot counts are
+still derived at startup. Watch `pulso_memory_pressure`,
+`pulso_memory_pressure_transitions_total` and
+`pulso_admission_rejections_total{layer="query",reason="memory"}`. Frequent
+pressure means the node is undersized. On nodes with flat manifests (no paged
+format, no retention) memory grows with history, so a node can stay in pressure
+until it is resized or upgraded. Pressure sheds load, not memory already held:
+it keeps queries from adding to it. Query slots and per-query budgets are the
+primary bound; in soak tests of paged nodes they kept memory flat without
+pressure ever triggering.
+
 ## Per-tenant limits
 
 Without configuration, each signal's ingest slots are already shared fairly
@@ -135,6 +173,7 @@ the private [`/metrics`](self-monitoring.md) endpoint of every instance:
 | Ingest refusals | `sum by (signal) (rate(pulso_ingest_admission_total{outcome="rejected"}[5m]))` |
 | Query saturation | `pulso_query_inflight / pulso_query_max_concurrent` |
 | Query refusals | `rate(pulso_admission_rejections_total{layer="query",reason="node"}[5m])` |
+| Memory pressure | `max_over_time(pulso_memory_pressure[5m])` |
 
 Ingest refusals include `tenant_limited` ones (fair-share refusals while free
 slots were kept for other tenants). Query refusals with reason `tenant` and

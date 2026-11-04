@@ -138,7 +138,8 @@ defmodule Pulso.MemoryStats do
     _ -> []
   end
 
-  defp resident do
+  @doc "Resident memory (`rss`, `rss_anon`) from /proc; empty off Linux."
+  def resident do
     case File.read("/proc/self/status") do
       {:ok, status} ->
         for {field, kind} <- [{"VmRSS", "rss"}, {"RssAnon", "rss_anon"}],

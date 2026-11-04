@@ -141,7 +141,17 @@ defmodule Pulso.QueryRunner do
   defp config(key, default), do: Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), key, default)
 
   defp acquire_interactive(class) when class in [:alerting, :reliability_callback], do: :ok
-  defp acquire_interactive(_class), do: acquire({:class, :interactive}, max_interactive())
+
+  # Under node memory pressure new interactive queries are refused (retryable)
+  # so ingest keeps its memory; alerting and reliability workers still run.
+  defp acquire_interactive(_class) do
+    if Pulso.MemoryPressure.active?() do
+      Pulso.SelfMetrics.admission_rejection(:query, :memory)
+      {:error, :query_overloaded}
+    else
+      acquire({:class, :interactive}, max_interactive())
+    end
+  end
 
   defp class_limit(class) do
     default = if class in [:raw, :discovery, :alerting, :reliability_callback], do: 1, else: 3

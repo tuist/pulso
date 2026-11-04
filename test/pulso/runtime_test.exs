@@ -24,8 +24,8 @@ defmodule Pulso.RuntimeTest do
 
   test "owned servers delegate status redaction" do
     server = start_supervised!({RuntimeStatusServer, secret: "must-not-appear"})
-    assert :sys.get_status(server) |> inspect() =~ "redacted"
-    refute :sys.get_status(server) |> inspect() =~ "must-not-appear"
+    assert :sys.get_status(server) |> inspect(limit: :infinity) =~ "redacted"
+    refute :sys.get_status(server) |> inspect(limit: :infinity) =~ "must-not-appear"
   end
 
   test "native object-store capability matches the bounded retention API" do

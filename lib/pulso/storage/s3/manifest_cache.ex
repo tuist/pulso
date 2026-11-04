@@ -21,6 +21,14 @@ defmodule Pulso.Storage.S3.ManifestCache do
   and each reader decodes a compact, sharing copy. Use `info/2` or `token/2`
   when only the version, ETag or generation is needed.
 
+  The cache is disposable and bounded by encoded payload bytes
+  (`PULSO_MANIFEST_CACHE_MAX_BYTES`). A sweep every second drops the least
+  recently used roots above the bound, always keeping the most recently used
+  one. Under node memory pressure (`Pulso.MemoryPressure`) it also drops roots
+  unused for 30 seconds; hot roots stay, since their owners republish them.
+  An evicted root leaves the same generation fence as `drop/2`, so the next
+  reader reloads it through its owner like any cold miss.
+
   The entry shape carries the manifest struct, the ETag it was fetched
   with (used on the next conditional GET to short-circuit an unchanged
   read), and the monotonic timestamp of the last refresh (used by the
@@ -35,6 +43,10 @@ defmodule Pulso.Storage.S3.ManifestCache do
   alias Pulso.Storage.S3.Retention
 
   @table __MODULE__
+  @access Module.concat(__MODULE__, Access)
+  @default_max_bytes 134_217_728
+  @sweep_ms 1000
+  @pressure_idle_ms 30_000
 
   @type entry :: %{
           manifest: Manifest.t(),
@@ -49,6 +61,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
   # Every table operation goes through the current runtime's instance name.
   defp table, do: Pulso.Runtime.table(@table)
+  defp access, do: Pulso.Runtime.table(@access)
 
   @doc """
   Look up the cached manifest for one `(tenant, signal)`. Returns
@@ -67,10 +80,27 @@ defmodule Pulso.Storage.S3.ManifestCache do
   @doc false
   def snapshot(tenant, signal) do
     case :ets.lookup(table(), {tenant, signal}) do
-      [{_, %{invalidated?: true, token: token}}] -> {nil, token}
-      [{_, entry}] -> {expand(entry), entry.token}
-      [] -> {nil, nil}
+      [{_, %{invalidated?: true, token: token}}] ->
+        {nil, token}
+
+      [{_, entry}] ->
+        used(tenant, signal)
+        {expand(entry), entry.token}
+
+      [] ->
+        {nil, nil}
     end
+  end
+
+  # Last-use order for eviction (reads and installs). A separate table, because entries are
+  # maps that cannot be updated in place without copying their payload.
+  defp used(tenant, signal) do
+    :ets.insert(
+      access(),
+      {{tenant, signal}, :erlang.unique_integer([:monotonic, :positive]), System.monotonic_time(:millisecond)}
+    )
+  rescue
+    ArgumentError -> true
   end
 
   # Cached payloads were produced by `Manifest.encode/1` (or validated fetched
@@ -192,6 +222,7 @@ defmodule Pulso.Storage.S3.ManifestCache do
 
   defp entry(tenant, signal, manifest, etag) do
     {manifest, payload} = wire(manifest)
+    used(tenant, signal)
 
     entry = %{
       payload: payload,
@@ -310,14 +341,100 @@ defmodule Pulso.Storage.S3.ManifestCache do
       :ets.delete_all_objects(table())
     end
 
+    if :ets.info(access()) != :undefined, do: :ets.match_delete(access(), {{:_, :_}, :_, :_})
+
     :ok
   end
 
-  @impl true
-  def init(_opts) do
-    ensure_table()
-    {:ok, %{}}
+  @doc "The configured byte bound on cached root payloads."
+  def max_bytes do
+    case :ets.lookup(access(), :max_bytes) do
+      [{:max_bytes, bytes}] -> bytes
+      [] -> configured_max_bytes()
+    end
+  rescue
+    ArgumentError -> configured_max_bytes()
   end
+
+  defp configured_max_bytes,
+    do: Keyword.get(Pulso.Runtime.get_env(:pulso, __MODULE__, []), :max_bytes, @default_max_bytes)
+
+  @doc """
+  Evict least recently used roots until cached payloads fit `target` bytes,
+  and every root last used before `idle_before` (monotonic milliseconds), keeping
+  the most recently used root. Returns `{evicted, evicted_bytes}`.
+  """
+  def evict(target, idle_before \\ nil) when is_integer(target) and target >= 0 do
+    last_use =
+      Map.new(:ets.select(access(), [{{{:"$1", :"$2"}, :"$3", :"$4"}, [], [{{{{:"$1", :"$2"}}, {{:"$3", :"$4"}}}}]}]))
+
+    entries =
+      :ets.select(table(), [
+        {{:"$1", %{payload: :"$2", token: :"$3"}}, [], [{{:"$1", {:byte_size, :"$2"}, :"$3"}}]}
+      ])
+      |> Enum.map(fn {key, bytes, token} -> {Map.get(last_use, key, {0, 0}), key, bytes, token} end)
+      |> Enum.sort()
+
+    total = Enum.reduce(entries, 0, fn {_, _, bytes, _}, acc -> acc + bytes end)
+    # The most recently used root stays even when it alone exceeds the bound.
+    candidates = Enum.drop(entries, -1)
+    evict(candidates, total, target, idle_before, {0, 0})
+  rescue
+    ArgumentError -> {0, 0}
+  end
+
+  defp evict([{{_, used_at}, key, bytes, token} | rest], total, target, idle_before, {count, evicted} = result) do
+    if total > target or (idle_before != nil and used_at < idle_before) do
+      fence = {key, %{invalidated?: true, token: make_ref()}}
+
+      # Only the observed generation; a concurrent refresh or publication wins.
+      if :ets.select_replace(table(), [{{key, %{token: token}}, [], [{:const, fence}]}]) == 1 do
+        :ets.delete(access(), key)
+        evict(rest, total - bytes, target, idle_before, {count + 1, evicted + bytes})
+      else
+        evict(rest, total, target, idle_before, result)
+      end
+    else
+      # Entries are ordered by last use, so no later one is idle either.
+      result
+    end
+  end
+
+  defp evict([], _total, _target, _idle_before, result), do: result
+
+  @impl true
+  def init(opts) do
+    ensure_table()
+    max = Keyword.get(opts, :max_bytes, configured_max_bytes())
+    :ets.insert(access(), {:max_bytes, max})
+    interval = Keyword.get(opts, :sweep_interval_ms, @sweep_ms)
+    state = %{max_bytes: max, interval: interval}
+    schedule(state)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:sweep, state) do
+    # Under memory pressure also drop roots no reader or publication used for
+    # 30 s. Hot roots stay: their owner republishes them on every flush, so
+    # evicting them frees nothing and makes every reader reload.
+    idle_before =
+      if Pulso.MemoryPressure.active?(), do: System.monotonic_time(:millisecond) - @pressure_idle_ms
+
+    sweep(state.max_bytes, idle_before)
+    schedule(state)
+    {:noreply, state}
+  end
+
+  defp sweep(target, idle_before) do
+    case evict(target, idle_before) do
+      {0, _} -> :ok
+      {count, bytes} -> Pulso.SelfMetrics.manifest_cache_evicted(count, bytes)
+    end
+  end
+
+  defp schedule(%{interval: :infinity}), do: :ok
+  defp schedule(%{interval: ms}), do: Process.send_after(self(), :sweep, ms)
 
   @doc false
   def ensure_table do
@@ -331,7 +448,12 @@ defmodule Pulso.Storage.S3.ManifestCache do
         ])
 
       _ ->
-        table()
+        :ok
     end
+
+    if :ets.info(access()) == :undefined,
+      do: :ets.new(access(), [:named_table, :set, :public, {:write_concurrency, true}])
+
+    table()
   end
 end

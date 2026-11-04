@@ -565,7 +565,9 @@ clustering:
 # slots from limits.memory (docs/configuration.md#node-memory-envelope), so
 # raising memory raises concurrency; overload beyond the slots is a retryable
 # 429. Override slots with ingestBatching.maxConcurrentRequests, or
-# PULSO_QUERY_MAX_CONCURRENT / PULSO_QUERY_MAX_HEAP_MB via extraEnv.
+# PULSO_QUERY_MAX_CONCURRENT / PULSO_QUERY_MAX_HEAP_MB via extraEnv. Above 85%
+# of limits.memory the node evicts caches and refuses new interactive queries
+# (PULSO_MEMORY_PRESSURE_PERCENT, docs/scaling.md#memory-pressure).
 resources:
   requests:
     cpu: 500m

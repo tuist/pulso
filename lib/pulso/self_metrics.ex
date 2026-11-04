@@ -34,10 +34,15 @@ defmodule Pulso.SelfMetrics do
     {"pulso_usage_dropped_total", "counter",
      "Usage counts dropped because an instance already tracks its maximum tenant-hours."},
     {"pulso_tenant_purged_objects_total", "counter", "Objects deleted while purging deleted tenants."},
+    {"pulso_manifest_cache_evictions_total", "counter",
+     "Cached manifest roots evicted to stay within the manifest cache byte bound."},
+    {"pulso_manifest_cache_evicted_bytes_total", "counter", "Encoded root bytes evicted from the manifest cache."},
+    {"pulso_memory_pressure_transitions_total", "counter",
+     "Node memory-pressure state changes, by the state entered (on, off)."},
     {"pulso_admission_rejections_total", "counter",
      "Requests refused with a retryable overload error, by layer and bounded reason."}
   ]
-  @admission_reasons %{ingest: [:tenant_concurrency, :tenant_rate], query: [:node, :tenant, :class]}
+  @admission_reasons %{ingest: [:tenant_concurrency, :tenant_rate], query: [:node, :tenant, :class, :memory]}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -69,6 +74,9 @@ defmodule Pulso.SelfMetrics do
     increment("pulso_keyed_publication_conflicts_total", "", 0)
     increment("pulso_usage_dropped_total", "", 0)
     increment("pulso_tenant_purged_objects_total", "", 0)
+    increment("pulso_manifest_cache_evictions_total", "", 0)
+    increment("pulso_manifest_cache_evicted_bytes_total", "", 0)
+    for state <- [:on, :off], do: increment("pulso_memory_pressure_transitions_total", ~s(state="#{state}"), 0)
 
     seed_admission_rejections()
 
@@ -197,6 +205,14 @@ defmodule Pulso.SelfMetrics do
   def keyed_publication_conflict, do: increment("pulso_keyed_publication_conflicts_total", "", 1)
 
   def usage_dropped, do: increment("pulso_usage_dropped_total", "", 1)
+
+  def manifest_cache_evicted(count, bytes) do
+    increment("pulso_manifest_cache_evictions_total", "", count)
+    increment("pulso_manifest_cache_evicted_bytes_total", "", bytes)
+  end
+
+  def memory_pressure(state) when state in [:on, :off],
+    do: increment("pulso_memory_pressure_transitions_total", ~s(state="#{state}"), 1)
 
   def tenant_purged_objects(count), do: increment("pulso_tenant_purged_objects_total", "", count)
 

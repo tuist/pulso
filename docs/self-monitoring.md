@@ -62,7 +62,7 @@ with count and sum only, without quantiles.
 | `pulso_ingest_rejected_records_total` | Counter | `signal`, `reason` | Records dropped from accepted (partial-success) requests, by fixed reason. Currently only traces report reasons; see [traces](traces.md#acknowledgments-and-limits). Services and tenants appear only in the rate-limited warning log, never as labels |
 | `pulso_usage_dropped_total` | Counter | none | Usage counts dropped because the instance already tracks 200,000 tenant-hours. See [usage metering](tenants.md#usage-metering) |
 | `pulso_tenant_purged_objects_total` | Counter | none | Objects deleted while purging deleted tenants. See [deletion](tenants.md#deletion) |
-| `pulso_admission_rejections_total` | Counter | `layer`, `reason` | Requests refused with a retryable overload error. `layer="ingest"`: `tenant_concurrency`, `tenant_rate` (configured tenant limits; node and fair-share refusals are in `pulso_ingest_admission_total`). `layer="query"`: `node` (interactive slots busy), `tenant`, `class`. Tenants never appear as labels |
+| `pulso_admission_rejections_total` | Counter | `layer`, `reason` | Requests refused with a retryable overload error. `layer="ingest"`: `tenant_concurrency`, `tenant_rate` (configured tenant limits; node and fair-share refusals are in `pulso_ingest_admission_total`). `layer="query"`: `node` (interactive slots busy), `tenant`, `class`, `memory` (refused under [memory pressure](scaling.md#memory-pressure)). Tenants never appear as labels |
 | `pulso_object_payload_bytes_total` | Counter | `direction` (`read`, `write`) | Consumed successful GET body bytes (including keyed-verification mismatches) and PUT payload bytes, including manifests; not provider-billed wire traffic or SDK retries |
 | `pulso_keyed_publication_conflicts_total` | Counter | None | Keyed appends permanently rejected because existing bytes differ; inspect writer compatibility and coherent storage history rather than retrying, overwriting or rotating keys. See [keyed ingestion](keyed-ingestion.md). |
 | `pulso_compaction_segments_total` | Counter | None | Source segments merged by successful compactions |
@@ -142,6 +142,12 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_memory_bytes` | Gauge | `kind` | Node memory by kind; see [memory breakdown](scaling.md#memory-breakdown) |
 | `pulso_memory_ets_bytes` | Gauge | `table` | ETS memory per table name, excluding the binaries the tables reference (those count under `pulso_memory_bytes{kind="binary"}`) |
 | `pulso_memory_process_bytes` | Gauge | `group` | Process heap, stack and mailbox memory by group: `manifest_owner`, `append_buffer`, `ingest_flush`, `query`, `maintenance`, `http_connection` (request handling, including ingest decoding) and `other` |
+| `pulso_memory_pressure` | Gauge | None | `1` while the node is under [memory pressure](scaling.md#memory-pressure) |
+| `pulso_memory_pressure_limit_bytes` | Gauge | None | Limit the pressure monitor compares resident memory with; `0` when disabled or unknown |
+| `pulso_memory_pressure_transitions_total` | Counter | `state` | Pressure state changes, by the state entered (`on`, `off`) |
+| `pulso_manifest_cache_max_bytes` | Gauge | None | Byte bound on cached manifest roots |
+| `pulso_manifest_cache_evictions_total` | Counter | None | Manifest roots evicted to stay within that bound |
+| `pulso_manifest_cache_evicted_bytes_total` | Counter | None | Encoded root bytes evicted |
 | `pulso_vm_run_queue` | Gauge | None | BEAM scheduler run-queue length |
 | `pulso_ingest_inflight_requests` | Gauge | None | Ingest requests holding an admission slot |
 | `pulso_ingest_max_concurrent_requests` | Gauge | None | Ingest admission slots on this node |

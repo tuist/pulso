@@ -31,6 +31,7 @@ alias Pulso.Storage.S3
 # file against a process-owned environment map instead of mutating the OS
 # environment. Without an installed runtime (every normal boot and release), this
 # is System.get_env/2.
+alias Pulso.Storage.S3.ManifestCache
 alias Pulso.Traces.TempoSearch
 
 env_var = fn name, default ->
@@ -403,12 +404,32 @@ tenant_registry_enabled = env_var.("PULSO_TENANT_REGISTRY_ENABLED", "false") in 
 tenant_cache_ttl_ms = parse_integer.("PULSO_TENANT_REGISTRY_CACHE_TTL_MS", 30_000, 1_000..300_000)
 tenant_deletion_grace_ms = parse_integer.("PULSO_TENANT_DELETION_GRACE_MS", 600_000, 60_000..2_592_000_000)
 
+# Node memory pressure (Pulso.MemoryPressure): above PULSO_MEMORY_PRESSURE_PERCENT
+# of the limit, new interactive queries get a retryable overload error and idle
+# manifest roots are evicted, until memory has stayed 10 points lower for 10 s. The limit is
+# PULSO_MEMORY_BUDGET_MB when set, otherwise the cgroup limit, re-read every
+# 15 s. 0 disables it.
+memory_pressure_percent = parse_integer.("PULSO_MEMORY_PRESSURE_PERCENT", 85, 0..99)
+
+memory_pressure_limit =
+  cond do
+    memory_pressure_percent == 0 -> nil
+    env_var.("PULSO_MEMORY_BUDGET_MB", "") != "" -> envelope.budget_mb * 1_048_576
+    config_env() == :prod -> :cgroup
+    true -> nil
+  end
+
+# Disposable cache of encoded manifest roots, bounded by bytes (LRU eviction).
+config :pulso, ManifestCache,
+  max_bytes: parse_integer.("PULSO_MANIFEST_CACHE_MAX_BYTES", 134_217_728, 1_048_576..68_719_476_736)
+
 config :pulso, Pulso.IngestAdmission,
   max_concurrent: ingest_max_concurrent,
   reserved_per_signal: ingest_reserved,
   max_pending_bytes: ingest_max_pending_bytes
 
 config :pulso, Pulso.IngestLimits, ingest_limits
+config :pulso, Pulso.MemoryPressure, high_percent: memory_pressure_percent, limit: memory_pressure_limit
 
 config :pulso, Pulso.QueryRunner,
   timeout_ms: parse_integer.("PULSO_QUERY_TIMEOUT_MS", 10_000, 1_000..300_000),

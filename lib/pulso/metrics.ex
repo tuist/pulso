@@ -124,6 +124,10 @@ defmodule Pulso.Metrics do
     "pulso_query_max_concurrent" => "Node-local interactive query slots.",
     "pulso_memory_budget_bytes" => "Memory budget that sized this node's slots; 0 when fixed defaults apply.",
     "pulso_vm_run_queue" => "BEAM scheduler run-queue length.",
+    "pulso_memory_pressure" => "1 while this node sheds caches and refuses new interactive queries for memory.",
+    "pulso_memory_pressure_limit_bytes" =>
+      "Memory limit the pressure monitor compares resident memory with; 0 when disabled or unknown.",
+    "pulso_manifest_cache_max_bytes" => "Byte bound on encoded manifest roots cached on this node.",
     "pulso_manifest_page_cache_entries" => "Immutable manifest pages in this node's bounded page cache.",
     "pulso_manifest_page_cache_bytes" =>
       "Accounted bytes of this node's bounded manifest page cache (16 MiB ceiling), including table memory."
@@ -496,6 +500,9 @@ defmodule Pulso.Metrics do
       gauge("pulso_query_max_concurrent", Pulso.QueryRunner.max_interactive()),
       gauge("pulso_memory_budget_bytes", memory_budget_bytes()),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue)),
+      gauge("pulso_memory_pressure", if(Pulso.MemoryPressure.active?(), do: 1, else: 0)),
+      gauge("pulso_memory_pressure_limit_bytes", elem(Pulso.MemoryPressure.stats(), 1) || 0),
+      gauge("pulso_manifest_cache_max_bytes", ManifestCache.max_bytes()),
       manifest_size_gauges(),
       Pulso.MemoryStats.render()
     ]

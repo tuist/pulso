@@ -2,6 +2,7 @@ defmodule Pulso.ResourceBudgetTest do
   use Pulso.Test.Case, async: true
 
   alias Pulso.ResourceBudget
+  alias Pulso.Storage.S3.ManifestCache
 
   doctest ResourceBudget
 
@@ -41,6 +42,12 @@ defmodule Pulso.ResourceBudgetTest do
     assert config[:pulso][Pulso.QueryRunner][:max_global] == 5
     assert config[:pulso][Pulso.QueryRunner][:max_heap_words] == div(76 * 1_048_576, 8)
     assert config[:pulso][Pulso.ResourceBudget][:budget_mb] == 1024
+    # Memory pressure compares against the same explicit budget.
+    assert config[:pulso][Pulso.MemoryPressure] == [high_percent: 85, limit: 1024 * 1_048_576]
+
+    Pulso.Runtime.put_env("PULSO_MEMORY_PRESSURE_PERCENT", "0")
+    assert Config.Reader.read!(@runtime, env: :test, target: :host)[:pulso][Pulso.MemoryPressure][:limit] == nil
+    Pulso.Runtime.delete_env("PULSO_MEMORY_PRESSURE_PERCENT")
 
     Pulso.Runtime.put_env("PULSO_INGEST_MAX_CONCURRENT_REQUESTS", "40")
     Pulso.Runtime.put_env("PULSO_QUERY_MAX_HEAP_MB", "64")
@@ -57,5 +64,7 @@ defmodule Pulso.ResourceBudgetTest do
     assert config[:pulso][Pulso.IngestAdmission][:max_concurrent] == 32
     assert config[:pulso][Pulso.QueryRunner][:max_interactive] == 3
     assert config[:pulso][Pulso.ResourceBudget][:budget_mb] == nil
+    assert config[:pulso][Pulso.MemoryPressure][:limit] == nil
+    assert config[:pulso][ManifestCache][:max_bytes] == 134_217_728
   end
 end
