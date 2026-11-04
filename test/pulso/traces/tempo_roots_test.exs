@@ -14,6 +14,10 @@ defmodule Pulso.Traces.TempoRootsTest do
     %{rows: rows, cases: Pulso.JSON.decode!(File.read!(@fixture <> "tempo-roots-oracle.json"))}
   end
 
+  # 44 oracle cases each run the reference and five native segment layouts,
+  # whose dirty-CPU NIF calls queue behind other tests' native work under CI
+  # contention. Keep every comparison without the ordinary one-minute budget.
+  @tag timeout: 300_000
   test "pinned actual engine selections, raw dictionaries and complete root results", %{rows: rows, cases: cases} do
     for {file, hash} <- [
           {"tempo-roots-input.protobuf", "ae50a9bc5b06df9eb7e3fde68dae7b2f689ef1898e2f8f70712570b354598706"},

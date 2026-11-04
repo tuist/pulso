@@ -457,6 +457,10 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert reads in 51..59
   end
 
+  # Converting the 20,000-entry flat history into pages takes about 25 s on an
+  # idle two-core machine and longer under CI contention. The heap cap, not
+  # the time, is what this test checks.
+  @tag timeout: 300_000
   test "appends never copy a large cached flat manifest into the request process", ctx do
     # Retain-forever flat manifests gain one entry per append. Ingest must not
     # deep-copy them out of the cache per request: Alloy keeps many keep-alive
@@ -486,7 +490,7 @@ defmodule Pulso.Storage.S3.TracesTest do
         S3.append(:traces, ctx.tenant, ctx.spans, [])
       end)
 
-    assert Task.await(task, 30_000) == :ok
+    assert Task.await(task, 240_000) == :ok
     assert {:ok, %{manifest: manifest}} = ManifestOwner.ensure_loaded(ctx.tenant, "traces", config)
     # That append converted the flat history into pages; the root lists only its tail.
     assert manifest.version == 4
