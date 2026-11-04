@@ -31,6 +31,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Storage.S3.Retention
+  alias Pulso.Storage.S3.TraceAttributeSummary
   alias Pulso.Storage.S3.TraceSummary
 
   def compact(tenant, config, opts \\ []) do
@@ -125,7 +126,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
         key
         |> Segment.build(min_ts, max_ts, row_count, byte_size(payload))
         |> summarize_replacement(config, records, summary)
-        |> merge_log_labels(config, sources)
+        |> merge_source_summaries(config, sources)
 
       source_keys = Enum.map(sources, & &1.key)
       grace = Keyword.get(opts, :grace_ms, 3_600_000)
@@ -267,10 +268,22 @@ defmodule Pulso.Storage.S3.SignalCompactor do
 
   # A replacement holds exactly its sources' rows, so the union of their
   # complete stream-label sets is complete for it too.
-  defp merge_log_labels(segment, %{compaction_signal: :logs}, sources),
+  defp merge_source_summaries(segment, %{compaction_signal: :logs}, sources),
     do: %{segment | log_labels: Segment.merge_log_labels(Enum.map(sources, & &1.log_labels))}
 
-  defp merge_log_labels(segment, _config, _sources), do: segment
+  # Likewise for trace attribute value sets.
+  defp merge_source_summaries(
+         %{trace_summary: %TraceSummary{} = summary} = segment,
+         %{compaction_signal: :traces},
+         sources
+       ) do
+    attributes =
+      TraceAttributeSummary.merge(Enum.map(sources, &(&1.trace_summary && &1.trace_summary.attributes)), :segment)
+
+    %{segment | trace_summary: %{summary | attributes: attributes}}
+  end
+
+  defp merge_source_summaries(segment, _config, _sources), do: segment
 
   # Through the manifest owner, so local appends cannot slip in between the
   # read of the root and its conditional write. Every attempt first checks for

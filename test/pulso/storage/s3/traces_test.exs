@@ -245,18 +245,19 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert query.(resource: %{"service.name" => "noise"}) == {%{"noise" => 6}, 6}
     assert query.(resource_regex: %{"service.name" => "missing.*"}) == {%{}, 0}
 
-    # Other resource keys say nothing about services: every source is read.
-    assert {%{}, 24} = query.(resource_regex: %{"service.namespace" => "kura"})
+    # Other resource keys prune through their own complete value sets.
+    assert {%{}, 0} = query.(resource_regex: %{"service.namespace" => "kura"})
+    assert {_, 24} = query.(resource: %{"service.namespace" => "tuist"})
 
     # Without the proof that the promoted service is the original string
-    # service.name, sources are read.
+    # service.name, or a resource value set, sources are read.
     Agent.update(ctx.agent, fn state ->
       key = Manifest.manifest_key(ctx.tenant, "traces")
       {etag, body} = Map.fetch!(state.objects, key)
       {:ok, root} = Manifest.decode(body)
 
       segments =
-        Enum.map(root.segments, &%{&1 | trace_summary: %{&1.trace_summary | pruning_safe?: false}})
+        Enum.map(root.segments, &%{&1 | trace_summary: %{&1.trace_summary | pruning_safe?: false, attributes: nil}})
 
       body = %{root | segments: segments} |> Manifest.encode() |> IO.iodata_to_binary()
       %{state | objects: Map.put(state.objects, key, {etag <> "-unproven", body})}
@@ -265,6 +266,97 @@ defmodule Pulso.Storage.S3.TracesTest do
     assert :ok = stop_supervised(ManifestSupervision)
     start_supervised!(ManifestSupervision)
     assert query.(resource: %{"service.name" => "noise"}) == {%{"noise" => 6}, 24}
+  end
+
+  @tag timeout: 120_000
+  test "limited span queries skip sources and manifest leaves without a matching attribute value", ctx do
+    [base | _] = ctx.spans
+
+    # 600 one-span pushes, as exporters produce them: more than the inline
+    # tail holds, so older segments live in leaf pages. Kura pushes carry
+    # health-check routes; one in 50 is a cache request. The oldest push has
+    # a distinctly named span.
+    span = fn n ->
+      kura? = rem(n, 2) == 0
+      route = if rem(n, 50) == 0, do: "/api/cache/cas/{id}", else: if(kura?, do: "/up", else: "/api/runs")
+      {service, namespace} = if kura?, do: {"kura-eu-#{rem(n, 3)}", "kura"}, else: {"tuist-server", "tuist"}
+
+      resource =
+        Enum.map(base.otlp["resource"], fn
+          %{"key" => "service.name"} = pair -> %{pair | "value" => %{"stringValue" => service}}
+          %{"key" => "service.namespace"} = pair -> %{pair | "value" => %{"stringValue" => namespace}}
+          pair -> pair
+        end)
+
+      typed = [%{"key" => "http.route", "value" => %{"stringValue" => route}} | base.otlp["attributes"]]
+
+      %{
+        base
+        | service: service,
+          name: if(n == 1, do: "oldest", else: base.name),
+          resource: %{base.resource | "service.name" => service, "service.namespace" => namespace},
+          attributes: Map.put(base.attributes, "http.route", route),
+          trace_id: Base.encode16(<<n::128>>, case: :lower),
+          timestamp_ns: n * 1000,
+          end_timestamp_ns: n * 1000 + 10,
+          otlp: %{base.otlp | "resource" => resource, "attributes" => typed}
+      }
+    end
+
+    1..600
+    |> Task.async_stream(&S3.append(:traces, ctx.tenant, [span.(&1)]), max_concurrency: 8, timeout: :infinity)
+    |> Enum.each(&assert(&1 == {:ok, :ok}))
+
+    leaves =
+      Agent.get(ctx.agent, fn state ->
+        state.objects |> Map.keys() |> Enum.count(&String.ends_with?(&1, "-leaf.json"))
+      end)
+
+    assert leaves > 0
+
+    query = fn opts ->
+      :ok = S3.MetadataCache.clear()
+      Agent.update(ctx.agent, &%{&1 | reads: []})
+      result = S3.query(:traces, ctx.tenant, Keyword.merge([start_ts: 0, end_ts: 1_000_000, limit: 50], opts))
+      reads = Agent.get(ctx.agent, & &1.reads)
+
+      {result, Enum.count(reads, &String.ends_with?(&1, ".parquet")),
+       Enum.count(reads, &String.ends_with?(&1, "-leaf.json"))}
+    end
+
+    starts = fn {:ok, spans} -> Enum.map(spans, & &1.timestamp_ns) end
+
+    # Unfiltered: the newest candidates are planned from the inline tail and
+    # the scan stops after 50 one-span segments; no leaf is read.
+    {result, reads, pages} = query.([])
+    assert starts.(result) == Enum.map(600..551//-1, &(&1 * 1000))
+    assert {reads, pages} == {50, 0}
+
+    # The Grafana Kura cache panel: only the 12 cache segments are read.
+    kura = [
+      resource: %{"service.namespace" => "kura"},
+      resource_regex: %{"service.name" => "kura-(.*)-.*"},
+      attributes_regex: %{"http.route" => "/api/cache.*|/api/metro/cache.*|/v1/cache.*"}
+    ]
+
+    {result, reads, _pages} = query.(kura)
+    assert starts.(result) == Enum.map(600..50//-50, &(&1 * 1000))
+    assert reads == 12
+
+    # Values no source holds read neither segments nor leaves.
+    assert {{:ok, []}, 0, 0} = query.(attributes: %{"http.route" => "/v1/cache/{hash}"})
+    assert {{:ok, []}, 0, 0} = query.(resource: %{"service.namespace" => "missing"})
+    assert {{:ok, []}, 0, 0} = query.(attributes_regex: %{"missing.key" => ".*"})
+
+    # A filter no summary decides visits every candidate, window after
+    # window, and still finds the oldest span.
+    {result, reads, pages} = query.(name: "oldest")
+    assert starts.(result) == [1000]
+    assert {reads, pages} == {600, leaves}
+
+    # Visited segments count across windows.
+    assert {{:error, :query_scan_limit}, _, _} = query.(name: "oldest", max_scan_segments: 100)
+    assert %{limit: :max_scan_segments, observed: 101, stage: :visited} = Pulso.QueryLimit.take()
   end
 
   test "trace search scans every object before limiting traces; one hot trace cannot hide another", ctx do

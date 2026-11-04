@@ -373,11 +373,21 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
     read = &stream_leaves(&1, tenant, signal, config, deadline, fn leaf -> Enum.filter(leaf.segments, match) end)
 
-    case opts[:log_window] do
-      {order, n} when signal == "logs" and is_integer(n) -> window(leaves, found, {order, n}, read)
-      _ -> all_candidates(leaves, found, maximum, read)
+    case plan_window(signal, opts) do
+      nil -> all_candidates(leaves, found, maximum, read)
+      window -> window(leaves, found, window, read)
     end
   end
+
+  defp plan_window("logs", opts),
+    do:
+      (case opts[:log_window] do
+         {_, n} = window when is_integer(n) -> window
+         _ -> nil
+       end)
+
+  defp plan_window("traces", opts), do: if(is_integer(opts[:trace_window]), do: {:backward, opts[:trace_window]})
+  defp plan_window(_signal, _opts), do: nil
 
   defp all_candidates(leaves, found, maximum, read) do
     if maximum != nil and length(found) > maximum, do: too_many(maximum, length(found))

@@ -115,4 +115,45 @@ defmodule Pulso.Storage.S3.TraceSummaryTest do
     refute TraceSummary.matches?(hd(proven), resource: %{"service.name" => "web"})
     assert TraceSummary.matches?(hd(unproven), resource: %{"service.name" => "web"})
   end
+
+  test "attribute value sets prune only what every row proves" do
+    row = fn route, extra ->
+      %{
+        trace_id: Base.encode16(<<1::128>>, case: :lower),
+        service: "kura-eu",
+        resource: %{"service.namespace" => "kura"},
+        attributes: Map.merge(%{"http.route" => route, "http.response.status_code" => 200}, extra)
+      }
+    end
+
+    summary = TraceSummary.build([row.("/up", %{}), row.("/metrics", %{"url.path" => String.duplicate("x", 200)})])
+    summary = TraceSummary.parse(TraceSummary.to_wire(summary))
+    may? = &TraceSummary.matches?(summary, &1)
+
+    assert may?.(attributes_regex: %{"http.route" => "/metrics|/v1/cache.*"})
+    refute may?.(attributes_regex: %{"http.route" => "/api/cache.*"})
+    refute may?.(attributes: %{"http.route" => "/api/cache"})
+    refute may?.(resource: %{"service.namespace" => "tuist"})
+    # Every row's keys are known: a key no row holds as a string cannot match.
+    refute may?.(attributes_regex: %{"missing" => ".*"})
+    # Non-string wanted values and oversized values are never ruled out; a
+    # string never equals an integer projection.
+    assert may?.(attributes: %{"http.response.status_code" => 200})
+    refute may?.(attributes: %{"http.response.status_code" => "200"})
+    assert may?.(attributes: %{"url.path" => "anything"})
+
+    # More distinct values than a set keeps leave the key undecided.
+    wide = TraceSummary.build(for n <- 1..20, do: row.("/r/#{n}", %{}))
+    assert TraceSummary.matches?(wide, attributes: %{"http.route" => "/other"})
+
+    # A page union proves only what every entry proves: an entry without
+    # attribute sets (an older writer) keeps the key undecided.
+    entry = &%{"t" => TraceSummary.to_wire(&1)}
+    legacy = %{TraceSummary.build([row.("/v1/cache/1", %{})]) | attributes: nil}
+    page = TraceSummary.page_summary([entry.(summary), entry.(legacy)])
+    assert TraceSummary.page_matches?(page, attributes: %{"http.route" => "/v1/cache/1"})
+    page = TraceSummary.page_summary([entry.(summary), entry.(TraceSummary.build([row.("/v1/cache/1", %{})]))])
+    assert TraceSummary.page_matches?(page, attributes: %{"http.route" => "/v1/cache/1"})
+    refute TraceSummary.page_matches?(page, attributes: %{"http.route" => "/api/cache"})
+  end
 end

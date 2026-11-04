@@ -3,19 +3,21 @@ defmodule Pulso.Storage.S3.TraceSummary do
   import Bitwise
 
   alias Pulso.Codec.NIF
+  alias Pulso.Storage.S3.TraceAttributeSummary
 
   @zero_id String.duplicate("0", 32)
   @max_bloom_bytes 8192
   @write_bloom_bytes 1024
   @max_lookup_ids 256
   @canonical_bytes 2048
-  defstruct [:services, :bits, :lookup_hashes, :lookup_bits, pruning_safe?: false]
+  defstruct [:services, :bits, :lookup_hashes, :lookup_bits, :attributes, pruning_safe?: false]
 
   @type t :: %__MODULE__{
           services: [String.t()] | nil,
           bits: binary() | nil,
           lookup_hashes: binary() | nil,
           lookup_bits: binary() | nil,
+          attributes: TraceAttributeSummary.t(),
           pruning_safe?: boolean()
         }
 
@@ -25,7 +27,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
   def build(records, pruning_safe? \\ false) do
     services = Enum.reduce_while(records, MapSet.new(), &collect_service/2)
     ids = Enum.reduce_while(records, MapSet.new(), &collect_id/2)
-    summary(services, ids, pruning_safe?)
+    %{summary(services, ids, pruning_safe?) | attributes: TraceAttributeSummary.build(records)}
   end
 
   @doc false
@@ -99,6 +101,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
     wire = %{"v" => 1, "s" => services, "b" => if(bits, do: Base.encode64(bits))}
     wire = if hashes, do: Map.put(wire, "h", Base.encode64(hashes)), else: wire
     wire = if canonical, do: Map.put(wire, "c", %{"v" => 1, "b" => Base.encode64(canonical)}), else: wire
+    wire = if summary.attributes, do: Map.put(wire, "a", TraceAttributeSummary.to_wire(summary.attributes)), else: wire
     if summary.pruning_safe? == true, do: Map.put(wire, "k", true), else: wire
   end
 
@@ -108,6 +111,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
       bits: parse_bits(wire["b"]),
       lookup_hashes: parse_hashes(wire["h"]),
       lookup_bits: parse_canonical(wire["c"]),
+      attributes: TraceAttributeSummary.parse(wire["a"]),
       pruning_safe?: wire["k"] == true
     }
   end
@@ -177,8 +181,23 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
     # Like each entry's own flag: every row's promoted service is its original
     # string resource service.name, so resource service.name filters prune.
-    if services && Enum.all?(summaries, &match?(%__MODULE__{pruning_safe?: true}, &1)),
-      do: Map.put(page, "k", true),
+    page =
+      if services && Enum.all?(summaries, &match?(%__MODULE__{pruning_safe?: true}, &1)),
+        do: Map.put(page, "k", true),
+        else: page
+
+    put_page_attributes(page, summaries)
+  end
+
+  # References are capped at 4 KiB and lose their whole summary beyond it, so
+  # attribute sets join only while the service/ID summary keeps room.
+  @page_bytes 3584
+  defp put_page_attributes(page, summaries) do
+    attributes = summaries |> Enum.map(&(&1 && &1.attributes)) |> TraceAttributeSummary.merge()
+    with_attributes = if attributes, do: Map.put(page, "a", TraceAttributeSummary.to_wire(attributes)), else: page
+
+    if IO.iodata_length(Pulso.JSON.encode_to_iodata!(with_attributes)) <= @page_bytes,
+      do: with_attributes,
       else: page
   end
 
@@ -274,7 +293,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
     id = opts[:trace_id]
 
     (is_nil(service) or is_nil(services) or service in services) and page_id_matches?(bits, id) and
-      resource_services_match?(wire["k"] == true, services, opts)
+      resource_services_match?(wire["k"] == true, services, opts) and
+      TraceAttributeSummary.matches?(TraceAttributeSummary.parse(wire["a"]), opts)
   end
 
   def page_matches?(_wire, _opts), do: true
@@ -295,6 +315,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
     (is_nil(service) or is_nil(services) or service in services) and
       resource_services_match?(summary.pruning_safe?, services, opts) and
+      TraceAttributeSummary.matches?(summary.attributes, opts) and
       if(canonical,
         do: page_id_matches?(canonical, trace_id),
         else: is_nil(trace_id) or is_nil(bits) or member?(bits, trace_id)
@@ -325,7 +346,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
   # The regex engine and anchoring `Pulso.Traces.RegexFilters` evaluates rows
   # with. Summaries repeat the same few services; memoized per process.
   @regex_memo {__MODULE__, :regex_memo}
-  defp regex_match?(pattern, service) do
+  @doc false
+  def regex_match?(pattern, service) do
     memo = Process.get(@regex_memo, %{})
 
     case memo do

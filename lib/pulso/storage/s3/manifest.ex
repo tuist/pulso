@@ -551,7 +551,8 @@ defmodule Pulso.Storage.S3.Manifest do
     merged = merge_sorted(new_sorted, existing, [], MapSet.new(Enum.map(new_sorted, & &1.key)))
     # Complete hash sets are only a paged-leaf construction aid. Flat point
     # lookups use adaptive/canonical blooms; don't retain/rewrite unused hashes
-    # indefinitely. Migration safely treats these absent sets as unknown.
+    # (or grow unbounded flat roots with attribute value sets) indefinitely.
+    # Migration safely treats these absent sets as unknown.
     merged = if manifest.version < 3, do: Enum.map(merged, &thin_flat_trace_summary/1), else: merged
     %{manifest | segments: merged, retired: retired}
   end
@@ -559,8 +560,10 @@ defmodule Pulso.Storage.S3.Manifest do
   # Return already-thin segments unchanged, so they stay identical terms for the
   # owner's encode cache instead of being rebuilt on every merge.
   defp thin_flat_trace_summary(%{trace_summary: nil} = segment), do: segment
-  defp thin_flat_trace_summary(%{trace_summary: %{lookup_hashes: nil}} = segment), do: segment
-  defp thin_flat_trace_summary(segment), do: %{segment | trace_summary: %{segment.trace_summary | lookup_hashes: nil}}
+  defp thin_flat_trace_summary(%{trace_summary: %{lookup_hashes: nil, attributes: nil}} = segment), do: segment
+
+  defp thin_flat_trace_summary(segment),
+    do: %{segment | trace_summary: %{segment.trace_summary | lookup_hashes: nil, attributes: nil}}
 
   defp retry_retired(segment, retired) do
     case Map.fetch(retired, segment.key) do

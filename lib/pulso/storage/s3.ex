@@ -789,6 +789,7 @@ defmodule Pulso.Storage.S3 do
          {:ok, entry} <- query_manifest(tenant, signal_string(signal), config, opts),
          :ok <- check_deadline(opts[:deadline_ms]) do
       start_ts = retained_start(entry.manifest, start_ts)
+      opts = put_trace_window(signal, entry.manifest, start_ts, end_ts, opts, tenant, config)
 
       with {:ok, segments} <- query_segments(entry.manifest, signal, start_ts, end_ts, opts, tenant, config),
            :ok <- check_scan_budget(signal, segments, opts) do
@@ -977,6 +978,27 @@ defmodule Pulso.Storage.S3 do
 
   defp put_log_window(_signal, opts), do: opts
 
+  # A limited span query visits candidates newest `max_ts` first and stops
+  # once its kth span starts after the next candidate's `max_ts`, often
+  # within the first few segments. Format-4 manifests plan it a window at a
+  # time: the newest @trace_window candidates, reading only the leaves that
+  # can hold them, then four times as many whenever the scan needs more
+  # (pages already read come from the metadata cache).
+  @trace_window 64
+  defp put_trace_window(:traces, %Manifest{version: 4} = root, start_ts, end_ts, opts, tenant, config) do
+    if limited_span_query?(opts) and is_nil(opts[:trace_metrics]) and is_nil(opts[:assemble_trace]) do
+      plan = fn n ->
+        query_segments(root, :traces, start_ts, end_ts, Keyword.put(opts, :trace_window, n), tenant, config)
+      end
+
+      opts |> Keyword.put(:trace_window, @trace_window) |> Keyword.put(:trace_plan, plan)
+    else
+      opts
+    end
+  end
+
+  defp put_trace_window(_signal, _root, _start_ts, _end_ts, opts, _tenant, _config), do: opts
+
   defp query_segments(manifest, :logs, start_ts, end_ts, opts, tenant, config) do
     opts = Segment.compile_log_matchers(opts)
 
@@ -1040,6 +1062,7 @@ defmodule Pulso.Storage.S3 do
     with :ok <- check_deadline(opts[:deadline_ms]),
          {:ok, manifest, _etag} <- Retention.load(tenant, signal_string(signal), config),
          start_ts = retained_start(manifest, start_ts),
+         opts = put_trace_window(signal, manifest, start_ts, end_ts, opts, tenant, config),
          {:ok, segments} <- query_segments(manifest, signal, start_ts, end_ts, opts, tenant, config),
          :ok <- check_deadline(opts[:deadline_ms]),
          :ok <- check_scan_budget(signal, segments, opts),
@@ -1315,6 +1338,8 @@ defmodule Pulso.Storage.S3 do
         # Early-stop checks look at the next segment after every visit; index a
         # tuple instead of walking the list, which is quadratic in the scan.
         indexed: List.to_tuple(segments),
+        # Candidates visited in earlier windows, for the visited budget.
+        offset: 0,
         start_ts: start_ts,
         end_ts: end_ts,
         opts: opts,
@@ -1392,7 +1417,7 @@ defmodule Pulso.Storage.S3 do
 
     case TraceSummary.service_filter(ctx.opts[:tempo_search]) do
       nil ->
-        scan_sources(ctx.segments, ctx, state)
+        with {:ok, state} <- scan_sources(ctx.segments, ctx, state), do: next_window(ctx, state)
 
       target ->
         first = candidate_segments(ctx.segments, target)
@@ -1402,6 +1427,48 @@ defmodule Pulso.Storage.S3 do
              do: scan_context(ctx, first, state, ids)
     end
   end
+
+  # A full window may be followed by older candidates: plan four times as
+  # many and visit those after it, unless the kth span already starts after
+  # the newest of them. Candidates keep their `{-max_ts, key}` plan order, so
+  # a larger window of the same root begins with the smaller one.
+  defp next_window(%{opts: opts, offset: offset, segments: segments} = ctx, state) do
+    n = opts[:trace_window]
+    kth = window_kth(state, ctx)
+
+    # Every later candidate ends no later than this window's last one.
+    if is_integer(n) and offset + length(segments) == n and not older_than?(kth, List.last(segments)) do
+      with {:ok, planned} <- opts[:trace_plan].(4 * n),
+           do: scan_window(Enum.drop(planned, n), kth, ctx, state)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp scan_window([], _kth, _ctx, state), do: {:ok, state}
+
+  defp scan_window([next | _] = rest, kth, %{opts: opts} = ctx, state) do
+    if older_than?(kth, next) do
+      {:ok, state}
+    else
+      n = opts[:trace_window]
+      opts = Keyword.put(opts, :trace_window, 4 * n)
+      ctx = %{ctx | segments: rest, indexed: List.to_tuple(rest), offset: n, opts: opts}
+      with {:ok, state} <- scan_sources(rest, ctx, state), do: next_window(ctx, state)
+    end
+  end
+
+  defp older_than?(kth, %{max_ts: max_ts}) when is_integer(kth) and is_integer(max_ts), do: kth > max_ts
+  defp older_than?(_kth, _segment), do: false
+
+  # The native path reports its kth start; the record path keeps the top
+  # `limit` start times.
+  defp window_kth(%{kth: kth}, _ctx), do: kth
+
+  defp window_kth(%{count: count, top: top}, %{limit: limit}) when is_integer(limit) and count >= limit,
+    do: Enum.at(top, limit - 1)
+
+  defp window_kth(_state, _ctx), do: nil
 
   # Object GET latency dominates scans on real object stores. With
   # `query_prefetch` above 1, the next segments are fetched while earlier ones
@@ -1470,11 +1537,13 @@ defmodule Pulso.Storage.S3 do
   # early start at the configured depth and grow towards it.
   @prefetch_bytes 16 * 1024 * 1024
   @max_prefetch 32
-  defp prefetch_depth(%{signal: signal, opts: opts}, sources, configured)
+  defp prefetch_depth(%{signal: signal, opts: opts} = ctx, sources, configured)
        when configured > 1 and signal in [:logs, :metrics, :traces] do
+    offset = Map.get(ctx, :offset, 0)
     largest = sources |> Enum.map(&(&1.byte_size || @prefetch_bytes)) |> Enum.max(fn -> @prefetch_bytes end)
     maximum = max(configured, min(@max_prefetch, div(@prefetch_bytes, max(largest, 1))))
-    stops_early? = signal == :traces or (signal == :logs and opts[:log_window] != nil)
+    # A later trace window follows a whole window the scan could not stop in.
+    stops_early? = (signal == :traces and offset == 0) or (signal == :logs and opts[:log_window] != nil)
     if stops_early?, do: {configured, maximum}, else: {maximum, maximum}
   end
 
@@ -1718,7 +1787,7 @@ defmodule Pulso.Storage.S3 do
   defp finish_scan({:error, _} = error, _native, _limit, _trace_id), do: error
 
   defp visit_segment({segment, index}, {:ok, state}, ctx, fetched \\ nil) do
-    with :ok <- check_visited_budget(index + 1, state.rows + stored_rows(ctx, segment), ctx),
+    with :ok <- check_visited_budget(ctx.offset + index + 1, state.rows + stored_rows(ctx, segment), ctx),
          :ok <- check_read_bytes(state.bytes + (segment.byte_size || 0), ctx.opts),
          :ok <- check_deadline(ctx.opts[:deadline_ms]),
          {:ok, blob} <- fetched || read_segment(ctx, segment.key, state),
@@ -1727,7 +1796,7 @@ defmodule Pulso.Storage.S3 do
          :ok <- check_read_bytes(bytes, ctx.opts),
          {:ok, row_count} <- scan_row_count(ctx, segment, blob),
          rows = state.rows + row_count,
-         :ok <- check_visited_budget(index + 1, rows, ctx) do
+         :ok <- check_visited_budget(ctx.offset + index + 1, rows, ctx) do
       continue_or_halt(%{state | bytes: bytes, rows: rows}, blob, index, ctx)
     else
       {:error, {:footer_source_missing, cost, rows}} ->
@@ -1736,7 +1805,7 @@ defmodule Pulso.Storage.S3 do
           {:segment_missing,
            %{
              max_scan_bytes: state.bytes + cost,
-             max_scan_segments: index + 1,
+             max_scan_segments: ctx.offset + index + 1,
              max_scan_rows: state.rows + rows
            }}}}
 
@@ -1744,7 +1813,7 @@ defmodule Pulso.Storage.S3 do
         consumed = %{
           max_scan_bytes: state.bytes,
           max_decoded_bytes: state.decoded_bytes,
-          max_scan_segments: index + 1,
+          max_scan_segments: ctx.offset + index + 1,
           max_scan_rows: state.rows
         }
 
@@ -1887,7 +1956,7 @@ defmodule Pulso.Storage.S3 do
       {:ok, {count, kth, _rows}} ->
         next = next_segment(ctx, index)
         done? = is_nil(next) or (is_integer(kth) and is_integer(next.max_ts) and kth > next.max_ts)
-        state = %{state | count: count}
+        state = state |> Map.put(:count, count) |> Map.put(:kth, kth)
         if done?, do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
 
       {:error, _} = error ->

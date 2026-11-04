@@ -1545,8 +1545,25 @@ and saturation only add reads. `query_traces` `resource` string equality and
 `resource_regex` patterns on `service.name` also skip segments, and leaves
 written by this release, whose complete service sets prove that every row's
 original string `service.name` is one of them and none satisfies the filter.
-Segments and leaves without that proof are read. Other resource keys, such as
-`service.namespace`, and span attributes never prune. Limited scans that keep
+Segments and leaves without that proof are read.
+
+Segments written by this release also carry bounded value sets of their string
+resource and span attributes, for example `service.namespace`, `http.route` and
+`http.request.method`. Up to 64 keys per owner keep up to 8 distinct values of
+at most 96 bytes each, within 384 encoded bytes per segment. Leaves keep the
+union within 512 bytes, and a key with more values stays known only by its
+name. So `query_traces` `attributes`/`resource` string equality and
+`attributes_regex`/`resource_regex` patterns skip segments and leaves that
+cannot hold a match. Keys and values past these bounds, non-string values,
+legacy segments and flat (`PULSO_MANIFEST_FORMAT=flat`) manifests never prune.
+On segments with few spans per push this adds about 350 bytes to each manifest
+entry. Paged manifest pages and inline tails fill sooner, and there are more
+leaf pages per hour. Trace compaction unions source sets.
+
+Limited `query_traces` scans on paged manifests plan the newest 64 candidates
+first, reading only the leaves that can hold them. They plan four times as many
+whenever the scan needs more. A query whose newest segments already fill its
+limit no longer reads every leaf of the range. Limited scans that keep
 going read further ahead, up to 32 segments within 16 MiB in flight. Exact-ID lookup reserves 64 KiB per overlapping
 live bucket in addition to its 8 MiB metadata-byte default, capped at 32 MiB;
 an explicit configured byte limit is never raised. Other searches and
