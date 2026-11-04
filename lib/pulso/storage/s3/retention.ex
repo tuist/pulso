@@ -117,6 +117,7 @@ defmodule Pulso.Storage.S3.Retention do
 
         RetentionTasks
         |> Task.Supervisor.async_nolink(fn ->
+          Process.set_label({:pulso, :maintenance})
           Process.flag(:max_heap_size, %{size: heap, kill: true, error_logger: false, include_shared_binaries: true})
           advance(tenant, signal, config)
         end)

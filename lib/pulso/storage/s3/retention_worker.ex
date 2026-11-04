@@ -164,6 +164,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
   defp run(fun, config) do
     task =
       Task.Supervisor.async_nolink(RetentionTasks, fn ->
+        Process.set_label({:pulso, :maintenance})
         heap = if config[:retention_mode] == "enforce", do: 64_000_000, else: 4_000_000
         Process.flag(:max_heap_size, %{size: heap, kill: true, error_logger: false, include_shared_binaries: true})
 

@@ -477,6 +477,39 @@ defmodule Pulso.MetricsTest do
     assert Metrics.render() =~ "pulso_manifest_pending_segments 0\n"
   end
 
+  test "memory breakdown partitions BEAM memory and attributes labelled process heaps" do
+    parent = self()
+
+    pid =
+      start_supervised!(
+        {Task,
+         fn ->
+           Process.set_label({:pulso, :query})
+           heap = Enum.to_list(1..1_000_000)
+           send(parent, :built)
+
+           receive do
+             :finish -> length(heap)
+           end
+         end}
+      )
+
+    assert_receive :built, 5_000
+    kinds = Map.new(Pulso.MemoryStats.kinds())
+    beam = ~w(processes binary ets code atom system_other) |> Enum.map(&Map.fetch!(kinds, &1)) |> Enum.sum()
+    assert beam == kinds["total"]
+    assert kinds["beam_allocated"] >= kinds["beam_allocator_free"]
+    assert is_integer(kinds["native_codec"]) and is_integer(kinds["native_object_store"])
+    # A million-element list takes 16 MiB of heap on a 64-bit VM.
+    assert Map.new(Pulso.MemoryStats.processes())["query"] >= 16_000_000
+
+    rendered = Metrics.render()
+    assert rendered =~ ~s(pulso_memory_bytes{kind="beam_allocated"} )
+    assert rendered =~ ~s(pulso_memory_process_bytes{group="manifest_owner"} )
+    assert rendered =~ ~r/pulso_memory_ets_bytes\{table="[^"]*Pulso\.Metrics"\} \d+/
+    send(pid, :finish)
+  end
+
   test "object counters distinguish successful bodies, conflicts, conditional reads, and missing objects" do
     agent =
       start_supervised!(

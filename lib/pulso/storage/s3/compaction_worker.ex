@@ -165,7 +165,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp metric_dimension("discovery"), do: :worker_discovery
 
   defp do_run_operation(operation, tenant, name, config) do
-    task = Task.Supervisor.async_nolink(CompactionTasks, fn -> execute_operation(operation, tenant, name) end)
+    task =
+      Task.Supervisor.async_nolink(CompactionTasks, fn ->
+        Process.set_label({:pulso, :maintenance})
+        execute_operation(operation, tenant, name)
+      end)
 
     case Task.yield(task, operation_timeout(config, name)) do
       {:ok, result} ->

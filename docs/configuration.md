@@ -376,8 +376,9 @@ under a container memory limit, Pulso derives the slots from that budget:
 get retryable overload errors, counted by `pulso_ingest_admission_total` (ingest)
 and `pulso_admission_rejections_total` (queries and tenant limits),
 and the slot gauges show saturation for autoscaling; see [scaling](scaling.md).
-Flat manifests of tenants without retention still grow with history and are not
-covered by the reserve.
+Flat manifests (`PULSO_MANIFEST_FORMAT=flat`) still grow with history and are
+not covered by the reserve; see the [sizing formula](scaling.md#sizing-formula)
+and the `pulso_memory_bytes` breakdown on `/metrics`.
 
 ## Ingest memory
 

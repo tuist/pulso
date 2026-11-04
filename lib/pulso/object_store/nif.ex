@@ -34,6 +34,7 @@ defmodule Pulso.ObjectStore.NIF do
   def keyed_publication_api_version, do: :erlang.nif_error(:nif_not_loaded)
   def snapshot_api_version, do: :erlang.nif_error(:nif_not_loaded)
   def async_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def native_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
   def get_snapshot(_ref, _config, _key, _etag, _suffix, _limit, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
 

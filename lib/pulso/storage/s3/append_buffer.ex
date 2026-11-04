@@ -172,6 +172,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
 
   @impl true
   def init(opts) do
+    Process.set_label({:pulso, :append_buffer})
     admission = :ets.new(__MODULE__, [:set, :public, write_concurrency: true])
     true = :ets.insert(admission, {:pending, 0, 0, 0})
     Registry.update_value(AppendRegistry, opts[:key], fn _ -> admission end)
@@ -307,6 +308,7 @@ defmodule Pulso.Storage.S3.AppendBuffer do
     # as an inline flush would, instead of leaving callers without a reply.
     {:ok, _pid} =
       Pulso.Runtime.Task.start_link(fn ->
+        Process.set_label({:pulso, :ingest_flush})
         publish(pending, state, buffer)
         send(buffer, {:flushed, Process.get(:uploaded, false)})
       end)

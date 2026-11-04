@@ -43,6 +43,14 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("failed to build tokio runtime for pulso_object_store")
 });
 
+mod counting_alloc;
+
+// Bytes this library currently holds on the native heap (see counting_alloc.rs).
+#[rustler::nif]
+fn native_allocated_bytes() -> i64 {
+    counting_alloc::allocated()
+}
+
 mod atoms {
     rustler::atoms! {
         ok,

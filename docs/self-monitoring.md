@@ -138,7 +138,10 @@ Filter a single view, and a single query/maintenance layer, for each calculation
 | `pulso_retention_root_capacity_ratio` | Gauge | None | Highest metadata capacity ratio among the retention-managed scopes cached on this node; `0` when none are cached |
 | `pulso_retention_pending_buckets` | Gauge | None | Expired time buckets still awaiting cleanup, summed over cached retention-managed scopes |
 | `pulso_retention_managed_scopes` | Gauge | None | Retention-managed tenant/signal scopes cached on this node |
-| `pulso_vm_memory_bytes` | Gauge | None | Total BEAM-reported memory |
+| `pulso_vm_memory_bytes` | Gauge | None | Total BEAM-reported memory. Only part of what the container uses; see `pulso_memory_bytes` |
+| `pulso_memory_bytes` | Gauge | `kind` | Node memory by kind; see [memory breakdown](scaling.md#memory-breakdown) |
+| `pulso_memory_ets_bytes` | Gauge | `table` | ETS memory per table name, excluding the binaries the tables reference (those count under `pulso_memory_bytes{kind="binary"}`) |
+| `pulso_memory_process_bytes` | Gauge | `group` | Process heap, stack and mailbox memory by group: `manifest_owner`, `append_buffer`, `ingest_flush`, `query`, `maintenance`, `http_connection` (request handling, including ingest decoding) and `other` |
 | `pulso_vm_run_queue` | Gauge | None | BEAM scheduler run-queue length |
 | `pulso_ingest_inflight_requests` | Gauge | None | Ingest requests holding an admission slot |
 | `pulso_ingest_max_concurrent_requests` | Gauge | None | Ingest admission slots on this node |
@@ -268,6 +271,16 @@ histogram_quantile(0.9, sum by (le, signal, format, root_bytes_le) (rate(pulso_m
 
 # Roots still in the flat format.
 sum by (signal) (pulso_manifest_roots{format="flat"})
+
+# Resident memory not attributed to BEAM mappings or the C allocator: mapped
+# code, thread stacks and anything unexpected.
+pulso_memory_bytes{kind="rss"}
+  - ignoring(kind) sum without(kind) (pulso_memory_bytes{kind=~"beam_mapped|malloc_in_use|malloc_free"})
+
+# Where BEAM memory goes, and the largest process groups and ETS tables.
+pulso_memory_bytes{kind=~"processes|binary|ets|code|atom|system_other"}
+topk(5, pulso_memory_process_bytes)
+topk(5, pulso_memory_ets_bytes)
 
 # Detailed public query failures.
 sum by (instance, operation, outcome) (

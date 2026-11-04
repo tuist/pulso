@@ -19,11 +19,74 @@ being OOM-killed.
 
 Two things are not covered by the slots:
 
-- **Manifests of tenants without retention.** Each signal's manifest is a flat
-  list that grows with every append. Enable [retention](retention.md) (and
-  compaction) for long-running tenants so manifests stay bounded.
+- **Flat manifests.** A flat manifest (`PULSO_MANIFEST_FORMAT=flat`) grows with
+  every append, at about 2 KiB of node memory per segment (see
+  [memory breakdown](#memory-breakdown)). Paged and retention-managed manifests
+  stay bounded.
 - **Native query memory outside the heap**, such as decoded segments and
   accumulators. Each is bounded per query, not per node.
+
+## Memory breakdown
+
+`/metrics` breaks node memory down so you can see where it goes and catch
+growth early:
+
+- `pulso_memory_bytes{kind}`: `processes`, `binary`, `ets`, `code`, `atom` and
+  `system_other` add up to `total`, the BEAM's own view
+  (`pulso_vm_memory_bytes`). `beam_allocated` is what its allocators hold in
+  carriers, `beam_allocator_free` the part of that holding no live data, and
+  `beam_mapped` everything the BEAM has mapped. `native_codec`,
+  `native_object_store` and `native_grpc` are the live Rust heaps of the native
+  libraries; `malloc_in_use` and `malloc_free` are the C allocator's view.
+  `rss` and `rss_anon` are what the operating system (and `kubectl top`) count.
+- `pulso_memory_process_bytes{group}`: process heaps by role
+  (`manifest_owner`, `append_buffer`, `ingest_flush`, `query`, `maintenance`,
+  `http_connection`, `other`).
+- `pulso_memory_ets_bytes{table}`: ETS tables by name.
+
+Measured on one node with paged manifests referencing about 100,000 segments,
+Alloy-like traffic of a few requests per second per signal, coalescing on and a
+query round every 30 seconds, memory stayed flat for 40 minutes:
+
+| Part | Mean | Scales with |
+| --- | --- | --- |
+| Code, atoms and literals | 55 MiB | release |
+| Manifest owners (paged roots) | 5 MiB | recent segments, not history |
+| Ingest buffers, flushes and connections | 10 MiB | request rate and size |
+| Running queries | 0 to 10 MiB each here | query size, up to the query heap ceiling |
+| Referenced binaries | 20 MiB | in-flight requests and cached roots |
+| Other processes, ETS tables and runtime | 30 MiB | fixed |
+| Allocator space holding no live data | 30 MiB | heap peaks |
+| C allocator, native libraries and thread stacks | 130 MiB | fixed |
+| **Resident (`rss`)** | **255 MiB** (peaks 265) | |
+
+The Rust libraries return their memory after every call: between requests they
+hold under 3 MiB. Releases start the VM with `+MMmcs 0`, so freed memory
+segments go back to the operating system instead of staying cached without being
+reported, and they trim the C allocator every 10 seconds. Without both, `rss`
+was 20 to 35% higher at the same load.
+
+Flat manifests (`PULSO_MANIFEST_FORMAT=flat`, or roots not yet converted) cost
+about 2 KiB of node memory per segment, summed over tenants and signals, because
+their owners and every query decode the whole list: the same node used 400 MiB
+at 100,000 flat segments and 540 MiB at 200,000.
+
+### Sizing formula
+
+```text
+limit ≈ 1.25 × ( 260 MiB
+               + in-flight ingest requests × request size  (at most 32 MiB each)
+               + PULSO_INGEST_MAX_PENDING_BYTES             (with coalescing)
+               + running queries and workers × query heap ceiling
+               + 2 KiB × segments in flat manifests )
+```
+
+Typical exporter batches use far less than the 32 MiB worst case: Alloy
+requests here took under 0.1 MiB each. Queries can reach their heap ceiling, so
+budget it for the queries you expect to run at once, plus the alerting and
+reliability workers when they are enabled. Enforced retention runs one more
+maintenance worker with a heap ceiling of about 500 MiB while it converts or
+expires a manifest; budget it on maintenance instances.
 
 ## Per-tenant limits
 

@@ -67,6 +67,81 @@ use term_json::{EncodeError, JsonEncoder, TermBuilder};
 use rustler::{Binary, Encoder, Env, ListIterator, NewBinary, NifResult, Term};
 use std::borrow::Cow;
 
+mod counting_alloc;
+
+// Bytes this library currently holds on the native heap (see counting_alloc.rs).
+#[rustler::nif]
+fn native_allocated_bytes() -> i64 {
+    counting_alloc::allocated()
+}
+
+// Process-wide glibc malloc statistics: `{system, in_use, free}` bytes, where
+// `system` is what malloc holds from the OS (arenas plus mmapped chunks),
+// `in_use` what callers hold and `free` what malloc keeps without returning.
+// Covers every malloc user in the VM (the BEAM's own sys_alloc, OpenSSL, all
+// NIF crates). `nil` on other C libraries.
+#[rustler::nif]
+fn native_malloc_stats() -> Option<(i64, i64, i64)> {
+    malloc_stats()
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_stats() -> Option<(i64, i64, i64)> {
+    #[repr(C)]
+    struct MallInfo {
+        arena: std::ffi::c_int,
+        ordblks: std::ffi::c_int,
+        smblks: std::ffi::c_int,
+        hblks: std::ffi::c_int,
+        hblkhd: std::ffi::c_int,
+        usmblks: std::ffi::c_int,
+        fsmblks: std::ffi::c_int,
+        uordblks: std::ffi::c_int,
+        fordblks: std::ffi::c_int,
+        keepcost: std::ffi::c_int,
+    }
+    extern "C" {
+        // `mallinfo2` needs glibc 2.33; the int fields here wrap at 4 GiB,
+        // which is read as unsigned and is beyond any supported node size.
+        fn mallinfo() -> MallInfo;
+    }
+    let info = unsafe { mallinfo() };
+    let u = |v: std::ffi::c_int| v as u32 as i64;
+    Some((
+        u(info.arena) + u(info.hblkhd),
+        u(info.uordblks) + u(info.hblkhd),
+        u(info.fordblks),
+    ))
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_stats() -> Option<(i64, i64, i64)> {
+    None
+}
+
+// Return free C-allocator memory to the operating system. glibc keeps freed
+// chunks in per-thread arenas and only gives back the top of each heap on its
+// own, so memory freed by native work (Parquet encoding, manifest JSON) in
+// the middle of an arena stays resident. `malloc_trim` releases those pages.
+// Returns whether anything was released; `false` on other C libraries.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn native_malloc_trim() -> bool {
+    malloc_trim()
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_trim() -> bool {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::ffi::c_int;
+    }
+    unsafe { malloc_trim(0) == 1 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_trim() -> bool {
+    false
+}
+
 mod atoms {
     rustler::atoms! {
         done,

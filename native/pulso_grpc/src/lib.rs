@@ -34,6 +34,14 @@ use tonic::server::{Grpc, NamedService};
 use tonic::service::Routes;
 use tonic::{Code, Status};
 
+mod counting_alloc;
+
+// Bytes this library currently holds on the native heap (see counting_alloc.rs).
+#[rustler::nif]
+fn native_allocated_bytes() -> i64 {
+    counting_alloc::allocated()
+}
+
 mod atoms {
     rustler::atoms! { ok, error, logs, metrics, traces, pulso_otlp_grpc, already_replied }
 }

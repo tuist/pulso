@@ -496,7 +496,8 @@ defmodule Pulso.Metrics do
       gauge("pulso_query_max_concurrent", Pulso.QueryRunner.max_interactive()),
       gauge("pulso_memory_budget_bytes", memory_budget_bytes()),
       gauge("pulso_vm_run_queue", :erlang.statistics(:run_queue)),
-      manifest_size_gauges()
+      manifest_size_gauges(),
+      Pulso.MemoryStats.render()
     ]
   end
 

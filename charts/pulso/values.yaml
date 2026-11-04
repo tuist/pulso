@@ -541,7 +541,9 @@ pools:
 clustering:
   enabled: false
 
-# Starting points, not measured capacity. Pulso sizes its ingest and query
+# Starting points, not measured capacity. Size limits.memory with
+# docs/scaling.md#sizing-formula (flat manifests add about 2 KiB per
+# segment). Pulso sizes its ingest and query
 # slots from limits.memory (docs/configuration.md#node-memory-envelope), so
 # raising memory raises concurrency; overload beyond the slots is a retryable
 # 429. Override slots with ingestBatching.maxConcurrentRequests, or

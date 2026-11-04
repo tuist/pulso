@@ -363,6 +363,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   @impl true
   def init(opts) do
+    Process.set_label({:pulso, :manifest_owner})
+
     state = %{
       tenant: Keyword.fetch!(opts, :tenant),
       signal: Keyword.fetch!(opts, :signal),
@@ -376,7 +378,11 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       waiters: [],
       timer_ref: nil,
       # Moving average of recent publication durations (ms); see commit_eta/2.
-      commit_ms: nil
+      commit_ms: nil,
+      # Heap words after the last full sweep and publications since; see
+      # collect_garbage/1.
+      swept_words: 0,
+      unswept: 0
     }
 
     # Load on the first request so an initial registration can create the
@@ -442,8 +448,10 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp cache_loaded(_state, _manifest, nil, _token), do: :ok
 
+  # Encode through the owner's wire cache, which the next publication needs
+  # anyway; a bare manifest would make the cache run a second, uncached encode.
   defp cache_loaded(state, manifest, etag, token),
-    do: ManifestCache.put_snapshot(state.tenant, state.signal, manifest, etag, token)
+    do: ManifestCache.put_snapshot(state.tenant, state.signal, {manifest, encode_cached(manifest)}, etag, token)
 
   # ---- flush pipeline -------------------------------------------------------
 
@@ -579,6 +587,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         warn_flat_growth(state, manifest)
 
         Enum.each(outcomes, fn {from, result} -> GenServer.reply(from, result) end)
+        state = collect_garbage(state)
 
         {:noreply,
          %{
@@ -617,6 +626,31 @@ defmodule Pulso.Storage.S3.ManifestOwner do
   end
 
   defp observe_commit(_state, _result, _started), do: Process.delete(@published_bytes)
+
+  # A flat root is decoded, merged and encoded whole on every publication, and
+  # replaced roots and payloads land on the old heap, which the default
+  # generational GC (fullsweep_after 65535) only reclaims when it fills. Owners
+  # of large roots then sat at two to three times their live manifest and kept
+  # superseded multi-megabyte payload binaries alive. A full sweep once the heap
+  # has doubled since the last one bounds that at about twice the live data.
+  # It runs after waiters are replied to, so it never delays an acknowledgment.
+  # Every hundredth publication sweeps too, so the mark follows live data that
+  # shrank, as when a flat root converts to a paged one; owners of small roots
+  # stay under the floor otherwise.
+  @sweep_floor_words div(8 * 1_048_576, 8)
+  @sweep_every 100
+  defp collect_garbage(state) do
+    {:total_heap_size, words} = Process.info(self(), :total_heap_size)
+
+    if words > max(2 * state.swept_words, @sweep_floor_words) or
+         (state.unswept >= @sweep_every and words > div(@sweep_floor_words, 8)) do
+      :erlang.garbage_collect()
+      {:total_heap_size, swept} = Process.info(self(), :total_heap_size)
+      %{state | swept_words: swept, unswept: 0}
+    else
+      %{state | unswept: state.unswept + 1}
+    end
+  end
 
   # Flat manifests are rewritten whole on every flush and decoded by every
   # query, so their cost grows with history. Say so, rarely.

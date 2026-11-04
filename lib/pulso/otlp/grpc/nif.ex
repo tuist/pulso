@@ -20,6 +20,7 @@ defmodule Pulso.OTLP.GRPC.NIF do
     nif_versions: ~w(2.16)
 
   def otlp_grpc_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def native_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
   def otlp_grpc_start(_ip, _port, _owner, _max_message_bytes, _max_in_flight, _timeout_ms),
     do: :erlang.nif_error(:nif_not_loaded)

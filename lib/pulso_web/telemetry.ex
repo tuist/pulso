@@ -63,9 +63,8 @@ defmodule PulsoWeb.Telemetry do
 
   defp periodic_measurements do
     [
-      # A module, function and arguments to be invoked periodically.
-      # This function must call :telemetry.execute/3 and a metric must be added above.
-      # {PulsoWeb, :count_users, []}
+      # Return memory freed by native work to the operating system.
+      {Pulso.MemoryStats, :trim, []}
     ]
   end
 end

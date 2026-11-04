@@ -41,6 +41,9 @@ defmodule Pulso.Codec.NIF do
   end
 
   def otlp_wire_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def native_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
+  def native_malloc_stats, do: :erlang.nif_error(:nif_not_loaded)
+  def native_malloc_trim, do: :erlang.nif_error(:nif_not_loaded)
 
   def ensure_otlp_wire_api! do
     version =

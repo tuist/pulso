@@ -19,6 +19,8 @@ defmodule Pulso.QueryRunner do
       task =
         try do
           Task.Supervisor.async_nolink(TaskSupervisor, fn ->
+            Process.set_label({:pulso, :query})
+
             Process.flag(:max_heap_size, %{
               size: heap_words(class),
               kill: true,
