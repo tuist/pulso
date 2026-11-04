@@ -675,6 +675,9 @@ segments like any other.
 Each maintenance pass (every minute) keeps merging a tenant's segments while
 merges make progress, up to 32 merges per signal, so compaction keeps up with
 shippers that push every second instead of falling behind one merge a minute.
+A merge fetches its sources eight at a time. Cleanup deletes merged originals
+after their grace period, eight at a time and 128 per batch, and repeats full
+batches up to four times per pass so deletions keep pace with merges.
 
 ## Retention
 

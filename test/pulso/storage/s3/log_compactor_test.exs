@@ -239,5 +239,30 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       _ = :sys.get_state(worker, 60_000)
       assert [_] = segments(ctx)
     end
+
+    test "a pass repeats full cleanup batches so deletions keep pace with merges", ctx do
+      for ts <- 1..40, do: assert(:ok = S3.append(:logs, ctx.tenant, [record(ts, "api", "a")]))
+
+      config =
+        Map.merge(ctx.config, %{
+          compaction_enabled: false,
+          trace_compaction_enabled: false,
+          log_compaction_enabled: true,
+          compaction_interval_ms: 60_000,
+          log_compaction_options: [grace_ms: 0],
+          log_compaction_cleanup_options: [max_deletions: 8]
+        })
+
+      start_supervised!(%{id: CompactionOwnership, start: {:pg, :start_link, [CompactionOwnership.scope()]}})
+      start_supervised!({Task.Supervisor, name: CompactionTasks})
+      worker = start_supervised!({CompactionWorker, config})
+      send(worker, :compact)
+      _ = :sys.get_state(worker, 60_000)
+      assert [_] = segments(ctx)
+
+      # Over 40 retired originals are due: four full batches of eight in one pass.
+      deleted = Agent.get(ctx.agent, &Enum.count(&1.deletes, fn key -> String.ends_with?(key, ".parquet") end))
+      assert deleted == 32
+    end
   end
 end

@@ -190,9 +190,13 @@ defmodule Pulso.Storage.S3.SignalCompactor do
       Enum.all?(String.split(key, "/"), &(&1 not in [".", ".."]))
   end
 
+  # Sources are fetched eight at a time: one GET each at object-store latency
+  # otherwise dominates a merge. They stay within the merge's input bounds.
   defp read_sources(config, sources) do
-    Enum.reduce_while(sources, {:ok, []}, fn source, {:ok, batches} ->
-      with {:ok, blob} <- ObjectStore.get(config, source.key),
+    sources
+    |> Pulso.Runtime.Task.async_stream(&{&1, ObjectStore.get(config, &1.key)}, max_concurrency: 8, timeout: :infinity)
+    |> Enum.reduce_while({:ok, []}, fn {:ok, {source, fetched}}, {:ok, batches} ->
+      with {:ok, blob} <- fetched,
            true <- byte_size(blob) == source.byte_size,
            {:ok, records} <- read_records(config, blob, source.row_count) do
         {:cont, {:ok, [records | batches]}}
@@ -466,7 +470,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
 
     with {:ok, plan} <- JournalManifest.cleanup_plan(root, now, maximum, tenant, signal, config) do
       retired = Enum.filter(plan.retired, fn {key, _} -> valid_segment_key?(tenant, key, config) end)
-      {deleted, errors} = Enum.reduce(retired, {[], []}, &delete_retired(&1, &2, config))
+      {deleted, errors} = delete_retired(retired, config)
       pages = delete_pages(plan.pages, config)
 
       gc_refs =
@@ -549,7 +553,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp delete_candidates([], _tenant, _config), do: {:ok, 0}
 
   defp delete_candidates(candidates, tenant, config) do
-    {deleted, errors} = Enum.reduce(candidates, {[], []}, &delete_retired(&1, &2, config))
+    {deleted, errors} = delete_retired(candidates, config)
     {cursor, _} = List.last(candidates)
 
     with :ok <- publish_deletions(tenant, config, deleted, cursor) do
@@ -557,12 +561,22 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp delete_retired({key, _} = candidate, {deleted, errors}, config) do
-    case ObjectStore.delete(config, key) do
-      :ok -> {[candidate | deleted], errors}
-      {:error, :not_found} -> {[candidate | deleted], errors}
-      {:error, reason} -> {deleted, [{key, reason} | errors]}
-    end
+  # Eight deletes at a time: one at a time, a full batch at object-store
+  # latency took most of the operation timeout.
+  defp delete_retired(candidates, config) do
+    candidates
+    |> Pulso.Runtime.Task.async_stream(fn {key, _} -> ObjectStore.delete(config, key) end,
+      max_concurrency: 8,
+      timeout: :infinity
+    )
+    |> Enum.zip(candidates)
+    |> Enum.reduce({[], []}, fn
+      {{:ok, result}, candidate}, {deleted, errors} when result in [:ok, {:error, :not_found}] ->
+        {[candidate | deleted], errors}
+
+      {{:ok, {:error, reason}}, {key, _}}, {deleted, errors} ->
+        {deleted, [{key, reason} | errors]}
+    end)
   end
 
   defp publish_deletions(tenant, config, deleted, cursor) do

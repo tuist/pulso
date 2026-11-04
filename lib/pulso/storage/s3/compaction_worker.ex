@@ -152,14 +152,27 @@ defmodule Pulso.Storage.S3.CompactionWorker do
 
   defp cleanup_if_owner({:error, :timeout} = result, _tenant, _signal, _config, _module, _opts), do: result
 
-  defp cleanup_if_owner(result, tenant, signal, config, module, opts) do
+  defp cleanup_if_owner(result, tenant, signal, config, module, opts),
+    do: cleanup_while_full(result, tenant, signal, config, module, opts, 4)
+
+  # Each merge retires up to 32 sources, so one pass's merges can make more
+  # deletions due than one cleanup batch removes. Repeat full batches a few
+  # times per pass so cleanup keeps pace with compaction.
+  defp cleanup_while_full(result, tenant, signal, config, module, opts, remaining) do
     # Recheck after the merge: ownership may have moved while storage was busy.
     if CompactionOwnership.local_owner?(tenant, signal, config) do
-      run_operation(fn -> module.cleanup(tenant, config, opts) end, {signal, tenant}, "cleanup", config)
+      cleaned = run_operation(fn -> module.cleanup(tenant, config, opts) end, {signal, tenant}, "cleanup", config)
+
+      if remaining > 1 and full_batch?(cleaned, opts),
+        do: cleanup_while_full(cleaned, tenant, signal, config, module, opts, remaining - 1),
+        else: cleaned
     else
       result
     end
   end
+
+  defp full_batch?({:ok, deleted}, opts) when is_integer(deleted), do: deleted >= Keyword.get(opts, :max_deletions, 128)
+  defp full_batch?(_result, _opts), do: false
 
   # `subject` is `{signal, tenant}`; discovery spans every signal and tenant.
   defp run_operation(operation, subject, name, config) do

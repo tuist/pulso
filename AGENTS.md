@@ -41,7 +41,9 @@ read as far ahead as they have visited, up to the same bound. Format-4 log leaf
 refs carry a `q` union summary (`Segment.log_page_summary/1`, `ls`/`el`, 2 KiB)
 so planning skips leaves; index and leaf pages are read 32 at a time. Proven
 (`pruning_safe?`) trace segments/leaves prune `query_traces` resource
-`service.name` equality/regex. `Pulso.QueryLimit` records which scan budget a
+`service.name` equality/regex. Compaction fetches sources and deletes retired
+objects eight at a time; the worker repeats full cleanup batches up to four
+times per pass. `Pulso.QueryLimit` records which scan budget a
 `:query_scan_limit` hit (reason stays the bare atom); `QueryRunner` carries it
 to the caller for MCP/Loki error text. Line filters have no segment index.
 PromQL plans every selector's storage request before evaluation and loads them
