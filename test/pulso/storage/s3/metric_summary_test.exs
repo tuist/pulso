@@ -53,6 +53,60 @@ defmodule Pulso.Storage.S3.MetricSummaryTest do
     assert segment([String.duplicate("x", 257)]).metric_names == nil
   end
 
+  test "remote-write-sized name sets prune through a bounded bloom without dropping present names" do
+    present = Enum.map(1..1000, &"kube_metric_#{&1}_bytes")
+    absent = Enum.map(1..1000, &"node_metric_#{&1}_bytes")
+    summary = segment(present)
+    assert summary.metric_names == nil
+    assert byte_size(summary.metric_name_bloom) == 1024
+
+    assert {:ok, %Manifest{segments: [decoded]}} =
+             %Manifest{segments: [summary]} |> Manifest.encode() |> IO.iodata_to_binary() |> Manifest.decode()
+
+    assert decoded == summary
+
+    for candidate <- [summary, decoded] do
+      assert Enum.all?(present, &Segment.matches_metric_name?(candidate, [{"__name__", :eq, &1}]))
+      # At the 1 KiB cap: about 2.4% false positives at eight bits per name.
+      assert Enum.count(absent, &Segment.matches_metric_name?(candidate, [{"__name__", :eq, &1}])) < 60
+    end
+
+    # PromQL pushes anchored literal alternations; any present alternative keeps it.
+    re = fn names -> {"__name__", :re, "(?s:\\A(?:" <> Enum.join(names, "|") <> ")\\z)"} end
+    assert Segment.matches_metric_name?(summary, [re.([hd(absent), hd(present)])])
+    refute Segment.matches_metric_name?(summary, [re.(Enum.take(absent, 1))])
+
+    # Matchers a bloom cannot decide never prune.
+    for matcher <- [{"__name__", :neq, hd(present)}, {"__name__", :re, "(?s:\\A(?:node_.*)\\z)"}, {"__name__", :eq, ""}],
+        do: assert(Segment.matches_metric_name?(summary, [matcher]))
+
+    # Small sets keep their exact list; larger, invalid or long-name sets stay unknown.
+    assert segment(Enum.take(present, 128)).metric_name_bloom == nil
+    assert byte_size(segment(Enum.take(present, 129)).metric_name_bloom) == 512
+
+    for names <- [Enum.map(1..2049, &"m#{&1}"), [<<0xFF>> | present], [String.duplicate("x", 257) | present]] do
+      unknown = segment(names)
+      assert {unknown.metric_names, unknown.metric_name_bloom} == {nil, nil}
+    end
+  end
+
+  test "older, malformed and missing name blooms remain eligible" do
+    bits = segment(Enum.map(1..300, &"m#{&1}")).metric_name_bloom
+
+    for encoded <- [
+          nil,
+          7,
+          "not base64",
+          Base.encode64(<<1, 2, 3>>),
+          Base.encode64(<<0::8192>>),
+          Base.encode64(bits <> <<1>>)
+        ] do
+      assert {:ok, summary} = Segment.from_wire(%{"k" => "x", "mn" => 1, "mx" => 2, "nb" => encoded})
+      assert summary.metric_name_bloom == nil
+      assert Segment.matches_metric_name?(summary, [{"__name__", :eq, "anything"}])
+    end
+  end
+
   test "all exact name matchers must be satisfiable; absent names use empty string" do
     summary = Segment.build("x", 1, 2, 1) |> Segment.summarize_metrics([%MetricSample{}])
     assert summary.metric_names == [""]

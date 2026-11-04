@@ -150,6 +150,16 @@ selector matcher cannot match:
 - `=~".*"` adds no constraint. `!~".*"` matches nothing.
 - `__name__` regex and prefix matchers, such as `{__name__=~"prefix_.*"}`.
 
+A remote-write batch often holds more than 128 metric names. Its entry then
+carries a bloom filter of up to 2,048 names instead (16 bits per name, at most
+1 KiB, so no larger than the list it replaces). The filter decides `__name__`
+equality and literal alternations only: a segment is skipped when none of the
+accepted names can be present. False positives (under 0.1%, about 2% at the
+1 KiB cap) only add reads. Because a batch holds the targets scraped around its
+send time, a selector of a metric exposed by few targets reads only the batches
+around those scrapes, not every batch of the window. Segments written before
+this filter existed have no filter and are scanned for name matchers.
+
 Flags such as `(?i)`, `\Q...\E`, and patterns with no literal prefix (such as
 `.+suffix`) never prune. Segments without summaries (older writers, high
 cardinality, long values) are always scanned. Every selector still filters

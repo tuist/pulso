@@ -633,7 +633,7 @@ defmodule Pulso.Storage.S3 do
     selectors = wanted |> Enum.map(&elem(&1, 0)) |> List.to_tuple()
     state = %{bytes: 0, rows: 0, segments: 0, count: 0, batches: %{}}
     items = Enum.with_index(union)
-    concurrency = Map.get(config, :query_prefetch, 1)
+    concurrency = prefetch_depth(%{signal: :metrics, opts: opts}, union, Map.get(config, :query_prefetch, 1))
     visit = &visit_selector_segment(&1, &2, &3, {needs, selectors, config, opts})
 
     result =
@@ -1415,14 +1415,16 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  # Small uncompacted log segments make full log scans latency-bound: one
-  # GET per push. Unlimited log scans read further ahead while the candidates'
-  # sizes keep at most @prefetch_bytes in flight. Limited queries keep the
-  # configured depth, since they usually stop after a few segments and every
-  # prefetched read past the stop is wasted.
+  # Small uncompacted log and metric segments make full scans latency-bound:
+  # one GET per push or remote-write batch. Metric scans and unlimited log
+  # scans read further ahead while the candidates' sizes keep at most
+  # @prefetch_bytes in flight. Limited log queries keep the configured depth,
+  # since they usually stop after a few segments and every prefetched read
+  # past the stop is wasted.
   @prefetch_bytes 16 * 1024 * 1024
   @max_prefetch 32
-  defp prefetch_depth(%{signal: :logs, opts: opts}, sources, configured) when configured > 1 do
+  defp prefetch_depth(%{signal: signal, opts: opts}, sources, configured)
+       when signal in [:logs, :metrics] and configured > 1 do
     if opts[:log_window] do
       configured
     else

@@ -144,6 +144,58 @@ defmodule Pulso.PromQL.SegmentReadsTest do
     assert reads(ctx.agent) == 2 * @segments
   end
 
+  # Forty remote-write batches in the last five minutes, each holding more
+  # metric names than a name list keeps, as a node's mixed scrape batches do.
+  # Only two of them carry `wanted_total`; every batch carries `up`.
+  defp remote_write_batches(ctx) do
+    for batch <- 1..40 do
+      ts = 100_000_000_000 + batch * 5_000_000_000
+      names = for n <- 1..150, do: "batch#{batch}_metric_#{n}"
+      names = if batch in [7, 31], do: ["wanted_total" | names], else: names
+
+      records =
+        for name <- ["up" | names], do: %MetricSample{timestamp_ns: ts, value: 1.0, labels: %{"__name__" => name}}
+
+      assert :ok = S3.append(:metrics, ctx.tenant, records)
+    end
+
+    reads(ctx.agent)
+    %{end_ts_ns: 100_000_000_000 + 40 * 5_000_000_000}
+  end
+
+  test "an instant selector reads only the remote-write batches that can hold its metric name", ctx do
+    at = remote_write_batches(ctx)
+
+    assert {:ok, %{"data" => %{"result" => [%{"metric" => %{"__name__" => "wanted_total"}}]}}} =
+             Evaluator.query("wanted_total", ctx.tenant, at)
+
+    assert reads(ctx.agent) == 2
+
+    assert {:ok, %{"data" => %{"result" => []}}} = Evaluator.query(~s|{__name__=~"absent_a\|absent_b"}|, ctx.tenant, at)
+    assert reads(ctx.agent) == 0
+  end
+
+  test "metric scans fetch small segments well ahead of the configured prefetch", ctx do
+    at = remote_write_batches(ctx)
+    Runtime.put_env(:pulso, S3, Map.put(Runtime.get_env(:pulso, S3), :query_prefetch, 4))
+    owner = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", :segment} => owner}})
+    query = Task.async(fn -> Evaluator.query("up", ctx.tenant, at) end)
+
+    # Every batch matches `up`; 32 reads are in flight before any completes.
+    held =
+      for _ <- 1..32 do
+        assert_receive {:storage_barrier, request, "GET", key}, 5_000
+        {request, key}
+      end
+
+    refute_receive {:storage_barrier, _, "GET", _}, 200
+    Agent.update(ctx.agent, &%{&1 | barriers: %{}})
+    for {request, key} <- held, do: send(request, {:release_storage, key})
+    assert {:ok, %{"data" => %{"result" => [_]}}} = Task.await(query, 10_000)
+    assert reads(ctx.agent) == 40
+  end
+
   test "the deadline covers the whole query: a stalled read answers at the deadline and reads no further", ctx do
     owner = self()
 

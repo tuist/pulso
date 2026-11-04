@@ -124,6 +124,26 @@ defmodule Pulso.Storage.S3.JournalManifestTest do
     assert new.body == "new"
   end
 
+  test "a narrow window reads only the pages on its path, not the rest of history", ctx do
+    put_root(ctx, %Manifest{version: 1, segments: history(ctx.tenant, 9000)})
+    assert :ok = S3.append(:logs, ctx.tenant, [%Log{timestamp_ns: 10_000_000_000, service: "api", body: "new"}])
+    {_, root} = root(ctx)
+
+    journal_gets = fn ->
+      Agent.get(ctx.agent, fn s -> Enum.count(s.requests, fn {m, k} -> m == "GET" and k =~ "/journal/" end) end)
+    end
+
+    for {start, finish} <- [{4_499_999_800, 4_500_000_200}, {8_999_000_000, 9_000_000_600}] do
+      MetadataCache.clear()
+      Agent.update(ctx.agent, &%{&1 | requests: []})
+      assert stats(ctx, start, finish, nil) == expected(history(ctx.tenant, 9000), start, finish, nil)
+      # One index page and one leaf at most, of more than 16 leaves in all.
+      assert journal_gets.() <= 2
+    end
+
+    assert Enum.sum_by(root.paging["refs"], & &1["l"]) > 16
+  end
+
   test "appends spill into pages, keyed retries stay idempotent and every root stays bounded", ctx do
     keyed =
       for i <- 1..1500 do

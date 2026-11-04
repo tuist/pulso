@@ -11,6 +11,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   operation.
   """
 
+  import Bitwise
+
   alias Pulso.Codec.NIF
   alias Pulso.Storage.S3.MetricLabelSummary
   alias Pulso.Storage.S3.TraceSummary
@@ -22,6 +24,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     :row_count,
     :byte_size,
     :metric_names,
+    :metric_name_bloom,
     :log_services,
     :metric_labels,
     :trace_summary,
@@ -35,6 +38,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           row_count: non_neg_integer() | nil,
           byte_size: non_neg_integer() | nil,
           metric_names: [String.t()] | nil,
+          metric_name_bloom: binary() | nil,
           log_services: [String.t()] | nil,
           metric_labels: %{String.t() => [String.t()]} | nil,
           trace_summary: TraceSummary.t() | nil,
@@ -93,6 +97,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
     base = if segment.byte_size, do: Map.put(base, "b", segment.byte_size), else: base
     base = if segment.metric_names, do: Map.put(base, "n", segment.metric_names), else: base
+    base = if segment.metric_name_bloom, do: Map.put(base, "nb", Base.encode64(segment.metric_name_bloom)), else: base
     base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
     base = if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
     base = if segment.log_labels, do: Map.put(base, "el", segment.log_labels), else: base
@@ -118,6 +123,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        row_count: row_count,
        byte_size: byte_size,
        metric_names: valid_names(wire["n"]),
+       metric_name_bloom: valid_name_bloom(wire["nb"]),
        log_services: valid_services(wire["ls"]),
        metric_labels: MetricLabelSummary.parse(wire["l"]),
        trace_summary: TraceSummary.parse(wire["t"]),
@@ -149,24 +155,84 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   defp valid_names(_), do: nil
 
+  # A remote-write batch commonly carries hundreds of metric names. Up to 128
+  # names are listed exactly; up to 2,048 are summarized by a bloom filter of
+  # 16 bits per name (under 0.1% false positives), capped at 1 KiB (still at
+  # least four bits per name), much smaller than the list it replaces. More
+  # names, or names that are too long or not UTF-8, leave the set unknown.
+  @listed_names 128
+  @bloom_names 2048
+  @bloom_sizes [64, 128, 256, 512, 1024]
+
   @doc "Attach a complete, bounded metric-name set; nil means unknown, never truncated."
   def summarize_metrics(segment, records) do
     names = Enum.reduce_while(records, MapSet.new(), &collect_metric_name/2)
 
-    names = if names, do: names |> Enum.map(&:binary.copy/1) |> Enum.sort()
-    %{segment | metric_names: names, metric_labels: MetricLabelSummary.build(records)}
+    {listed, bloom} =
+      cond do
+        names == nil -> {nil, nil}
+        MapSet.size(names) <= @listed_names -> {names |> Enum.map(&:binary.copy/1) |> Enum.sort(), nil}
+        true -> {nil, name_bloom(names)}
+      end
+
+    %{segment | metric_names: listed, metric_name_bloom: bloom, metric_labels: MetricLabelSummary.build(records)}
   end
 
   defp collect_metric_name(record, names) do
     name = Map.get(record.labels, "__name__", "")
 
-    if is_binary(name) and byte_size(name) <= 256 do
+    if is_binary(name) and byte_size(name) <= 256 and String.valid?(name) do
       names = MapSet.put(names, name)
-      if MapSet.size(names) <= 128, do: {:cont, names}, else: {:halt, nil}
+      if MapSet.size(names) <= @bloom_names, do: {:cont, names}, else: {:halt, nil}
     else
       {:halt, nil}
     end
   end
+
+  defp name_bloom(names) do
+    wanted = MapSet.size(names) * 2
+    bytes = Enum.find(@bloom_sizes, List.last(@bloom_sizes), &(&1 >= wanted))
+    size = bytes * 8
+
+    bits =
+      Enum.reduce(names, 0, fn name, bits ->
+        Enum.reduce(bloom_positions(name_hash(name), size), bits, &bor(&2, bsl(1, &1)))
+      end)
+
+    <<bits::unsigned-size(size)>>
+  end
+
+  defp name_hash(name) do
+    <<hash::64, _::binary>> = :crypto.hash(:sha256, name)
+    hash
+  end
+
+  defp bloom_positions(hash, size) do
+    a = bsr(hash, 32)
+    b = bor(band(hash, 0xFFFFFFFF), 1)
+    Enum.map(0..3, &rem(a + &1 * b, size))
+  end
+
+  # Bit `p` of the big-endian integer the bloom was built from.
+  defp bloom_member?(bits, hash) do
+    last = byte_size(bits) - 1
+
+    Enum.all?(bloom_positions(hash, byte_size(bits) * 8), fn p ->
+      band(:binary.at(bits, last - div(p, 8)), bsl(1, rem(p, 8))) != 0
+    end)
+  end
+
+  defp valid_name_bloom(encoded) when is_binary(encoded) and byte_size(encoded) <= 1368 do
+    with {:ok, bits} <- Base.decode64(encoded),
+         true <- byte_size(bits) in @bloom_sizes,
+         true <- bits != :binary.copy(<<0>>, byte_size(bits)) do
+      :binary.copy(bits)
+    else
+      _ -> nil
+    end
+  end
+
+  defp valid_name_bloom(_), do: nil
 
   @doc "Keep unknown summaries and segments whose name set could satisfy every name matcher."
   def matches_metric_name?(segment, matchers) do
@@ -175,23 +241,51 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   end
 
   @doc "Compile storage matchers once per query for `matches_metrics?/2`."
-  def metrics_filter({:metric_plan, _} = plan), do: plan
-  def metrics_filter(matchers), do: {:metric_plan, MetricLabelSummary.plan(matchers)}
+  def metrics_filter({:metric_plan, _, _} = plan), do: plan
+
+  def metrics_filter(matchers) do
+    plan = MetricLabelSummary.plan(matchers)
+
+    # Name matchers a bloom can decide: each needs one of these names present.
+    names =
+      for {"__name__", op, expected} <- plan,
+          alternatives = bloom_names(op, expected),
+          alternatives != nil,
+          do: Enum.map(alternatives, &name_hash/1)
+
+    {:metric_plan, plan, names}
+  end
+
+  defp bloom_names(:eq, ""), do: nil
+  defp bloom_names(:eq, name), do: [name]
+
+  defp bloom_names(:re, {exact, []}) do
+    if not MapSet.member?(exact, ""), do: MapSet.to_list(exact)
+  end
+
+  defp bloom_names(_op, _expected), do: nil
 
   @doc """
   Prune metrics only when a complete name or label value set proves that some
-  matcher (equality, inequality, or a recognized regex shape) cannot match.
+  matcher (equality, inequality, or a recognized regex shape) cannot match, or
+  a name bloom proves that no name an equality or literal alternation accepts
+  is present.
   """
-  def matches_metrics?(segment, {:metric_plan, plan}) do
+  def matches_metrics?(segment, {:metric_plan, plan, names}) do
     MetricLabelSummary.satisfiable?(plan, fn
       "__name__" when is_list(segment.metric_names) -> {:ok, segment.metric_names}
       "__name__" -> :error
       _name when segment.metric_labels == nil -> :error
       name -> Map.fetch(segment.metric_labels, name)
-    end)
+    end) and bloom_may_match?(segment, names)
   end
 
   def matches_metrics?(segment, matchers), do: matches_metrics?(segment, metrics_filter(matchers))
+
+  defp bloom_may_match?(%__MODULE__{metric_names: nil, metric_name_bloom: bits}, names) when is_binary(bits),
+    do: Enum.all?(names, fn hashes -> Enum.any?(hashes, &bloom_member?(bits, &1)) end)
+
+  defp bloom_may_match?(_segment, _names), do: true
 
   defp valid_services([_ | _] = services) do
     if length(services) <= 128 and
