@@ -463,7 +463,8 @@ impl Builder {
                     drop(std::mem::take(&mut self.extras));
                     let ranges = groups(&aggregates, &self.series, |a| a.series, target, max_names);
                     let plan = self.plan.as_mut().ok_or(TierError::Invalid)?;
-                    plan.pending.extend(ranges.into_iter().map(Pending::Rollups));
+                    plan.pending
+                        .extend(ranges.into_iter().map(Pending::Rollups));
                     plan.aggregates = Some(aggregates);
                 }
                 None => return Ok(None),

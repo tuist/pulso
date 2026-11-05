@@ -103,7 +103,9 @@ impl Builder {
     }
 
     fn wanted(&self, bucket: i64) -> bool {
-        self.allowed.as_ref().is_none_or(|allowed| allowed.contains(&bucket))
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&bucket))
     }
 
     fn intern(&mut self, stream: Stream) -> Result<u32, RollupError> {
@@ -138,7 +140,8 @@ impl Builder {
 
     /// Add every line of one log segment with a timestamp in range.
     pub fn add_segment(&mut self, bytes: Bytes) -> Result<usize, RollupError> {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| RollupError::Fallback)?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| RollupError::Fallback)?;
         let schema = builder.schema().clone();
         let names = [
             "timestamp_ns",
@@ -173,7 +176,11 @@ impl Builder {
                 .column_by_name("timestamp_ns")
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .ok_or(RollupError::Fallback)?;
-            let (service, level, body) = (strings("service")?, strings("severity_text")?, strings("body")?);
+            let (service, level, body) = (
+                strings("service")?,
+                strings("severity_text")?,
+                strings("body")?,
+            );
             let (attributes, resource) = (strings("attributes")?, strings("resource")?);
             let (trace_id, span_id) = (strings("trace_id")?, strings("span_id")?);
             // Streams repeat in runs: reuse the previous row's interned index.
@@ -186,12 +193,16 @@ impl Builder {
                 if ts < self.start || ts > self.end || !self.wanted(bucket_end(ts)) {
                     continue;
                 }
-                let raw = (!body.is_null(row) && !body.value(row).is_empty()).then(|| body.value(row).as_bytes());
+                let raw = (!body.is_null(row) && !body.value(row).is_empty())
+                    .then(|| body.value(row).as_bytes());
                 // Entry.line re-encodes non-string bodies; only strings count natively.
-                if raw.is_some_and(|raw| raw.len() < 2 || raw[0] != b'"' || raw[raw.len() - 1] != b'"') {
+                if raw.is_some_and(|raw| {
+                    raw.len() < 2 || raw[0] != b'"' || raw[raw.len() - 1] != b'"'
+                }) {
                     return Err(RollupError::Fallback);
                 }
-                let size = raw.map_or(0, |raw| query_filter::line_bytes_for_match(raw).len()) as i64;
+                let size =
+                    raw.map_or(0, |raw| query_filter::line_bytes_for_match(raw).len()) as i64;
                 let same = previous.is_some_and(|(p, _)| {
                     same_value(resource, p, row)
                         && same_value(attributes, p, row)
@@ -204,7 +215,8 @@ impl Builder {
                         let text = |a: &StringArray| -> Arc<str> {
                             Arc::from(if a.is_null(row) { "" } else { a.value(row) })
                         };
-                        let optional = |a: &StringArray| (!a.is_null(row)).then(|| Arc::from(a.value(row)));
+                        let optional =
+                            |a: &StringArray| (!a.is_null(row)).then(|| Arc::from(a.value(row)));
                         self.intern(Stream {
                             resource: text(resource),
                             attributes: text(attributes),
@@ -216,7 +228,15 @@ impl Builder {
                 previous = Some((row, stream));
                 let has_id = |a: &StringArray| !a.is_null(row) && !a.value(row).is_empty();
                 let traced = i64::from(has_id(trace_id) || has_id(span_id));
-                self.add_cell(bucket_end(ts), stream, Cell { count: 1, bytes: size, traced })?;
+                self.add_cell(
+                    bucket_end(ts),
+                    stream,
+                    Cell {
+                        count: 1,
+                        bytes: size,
+                        traced,
+                    },
+                )?;
                 added += 1;
             }
         }
@@ -262,8 +282,20 @@ impl Builder {
         let streams = &self.streams;
         rows.sort_unstable_by(|a, b| {
             let (sa, sb) = (&streams[a.stream as usize], &streams[b.stream as usize]);
-            (a.bucket_end, &sa.service, &sa.resource, &sa.attributes, &sa.level)
-                .cmp(&(b.bucket_end, &sb.service, &sb.resource, &sb.attributes, &sb.level))
+            (
+                a.bucket_end,
+                &sa.service,
+                &sa.resource,
+                &sa.attributes,
+                &sa.level,
+            )
+                .cmp(&(
+                    b.bucket_end,
+                    &sb.service,
+                    &sb.resource,
+                    &sb.attributes,
+                    &sb.level,
+                ))
         });
         let mut totals: Vec<(i64, i64)> = Vec::new();
         for row in &rows {
@@ -313,7 +345,11 @@ fn schema() -> Arc<Schema> {
     Arc::new(Schema::new_with_metadata(fields, metadata))
 }
 
-fn encode(rows: &[RollupRow], streams: &[Stream], sources: &[String]) -> Result<Vec<u8>, RollupError> {
+fn encode(
+    rows: &[RollupRow],
+    streams: &[Stream],
+    sources: &[String],
+) -> Result<Vec<u8>, RollupError> {
     let n = rows.len();
     let mut bucket = Int64Builder::with_capacity(n);
     let mut resource = StringBuilder::with_capacity(n, n * 32);
@@ -347,7 +383,9 @@ fn encode(rows: &[RollupRow], streams: &[Stream], sources: &[String]) -> Result<
     let batch = RecordBatch::try_new(schema(), columns).map_err(|_| RollupError::Fallback)?;
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).map_err(|_| RollupError::Fallback)?))
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(6).map_err(|_| RollupError::Fallback)?,
+        ))
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_offset_index_disabled(true)
         .set_max_row_group_size(65_536);
@@ -355,7 +393,10 @@ fn encode(rows: &[RollupRow], streams: &[Stream], sources: &[String]) -> Result<
         builder = builder.set_column_dictionary_enabled(ColumnPath::from(column), true);
     }
     if !sources.is_empty() {
-        builder = builder.set_key_value_metadata(Some(vec![KeyValue::new(SOURCES_KEY.to_owned(), sources.join("\n"))]));
+        builder = builder.set_key_value_metadata(Some(vec![KeyValue::new(
+            SOURCES_KEY.to_owned(),
+            sources.join("\n"),
+        )]));
     }
     let mut out = Vec::with_capacity(256 + n * 8);
     let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(builder.build()))
@@ -366,7 +407,8 @@ fn encode(rows: &[RollupRow], streams: &[Stream], sources: &[String]) -> Result<
 }
 
 fn reader(bytes: Bytes) -> Result<ParquetRecordBatchReaderBuilder<Bytes>, RollupError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| RollupError::Fallback)?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| RollupError::Fallback)?;
     let schema = builder.schema();
     let expected = self::schema();
     if schema.metadata().get(ROLLUP_KEY).map(String::as_str) != Some(ROLLUP_VERSION)
@@ -389,7 +431,13 @@ pub fn sources(bytes: Bytes) -> Result<Vec<String>, RollupError> {
     Ok(metadata
         .and_then(|kv| kv.iter().find(|kv| kv.key == SOURCES_KEY))
         .and_then(|kv| kv.value.as_ref())
-        .map(|value| value.split('\n').filter(|k| !k.is_empty()).map(str::to_owned).collect())
+        .map(|value| {
+            value
+                .split('\n')
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default())
 }
 
@@ -398,13 +446,29 @@ pub fn read(
     bytes: Bytes,
     mut visit: impl FnMut(i64, Stream, Cell) -> Result<(), RollupError>,
 ) -> Result<(), RollupError> {
-    let reader = reader(bytes)?.with_batch_size(8192).build().map_err(|_| RollupError::Fallback)?;
+    let reader = reader(bytes)?
+        .with_batch_size(8192)
+        .build()
+        .map_err(|_| RollupError::Fallback)?;
     for batch in reader {
         let batch = batch.map_err(|_| RollupError::Fallback)?;
-        let ints = |i: usize| batch.column(i).as_any().downcast_ref::<Int64Array>().ok_or(RollupError::Fallback);
-        let strings = |i: usize| batch.column(i).as_any().downcast_ref::<StringArray>().ok_or(RollupError::Fallback);
+        let ints = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or(RollupError::Fallback)
+        };
+        let strings = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(RollupError::Fallback)
+        };
         let (bucket, count, size, traced) = (ints(0)?, ints(5)?, ints(6)?, ints(7)?);
-        let (resource, attributes, service, level) = (strings(1)?, strings(2)?, strings(3)?, strings(4)?);
+        let (resource, attributes, service, level) =
+            (strings(1)?, strings(2)?, strings(3)?, strings(4)?);
         let mut previous: Option<(usize, Stream)> = None;
         for row in 0..batch.num_rows() {
             let stream = match &previous {
@@ -485,7 +549,11 @@ fn log_rollup_add<'a>(
         return atoms::fallback().encode(env);
     };
     let bytes = crate::erlang_bytes::from_binary(blob);
-    let result = if segment { builder.add_segment(bytes) } else { builder.add_rollup(bytes, &buckets) };
+    let result = if segment {
+        builder.add_segment(bytes)
+    } else {
+        builder.add_rollup(bytes, &buckets)
+    };
     match result {
         Ok(rows) => (atoms::ok(), rows).encode(env),
         Err(reason) => {
@@ -498,21 +566,31 @@ fn log_rollup_add<'a>(
 /// `{:ok, payload, rows, [{bucket_end, lines}]}`, recording `sources` (a
 /// list of object keys) in the rollup's metadata.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn log_rollup_finish<'a>(env: Env<'a>, rollup: ResourceArc<LogRollup>, sources: Term<'a>) -> Term<'a> {
+fn log_rollup_finish<'a>(
+    env: Env<'a>,
+    rollup: ResourceArc<LogRollup>,
+    sources: Term<'a>,
+) -> Term<'a> {
     let Some(builder) = rollup.0.lock().ok().and_then(|mut guard| guard.take()) else {
         return atoms::fallback().encode(env);
     };
-    let Ok(sources) = sources
-        .decode::<ListIterator>()
-        .and_then(|list| list.map(|t| t.decode::<String>()).collect::<Result<Vec<_>, _>>())
-    else {
+    let Ok(sources) = sources.decode::<ListIterator>().and_then(|list| {
+        list.map(|t| t.decode::<String>())
+            .collect::<Result<Vec<_>, _>>()
+    }) else {
         return atoms::fallback().encode(env);
     };
     match builder.finish(&sources) {
         Ok(finished) => {
             let mut binary = rustler::NewBinary::new(env, finished.payload.len());
             binary.as_mut_slice().copy_from_slice(&finished.payload);
-            (atoms::ok(), Binary::from(binary), finished.rows, finished.totals).encode(env)
+            (
+                atoms::ok(),
+                Binary::from(binary),
+                finished.rows,
+                finished.totals,
+            )
+                .encode(env)
         }
         Err(reason) => error(env, reason),
     }
@@ -550,15 +628,24 @@ mod tests {
             level: None,
         };
         let index = builder.intern(stream.clone()).unwrap();
-        let cell = |count, bytes, traced| Cell { count, bytes, traced };
+        let cell = |count, bytes, traced| Cell {
+            count,
+            bytes,
+            traced,
+        };
         builder.add_cell(BUCKET_NS, index, cell(3, 30, 1)).unwrap();
-        builder.add_cell(2 * BUCKET_NS, index, cell(1, 7, 0)).unwrap();
+        builder
+            .add_cell(2 * BUCKET_NS, index, cell(1, 7, 0))
+            .unwrap();
         builder.add_cell(BUCKET_NS, index, cell(2, 1, 0)).unwrap();
         let finished = builder.finish(&["a".into(), "b".into()]).unwrap();
         assert_eq!(finished.rows, 2);
         assert_eq!(finished.totals, vec![(BUCKET_NS, 5), (2 * BUCKET_NS, 1)]);
         let bytes = Bytes::from(finished.payload);
-        assert_eq!(sources(bytes.clone()).unwrap(), vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            sources(bytes.clone()).unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
         let mut seen = Vec::new();
         read(bytes, |b, s, c| {
             assert!(s == stream);

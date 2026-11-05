@@ -361,7 +361,12 @@ fn log_metric_scan_new<'a>(
 /// log segments (`log_metric_scan_add`) and rollups (`log_metric_scan_rollup`).
 /// `max_samples` bounds the buckets kept.
 #[rustler::nif]
-fn log_metric_binned_new<'a>(env: Env<'a>, value: Term<'a>, grouping: Term<'a>, max_samples: u64) -> Term<'a> {
+fn log_metric_binned_new<'a>(
+    env: Env<'a>,
+    value: Term<'a>,
+    grouping: Term<'a>,
+    max_samples: u64,
+) -> Term<'a> {
     let build = || {
         let value = match value.decode::<rustler::Atom>() {
             Ok(atom) if atom == atoms::count() => Value::Count,
@@ -427,7 +432,8 @@ fn log_metric_scan_rollup<'a>(
             matchers,
             line_filters: Vec::new(),
         };
-        let outcome = state.add_rollup(crate::erlang_bytes::from_binary(blob), &buckets, &selection);
+        let outcome =
+            state.add_rollup(crate::erlang_bytes::from_binary(blob), &buckets, &selection);
         if outcome.is_err() {
             guard.take();
         }
@@ -492,7 +498,12 @@ fn log_metric_scan_finish<'a>(env: Env<'a>, scan: ResourceArc<Scan>) -> Term<'a>
             // One `(bucket_end, Int(sum))` sample per bucket.
             Some(bins) => bins
                 .into_iter()
-                .map(|(labels, bins)| (labels, bins.into_iter().map(|(b, v)| (b, Sample::Int(v))).collect()))
+                .map(|(labels, bins)| {
+                    (
+                        labels,
+                        bins.into_iter().map(|(b, v)| (b, Sample::Int(v))).collect(),
+                    )
+                })
                 .collect(),
             None => state.series,
         };
@@ -871,7 +882,12 @@ impl State {
             if !names.iter().any(|n| matches!(n.as_str(), "trace_id" | "span_id" | "trace_id_extracted" | "span_id_extracted")))
     }
 
-    fn add_rollup(&mut self, bytes: Bytes, buckets: &HashSet<i64>, selection: &Selection) -> Res<usize> {
+    fn add_rollup(
+        &mut self,
+        bytes: Bytes,
+        buckets: &HashSet<i64>,
+        selection: &Selection,
+    ) -> Res<usize> {
         if self.bins.is_none() {
             return Err(Error::Fallback);
         }
@@ -921,12 +937,23 @@ impl State {
     }
 
     // The series key of a selected rollup stream, None when unselected.
-    fn rollup_key(&self, stream: &crate::log_rollup::Stream, selection: &Selection) -> Res<Option<SeriesKey>> {
+    fn rollup_key(
+        &self,
+        stream: &crate::log_rollup::Stream,
+        selection: &Selection,
+    ) -> Res<Option<SeriesKey>> {
         let (service, level) = (stream.service.as_deref(), stream.level.as_deref());
         if !selected(selection, stream.resource.as_bytes(), service, level) {
             return Ok(None);
         }
-        let base = entry_labels(&stream.resource, &stream.attributes, service, level, None, None)?;
+        let base = entry_labels(
+            &stream.resource,
+            &stream.attributes,
+            service,
+            level,
+            None,
+            None,
+        )?;
         if base.labels.get("__error__").is_some_and(|e| !e.is_empty()) {
             return Err(Error::Pipeline);
         }
