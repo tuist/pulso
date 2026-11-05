@@ -144,6 +144,14 @@ spec:
               value: {{ .Values.tempoSearch.enabled | quote }}
             - name: PULSO_METRICS_FOOTER_PRUNING_ENABLED
               value: {{ .Values.metricsFooterPruning.enabled | quote }}
+            - name: PULSO_OBJECT_CACHE_MEMORY_MB
+              value: {{ include "pulso.boundedInteger" (list "objectCache.memoryMb" .Values.objectCache.memoryMb 0 1048576) | quote }}
+            {{- if .Values.objectCache.disk.enabled }}
+            - name: PULSO_OBJECT_CACHE_DIR
+              value: /var/cache/pulso/objects
+            - name: PULSO_OBJECT_CACHE_DISK_MB
+              value: {{ include "pulso.boundedInteger" (list "objectCache.disk.sizeMb" .Values.objectCache.disk.sizeMb 1 104857600) | quote }}
+            {{- end }}
             - name: PULSO_TRACE_COMPACTION_ENABLED
               value: {{ .Values.traceCompaction.enabled | quote }}
             - name: PULSO_LOG_COMPACTION_ENABLED
@@ -298,6 +306,10 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.objectCache.disk.enabled }}
+            - name: object-cache
+              mountPath: /var/cache/pulso/objects
+            {{- end }}
             {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
             - name: kubernetes-api
               mountPath: /var/run/secrets/pulso/kubernetes-api
@@ -306,6 +318,15 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.objectCache.disk.enabled }}
+        - name: object-cache
+          emptyDir:
+            {{- with .Values.objectCache.disk.medium }}
+            medium: {{ . }}
+            {{- end }}
+            # Headroom over the cache bound for files being written.
+            sizeLimit: {{ add (div (mul (int64 .Values.objectCache.disk.sizeMb) 11) 10) 64 }}Mi
+        {{- end }}
         {{- if .Values.workloadIdentity.kubernetesApiToken.enabled }}
         - name: kubernetes-api
           projected:

@@ -31,6 +31,7 @@ defmodule Pulso.Storage.S3.LogRollups do
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.MetricTiers
+  alias Pulso.Storage.S3.ObjectCache
   alias Pulso.Storage.S3.Retention
 
   @minute 60_000_000_000
@@ -273,7 +274,7 @@ defmodule Pulso.Storage.S3.LogRollups do
 
   defp add_inputs(builder, config, inputs, opts) do
     inputs
-    |> Pulso.Runtime.Task.async_stream(fn {segment, buckets} -> {ObjectStore.get(config, segment.key), buckets} end,
+    |> Pulso.Runtime.Task.async_stream(fn {segment, buckets} -> {ObjectCache.get(config, segment.key), buckets} end,
       max_concurrency: Keyword.get(opts, :concurrency, 8),
       ordered: false,
       timeout: :infinity
@@ -308,8 +309,12 @@ defmodule Pulso.Storage.S3.LogRollups do
     segment = %{Segment.build(key, start, finish, cells, byte_size(payload)) | log_minutes: minutes}
 
     case ObjectStore.put(config, key, payload) do
-      {:ok, _etag} -> {:ok, segment}
-      error -> error
+      {:ok, _etag} ->
+        ObjectCache.put(key, payload)
+        {:ok, segment}
+
+      error ->
+        error
     end
   end
 

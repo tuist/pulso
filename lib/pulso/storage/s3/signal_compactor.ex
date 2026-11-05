@@ -30,6 +30,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
   alias Pulso.Storage.S3.MetadataCache
+  alias Pulso.Storage.S3.ObjectCache
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.TraceAttributeSummary
@@ -156,6 +157,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
       grace = Keyword.get(opts, :grace_ms, 3_600_000)
 
       with {:ok, _etag} <- ObjectStore.put(config, key, payload),
+           :ok <- ObjectCache.put(key, payload),
            :ok <- publish_replacement(tenant, config, source_keys, replacement, grace) do
         {:ok, %{segments_before: length(manifest.segments), merged: length(sources), replacement: key}}
       end
@@ -220,7 +222,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   # otherwise dominates a merge. They stay within the merge's input bounds.
   defp read_sources(config, sources) do
     sources
-    |> Pulso.Runtime.Task.async_stream(&{&1, ObjectStore.get(config, &1.key)}, max_concurrency: 8, timeout: :infinity)
+    |> Pulso.Runtime.Task.async_stream(&{&1, ObjectCache.get(config, &1.key)}, max_concurrency: 8, timeout: :infinity)
     |> Enum.reduce_while({:ok, []}, fn {:ok, {source, fetched}}, {:ok, batches} ->
       with {:ok, blob} <- fetched,
            true <- byte_size(blob) == source.byte_size,

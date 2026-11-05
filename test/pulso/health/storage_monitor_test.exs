@@ -2,6 +2,7 @@ defmodule Pulso.Health.StorageMonitorTest do
   use Pulso.Test.Case, async: true
 
   alias Pulso.Health.StorageMonitor
+  alias Pulso.Test.CompactionStore
 
   defp start_monitor(probe, opts \\ []) do
     name = :"monitor_#{System.unique_integer([:positive])}"
@@ -129,6 +130,59 @@ defmodule Pulso.Health.StorageMonitorTest do
     end)
 
     serve_no_such_bucket(listener)
+  end
+
+  # A LIST is a billed Class A request. Successful object-store traffic since
+  # the previous probe already proves the bucket reachable.
+  test "successful object-store requests stand in for the probe's LIST" do
+    agent =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             objects: %{},
+             reads: [],
+             version: 0,
+             hook: nil,
+             faults: %{},
+             barriers: %{},
+             lists: 0,
+             deletes: [],
+             requests: []
+           }
+         end}
+      )
+
+    server = start_supervised!({Bandit, plug: {CompactionStore, agent: agent}, ip: {127, 0, 0, 1}, port: 0})
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    config = %{
+      bucket: "pulso",
+      region: "us-east-1",
+      access_key_id: "a",
+      secret_access_key: "s",
+      allow_http: true,
+      endpoint: "http://127.0.0.1:#{port}"
+    }
+
+    name = :"monitor_#{System.unique_integer([:positive])}"
+    start_supervised!({StorageMonitor, name: name, config: config, interval_ms: 50})
+    assert await_status(name, :ok) == :ok
+    lists = fn -> Agent.get(agent, & &1.lists) end
+    assert lists.() == 1
+
+    # Busy: several probe intervals with successful requests in each, no LIST.
+    for n <- 1..40 do
+      assert {:ok, _} = Pulso.ObjectStore.put(config, "k#{n}", "v")
+      Process.sleep(10)
+    end
+
+    assert lists.() == 1
+    assert StorageMonitor.status(name) == :ok
+
+    # Idle: the probe lists again.
+    Process.sleep(250)
+    assert lists.() > 1
   end
 
   test "a crashing probe is reported and does not kill the monitor" do

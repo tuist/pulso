@@ -103,7 +103,7 @@ defmodule Pulso.Test.LatencyStore do
         true -> "B"
       end
 
-    purpose = if list?, do: "list", else: purpose(key)
+    purpose = if list?, do: "list", else: detail(key)
     slot = {class, purpose, method, status}
     :ets.update_counter(store.stats, slot, [{2, 1}, {3, bytes}], {slot, 0, 0})
   end
@@ -116,6 +116,28 @@ defmodule Pulso.Test.LatencyStore do
       String.ends_with?(key, ".json") -> "metadata_page"
       true -> "other"
     end
+  end
+
+  # Billing purpose refined by what wrote the object: ingest (`-rand-`),
+  # keyed (`-idem-`), compaction, metric grouping/finalization and rollups,
+  # and the journal page kinds of paged manifests.
+  @doc false
+  def detail(key) do
+    base = Path.basename(key)
+
+    tag =
+      case purpose(key) do
+        "segment" ->
+          Enum.find(~w(rand idem compact group final edge rollup), "other", &String.contains?(base, "-#{&1}-"))
+
+        "metadata_page" ->
+          Enum.find(~w(leaf index gc), "other", &String.ends_with?(base, "-#{&1}.json"))
+
+        _ ->
+          nil
+      end
+
+    if tag, do: purpose(key) <> "/" <> tag, else: purpose(key)
   end
 
   defp read_full_body(conn, chunks) do

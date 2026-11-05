@@ -141,6 +141,18 @@ defmodule Pulso.SelfMetrics do
     end
   end
 
+  @doc "Object-store operations on this node that returned without an error, of every kind."
+  def object_successes do
+    Enum.sum_by(Map.fetch!(@operations, :object), fn dimension ->
+      case :ets.lookup(table(), {"pulso_operations_total", operation_labels(:object, dimension, :success)}) do
+        [{_, count}] -> count
+        [] -> 0
+      end
+    end)
+  rescue
+    ArgumentError -> 0
+  end
+
   def operation(kind, dimension, outcome, duration)
       when outcome in [:success, :error, :exception] and is_integer(duration) and duration >= 0 do
     if dimension in Map.get(@operations, kind, []) do

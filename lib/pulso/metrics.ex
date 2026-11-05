@@ -14,6 +14,7 @@ defmodule Pulso.Metrics do
   alias Pulso.Storage.S3.ManifestCache
   alias Pulso.Storage.S3.ManifestRegistry
   alias Pulso.Storage.S3.MetadataCache
+  alias Pulso.Storage.S3.ObjectCache
 
   @table __MODULE__
   @handler {__MODULE__, :metrics}
@@ -134,7 +135,12 @@ defmodule Pulso.Metrics do
     "pulso_manifest_cache_max_bytes" => "Byte bound on encoded manifest roots cached on this node.",
     "pulso_manifest_page_cache_entries" => "Immutable manifest pages in this node's bounded page cache.",
     "pulso_manifest_page_cache_bytes" =>
-      "Accounted bytes of this node's bounded manifest page cache (16 MiB ceiling), including table memory."
+      "Accounted bytes of this node's bounded manifest page cache (16 MiB ceiling), including table memory.",
+    "pulso_object_cache_bytes" => "Bytes of segment objects in this node's read cache, by tier.",
+    "pulso_object_cache_entries" => "Segment objects in this node's read cache, by tier.",
+    "pulso_object_cache_reads_total" =>
+      "Segment reads through the node-local object cache by result: memory/disk hits, misses that issued a GET, " <>
+        "and reads that shared a concurrent GET."
   }
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -561,7 +567,44 @@ defmodule Pulso.Metrics do
       end,
       gauge("pulso_manifest_page_cache_entries", page_entries),
       gauge("pulso_manifest_page_cache_bytes", page_bytes),
+      object_cache_gauges(),
       stored_bytes_gauges()
+    ]
+  end
+
+  defp object_cache_gauges do
+    stats = ObjectCache.stats()
+
+    [
+      for {name, index} <- [{"pulso_object_cache_entries", 0}, {"pulso_object_cache_bytes", 1}] do
+        [
+          metric_header(name, "gauge", Map.fetch!(@gauge_help, name)),
+          for tier <- [:memory, :disk] do
+            [
+              name,
+              "{tier=\"",
+              Atom.to_string(tier),
+              "\"} ",
+              stats |> Map.fetch!(tier) |> elem(index) |> Integer.to_string(),
+              "\n"
+            ]
+          end
+        ]
+      end,
+      metric_header(
+        "pulso_object_cache_reads_total",
+        "counter",
+        Map.fetch!(@gauge_help, "pulso_object_cache_reads_total")
+      ),
+      for {result, key} <- [memory_hit: :memory_hits, disk_hit: :disk_hits, miss: :misses, shared: :shared] do
+        [
+          "pulso_object_cache_reads_total{result=\"",
+          Atom.to_string(result),
+          "\"} ",
+          Integer.to_string(stats[key]),
+          "\n"
+        ]
+      end
     ]
   end
 

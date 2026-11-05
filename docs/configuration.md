@@ -34,6 +34,9 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_OTLP_GRPC_TIMEOUT_MS` | `30000` | End-to-end OTLP/gRPC deadline including admission wait, body completion and storage; expires as retryable `UNAVAILABLE`. A BEAM-handler watchdog fires this interval plus 1 second after handoff; it does not cancel already-running native/provider work. |
 | `PULSO_S3_ENDPOINT` | Amazon S3 | URL of an S3-compatible endpoint, for example `https://<account>.r2.cloudflarestorage.com`. |
 | `PULSO_S3_ALLOW_HTTP` | `false` | Allow a plain-HTTP storage endpoint. Use only for storage on a private network. |
+| `PULSO_OBJECT_CACHE_MEMORY_MB` | `64` | Memory tier of the node-local [object cache](#object-cache) of immutable segments, `0` to disable. |
+| `PULSO_OBJECT_CACHE_DIR` | unset | Directory for the cache's disk tier, for example an `emptyDir` volume. Unset keeps it disabled. |
+| `PULSO_OBJECT_CACHE_DISK_MB` | `4096` | Byte bound of the disk tier when `PULSO_OBJECT_CACHE_DIR` is set. |
 | `PULSO_METRICS_FOOTER_PRUNING_ENABLED` | `false` | Optional bounded suffix-GET exclusion for ordinary metric queries. Requires strong ETags, suffix Range and GET If-Match; may add GETs/earlier scan rejection. See [provider prerequisites and bounds](metric-footer-pruning.md). |
 | `PULSO_MANIFEST_FORMAT` | `paged` | Manifest format for prefixes without enforced retention. `paged` keeps the conditionally written root bounded and converts flat manifests on their next write, so ingest cost and manifest memory no longer grow with history. `flat` keeps writing flat lists; use it while older releases still write to the bucket. Read [Manifest format](#manifest-format) first. |
 | `PULSO_METRICS_COMPACTION_ENABLED` | `false` | Merge small metrics segments in the background. Read [Metrics compaction](#metrics-compaction) first. |
@@ -468,6 +471,36 @@ appends a second, more for traces). Pulso logs a warning once a flat manifest
 passes 20,000 segments. For a long-running deployment, enable
 [retention](retention.md) so manifests become bounded pages, enable compaction to
 reduce segment counts, and consider [ingest coalescing](#ingest-coalescing).
+
+## Object cache
+
+Segments, compaction outputs and rollups are immutable and never reuse a key
+for different bytes, so each node keeps a disposable read cache of them. A
+dashboard refreshing its panels reads the same recent segments every time,
+and maintenance (compaction, grouping the current hour, finalization, log
+rollups) reads the segments the node has just uploaded. Both are served from
+the cache instead of a billed GET at object-store latency.
+
+- The memory tier (`PULSO_OBJECT_CACHE_MEMORY_MB`, default 64) is a
+  least-recently-used set of segment bodies. It is emptied, and stops
+  admitting, while the node is under [memory pressure](scaling.md#memory-pressure).
+  Count it in the node's memory budget.
+- The disk tier (`PULSO_OBJECT_CACHE_DIR`, `PULSO_OBJECT_CACHE_DISK_MB`,
+  default 4096 when a directory is set; chart `objectCache.disk`) holds far
+  more for little memory. Segments a node uploads go there first. Files are
+  written under a temporary name and renamed, and the directory is rescanned
+  at startup, so a restarted container keeps its working set. Size it for the
+  dashboard working set plus about an hour of ingest; at Tuist production
+  volume an hour of segments is about 4 GiB.
+- Concurrent reads of an object missing from both tiers share one GET.
+
+Objects larger than a quarter of a tier are not stored in it. Keyed
+(`Idempotency-Key`) segments are never cached. A miss costs exactly the GET it
+would have cost without the cache, and query budgets charge cached and
+uncached reads alike, so the cache never changes which queries are admitted or
+what they return. `pulso_object_cache_reads_total{result}`,
+`pulso_object_cache_bytes{tier}` and `pulso_object_cache_entries{tier}`
+report its effect.
 
 ## Ingest coalescing
 

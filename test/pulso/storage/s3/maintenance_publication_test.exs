@@ -145,6 +145,80 @@ defmodule Pulso.Storage.S3.MaintenancePublicationTest do
     assert {:ok, 0} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
   end
 
+  defp root_puts(ctx) do
+    ctx.agent
+    |> Agent.get(& &1.requests)
+    |> Enum.count(fn {method, key} -> method == "PUT" and String.ends_with?(key, "/manifest.json") end)
+  end
+
+  # With spaced publications (the ingest window), a maintenance change waits
+  # for the next publication and shares its root write with the appends and
+  # changes queued by then. Each used to write the root on its own.
+  defp await_queued(ctx) do
+    {:ok, owner} = ManifestOwner.ensure_started(ctx.tenant, "metrics", ctx.config)
+
+    if :sys.get_state(owner).transactions == [] do
+      Process.sleep(10)
+      await_queued(ctx)
+    end
+  end
+
+  defp spaced(ctx), do: %{ctx | config: Map.put(ctx.config, :ingest_flush_interval_ms, 1_000)}
+
+  test "a merge and concurrent appends share one root write per ingest window", ctx do
+    ctx = spaced(ctx)
+    Runtime.put_env(:pulso, S3, ctx.config)
+    paged_history(ctx)
+    # A first append starts a window; the rest of the work falls inside it.
+    assert :ok = append(ctx, 1)
+    Agent.update(ctx.agent, &%{&1 | requests: []})
+
+    compaction = Task.async(fn -> MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0) end)
+    await_queued(ctx)
+    work = [compaction, Task.async(fn -> append(ctx, 2) end), Task.async(fn -> append(ctx, 3) end)]
+    assert [{:ok, %{merged: 32}}, :ok, :ok] = Enum.map(work, &Task.await(&1, 30_000))
+    assert root_puts(ctx) == 1
+
+    {:ok, root, _} = Retention.load(ctx.tenant, "metrics", ctx.config)
+    # Appends 2 and 3 may share one coalesced segment.
+    assert JournalManifest.referenced(root) in (600 - 32 + 1 + 2)..(600 - 32 + 1 + 3)
+
+    # The cleanup of the merge's sources folds into a later window too.
+    Agent.update(ctx.agent, &%{&1 | requests: []})
+    assert {:ok, 32} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+    assert root_puts(ctx) == 1
+    assert {:ok, 0} = MetricsCompactor.cleanup(ctx.tenant, ctx.config)
+  end
+
+  test "a folded maintenance change is applied again after another writer's root write", ctx do
+    ctx = spaced(ctx)
+    Runtime.put_env(:pulso, S3, ctx.config)
+    paged_history(ctx)
+    assert :ok = append(ctx, 1)
+
+    # Another instance republishes the root just before this owner's write.
+    key = Manifest.manifest_key(ctx.tenant, "metrics")
+
+    Agent.update(ctx.agent, fn state ->
+      hook = fn state ->
+        {_etag, body} = Map.fetch!(state.objects, key)
+        etag = "\"#{state.version + 1}\""
+        %{state | objects: Map.put(state.objects, key, {etag, body}), version: state.version + 1}
+      end
+
+      %{state | hook: hook}
+    end)
+
+    compaction = Task.async(fn -> MetricsCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0) end)
+    await_queued(ctx)
+    work = [compaction, Task.async(fn -> append(ctx, 2) end)]
+
+    assert [{:ok, %{merged: 32}}, :ok] = Enum.map(work, &Task.await(&1, 30_000))
+    assert Agent.get(ctx.agent, &Map.get(&1, :manifest_conflicts, 0)) == 1
+    {:ok, root, _} = Retention.load(ctx.tenant, "metrics", ctx.config)
+    assert JournalManifest.referenced(root) == 600 - 32 + 1 + 2
+  end
+
   test "a format-4 backup copies the root, and cleanup keeps the pages it references", ctx do
     paged_history(ctx)
     assert {:ok, %{key: key, taken_ms: taken, segments: 600}} = ManifestBackup.backup(ctx.tenant, "metrics", ctx.config)

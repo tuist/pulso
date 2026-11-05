@@ -78,6 +78,7 @@ limit ≈ 1.25 × ( 260 MiB
                + in-flight ingest requests × request size  (at most 32 MiB each)
                + PULSO_INGEST_MAX_PENDING_BYTES             (with coalescing)
                + running queries and workers × query heap ceiling
+               + PULSO_OBJECT_CACHE_MEMORY_MB                (default 64 MiB)
                + 2 KiB × segments in flat manifests )
 ```
 

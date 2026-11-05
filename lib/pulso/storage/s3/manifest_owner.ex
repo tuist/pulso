@@ -410,7 +410,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       loaded?: false,
       pending: [],
       waiters: [],
+      # Maintenance transactions waiting for the next spaced publication,
+      # newest first; see `handle_call({:transact, ...})`.
+      transactions: [],
       timer_ref: nil,
+      # Whether the pending flush timer only waits for appends to share a
+      # queued maintenance change's publication (see `await_appends/1`).
+      timer_fallback?: false,
       # Moving average of recent publication durations (ms); see commit_eta/2.
       commit_ms: nil,
       # Heap words after the last full sweep and publications since; see
@@ -469,10 +475,17 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  def handle_call({:transact, fun, config}, _from, state) do
+  def handle_call({:transact, fun, config}, from, state) do
     owner_config = state.config
 
     case loaded_for_transaction(%{state | config: config}) do
+      # With spaced publications, a paged root's maintenance change shares
+      # the next publication's conditional write with the appends and other
+      # changes queued by then, instead of writing the root once more.
+      {:ok, %{manifest: %{version: 4}} = loaded} when state.commit_interval_ms > 0 ->
+        loaded = %{loaded | config: owner_config, transactions: [{from, fun} | loaded.transactions]}
+        {:noreply, await_appends(loaded)}
+
       {:ok, loaded} ->
         {reply, updated} = run_transaction(loaded, fun, @cas_max_retries)
         {:reply, reply, %{updated | config: owner_config}, @idle_hibernate_ms}
@@ -573,17 +586,26 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     publish_queue_depth(state)
 
     cond do
-      length(state.pending) >= state.flush_batch_max ->
-        cancel_timer(state) |> do_flush()
-
-      state.timer_ref == nil ->
-        ref = Process.send_after(self(), :flush, flush_delay(state))
-        {:noreply, %{state | timer_ref: ref}}
-
-      true ->
-        {:noreply, state}
+      length(state.pending) >= state.flush_batch_max -> cancel_timer(state) |> do_flush()
+      state.timer_fallback? -> {:noreply, state |> cancel_timer() |> ensure_flush_timer()}
+      true -> {:noreply, ensure_flush_timer(state)}
     end
   end
+
+  defp ensure_flush_timer(%{timer_ref: nil} = state),
+    do: %{state | timer_ref: Process.send_after(self(), :flush, flush_delay(state))}
+
+  defp ensure_flush_timer(state), do: state
+
+  # A queued maintenance change rides the next publication appends start, so
+  # it never takes a spacing slot an append would then wait a whole window
+  # for. Without appends it publishes on its own after two windows.
+  defp await_appends(%{timer_ref: nil} = state) do
+    delay = max(flush_delay(state), 2 * state.commit_interval_ms)
+    %{state | timer_ref: Process.send_after(self(), :flush, delay), timer_fallback?: true}
+  end
+
+  defp await_appends(state), do: state
 
   # While publishing, `committing` is `{started_ms, queued}`: the publication
   # start and the segments deferred to a later one. Gauges keep counting the
@@ -649,7 +671,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         :ok
     end
 
-    %{state | timer_ref: nil}
+    %{state | timer_ref: nil, timer_fallback?: false}
   end
 
   # Copy a cached root only when another path (retention) replaced it.
@@ -663,13 +685,13 @@ defmodule Pulso.Storage.S3.ManifestOwner do
     end
   end
 
-  defp do_flush(%{pending: []} = state) do
-    {:noreply, %{state | timer_ref: nil}, @idle_hibernate_ms}
+  defp do_flush(%{pending: [], transactions: []} = state) do
+    {:noreply, %{state | timer_ref: nil, timer_fallback?: false}, @idle_hibernate_ms}
   end
 
   defp do_flush(state) do
     base = ManifestCache.publication_base(state.tenant, state.signal)
-    state = %{state | timer_ref: nil, committed_at: System.monotonic_time(:millisecond)}
+    state = %{state | timer_ref: nil, timer_fallback?: false, committed_at: System.monotonic_time(:millisecond)}
 
     state = adopt_cached_root(state)
 
@@ -699,6 +721,7 @@ defmodule Pulso.Storage.S3.ManifestOwner do
         warn_flat_growth(state, manifest)
 
         Enum.each(outcomes, fn {from, result} -> GenServer.reply(from, result) end)
+        state = %{state | transactions: []}
         state = collect_garbage(state)
 
         {:noreply,
@@ -715,6 +738,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       {:error, reason} = err ->
         {_eligible, outcomes} = publication_requests(state)
         Enum.each(outcomes, fn {from, outcome} -> GenServer.reply(from, failure_reply(outcome, err)) end)
+        Enum.each(state.transactions, fn {from, _fun} -> GenServer.reply(from, err) end)
+        state = %{state | transactions: []}
 
         Logger.warning("manifest CAS gave up tenant=#{state.tenant} signal=#{state.signal} reason=#{inspect(reason)}")
 
@@ -842,8 +867,55 @@ defmodule Pulso.Storage.S3.ManifestOwner do
 
   defp cas_with_retry(state, segments, retries_left) do
     {eligible, outcomes} = publication_requests(state)
+    {applied, transaction_outcomes, written?} = apply_transactions(state)
+    outcomes = outcomes ++ transaction_outcomes
 
-    state
+    if segments == [] and not written? do
+      {:skipped, state.manifest, state.etag, outcomes}
+    else
+      publish_prepared(state, applied, segments, eligible, outcomes, written?, retries_left)
+    end
+  end
+
+  # Queued maintenance changes, oldest first, each against the root the
+  # previous one left; appends are applied on top of the result. A conflict
+  # reloads the root and runs them all again, as a transaction alone would.
+  defp apply_transactions(%{transactions: []} = state), do: {state, [], false}
+
+  defp apply_transactions(state) do
+    {manifest, outcomes, written?} =
+      state.transactions
+      |> Enum.reverse()
+      |> Enum.reduce({state.manifest, [], false}, fn {from, fun}, {manifest, outcomes, written?} ->
+        case run_folded(fun, manifest) do
+          {:write, %Manifest{version: 4} = updated, _payload, result} ->
+            {updated, [{from, {:ok, result}} | outcomes], true}
+
+          {:write, _updated, _payload, _result} ->
+            {manifest, [{from, {:error, :manifest_version_changed}} | outcomes], written?}
+
+          {:done, result} ->
+            {manifest, [{from, {:ok, result}} | outcomes], written?}
+
+          {:error, _} = error ->
+            {manifest, [{from, error} | outcomes], written?}
+        end
+      end)
+
+    {%{state | manifest: manifest}, Enum.reverse(outcomes), written?}
+  end
+
+  # One failing change must not take the appends sharing its publication down.
+  defp run_folded(fun, manifest) do
+    fun.(manifest)
+  rescue
+    exception -> {:error, {:transaction_raised, Exception.message(exception)}}
+  catch
+    kind, reason -> {:error, {:transaction_exited, {kind, reason}}}
+  end
+
+  defp publish_prepared(state, applied, segments, eligible, outcomes, written?, retries_left) do
+    applied
     |> prepare_publication(segments, eligible)
     |> seal(state)
     |> case do
@@ -858,7 +930,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
           merged: merged,
           payload: payload,
           eligible: eligible,
-          outcomes: outcomes
+          outcomes: outcomes,
+          written?: written?
         }
 
         publish(attempt)
@@ -995,7 +1068,8 @@ defmodule Pulso.Storage.S3.ManifestOwner do
       merged.version != current.version ->
         retry_cas(attempt, %{attempt.state | manifest: current, etag: etag, loaded?: true})
 
-      publication_visible?(current, attempt.eligible, attempt.state) ->
+      # Visible appends do not prove that folded maintenance changes landed.
+      not Map.get(attempt, :written?, false) and publication_visible?(current, attempt.eligible, attempt.state) ->
         {:ok, current, etag, attempt.outcomes}
 
       reason in @cas_conflicts ->

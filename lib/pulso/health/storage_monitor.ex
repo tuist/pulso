@@ -7,6 +7,11 @@ defmodule Pulso.Health.StorageMonitor do
   misconfigured bucket cannot pass for healthy. Until the first probe
   finishes the status is `{:error, :not_probed}`.
 
+  Successful object-store requests the node made since the previous probe
+  already prove the bucket reachable, so the default probe skips its LIST
+  (a billed Class A request) while ingest, queries or maintenance are
+  talking to the store; an idle or failing node still lists.
+
   At most one probe is ever in flight. The probe runs in a process linked to
   the monitor, so it cannot outlive it, and the monitor traps exits so a
   crashing probe is reported instead of taking the monitor down. When a probe
@@ -55,6 +60,9 @@ defmodule Pulso.Health.StorageMonitor do
       interval_ms: Keyword.get(opts, :interval_ms, Keyword.get(env, :probe_interval_ms, @default_interval_ms)),
       timeout_ms: Keyword.get(opts, :timeout_ms, Keyword.get(env, :probe_timeout_ms, @default_timeout_ms)),
       probe: Keyword.get(opts, :probe, &default_probe/1),
+      # Object-store successes counted when the last probe started; nil with
+      # an explicit probe, which always runs.
+      successes: if(!Keyword.has_key?(opts, :probe), do: -1),
       status: {:error, :not_probed},
       task: nil
     }
@@ -93,7 +101,20 @@ defmodule Pulso.Health.StorageMonitor do
   def terminate(_reason, %{task: %{pid: pid}}), do: Process.exit(pid, :kill)
   def terminate(_reason, _state), do: :ok
 
-  defp start_probe(state) do
+  defp start_probe(%{successes: seen} = state) when is_integer(seen) do
+    case Pulso.SelfMetrics.object_successes() do
+      count when seen >= 0 and count > seen ->
+        Process.send_after(self(), :probe, state.interval_ms)
+        %{state | status: :ok, successes: count}
+
+      _count ->
+        run_probe(state)
+    end
+  end
+
+  defp start_probe(state), do: run_probe(state)
+
+  defp run_probe(state) do
     parent = self()
     tag = make_ref()
     config = state.config
@@ -107,7 +128,9 @@ defmodule Pulso.Health.StorageMonitor do
   defp finish_probe(%{task: %{timer: timer}} = state, status) do
     Process.cancel_timer(timer)
     Process.send_after(self(), :probe, state.interval_ms)
-    %{state | status: status, task: nil}
+    # Only requests after this probe's own LIST stand in for the next one.
+    successes = if is_integer(state.successes), do: Pulso.SelfMetrics.object_successes()
+    %{state | status: status, task: nil, successes: successes}
   end
 
   defp normalize(:ok), do: :ok

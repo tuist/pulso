@@ -31,7 +31,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
   def init(config) do
     if config[:retention_mode] != "paused", do: :ok = ProcessGroup.join(@scope, group(config), self())
     schedule(config)
-    {:ok, %{config: config, queue: [], discovery: nil, local_cursor: nil, action: 0}}
+    {:ok, %{config: config, queue: [], discovery: nil, walked_at: nil, local_cursor: nil, action: 0}}
   end
 
   @impl true
@@ -56,6 +56,23 @@ defmodule Pulso.Storage.S3.RetentionWorker do
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  # Each page is a billed LIST. Locally cached scopes are maintained every
+  # pass; a complete walk of the durable tenant prefixes, which finds the
+  # rest, starts at most once per `:retention_discovery_interval_ms`.
+  defp discover(state, slots) do
+    now = System.monotonic_time(:millisecond)
+    interval = Map.get(state.config, :retention_discovery_interval_ms, 600_000)
+    starting? = state.discovery == nil
+    rested? = starting? and state.walked_at != nil and now - state.walked_at < interval
+
+    if slots == 0 or rested? do
+      {{:ok, [], state.discovery}, state}
+    else
+      state = if starting?, do: %{state | walked_at: now}, else: state
+      {run(fn -> ObjectStore.discover_tenants(state.config, state.discovery, slots) end, state.config), state}
+    end
+  end
+
   defp run_pass(state) do
     # Reserve room for durable discovery even under sustained local activity.
     local_slots = min(8, div(64 - length(state.queue), 2))
@@ -69,11 +86,7 @@ defmodule Pulso.Storage.S3.RetentionWorker do
     queue = Enum.uniq(state.queue ++ Enum.filter(chosen, fn {tenant, _signal} -> Pulso.Tenants.active?(tenant) end))
     # Never advance durable discovery past scopes that did not fit in the queue.
     slots = min(16, div(64 - length(queue), length(Retention.signals())))
-
-    discovery =
-      if slots == 0,
-        do: {:ok, [], state.discovery},
-        else: run(fn -> ObjectStore.discover_tenants(state.config, state.discovery, slots) end, state.config)
+    {discovery, state} = discover(state, slots)
 
     case discovery do
       {:ok, tenants, cursor} ->

@@ -37,6 +37,17 @@ latency: 2 s took one 2-vCPU node from 58 Class A/s, 429s and failing dashboards
 to 3.2/s with every push acknowledged. `pulso_object_requests_total{class,purpose}`
 counts billing classes (DELETE/304/412 free); format-4 page refs carry `sb`
 (subtree segment bytes) for `pulso_manifest_referenced_bytes{signal,age}`.
+`Pulso.Storage.S3.ObjectCache` is a disposable node-local read cache of
+immutable `.parquet` objects (never `-idem-` keys): memory LRU
+(`PULSO_OBJECT_CACHE_MEMORY_MB`, cleared under memory pressure), optional disk
+LRU (`PULSO_OBJECT_CACHE_DIR`/`_DISK_MB`, chart `objectCache.disk`, rescanned at
+boot), single-flight misses and write-through of this node's uploads; query
+reads, compaction, finalization and log rollups go through it, and scan budgets
+charge the returned body either way. With an ingest window on format 4,
+`ManifestOwner.transact` folds maintenance writes into the next ingest
+publication's CAS (fallback after two windows). `StorageMonitor` skips its
+LIST while object requests succeed; compaction and retention tenant discovery
+LIST at most every 10 minutes.
 
 With metrics compaction on, settled hours are finalized
 (`Pulso.Storage.S3.MetricTiers`, native `metric_tiers.rs`, tier API 1): rows

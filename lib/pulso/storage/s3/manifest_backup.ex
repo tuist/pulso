@@ -101,9 +101,10 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   @doc """
   The newest backup's time (nil without one), first taking a backup when the
   newest is older than `:manifest_backup_interval_ms` (15 minutes). The time
-  is cached node-locally for a minute so maintenance passes do not LIST the
-  backups each time; a stale value only holds deletions back longer. A failed
-  backup keeps the previous time.
+  is cached node-locally until the next backup is due (and for at least a
+  minute), so maintenance passes do not LIST the backups (a billed Class A
+  request) each time; a stale value only holds deletions back longer. A
+  failed backup keeps the previous time.
   """
   def ensure_recent(tenant, signal, config) do
     with {:ok, taken} <- cached_latest(tenant, signal, config) do
@@ -134,11 +135,20 @@ defmodule Pulso.Storage.S3.ManifestBackup do
       {:ok, {checked, taken}} when now - checked < 60_000 ->
         {:ok, taken}
 
+      {:ok, {_checked, taken}} when is_integer(taken) ->
+        if System.system_time(:millisecond) - taken < Map.get(config, :manifest_backup_interval_ms, 900_000),
+          do: {:ok, taken},
+          else: refresh_latest(tenant, signal, config)
+
       _ ->
-        with {:ok, taken} <- latest(tenant, signal, config) do
-          remember(tenant, signal, taken)
-          {:ok, taken}
-        end
+        refresh_latest(tenant, signal, config)
+    end
+  end
+
+  defp refresh_latest(tenant, signal, config) do
+    with {:ok, taken} <- latest(tenant, signal, config) do
+      remember(tenant, signal, taken)
+      {:ok, taken}
     end
   end
 

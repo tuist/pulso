@@ -101,20 +101,26 @@ Per instance that receives a signal, with `W` the
 Requests with an `Idempotency-Key` always upload their own segment but share
 the root writes. Add per tenant:
 
-- maintenance: each compaction merge is one PUT plus one root write for up to 32
-  segments, each cleanup batch one root write, and tenant discovery a LIST each
-  pass (about 0.1 Class A/s in total at one-minute passes);
+- maintenance: each compaction merge is one PUT for up to 32 segments, plus the
+  manifest pages its leaf rewrite needs. With the window on, merges, cleanup
+  batches, rollups and finalizations of paged roots add no root writes of their
+  own: they wait for the next ingest publication and share its conditional
+  write (an idle prefix publishes them alone after two windows). Without the
+  window each is one more root write;
 - [metric hour finalization](configuration.md#long-dashboard-and-alert-ranges):
-  its metric-grouped segments, rollups and one root write per settled hour, and
+  its metric-grouped segments and rollups per settled hour, and
   [manifest backups](configuration.md#manifest-backups): one PUT per compacted
   prefix per backup interval;
 - [alerting](alerting.md#record-a-rule-group): every evaluation pass on every
   evaluating instance LISTs the tenants and each tenant's rules (one Class A
   request each per `PULSO_ALERTING_POLL_INTERVAL_MS`); a recording group tick adds
   at most four Class A requests, a single recording rule five;
+- periodic LISTs: tenant discovery at most every 10 minutes per instance, and the
+  readiness probe only while the instance makes no other successful request;
 - Class B: query segment and page GETs, compaction source GETs, and conditional
-  root reads that return a changed root. `304 Not Modified` and `412` conflicts
-  are free on Tigris.
+  root reads that return a changed root. The [object cache](configuration.md#object-cache)
+  serves repeated query reads and maintenance reads of segments the instance
+  uploaded itself. `304 Not Modified` and `412` conflicts are free on Tigris.
 
 Every instance that receives a signal runs its own window and publications,
 so ingest request cost scales with the number of ingest instances. Conflicting
@@ -214,6 +220,11 @@ traceCompaction:
   enabled: false               # needs bucket versioning
 manifestBackups:
   enabled: true
+objectCache:
+  memoryMb: 64
+  disk:
+    enabled: true
+    sizeMb: 8192               # about two hours of segments at production volume
 retention:
   mode: enforce                # after every node runs 1.32 or later
   manifestFormat: paged
@@ -288,6 +299,32 @@ panel (out of 120 each):
 Ingest stayed fully acknowledged (p99 2.8–4.4 s), RSS p50 496 MiB and max 660
 MiB, at 4.3 Class A requests/s.
 
+1.36 adds the node-local [object cache](configuration.md#object-cache) and folds
+maintenance root writes into ingest publications. Two 75-minute runs with the
+settings above, retention enforced, and the second with an 8 GiB disk tier
+(`objectCache.disk.enabled: true`):
+
+| | 1.34.0 | 1.36, disk cache 8 GiB |
+| --- | --- | --- |
+| Class A requests/s | 4.34 ($56/month) | 3.96 ($51/month) |
+| Root writes/s | 1.66 | 1.47 |
+| LIST/s | 0.19 | 0.01 |
+| Class B requests/s | 10.7 ($14/month) | 0.64 ($1/month) |
+| Segment GETs/s | 9.9 | 0 (every read a memory or disk hit) |
+| `sum by (job) (rate(m[5m]))` p50 / p99 | 5.0 s / 12.7 s | 5.9 s / 14.6 s |
+| `topk(10, ...)` p50 / p99 | 2.2 s / 6.6 s | 1.7 s / 4.9 s |
+| `count(m)` p50 / p99 | 1.9 s / 6.8 s | 1.6 s / 5.1 s |
+| Log volume by level p50 / p99 | 2.7 s / 5.1 s | 1.5 s / 3.4 s |
+| Error lines, 15 min, p50 | 0.25 s | 0.10 s |
+| Tempo search p50 / p99 | 2.2 s / 10.5 s | 4.8 s / 12.1 s |
+| RSS p50 / max | 561 / 718 MiB | 668 / 884 MiB |
+
+Ingest stayed fully acknowledged in both runs. The disk tier held 3.6 GiB after
+an hour: about one hour of this node's segments. Both runs saturate two vCPU;
+the two slower panels are CPU-bound, and without GET waits compaction got
+through more work in the same time (0.21 against 0.16 merge PUTs/s), which
+likely took CPU from them. More CPU, not a larger cache, is the lever there.
+
 ## Avoiding amplification
 
 By default Pulso writes one immutable Parquet segment per nonempty append and
@@ -321,7 +358,7 @@ Experimental [event-time retention](retention.md) is implemented for logs,
 metrics and traces. Managed scopes add immutable metadata pages, cleanup requests
 and a grace-period storage overlap; measure the full lifecycle, not just ingest
 PUTs. Flat retain-forever catalogs and their tombstones still grow without bound.
-A local segment cache remains unimplemented. Do not apply bucket lifecycle
+Do not apply bucket lifecycle
 deletion to referenced segments or pages: it leaves dangling manifest references.
 Recovery requires coherent manifest, metadata-page and segment backups.
 Infrequent Access adds retrieval charges and a 30-day minimum; Archive Instant

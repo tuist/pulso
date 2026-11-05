@@ -47,6 +47,7 @@ defmodule Pulso.Storage.S3.MetricTiers do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
+  alias Pulso.Storage.S3.ObjectCache
   alias Pulso.Storage.S3.Retention
 
   @hour_ns 3_600_000_000_000
@@ -343,7 +344,7 @@ defmodule Pulso.Storage.S3.MetricTiers do
 
   defp add_sources(finalizer, config, sources, opts) do
     sources
-    |> Pulso.Runtime.Task.async_stream(&ObjectStore.get(config, &1.key),
+    |> Pulso.Runtime.Task.async_stream(&ObjectCache.get(config, &1.key),
       max_concurrency: Keyword.get(opts, :concurrency, 8),
       ordered: false,
       timeout: :infinity
@@ -368,8 +369,12 @@ defmodule Pulso.Storage.S3.MetricTiers do
         segment = output_segment(tenant, output_tier(kind, tier), payload, min_ts, max_ts, rows, labels)
 
         case ObjectStore.put(config, segment.key, payload) do
-          {:ok, _etag} -> upload_next(finalizer, tenant, config, tier, [segment | acc])
-          {:error, _} = error -> discard(config, acc, error)
+          {:ok, _etag} ->
+            ObjectCache.put(segment.key, payload)
+            upload_next(finalizer, tenant, config, tier, [segment | acc])
+
+          {:error, _} = error ->
+            discard(config, acc, error)
         end
 
       :done ->

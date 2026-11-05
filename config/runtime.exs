@@ -32,6 +32,7 @@ alias Pulso.Storage.S3
 # environment. Without an installed runtime (every normal boot and release), this
 # is System.get_env/2.
 alias Pulso.Storage.S3.ManifestCache
+alias Pulso.Storage.S3.ObjectCache
 alias Pulso.Traces.TempoSearch
 
 env_var = fn name, default ->
@@ -409,9 +410,20 @@ memory_pressure_limit =
     true -> nil
   end
 
+# Disposable node-local read cache of immutable segment objects: a memory
+# tier, plus a disk tier when PULSO_OBJECT_CACHE_DIR names a writable
+# directory (for example an emptyDir volume). Off by default in tests, which
+# count object reads; cache tests enable it explicitly.
+object_cache_memory_mb = if config_env() == :test, do: 0, else: 64
+
 # Disposable cache of encoded manifest roots, bounded by bytes (LRU eviction).
 config :pulso, ManifestCache,
   max_bytes: parse_integer.("PULSO_MANIFEST_CACHE_MAX_BYTES", 134_217_728, 1_048_576..68_719_476_736)
+
+config :pulso, ObjectCache,
+  memory_bytes: parse_integer.("PULSO_OBJECT_CACHE_MEMORY_MB", object_cache_memory_mb, 0..1_048_576) * 1_048_576,
+  disk_dir: env_var.("PULSO_OBJECT_CACHE_DIR", nil),
+  disk_bytes: parse_integer.("PULSO_OBJECT_CACHE_DISK_MB", 4096, 0..104_857_600) * 1_048_576
 
 config :pulso, Pulso.IngestAdmission,
   max_concurrent: ingest_max_concurrent,

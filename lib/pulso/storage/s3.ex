@@ -96,6 +96,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.Storage.S3.MetricFooterReader
   alias Pulso.Storage.S3.MetricMetadataStore
   alias Pulso.Storage.S3.MetricTiers
+  alias Pulso.Storage.S3.ObjectCache
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.TraceSummary
@@ -198,7 +199,7 @@ defmodule Pulso.Storage.S3 do
   defp put_segment(config, key, payload, true, opts), do: KeyedPublication.put(config, key, payload, opts)
 
   defp put_segment(config, key, payload, false, _opts) do
-    with {:ok, _etag} <- ObjectStore.put(config, key, payload), do: :ok
+    with {:ok, _etag} <- ObjectStore.put(config, key, payload), do: ObjectCache.put(key, payload)
   end
 
   defp append_admission(signal, tenant, records, config, opts) do
@@ -482,7 +483,7 @@ defmodule Pulso.Storage.S3 do
     initial = %{selected: 0, kept: 0, budget: %{max_scan_segments: 0, max_scan_bytes: 0, max_scan_rows: 0}}
 
     planned
-    |> Pulso.Runtime.Task.async_stream(fn {rollup, buckets} -> {ObjectStore.get(config, rollup.key), buckets} end,
+    |> Pulso.Runtime.Task.async_stream(fn {rollup, buckets} -> {ObjectCache.get(config, rollup.key), buckets} end,
       max_concurrency: max(Map.get(config, :query_prefetch, 4), 1),
       ordered: false,
       timeout: :infinity
@@ -1806,7 +1807,7 @@ defmodule Pulso.Storage.S3 do
   defp prefetchable?(_ctx), do: true
 
   defp prefetch(config, limit, key) when is_integer(limit), do: read_bounded_segment(config, key, limit)
-  defp prefetch(config, _limit, key), do: ObjectStore.get(config, key)
+  defp prefetch(config, _limit, key), do: ObjectCache.get(config, key)
 
   # -- Tempo search --------------------------------------------------------------
   #
@@ -2212,13 +2213,13 @@ defmodule Pulso.Storage.S3 do
           else: QueryLimit.exceeded(:max_scan_bytes, limit, consumed, :visited)
 
       _ ->
-        ObjectStore.get(ctx.config, key)
+        ObjectCache.get(ctx.config, key)
     end
   end
 
   defp read_bounded_segment(config, key, remaining) do
-    case ObjectStore.get_bounded(config, key, nil, remaining) do
-      {:ok, _etag, body} -> {:ok, body}
+    case ObjectCache.get_bounded(config, key, remaining) do
+      {:ok, body} -> {:ok, body}
       {:error, :response_too_large} -> QueryLimit.exceeded(:max_scan_bytes, remaining, nil, :object)
       error -> error
     end

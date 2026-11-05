@@ -22,6 +22,7 @@ defmodule Pulso.MemoryPressure do
 
   alias Pulso.Runtime.GenServer
   alias Pulso.Storage.S3.ManifestCache
+  alias Pulso.Storage.S3.ObjectCache
 
   @table __MODULE__
   @interval_ms 1000
@@ -107,6 +108,7 @@ defmodule Pulso.MemoryPressure do
     Pulso.SelfMetrics.memory_pressure(:on)
     # Drop idle manifest roots now rather than on the next sweep.
     if pid = Pulso.Runtime.whereis(ManifestCache), do: send(pid, :sweep)
+    ObjectCache.clear_memory()
   end
 
   defp transition(false), do: Pulso.SelfMetrics.memory_pressure(:off)

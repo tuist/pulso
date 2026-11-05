@@ -120,6 +120,21 @@ storage:
   accessKeyId: ""
   secretAccessKey: ""
 
+# Node-local read cache of immutable segment objects (docs/configuration.md#object-cache).
+# Repeated dashboard panels and maintenance reads of segments this pod just
+# uploaded are served without a billed GET at object-store latency. Disposable:
+# a miss only costs the GET it saves, and correctness never depends on it.
+objectCache:
+  # Memory tier, 0..1048576 MiB (0 disables). Cleared under memory pressure.
+  memoryMb: 64
+  disk:
+    # Disk tier on an emptyDir volume, kept across container restarts. Size
+    # it for the dashboard working set plus the newest ingest (about an hour).
+    enabled: false
+    sizeMb: 4096
+    # Optional emptyDir medium ("" for node disk, Memory for tmpfs).
+    medium: ""
+
 # Optional suffix-GET metric exclusion; requires Range and strong If-Match support.
 # Can add up to 2 GETs for candidates needing full scans; does not raise scan capacity.
 metricsFooterPruning:

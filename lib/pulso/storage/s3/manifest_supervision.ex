@@ -2,7 +2,7 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
   @moduledoc """
   Supervision tree fragment for the manifest layer.
 
-  Runs eight children in this order:
+  Runs nine children in this order:
 
     1. `Pulso.Storage.S3.ManifestRegistry` — via-name lookup for owners.
     2. `Pulso.Storage.S3.ManifestSupervisor` — `DynamicSupervisor`
@@ -14,8 +14,9 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
     5. `Pulso.Storage.S3.AppendSupervisor` — bounded input buffers. Buffers
        are created only when ingest coalescing is enabled.
     6. `Pulso.Storage.S3.MetadataCache` — bounded, disposable immutable page cache.
-    7. `Pulso.Storage.S3.RetentionAdmission` — node-wide monitored DELETE slots.
-    8. `Pulso.Storage.S3.MetricMetadataStore` — bounded node-local record of
+    7. `Pulso.Storage.S3.ObjectCache` — disposable read cache of immutable segments.
+    8. `Pulso.Storage.S3.RetentionAdmission` — node-wide monitored DELETE slots.
+    9. `Pulso.Storage.S3.MetricMetadataStore` — bounded node-local record of
        metric metadata already published today.
 
   Wired into `Pulso.Application` only when the S3 adapter is active.
@@ -32,6 +33,7 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
   alias Pulso.Storage.S3.ManifestSupervisor
   alias Pulso.Storage.S3.MetadataCache
   alias Pulso.Storage.S3.MetricMetadataStore
+  alias Pulso.Storage.S3.ObjectCache
   alias Pulso.Storage.S3.RetentionAdmission
 
   @spec start_link(keyword()) :: Elixir.Supervisor.on_start()
@@ -48,6 +50,7 @@ defmodule Pulso.Storage.S3.ManifestSupervision do
       {Registry, keys: :unique, name: AppendRegistry},
       {DynamicSupervisor, strategy: :one_for_one, name: AppendSupervisor},
       MetadataCache,
+      ObjectCache,
       RetentionAdmission,
       MetricMetadataStore
     ]
