@@ -891,6 +891,47 @@ fn compact_trace_segments_impl<'a>(
     }
 }
 
+/// Merge up to 1024 trace segments into outputs partitioned by service, by
+/// error/event class and by at most `max_ids` (`max_flagged_ids`) trace IDs:
+/// `{:ok, [{blob, min_ts, max_ts, count, {services, ids, proof}, {statuses, events?}}]}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn compact_trace_segments_split<'a>(
+    env: Env<'a>,
+    blobs: Term<'a>,
+    max_rows: usize,
+    max_ids: usize,
+    max_flagged_ids: usize,
+    max_output_rows: usize,
+) -> Term<'a> {
+    if max_rows == 0
+        || max_rows > 100_000
+        || max_ids == 0
+        || max_flagged_ids == 0
+        || max_output_rows == 0
+        || blobs.list_length().map_or(true, |n| n > 1024)
+    {
+        return atoms::fallback().encode(env);
+    }
+    match trace_segment_parquet::compact_split(
+        env,
+        blobs,
+        max_rows,
+        max_ids,
+        max_flagged_ids,
+        max_output_rows,
+    ) {
+        Ok(outputs) => (atoms::ok(), outputs).encode(env),
+        Err(trace_segment_parquet::Error::PayloadTooLarge) => {
+            error(env, atoms::payload_too_large())
+        }
+        Err(trace_segment_parquet::Error::InvalidProjection) => {
+            error(env, atoms::trace_projection_invalid())
+        }
+        Err(trace_segment_parquet::Error::TooMany) => error(env, atoms::query_sample_limit()),
+        Err(_) => atoms::fallback().encode(env),
+    }
+}
+
 /// Streaming counterpart of `decode_log_segment_parquet_v2`: the same
 /// filters, decoded a bounded chunk at a time by `log_segment_reader_next`.
 pub struct LogSegmentReader(std::sync::Mutex<Option<segment_parquet::Reader>>);

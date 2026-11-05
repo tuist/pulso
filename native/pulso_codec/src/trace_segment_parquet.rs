@@ -278,18 +278,44 @@ type Compacted<'a> = (
     bool,
 );
 
-pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compacted<'a>> {
+/// Validated sources concatenated in input order, with what the summaries of
+/// any subset of their rows need: per-row metadata proof and event presence.
+struct Loaded {
+    schema: arrow::datatypes::SchemaRef,
+    merged: RecordBatch,
+    rows: usize,
+    safe: Vec<bool>,
+    events: Vec<bool>,
+}
+
+fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Res<&'a T> {
+    batch
+        .column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<T>())
+        .ok_or(Error::Invalid)
+}
+
+// Any event in the plain or the typed metadata. Legacy rows without typed
+// metadata count as having events: they never prove their absence.
+fn has_events(fields: &crate::json_read::RawFields<'_>) -> bool {
+    use crate::trace_search::{field, object};
+    let empty = |raw: &[u8]| Parser::new(raw).raw_array().is_ok_and(|v| v.is_empty());
+    let absent = || -> Option<bool> {
+        let metadata = field(fields, b"otlp").ok()?;
+        let typed = field(&object(metadata).ok()?, b"events").ok()?;
+        Some(empty(field(fields, b"events").ok()?) && empty(typed))
+    };
+    absent() != Some(true)
+}
+
+fn load(blobs: Term<'_>, max_rows: usize) -> Res<Loaded> {
     let mut batches = Vec::new();
     let mut schema = None;
     let mut rows = 0usize;
     let mut payload_bytes = 0usize;
     let mut column_bytes = 0usize;
-    let mut min = i64::MAX;
-    let mut max = i64::MIN;
-    let mut services = BTreeSet::new();
-    let mut complete_services = true;
-    let mut metadata_safe = true;
-    let mut ids = BTreeSet::new();
+    let mut safe = Vec::new();
+    let mut events = Vec::new();
     for term in blobs.decode::<ListIterator>().map_err(|_| Error::Invalid)? {
         let blob: Binary = term.decode().map_err(|_| Error::Invalid)?;
         let builder =
@@ -315,10 +341,7 @@ pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compac
                 return Err(Error::TooMany);
             }
             for name in STRINGS {
-                let values = batch
-                    .column_by_name(name)
-                    .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                    .ok_or(Error::Invalid)?;
+                let values: &StringArray = column(&batch, name)?;
                 column_bytes += values.value_data().len();
                 if name == "payload" {
                     payload_bytes += values.value_data().len();
@@ -327,42 +350,15 @@ pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compac
                     return Err(Error::PayloadTooLarge);
                 }
             }
-            let ts = batch
-                .column_by_name("timestamp_ns")
-                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                .ok_or(Error::Invalid)?;
-            let end = batch
-                .column_by_name("end_timestamp_ns")
-                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                .ok_or(Error::Invalid)?;
-            let service = batch
-                .column_by_name("service")
-                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .ok_or(Error::Invalid)?;
-            let trace = batch
-                .column_by_name("trace_id")
-                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .ok_or(Error::Invalid)?;
-            let payload = batch
-                .column_by_name("payload")
-                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .ok_or(Error::Invalid)?;
-            let span = batch
-                .column_by_name("span_id")
-                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .ok_or(Error::Invalid)?;
-            let name = batch
-                .column_by_name("name")
-                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
-                .ok_or(Error::Invalid)?;
-            let kind = batch
-                .column_by_name("kind")
-                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                .ok_or(Error::Invalid)?;
-            let status = batch
-                .column_by_name("status_code")
-                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                .ok_or(Error::Invalid)?;
+            let ts: &Int64Array = column(&batch, "timestamp_ns")?;
+            let end: &Int64Array = column(&batch, "end_timestamp_ns")?;
+            let service: &StringArray = column(&batch, "service")?;
+            let trace: &StringArray = column(&batch, "trace_id")?;
+            let payload: &StringArray = column(&batch, "payload")?;
+            let span: &StringArray = column(&batch, "span_id")?;
+            let name: &StringArray = column(&batch, "name")?;
+            let kind: &Int64Array = column(&batch, "kind")?;
+            let status: &Int64Array = column(&batch, "status_code")?;
             for i in 0..batch.num_rows() {
                 if payload.is_null(i)
                     || span.is_null(i)
@@ -398,11 +394,6 @@ pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compac
                     [ts.value(i), end.value(i), kind.value(i), status.value(i)],
                 )
                 .map_err(|_| Error::InvalidProjection)?;
-                if metadata_safe {
-                    metadata_safe = metadata_service_safe(&fields, projected[0]);
-                }
-                min = min.min(ts.value(i));
-                max = max.max(ts.value(i));
                 let id = trace.value(i);
                 if id.len() != 32
                     || id.bytes().all(|b| b == b'0')
@@ -412,36 +403,96 @@ pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compac
                 {
                     return Err(Error::Invalid);
                 }
-                ids.insert(id.to_owned());
-                if service.is_null(i) || service.value(i).is_empty() || service.value(i).len() > 256
-                {
-                    complete_services = false;
-                } else if complete_services {
-                    services.insert(service.value(i).to_owned());
-                    if services.len() > 128 {
-                        complete_services = false;
-                        services.clear();
-                    }
-                }
+                safe.push(metadata_service_safe(&fields, projected[0]));
+                events.push(has_events(&fields));
             }
             batches.push(batch);
         }
     }
     let schema = schema.ok_or(Error::Invalid)?;
     let merged = concat_batches(&schema, &batches).map_err(|_| Error::Invalid)?;
-    drop(batches);
-    let sort: Vec<_> = ["service", "timestamp_ns", "trace_id", "span_id"]
-        .iter()
-        .map(|name| {
-            Ok(SortColumn {
-                values: merged.column_by_name(name).ok_or(Error::Invalid)?.clone(),
-                options: None,
-            })
-        })
-        .collect::<Res<_>>()?;
-    let indices = lexsort_to_indices(&sort, None).map_err(|_| Error::Invalid)?;
-    let sorted = take_record_batch(&merged, &indices).map_err(|_| Error::Invalid)?;
-    drop(merged);
+    Ok(Loaded {
+        schema,
+        merged,
+        rows,
+        safe,
+        events,
+    })
+}
+
+/// Summary of some rows of a load: start bounds, complete service set
+/// (≤128 values of 1..256 bytes), trace IDs, metadata proof, status codes
+/// and whether any row has an event.
+struct Summary {
+    min: i64,
+    max: i64,
+    services: Option<Vec<String>>,
+    ids: Vec<String>,
+    safe: bool,
+    statuses: Vec<i64>,
+    events: bool,
+    resource: OwnerSummary,
+    span: OwnerSummary,
+}
+
+fn summarize(loaded: &Loaded, indices: &[u32]) -> Res<Summary> {
+    let ts: &Int64Array = column(&loaded.merged, "timestamp_ns")?;
+    let service: &StringArray = column(&loaded.merged, "service")?;
+    let trace: &StringArray = column(&loaded.merged, "trace_id")?;
+    let status: &Int64Array = column(&loaded.merged, "status_code")?;
+    let payload: &StringArray = column(&loaded.merged, "payload")?;
+    let (mut resource, mut span) = (Owner::new(), Owner::new());
+    let (mut min, mut max) = (i64::MAX, i64::MIN);
+    let mut services = Some(BTreeSet::new());
+    let mut ids = BTreeSet::new();
+    let mut statuses = BTreeSet::new();
+    let (mut safe, mut events) = (true, false);
+    for &i in indices {
+        let i = i as usize;
+        min = min.min(ts.value(i));
+        max = max.max(ts.value(i));
+        ids.insert(trace.value(i));
+        statuses.insert(status.value(i));
+        safe &= loaded.safe[i];
+        events |= loaded.events[i];
+        let fields = crate::trace_search::object(payload.value(i).as_bytes()).ok();
+        let owner = |name: &[u8]| {
+            fields
+                .as_ref()
+                .and_then(|f| crate::trace_search::field(f, name).ok())
+        };
+        resource.add(owner(b"resource"));
+        span.add(owner(b"attributes"));
+        services =
+            services.filter(|_| !service.is_null(i) && (1..=256).contains(&service.value(i).len()));
+        if let Some(set) = services.as_mut() {
+            set.insert(service.value(i));
+            if set.len() > 128 {
+                services = None;
+            }
+        }
+    }
+    if indices.is_empty() {
+        (min, max) = (0, 0);
+    }
+    Ok(Summary {
+        min,
+        max,
+        services: services.map(|s| s.into_iter().map(str::to_owned).collect()),
+        ids: ids.into_iter().map(str::to_owned).collect(),
+        safe,
+        statuses: statuses.into_iter().collect(),
+        events,
+        resource: resource.finish(),
+        span: span.finish(),
+    })
+}
+
+fn write<'a>(
+    env: Env<'a>,
+    schema: arrow::datatypes::SchemaRef,
+    batch: &RecordBatch,
+) -> Res<Binary<'a>> {
     let sink = crate::out::BinaryWriter(crate::out::BinSink::with_capacity(4096));
     let props = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
@@ -453,25 +504,149 @@ pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compac
         .set_column_dictionary_enabled(ColumnPath::from("span_id"), false);
     let mut writer =
         ArrowWriter::try_new(sink, schema, Some(props.build())).map_err(|_| Error::Invalid)?;
-    writer.write(&sorted).map_err(|_| Error::Invalid)?;
-    let blob = writer
+    writer.write(batch).map_err(|_| Error::Invalid)?;
+    Ok(writer
         .into_inner()
         .map_err(|_| Error::Invalid)?
         .0
-        .finish(env);
-    if rows == 0 {
-        min = 0;
-        max = 0;
-    }
+        .finish(env))
+}
+
+fn sort_columns(batch: &RecordBatch, names: &[&str]) -> Res<Vec<SortColumn>> {
+    names
+        .iter()
+        .map(|name| {
+            Ok(SortColumn {
+                values: batch.column_by_name(name).ok_or(Error::Invalid)?.clone(),
+                options: None,
+            })
+        })
+        .collect()
+}
+
+pub fn compact<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Res<Compacted<'a>> {
+    let loaded = load(blobs, max_rows)?;
+    let sort = sort_columns(
+        &loaded.merged,
+        &["service", "timestamp_ns", "trace_id", "span_id"],
+    )?;
+    let indices = lexsort_to_indices(&sort, None).map_err(|_| Error::Invalid)?;
+    let all: Vec<u32> = (0..loaded.rows as u32).collect();
+    let summary = summarize(&loaded, &all)?;
+    let sorted = take_record_batch(&loaded.merged, &indices).map_err(|_| Error::Invalid)?;
+    let blob = write(env, loaded.schema.clone(), &sorted)?;
     Ok((
         blob,
-        min,
-        max,
-        rows,
-        complete_services.then(|| services.into_iter().collect()),
-        ids.into_iter().collect(),
-        metadata_safe,
+        summary.min,
+        summary.max,
+        loaded.rows,
+        summary.services,
+        summary.ids,
+        summary.safe,
     ))
+}
+
+/// One output of `compact_split`: blob, bounds, rows, summary.
+pub type SplitOutput<'a> = (
+    Binary<'a>,
+    i64,
+    i64,
+    usize,
+    (Option<Vec<String>>, Vec<String>, bool),
+    (Vec<i64>, bool, OwnerSummary, OwnerSummary),
+);
+
+/// Merge sources into several outputs, each holding one service's rows of one
+/// class (spans with error status or events, or the others) in start order,
+/// at most `max_ids` distinct trace IDs (`max_flagged_ids` for the error/event
+/// class, which TraceQL metrics read) and `max_output_rows` rows. Outputs
+/// keep the encoder's `(service, timestamp, trace_id, span_id)` order, so a
+/// service filter, an error/event filter and trace-ID context lookups each
+/// read only the outputs that can hold their rows.
+pub fn compact_split<'a>(
+    env: Env<'a>,
+    blobs: Term<'a>,
+    max_rows: usize,
+    max_ids: usize,
+    max_flagged_ids: usize,
+    max_output_rows: usize,
+) -> Res<Vec<SplitOutput<'a>>> {
+    let loaded = load(blobs, max_rows)?;
+    let status: &Int64Array = column(&loaded.merged, "status_code")?;
+    let flagged: arrow::array::BooleanArray = (0..loaded.rows)
+        .map(|i| Some(status.value(i) == 2 || loaded.events[i]))
+        .collect();
+    let mut sort = sort_columns(&loaded.merged, &["service"])?;
+    sort.push(SortColumn {
+        values: Arc::new(flagged.clone()),
+        options: None,
+    });
+    sort.extend(sort_columns(
+        &loaded.merged,
+        &["timestamp_ns", "trace_id", "span_id"],
+    )?);
+    let order = lexsort_to_indices(&sort, None).map_err(|_| Error::Invalid)?;
+    let service: &StringArray = column(&loaded.merged, "service")?;
+    let trace: &StringArray = column(&loaded.merged, "trace_id")?;
+    let payload: &StringArray = column(&loaded.merged, "payload")?;
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut current: Vec<u32> = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    let key = |i: usize| {
+        (
+            (!service.is_null(i)).then(|| service.value(i)),
+            flagged.value(i),
+        )
+    };
+    for &i in order.values() {
+        let row = i as usize;
+        let id = trace.value(row);
+        let cap = if flagged.value(row) {
+            max_flagged_ids
+        } else {
+            max_ids
+        };
+        let split = current.last().is_some_and(|&last| {
+            key(last as usize) != key(row)
+                || current.len() >= max_output_rows
+                || bytes >= MAX_PAYLOAD_BYTES / 2
+                || (!ids.contains(id) && ids.len() >= cap)
+        });
+        if split {
+            groups.push(std::mem::take(&mut current));
+            ids.clear();
+            bytes = 0;
+        }
+        ids.insert(id);
+        bytes += payload.value(row).len();
+        current.push(i);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+        .into_iter()
+        .map(|group| {
+            let summary = summarize(&loaded, &group)?;
+            let indices = arrow::array::UInt32Array::from(group);
+            let batch = take_record_batch(&loaded.merged, &indices).map_err(|_| Error::Invalid)?;
+            let blob = write(env, loaded.schema.clone(), &batch)?;
+            Ok((
+                blob,
+                summary.min,
+                summary.max,
+                batch.num_rows(),
+                (summary.services, summary.ids, summary.safe),
+                (
+                    summary.statuses,
+                    summary.events,
+                    summary.resource,
+                    summary.span,
+                ),
+            ))
+        })
+        .collect()
 }
 
 pub fn row_count(blob: Binary<'_>) -> Res<usize> {
@@ -1122,4 +1297,75 @@ fn matches_attributes(
         }
     }
     Ok(true)
+}
+
+/// Per output, the string values of each resource ("r") and span ("s")
+/// attribute key, as `TraceAttributeSummary.build/1` collects them from the
+/// records' projected maps: at most 64 keys, 8 values of at most 96 bytes per
+/// key (more become unknown, `None`), and whether no unlisted key holds a
+/// string value. A row whose map is missing leaves the owner unknown.
+#[derive(Default)]
+struct Owner {
+    keys: std::collections::BTreeMap<String, Option<BTreeSet<String>>>,
+    complete: bool,
+    unknown: bool,
+}
+
+pub type OwnerSummary = (bool, Vec<(String, Option<Vec<String>>)>);
+
+impl Owner {
+    fn new() -> Self {
+        Owner {
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    fn add(&mut self, raw: Option<&[u8]>) {
+        if self.unknown {
+            return;
+        }
+        let Some(fields) = raw.and_then(|raw| crate::trace_search::object(raw).ok()) else {
+            self.unknown = true;
+            return;
+        };
+        for (key, value) in fields.iter() {
+            // Only string projections are tracked; other types never match.
+            let Ok(value) = crate::trace_search::string(value) else {
+                continue;
+            };
+            let Ok(key) = std::str::from_utf8(key.as_ref()) else {
+                self.complete = false;
+                continue;
+            };
+            let count = self.keys.len();
+            match self.keys.get_mut(key) {
+                Some(None) => {}
+                Some(slot @ Some(_)) => {
+                    let values = slot.as_mut().expect("present");
+                    values.insert(value.clone());
+                    if value.len() > 96 || values.len() > 8 {
+                        *slot = None;
+                    }
+                }
+                None if (1..=256).contains(&key.len()) && count < 64 => {
+                    let values = (value.len() <= 96).then(|| BTreeSet::from([value]));
+                    self.keys.insert(key.to_owned(), values);
+                }
+                None => self.complete = false,
+            }
+        }
+    }
+
+    fn finish(self) -> OwnerSummary {
+        if self.unknown {
+            return (false, Vec::new());
+        }
+        let keys = self
+            .keys
+            .into_iter()
+            .map(|(key, values)| (key, values.map(|v| v.into_iter().collect())))
+            .collect();
+        (self.complete, keys)
+    }
 }

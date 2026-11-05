@@ -8,12 +8,16 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
   alias Pulso.Storage.S3.CompactionOwnership
   alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.CompactionWorker
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.ManifestSupervision
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.TraceCompactor
   alias Pulso.Test.CompactionStore
   alias Pulso.Test.OTLPTraceFixture, as: Fixture
+  alias Pulso.Test.TuistTraceFixture
+  alias Pulso.Traces.Metrics
+  alias Pulso.Traces.TempoSearch
 
   setup tags do
     agent =
@@ -99,7 +103,10 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
     assert :ok = S3.append(:traces, ctx.tenant, [a, b], idempotency_key: "batch")
     assert :ok = S3.append(:traces, ctx.tenant, [a])
     assert {:ok, before} = S3.query(:traces, ctx.tenant, [])
-    assert {:ok, %{merged: 2, replacement: replacement}} = TraceCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+
+    assert {:ok, %{merged: 2, replacements: [replacement]}} =
+             TraceCompactor.compact(ctx.tenant, ctx.config, grace_ms: 0)
+
     manifest = load(ctx)
     assert [segment] = manifest.segments
     assert segment.key == replacement
@@ -170,5 +177,92 @@ defmodule Pulso.Storage.S3.TraceCompactorTest do
     send(worker, :compact)
     _ = :sys.get_state(worker, 60_000)
     assert [_] = load(ctx).segments
+  end
+
+  # Canary flushed traces every 2 s: an hour held more segments than one query
+  # may read, so every trace panel failed until hours were merged.
+  test "an hour of per-flush segments merges into service, class and ID objects that queries prune", ctx do
+    Runtime.put_env(:pulso, Pulso.Storage, adapter: S3)
+    Runtime.put_env(:pulso, TempoSearch, enabled: true)
+    hour = div(System.os_time(:second), 3600) * 3600 - 7200
+    flushes = 1100
+
+    1..flushes
+    |> Pulso.Runtime.Task.async_stream(
+      fn n -> :ok = S3.append(:traces, ctx.tenant, flush((hour + div(n * 3, 1)) * 1_000_000_000, n)) end,
+      max_concurrency: 16,
+      timeout: :infinity
+    )
+    |> Stream.run()
+
+    window = {hour * 1_000_000_000, (hour + 3600) * 1_000_000_000, 60_000_000_000}
+    errors = ~s[{ status = error } | rate()]
+
+    search =
+      &TempoSearch.query(ctx.tenant, &1,
+        trace_start: hour * 1_000_000_000,
+        trace_end: (hour + 3600) * 1_000_000_000,
+        limit: 20,
+        spss: 10
+      )
+
+    assert {:error, :query_scan_limit} = Metrics.query(ctx.tenant, errors, window, false)
+    {:ok, uncompacted} = search.(~s[{ status = error }])
+
+    # As maintenance passes do: an empty pass rotates the candidate cursor.
+    for _ <- 1..40, do: assert({:ok, _} = TraceCompactor.compact(ctx.tenant, ctx.config, settle_ms: 0))
+    segments = active(ctx)
+    assert length(segments) < 100
+    assert Enum.sum_by(segments, & &1.row_count) == flushes * 20
+
+    for segment <- segments do
+      summary = segment.trace_summary
+      assert [_service] = summary.services
+      flagged? = 2 in summary.statuses or summary.events?
+      assert byte_size(summary.lookup_hashes) <= if(flagged?, do: 1024, else: 256) * 8
+      assert summary.pruning_safe?
+      assert is_list(summary.statuses)
+    end
+
+    error_objects = Enum.filter(segments, &(2 in &1.trace_summary.statuses))
+    assert length(error_objects) * 3 < length(segments)
+
+    assert {:ok, json} = Metrics.query(ctx.tenant, errors, window, false)
+    # Five failing spans per flush; the 1h window holds every flush.
+    total =
+      json
+      |> Pulso.JSON.decode!()
+      |> get_in(["series", Access.all(), "samples", Access.all(), "value"])
+      |> List.flatten()
+      |> Enum.sum()
+
+    assert_in_delta total * 60, flushes * 5, 0.001
+    assert {:ok, ^uncompacted} = search.(~s[{ status = error }])
+  end
+
+  defp active(ctx) do
+    root = load(ctx)
+    {:ok, segments} = JournalManifest.query(root, ctx.tenant, "traces", [], ctx.config)
+    segments
+  end
+
+  defp flush(start, n) do
+    for request <- TuistTraceFixture.requests(start) do
+      request =
+        update_in(
+          request,
+          ["resourceSpans", Access.all(), "scopeSpans", Access.all(), "spans", Access.all(), "traceId"],
+          fn id ->
+            (n * 1000 + String.to_integer(id, 16))
+            |> Integer.to_string(16)
+            |> String.downcase()
+            |> String.pad_leading(32, "0")
+          end
+        )
+
+      {:ok, spans, 0} = Traces.decode(request)
+      spans
+    end
+    |> List.flatten()
   end
 end

@@ -96,6 +96,9 @@ pub struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
     depth: usize,
+    // The whole buffer is valid UTF-8, and so is every string chunk, since
+    // chunks end at ASCII quotes and backslashes.
+    utf8: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -104,6 +107,16 @@ impl<'a> Parser<'a> {
             buf,
             pos: 0,
             depth: 0,
+            utf8: false,
+        }
+    }
+
+    /// A parser over text already known to be UTF-8, such as an Arrow
+    /// string column value: strings then skip UTF-8 validation.
+    pub fn new_utf8(buf: &'a str) -> Self {
+        Parser {
+            utf8: true,
+            ..Parser::new(buf.as_bytes())
         }
     }
 
@@ -149,8 +162,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
     #[inline]
-    fn peek(&self) -> Res<u8> {
+    pub(crate) fn peek(&self) -> Res<u8> {
         self.buf.get(self.pos).copied().ok_or(Fallback)
     }
 
@@ -322,6 +339,35 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // After an array's `[`: true when a first element follows (positioned on
+    // it), false after an immediate `]`.
+    pub(crate) fn array_rest(&mut self) -> Res<bool> {
+        self.ws();
+        if self.peek()? == b']' {
+            self.pos += 1;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    // After an element: true when another follows (positioned on it), false
+    // after the closing `]`.
+    pub(crate) fn array_next(&mut self) -> Res<bool> {
+        self.ws();
+        match self.peek()? {
+            b',' => {
+                self.pos += 1;
+                self.ws();
+                Ok(true)
+            }
+            b']' => {
+                self.pos += 1;
+                Ok(false)
+            }
+            _ => Err(Fallback),
+        }
+    }
+
     /// Top-level object whose values are returned unparsed, as slices of
     /// the input. Used by the segment decoder to look at a few fields
     /// before deciding whether to build the rest.
@@ -382,7 +428,7 @@ impl<'a> Parser<'a> {
         let rest = &self.buf[start..];
         let end = memchr::memchr2(b'"', b'\\', rest).ok_or(Fallback)?;
         let chunk = &rest[..end];
-        check_chunk(chunk)?;
+        check_chunk(chunk, self.utf8)?;
         if rest[end] == b'"' {
             self.pos = start + end + 1;
             return Ok(Cow::Borrowed(chunk));
@@ -413,7 +459,7 @@ impl<'a> Parser<'a> {
             let rest = &self.buf[self.pos..];
             let end = memchr::memchr2(b'"', b'\\', rest).ok_or(Fallback)?;
             let chunk = &rest[..end];
-            check_chunk(chunk)?;
+            check_chunk(chunk, self.utf8)?;
             owned.extend_from_slice(chunk);
             self.pos += end;
             if rest[end] == b'"' {
@@ -568,8 +614,8 @@ fn has_nonzero_digit(text: &str) -> bool {
 /// A multi-byte sequence never contains `\` or `"`, so validating chunk by
 /// chunk is equivalent to validating the whole string.
 #[inline]
-fn check_chunk(chunk: &[u8]) -> Res<()> {
-    if chunk.iter().any(|&c| c < 0x20) || simdutf8::basic::from_utf8(chunk).is_err() {
+fn check_chunk(chunk: &[u8], utf8: bool) -> Res<()> {
+    if chunk.iter().any(|&c| c < 0x20) || (!utf8 && simdutf8::basic::from_utf8(chunk).is_err()) {
         Err(Fallback)
     } else {
         Ok(())

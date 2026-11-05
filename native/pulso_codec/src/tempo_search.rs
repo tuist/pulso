@@ -533,6 +533,21 @@ pub(crate) fn validate_row<'a>(
     validate_fields(id, start, end, &fields)?;
     Ok(fields)
 }
+/// `validate_row/4` for an Arrow string value, plus the typed envelope's
+/// members.
+pub(crate) fn validate_row_parts<'a>(
+    id: &str,
+    start: i64,
+    end: i64,
+    payload: &'a str,
+) -> Res<crate::trace_metadata::Parts<'a>> {
+    if payload.len() > MAX {
+        return Err(Error::Budget);
+    }
+    let parts = crate::trace_metadata::validated_parts_utf8(payload).map_err(|_| Error::Invalid)?;
+    validate_fields(id, start, end, &parts.0)?;
+    Ok(parts)
+}
 // The caller must already have validated the typed envelope.
 pub(crate) fn validate_fields(
     id: &str,
@@ -877,7 +892,7 @@ impl State {
             return true;
         }
         if let Some(hashes) =
-            hashes.filter(|h| !h.is_empty() && h.len() <= 2048 && h.len().is_multiple_of(8))
+            hashes.filter(|h| !h.is_empty() && h.len() <= 8192 && h.len().is_multiple_of(8))
         {
             for bytes in hashes.as_chunks::<8>().0 {
                 if self.plan_probes >= 2_000_000 {

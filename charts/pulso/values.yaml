@@ -229,6 +229,11 @@ manifestBackups:
 # admission but no storage. They do not establish stored values or TraceQL support.
 tempoSearch:
   enabled: false
+  # A candidate trace's other spans are read from sources starting or ending
+  # within this horizon of the candidates' segments. Traces longer than it can
+  # report a shorter duration and fewer matching spans. 0 reads every retained
+  # source, which is slow on long retention.
+  contextHorizonMs: 3600000
 
 # OTLP/gRPC receiver for logs, metrics and traces (Collector, Alloy and SDK
 # exporters). Uses the same tenancy (`x-scope-orgid` metadata or Basic
@@ -260,9 +265,14 @@ logCompaction:
   groupByStream: true
 
 traceCompaction:
-  # Experimental native merges. Upgrade all readers/writers/compactors and enable bucket versioning
-  # first. Retention is configured separately under retention.tracesDays.
-  enabled: false
+  # Merges each hour's per-flush trace segments into objects of one service,
+  # one class (error/event spans or the others) and at most 256 trace IDs, so
+  # Tempo search and TraceQL metrics read only the objects that can match.
+  # Uses the same manifest backups and cleanup as logs and metrics, so it is
+  # safe without bucket versioning (Tigris). Upgrade every pod writing to the
+  # bucket to 1.38 or later before relying on it; older pods read the merged
+  # objects but do not prune them. Retention is configured under retention.tracesDays.
+  enabled: true
 
 # Experimental event-time retention. Read docs/retention.md before changing any
 # of these. Defaults keep unlimited retention: no durations and no worker.

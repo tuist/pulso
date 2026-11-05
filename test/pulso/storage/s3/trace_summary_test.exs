@@ -2,6 +2,7 @@ defmodule Pulso.Storage.S3.TraceSummaryTest do
   use Pulso.Test.Case, async: true
 
   alias Pulso.Storage.S3.TraceSummary
+  alias Pulso.Traces.TempoSearch
 
   test "adaptive bounded bloom survives wire round trips with no false negatives" do
     records =
@@ -155,5 +156,48 @@ defmodule Pulso.Storage.S3.TraceSummaryTest do
     page = TraceSummary.page_summary([entry.(summary), entry.(TraceSummary.build([row.("/v1/cache/1", %{})]))])
     assert TraceSummary.page_matches?(page, attributes: %{"http.route" => "/v1/cache/1"})
     refute TraceSummary.page_matches?(page, attributes: %{"http.route" => "/api/cache"})
+  end
+
+  test "status and event classes prune only proven sources whose rows cannot match" do
+    plain = %{
+      trace_id: Base.encode16(<<1::128>>, case: :lower),
+      service: "api",
+      status: %{"code" => 0},
+      events: [],
+      otlp: %{"events" => []}
+    }
+
+    failing = %{plain | status: %{"code" => 2}}
+    with_event = %{plain | events: [%{"name" => "exception"}], otlp: %{"events" => [[]]}}
+
+    requires = fn query ->
+      {:ok, {:expression, program}} = TempoSearch.parse(query)
+      TraceSummary.requirements(program)
+    end
+
+    assert requires.(~s[{ status = error }]) == [:error]
+    assert requires.(~s[{ event.exception.type != "" } | select(event.exception.type)]) == [:event]
+    assert requires.(~s[{ span.a = "x" } >> { status = error && event.exception.type = "E" }]) == [:error, :event]
+    assert requires.(~s[{ status = error || span.a = "x" }]) == []
+    assert requires.(~s[{ status != error }]) == []
+
+    for {records, error?, event?} <- [
+          {[plain], false, false},
+          {[plain, failing], true, false},
+          {[with_event], false, true}
+        ] do
+      summary = TraceSummary.build(records, true)
+      assert TraceSummary.parse(TraceSummary.to_wire(summary)) == summary
+      assert TraceSummary.matches?(summary, trace_requires: [:error]) == error?
+      assert TraceSummary.matches?(summary, trace_requires: [:event]) == event?
+      page = TraceSummary.page_summary([%{"t" => TraceSummary.to_wire(summary)}])
+      assert TraceSummary.page_matches?(page, trace_requires: [:error]) == error?
+      # Without the publication proof nothing is pruned.
+      assert TraceSummary.matches?(TraceSummary.build(records), trace_requires: [:error, :event])
+    end
+
+    # Rows without typed metadata never prove they have no events.
+    legacy = TraceSummary.build([%{plain | otlp: nil}], true)
+    assert TraceSummary.matches?(legacy, trace_requires: [:event])
   end
 end

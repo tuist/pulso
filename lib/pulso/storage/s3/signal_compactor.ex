@@ -493,7 +493,8 @@ defmodule Pulso.Storage.S3.SignalCompactor do
       else: :ok
   end
 
-  defp advance_empty_cursor(%{version: 3}, candidates, tenant, config) do
+  @doc false
+  def advance_empty_cursor(%{version: 3}, candidates, tenant, config) do
     case candidates.paging["compaction_candidate"] do
       nil ->
         :ok
@@ -511,7 +512,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp advance_empty_cursor(%{version: 4}, candidates, tenant, config) do
+  def advance_empty_cursor(%{version: 4}, candidates, tenant, config) do
     next = candidates.paging["compaction_candidate"]
 
     advance = fn root ->
@@ -524,7 +525,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp advance_empty_cursor(_root, _candidates, _tenant, _config), do: :ok
+  def advance_empty_cursor(_root, _candidates, _tenant, _config), do: :ok
 
   defp compaction_candidates(%{version: 3} = root, tenant, config),
     do: PagedManifest.candidates(root, tenant, signal_string(config), config)
@@ -573,7 +574,8 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     monitor(:cleanup, fn -> do_cleanup(tenant, config, opts) end)
   end
 
-  defp monitor(operation, fun) do
+  @doc false
+  def monitor(operation, fun) do
     Pulso.Metrics.measure(
       :compaction,
       Atom.to_string(operation),

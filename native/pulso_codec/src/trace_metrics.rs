@@ -131,6 +131,12 @@ impl Mapper {
 // power-of-two bucket of bucketed operations.
 type Labels = Vec<Option<Vec<u8>>>;
 type Key = (Labels, Option<u64>);
+
+struct Observation {
+    interval: usize,
+    key: Key,
+    value: f64,
+}
 // A finished series: output labels and one value per interval (NaN: none).
 type Final = (Vec<(String, Vec<u8>)>, Vec<f64>);
 
@@ -532,6 +538,7 @@ impl State {
             };
             let (starts, ends) = (ints("timestamp_ns")?, ints("end_timestamp_ns")?);
             let (ids, payloads) = (strings("trace_id")?, strings("payload")?);
+            let mut selected = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 if starts.is_null(i) || ends.is_null(i) || ids.is_null(i) || payloads.is_null(i) {
                     return Err(Error::Invalid);
@@ -541,39 +548,93 @@ impl State {
                 if start < floor || start < 0 {
                     continue;
                 }
-                let Some(interval) = self.mapper.interval(start as u64) else {
-                    continue;
-                };
-                let payload = payloads.value(i).as_bytes();
-                let fields =
-                    crate::tempo_search::validate_row(ids.value(i), start, ends.value(i), payload)?;
-                self.observe(&fields, interval, start, ends.value(i), budget)?;
+                if let Some(interval) = self.mapper.interval(start as u64) {
+                    selected.push((i, interval));
+                }
+            }
+            // Row validation and selector evaluation dominate a scan and are
+            // independent per row, so chunks run on scoped threads; series are
+            // updated afterwards in row order. The first failing row's error
+            // wins, and work units are summed against the shared ceiling.
+            let measure = |chunk: &[(usize, usize)], mut work: usize| {
+                let mut out = Vec::with_capacity(chunk.len());
+                for &(i, interval) in chunk {
+                    let (start, end) = (starts.value(i), ends.value(i));
+                    let payload = payloads.value(i);
+                    let measured =
+                        crate::tempo_search::validate_row_parts(ids.value(i), start, end, payload)
+                            .and_then(|(fields, envelope)| {
+                                let envelope = envelope.as_ref();
+                                self.measure(&fields, envelope, interval, start, end, &mut work)
+                            });
+                    match measured {
+                        Ok(observation) => out.push(observation),
+                        Err(error) => return (out, work, Some(error)),
+                    }
+                }
+                (out, work, None)
+            };
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .clamp(1, 4);
+            let size = selected.len().div_ceil(threads).max(256);
+            let base = budget.work;
+            let results: Vec<_> = if selected.len() > size {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = selected
+                        .chunks(size)
+                        .map(|chunk| scope.spawn(move || measure(chunk, base)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or((Vec::new(), base, Some(Error::Invalid))))
+                        .collect()
+                })
+            } else {
+                vec![measure(&selected, base)]
+            };
+            for (observations, work, error) in results {
+                budget.work = budget.work.saturating_add(work - base);
+                if budget.work > MAX_WORK {
+                    return Err(Error::Budget);
+                }
+                for observation in observations.into_iter().flatten() {
+                    self.record(observation, budget)?;
+                }
+                if let Some(error) = error {
+                    return Err(error);
+                }
             }
         }
         Ok(rows)
     }
 
-    fn observe(
-        &mut self,
-        fields: &RawFields<'_>,
+    /// What one row adds, if it is selected; reads only `&self`.
+    fn measure<'p>(
+        &self,
+        fields: &RawFields<'p>,
+        envelope: Option<&crate::trace_metadata::Envelope<'p>>,
         interval: usize,
         start: i64,
         end: i64,
-        budget: &mut Budget,
-    ) -> Res<()> {
+        work: &mut usize,
+    ) -> Res<Option<Observation>> {
         if self.requires_originals && field(fields, b"otlp").unwrap_or(b"null") == b"null" {
             return Err(Error::Unknown);
         }
         if self.root_only && field(fields, b"parent_span_id")? != b"null" {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(program) = &self.program {
-            if !program.evaluate(fields, &mut budget.work, false)?.matched {
-                return Ok(());
+            if !program
+                .evaluate_with(fields, envelope, work, false)?
+                .matched
+            {
+                return Ok(None);
             }
         }
         let owners = if self.needs_attributes {
-            Owners::read(fields)?
+            Owners::read(fields, envelope)?
         } else {
             Owners::default()
         };
@@ -593,7 +654,7 @@ impl State {
         let bucket = if self.op.bucketed() {
             match bucket(&self.value, value) {
                 Some(bucket) => Some(bucket.to_bits()),
-                None => return Ok(()),
+                None => return Ok(None),
             }
         } else {
             None
@@ -604,7 +665,19 @@ impl State {
         } else {
             value
         };
-        let key = (labels, bucket);
+        Ok(Some(Observation {
+            interval,
+            key: (labels, bucket),
+            value,
+        }))
+    }
+
+    fn record(&mut self, observation: Observation, budget: &mut Budget) -> Res<()> {
+        let Observation {
+            interval,
+            key,
+            value,
+        } = observation;
         let full = budget.series >= MAX_SERIES
             || budget.points.saturating_add(self.mapper.count) > MAX_POINTS;
         let series = match self.series.entry(key) {
@@ -886,25 +959,29 @@ fn select_k(finals: Vec<Final>, top: bool, k: usize, intervals: usize) -> Vec<Fi
 // The typed attribute owners of a span, read once per observed span.
 #[derive(Default)]
 struct Owners<'a> {
-    resource: BTreeMap<String, &'a [u8]>,
-    span: BTreeMap<String, &'a [u8]>,
+    resource: crate::tempo_expression::Owner<'a>,
+    span: crate::tempo_expression::Owner<'a>,
 }
 
 impl<'a> Owners<'a> {
-    fn read(fields: &RawFields<'a>) -> Res<Self> {
-        match field(fields, b"otlp") {
-            Ok(raw) if raw != b"null" => {
-                let meta = object(raw)?;
-                Ok(Owners {
-                    resource: crate::tempo_expression::attributes(field(&meta, b"resource")?)?,
-                    span: crate::tempo_expression::attributes(field(&meta, b"attributes")?)?,
-                })
+    // `envelope` is the validated typed envelope's members, when known.
+    fn read(
+        fields: &RawFields<'a>,
+        envelope: Option<&crate::trace_metadata::Envelope<'a>>,
+    ) -> Res<Self> {
+        let parsed;
+        let meta = match (envelope, field(fields, b"otlp")) {
+            (Some(envelope), _) => &envelope.members,
+            (None, Ok(raw)) if raw != b"null" => {
+                parsed = object(raw)?;
+                &parsed
             }
-            _ => Ok(Owners {
-                resource: BTreeMap::new(),
-                span: BTreeMap::new(),
-            }),
-        }
+            _ => return Ok(Owners::default()),
+        };
+        Ok(Owners {
+            resource: crate::tempo_expression::attributes(field(meta, b"resource")?)?,
+            span: crate::tempo_expression::attributes(field(meta, b"attributes")?)?,
+        })
     }
 
     // The value as typed OTLP AnyValue JSON, or None when missing or of a
@@ -922,11 +999,11 @@ impl<'a> Owners<'a> {
             }
         };
         Ok(match lookup {
-            Lookup::Span(key) => attribute(self.span.get(key))?,
-            Lookup::Resource(key) => attribute(self.resource.get(key))?,
-            Lookup::Unscoped(key) => match attribute(self.span.get(key))? {
+            Lookup::Span(key) => attribute(self.span.get(key.as_str()))?,
+            Lookup::Resource(key) => attribute(self.resource.get(key.as_str()))?,
+            Lookup::Unscoped(key) => match attribute(self.span.get(key.as_str()))? {
                 Some(v) => Some(v),
-                None => attribute(self.resource.get(key))?,
+                None => attribute(self.resource.get(key.as_str()))?,
             },
             Lookup::Name => Some(string_value(string(field(fields, b"name")?)?.as_bytes())),
             Lookup::SpanId => Some(string_value(string(field(fields, b"span_id")?)?.as_bytes())),

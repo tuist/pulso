@@ -71,6 +71,8 @@ defmodule Pulso.Traces.Metrics do
   defp run(tenant, parsed, window, storage_opts, attempts \\ 2) do
     {start, finish, _step, _instant} = window
     opts = Keyword.merge(storage_opts, start_ts: start, end_ts: finish)
+    # The selector lets storage skip sources no matching span can be in.
+    opts = if is_list(parsed[:program]), do: Keyword.put(opts, :trace_program, parsed.program), else: opts
 
     with {:ok, metrics} <- new(parsed, window) do
       case Storage.trace_metrics_scan(tenant, opts, metrics) do

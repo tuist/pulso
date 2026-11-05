@@ -142,6 +142,8 @@ spec:
             {{- end }}
             - name: PULSO_TEMPO_SEARCH_ENABLED
               value: {{ .Values.tempoSearch.enabled | quote }}
+            - name: PULSO_TRACE_SEARCH_CONTEXT_HORIZON_MS
+              value: {{ include "pulso.boundedInteger" (list "tempoSearch.contextHorizonMs" .Values.tempoSearch.contextHorizonMs 0 604800000) | quote }}
             - name: PULSO_METRICS_FOOTER_PRUNING_ENABLED
               value: {{ .Values.metricsFooterPruning.enabled | quote }}
             - name: PULSO_OBJECT_CACHE_MEMORY_MB

@@ -72,6 +72,14 @@ defmodule Pulso.Storage.S3.TraceAttributeSummary do
   defp valid_value?(value), do: is_binary(value) and byte_size(value) <= @max_value_bytes and String.valid?(value)
 
   @doc false
+  # The value sets native trace compaction collected for one output, by the
+  # same rules as `build/1`: `{complete?, [{key, values | nil}]}` per owner.
+  def from_native({_, _} = resource, {_, _} = span),
+    do: fit(%{"r" => native_owner(resource), "s" => native_owner(span)}, @segment_bytes)
+
+  defp native_owner({complete?, keys}), do: {Map.new(keys), complete?}
+
+  @doc false
   # The union over sources whose rows together are exactly (or a subset of)
   # the target's rows: a compaction replacement or a manifest page. Unknown
   # sources keep only values every other source proves.

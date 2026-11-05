@@ -14,19 +14,26 @@ defmodule Pulso.Test.LatencyStore do
     dir = Keyword.fetch!(opts, :dir)
     File.mkdir_p!(dir)
 
-    %{
+    store = %{
       objects: :ets.new(:latency_store_objects, [:public, :ordered_set, read_concurrency: true]),
       stats: :ets.new(:latency_store_stats, [:public, :set, write_concurrency: true]),
       lock: :ets.new(:latency_store_locks, [:public, :set]),
-      dir: dir,
-      get_ms: Keyword.get(opts, :get_ms, {140, 190}),
-      put_ms: Keyword.get(opts, :put_ms, {220, 350}),
-      list_ms: Keyword.get(opts, :list_ms, {140, 190}),
-      delete_ms: Keyword.get(opts, :delete_ms, {100, 150})
+      latency: :ets.new(:latency_store_latency, [:public, :set, read_concurrency: true]),
+      dir: dir
     }
+
+    set_latency(store, opts)
+    store
   end
 
-  @doc "Counters as `%{{class, purpose, status} => {count, bytes}}`."
+  @doc "Change request latencies (`:get_ms`, `:put_ms`, `:list_ms`, `:delete_ms` ranges) of a running store."
+  def set_latency(store, opts) do
+    defaults = [get_ms: {140, 190}, put_ms: {220, 350}, list_ms: {140, 190}, delete_ms: {100, 150}]
+    for {name, default} <- defaults, do: :ets.insert(store.latency, {name, Keyword.get(opts, name, default)})
+    :ok
+  end
+
+  @doc "Counters as `%{{class, purpose, method, status} => {count, bytes}}`; purposes name their signal (`segment:traces`)."
   def stats(store) do
     for {key, count, bytes} when is_tuple(key) <- :ets.tab2list(store.stats), into: %{}, do: {key, {count, bytes}}
   end
@@ -35,13 +42,7 @@ defmodule Pulso.Test.LatencyStore do
   def inventory(store) do
     :ets.foldl(
       fn {key, _etag, size, _}, acc ->
-        signal =
-          case Regex.run(~r{/signal=(\w+)/}, key) do
-            [_, signal] -> ":" <> signal
-            _ -> ""
-          end
-
-        Map.update(acc, purpose(key) <> signal, {1, size}, fn {n, b} -> {n + 1, b + size} end)
+        Map.update(acc, purpose(key) <> signal(key), {1, size}, fn {n, b} -> {n + 1, b + size} end)
       end,
       %{},
       store.objects
@@ -64,7 +65,7 @@ defmodule Pulso.Test.LatencyStore do
     {body, conn} = read_full_body(conn, [])
     list? = conn.method == "GET" and Map.has_key?(conn.query_params, "list-type")
     {low, high} = latency(store, conn.method, list?)
-    Process.sleep(low + :rand.uniform(high - low + 1) - 1)
+    if high > 0, do: Process.sleep(low + :rand.uniform(high - low + 1) - 1)
 
     {status, headers, response} =
       if list? do
@@ -88,10 +89,11 @@ defmodule Pulso.Test.LatencyStore do
   defp response_size(response) when is_binary(response), do: byte_size(response)
   defp response_size(response), do: IO.iodata_length(response)
 
-  defp latency(store, "PUT", _), do: store.put_ms
-  defp latency(store, "DELETE", _), do: store.delete_ms
-  defp latency(store, "GET", true), do: store.list_ms
-  defp latency(store, _, _), do: store.get_ms
+  defp latency(store, "PUT", _), do: latency(store, :put_ms)
+  defp latency(store, "DELETE", _), do: latency(store, :delete_ms)
+  defp latency(store, "GET", true), do: latency(store, :list_ms)
+  defp latency(store, _, _), do: latency(store, :get_ms)
+  defp latency(store, name), do: :ets.lookup_element(store.latency, name, 2)
 
   # Tigris bills PUT/LIST as Class A and GET/HEAD as Class B; DELETE, 304 and
   # 412 responses are free.
@@ -103,9 +105,16 @@ defmodule Pulso.Test.LatencyStore do
         true -> "B"
       end
 
-    purpose = if list?, do: "list", else: detail(key)
+    purpose = if list?, do: "list", else: detail(key) <> signal(key)
     slot = {class, purpose, method, status}
     :ets.update_counter(store.stats, slot, [{2, 1}, {3, bytes}], {slot, 0, 0})
+  end
+
+  defp signal(key) do
+    case Regex.run(~r{/signal=(\w+)/}, key) do
+      [_, signal] -> ":" <> signal
+      _ -> ""
+    end
   end
 
   @doc false

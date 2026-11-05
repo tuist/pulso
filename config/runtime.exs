@@ -208,7 +208,7 @@ end
 
 # Opt in only after all writers understand compaction retirement metadata.
 metrics_compaction_enabled = env_var.("PULSO_METRICS_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
-trace_compaction_enabled = env_var.("PULSO_TRACE_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
+trace_compaction_enabled = env_var.("PULSO_TRACE_COMPACTION_ENABLED", "true") in ["1", "true", "yes"]
 log_compaction_enabled = env_var.("PULSO_LOG_COMPACTION_ENABLED", "false") in ["1", "true", "yes"]
 metric_footer_pruning_enabled = env_var.("PULSO_METRICS_FOOTER_PRUNING_ENABLED", "false") in ["1", "true", "yes"]
 # With metrics compaction, settled hours are rewritten into metric-grouped
@@ -333,6 +333,10 @@ parse_integer = fn name, default, range ->
     _ -> raise "#{name} must be an integer in #{inspect(range)}"
   end
 end
+
+# Tempo search reads a candidate trace's other spans from sources within this
+# horizon of the candidates' segments (0: every retained source).
+trace_context_horizon_ms = parse_integer.("PULSO_TRACE_SEARCH_CONTEXT_HORIZON_MS", 3_600_000, 0..604_800_000)
 
 retention_mode =
   case env_var.("PULSO_RETENTION_MODE", "observe") do
@@ -526,6 +530,7 @@ case config_env() do
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
       trace_compaction_enabled: trace_compaction_enabled,
+      trace_context_horizon_ms: trace_context_horizon_ms,
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
       log_rollup_enabled: log_rollup_enabled,
@@ -599,6 +604,7 @@ case config_env() do
     config :pulso, S3,
       compaction_enabled: metrics_compaction_enabled,
       trace_compaction_enabled: trace_compaction_enabled,
+      trace_context_horizon_ms: trace_context_horizon_ms,
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
       log_rollup_enabled: log_rollup_enabled,

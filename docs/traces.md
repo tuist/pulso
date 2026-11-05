@@ -397,9 +397,10 @@ IDs in the newest 4 candidates by `max_ts` (including matches outside the
 requested time window), replaying their exact admitted bytes locally without a
 second GET. Candidate IDs then select additional context sources through complete
 SHA-256-prefix sets or versioned canonical ID blooms, and paged-manifest leaves
-through their ID blooms, **without a service or request-time filter**. Earlier
-roots, other services and nonmatching spans of those IDs are recovered before
-overlap, order or limit. A trace that an unread candidate could still add starts
+through their ID blooms, **without a service or request-time filter**, among the
+sources within the [context horizon](#search-context-horizon) of the round's
+candidates (one hour by default). Earlier roots, other services and nonmatching
+spans of those IDs within it are recovered before overlap, order or limit. A trace that an unread candidate could still add starts
 no later than that candidate's `max_ts`, so when the round's `limit`th trace
 starts after the newest unread candidate, the round's answer is the answer.
 Otherwise the next round plans four times as many candidates, reusing (up to 64
@@ -415,7 +416,7 @@ not a distinct diagnostic metric.
 
 This is **not an integrity scrub of pruned objects**: a missing/corrupt object
 proven irrelevant at publication can go unread, unlike an unplanned full scan.
-Keep coherent manifest/page/segment backups and bucket versioning. It is not a
+Keep coherent manifest/page/segment backups (manifest backups or bucket versioning). It is not a
 posting index, a global query cache, full TraceQL or representative workload/deployed
 client acceptance. Discovery and window-local `search_traces` do **not** use this
 plan; their existing raw source/header costs remain unchanged.
@@ -1644,37 +1645,54 @@ on one node; it does not combine widely spaced sequential exporter flushes,
 compact old segments, or bound manifest growth. A larger batch is not a substitute
 for lifecycle management.
 
-### Optional native compaction
+### Native compaction
 
-Set `PULSO_TRACE_COMPACTION_ENABLED=true`, or Helm `traceCompaction.enabled: true`,
-only after upgrading every reader, writer and compactor sharing the bucket and enabling bucket
-versioning. This flag is independent of metrics compaction. Live eligible trace
-workers rendezvous-own maintenance; conditional manifest writes arbitrate
-ownership races. Idle tenants are discovered from durable storage, not merely
-from traffic handled by the current node.
+On by default (`PULSO_TRACE_COMPACTION_ENABLED`, Helm `traceCompaction.enabled`).
+Without it every ingest flush stays its own segment: at one flush every 2 s an
+hour holds thousands of objects, and Tempo search and TraceQL metrics over an
+hour exceed the query segment budget or time out.
 
-Each pass merges at most 32 small segments from one hour (or one retention
-bucket on paged storage), with default ceilings
-of 8 MiB compressed input and 100,000 rows. Native merge additionally bounds the
-combined normalized payload to 16 MiB and string-column data to 32 MiB; batches
-that cannot merge safely stay active and queryable. Duplicates and all retained
-metadata survive. No data is truncated to make a merge fit.
+Every maintenance pass (once a minute on the rendezvous owner of each tenant)
+rewrites the oldest settled flushes (30 s after their newest span), up to 512
+segments and 60,000 spans at a time, together with the same hour's merged
+objects that are not full yet. The merge splits the hour's spans into objects
+that each hold one service, one class (spans with error status or events, or
+the others) and at most 256 trace IDs, in start order. Each object's manifest
+entry lists its exact trace-ID hashes, its services and attribute value sets,
+its status codes and whether any span has an event, so:
 
-Encoders reject invalid core fields before any segment PUT. Compaction now also
-requires payload/column agreement for service, name, span ID, kind and status,
-besides typed envelopes and identity/timing. `trace_projection_invalid` means a
-stored source cannot merge faithfully; do not guess a repair, clear its proof to
-bypass validation, or delete referenced objects. Preserve the coherent backup,
-inspect/restore the affected data offline, and keep old matching artifacts for
-rollback. A bad earliest group can stall **flat-manifest** tenant compaction;
-paged manifests rotate maintenance cursors but the affected group stays blocked.
-This is fail-closed behavior, not automatic corruption recovery or catalog capacity.
+- service and attribute selectors read only the objects of matching services
+  and values;
+- `status = error`, `event.*` predicates and their `rate()` metrics read only
+  the error/event objects;
+- a candidate trace's other spans are read only from the objects listing it.
 
-Publication uploads the replacement before conditionally retiring originals.
-Originals have a **one-hour grace period**, then restart-safe cleanup deletes
-only the retired keys. Preserve bucket versioning for recovery; after publication
-the manifest, not a raw object listing, determines what is live. Compaction is not
-retention and does not authorize deleting active history.
+Nothing is dropped or aggregated: every span, duplicate and metadata field
+survives. Spans that cannot merge faithfully (`trace_projection_invalid`, a
+size mismatch) stay active and queryable, and their hour is set aside on that
+node for an hour so the others keep merging.
+
+Publication uploads the outputs before one conditional manifest write retires
+their sources. Sources are deleted after a one-hour grace period, and only
+once a [manifest backup](configuration.md#manifest-backups) records their
+retirement, the same model as logs and metrics. It is therefore safe on object
+stores without bucket versioning, such as Tigris. Keep manifest backups on.
+Prefixes with bucketed (`PULSO_RETENTION_MANIFEST_FORMAT=bucketed`) retention
+keep a simpler 32-segment merge and are not backed up; keep versioning there.
+
+Merged objects are readable by every release that reads format-4 manifests;
+older releases ignore the new summary fields and read more objects. Before
+1.38, releases with trace compaction enabled merge differently; upgrade every
+pod writing to the bucket before relying on the pruning above.
+
+#### Search context horizon
+
+Tempo search reads a candidate trace's other spans from sources overlapping
+the candidates' segments widened by `PULSO_TRACE_SEARCH_CONTEXT_HORIZON_MS`
+(Helm `tempoSearch.contextHorizonMs`, default one hour). Traces shorter than
+the horizon are complete. Spans of longer traces outside it are not read, so
+their reported duration and matched span count can be smaller. Set `0` to read
+every retained source, which on long retention is slow.
 
 ### Retention
 
@@ -1712,8 +1730,8 @@ callers cannot bypass the floor with an old cutoff. Choose retention longer than
 Retries of compacted keys are idempotent while retained. Once their bucket has
 expired, retries are permanently rejected instead of acknowledged or resurrected.
 
-Upgrade every reader/writer, enable bucket versioning and preserve coherent
-root/page backups before enforcement. Never remove `.managed` markers or
+Upgrade every reader/writer and preserve coherent root/page backups (bucket
+versioning or Pulso's manifest backups) before enforcement. Never remove `.managed` markers or
 manifests to force LIST reconstruction. Disabling retention or rolling back
 an image cannot undo its format or floor. Do not use bucket lifecycle deletion
 for referenced trace objects. Keep existing production tracing authoritative

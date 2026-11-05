@@ -531,6 +531,8 @@ defmodule Pulso.Storage.S3 do
 
   @impl Pulso.Storage
   def trace_metrics_scan(tenant, opts, metrics) do
+    {program, opts} = Keyword.pop(opts, :trace_program)
+    opts = if is_list(program), do: Keyword.merge(opts, TraceSummary.tempo_filters({:expression, program})), else: opts
     query(:traces, tenant, Keyword.put(Keyword.delete(opts, :limit), :trace_metrics, metrics))
   end
 
@@ -1806,7 +1808,11 @@ defmodule Pulso.Storage.S3 do
     largest = sources |> Enum.map(&(&1.byte_size || @prefetch_bytes)) |> Enum.max(fn -> @prefetch_bytes end)
     maximum = max(configured, min(@max_prefetch, div(@prefetch_bytes, max(largest, 1))))
     # A later trace window follows a whole window the scan could not stop in.
-    stops_early? = (signal == :traces and offset == 0) or (signal == :logs and opts[:log_window] != nil)
+    # TraceQL metrics read every candidate, so they prefetch at full depth.
+    stops_early? =
+      (signal == :traces and offset == 0 and is_nil(opts[:trace_metrics])) or
+        (signal == :logs and opts[:log_window] != nil)
+
     if stops_early?, do: {configured, maximum}, else: {maximum, maximum}
   end
 
@@ -1861,16 +1867,37 @@ defmodule Pulso.Storage.S3 do
   defp newest_first(%{max_ts: nil, key: key}), do: {0, 0, key}
   defp newest_first(%{max_ts: max_ts, key: key}), do: {1, -max_ts, key}
 
-  # Context needs every retained source that may hold a candidate trace:
-  # format-4 leaves whose ID blooms hold none of them are not read.
+  # Context needs every retained source within the context horizon of the
+  # round's candidate segments that may hold a candidate trace: format-4
+  # leaves whose ID blooms hold none of them are not read. A trace's spans
+  # start within its duration of each other, so the horizon (one hour by
+  # default, `:trace_context_horizon_ms`; 0 reads all retained sources) makes
+  # context complete for every trace shorter than it, without reading the
+  # whole retained catalog for each search.
   defp tempo_context_plan(%Manifest{version: 4} = root, start_ts, opts, tenant, config) do
-    fn hashes ->
-      query_segments(root, :traces, start_ts, nil, Keyword.put(opts, :context_hashes, hashes), tenant, config)
+    fn hashes, window ->
+      {from, to} = context_bounds(window, start_ts, config)
+      query_segments(root, :traces, from, to, Keyword.put(opts, :context_hashes, hashes), tenant, config)
     end
   end
 
-  defp tempo_context_plan(manifest, start_ts, opts, tenant, config),
-    do: fn _hashes -> query_segments(manifest, :traces, start_ts, nil, opts, tenant, config) end
+  defp tempo_context_plan(manifest, start_ts, opts, tenant, config) do
+    fn _hashes, window ->
+      {from, to} = context_bounds(window, start_ts, config)
+      query_segments(manifest, :traces, from, to, opts, tenant, config)
+    end
+  end
+
+  defp context_bounds(window, start_ts, config) do
+    horizon = Map.get(config, :trace_context_horizon_ms, 3_600_000) * 1_000_000
+
+    if horizon > 0 and window != [] and Enum.all?(window, &(is_integer(&1.min_ts) and is_integer(&1.max_ts))) do
+      from = Enum.min_by(window, & &1.min_ts).min_ts - horizon
+      {if(start_ts, do: max(start_ts, from), else: from), Enum.max_by(window, & &1.max_ts).max_ts + horizon}
+    else
+      {start_ts, nil}
+    end
+  end
 
   defp tempo_round(n, plan, {memo, memo_bytes}, start_ts, opts, config) do
     with {:ok, planned} <- plan.candidates.(n + 1),
@@ -1912,7 +1939,7 @@ defmodule Pulso.Storage.S3 do
     fetched = MapSet.new(ctx.segments, & &1.key)
 
     with {:ok, true} <- native_result(NIF.tempo_search_plan_hashes(ctx.native, hashes)),
-         {:ok, segments} <- plan.context.(for(<<hash::64 <- hashes>>, do: hash)),
+         {:ok, segments} <- plan.context.(for(<<hash::64 <- hashes>>, do: hash), ctx.segments),
          :ok <- check_catalog(segments),
          {:ok, hits} <- context_hits(Enum.reject(segments, &MapSet.member?(fetched, &1.key)), ctx.native) do
       # Pruned sources prove they hold no potential match; unread candidates

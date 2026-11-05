@@ -4,7 +4,9 @@
 //! Spansets are evaluated per span; structural joins run per complete trace
 //! over the spans' parent links (`structural`).
 use crate::json_read::{Parser, RawFields};
+use crate::trace_metadata::Envelope;
 use crate::trace_search::{field, object, string, Error, Res};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(crate) const WORK_MAX: usize = 20_000_000;
@@ -30,6 +32,8 @@ pub(crate) struct Expression {
     relations: Vec<Relation>,
     select: Vec<(String, String)>,
     events: bool,
+    // Whether any leaf or selection reads resource or span attributes.
+    attributes: bool,
     size: usize,
 }
 enum Instruction {
@@ -58,6 +62,7 @@ impl Expression {
         }
         let size = program.len();
         let (mut leaves, mut regexes, mut stack, mut events) = (0, 0, 0, false);
+        let mut attributes = false;
         let mut spansets = vec![Vec::new()];
         let (mut relations, mut select) = (Vec::new(), Vec::new());
         for (scope, key, op, wanted) in program {
@@ -71,6 +76,7 @@ impl Expression {
                     return None;
                 }
                 events |= key == "event";
+                attributes |= ["resource", "span", "none"].contains(&key.as_str());
                 select.push((key, op));
                 continue;
             }
@@ -155,6 +161,9 @@ impl Expression {
                 _ => return None,
             };
             events |= scope.starts_with("event.");
+            attributes |= ["resource.", "span.", "none."]
+                .iter()
+                .any(|prefix| scope.starts_with(prefix));
             out.push(Instruction::Leaf {
                 scope,
                 key,
@@ -168,6 +177,7 @@ impl Expression {
             relations,
             select,
             events,
+            attributes,
             size,
         })
     }
@@ -188,13 +198,45 @@ impl Expression {
         work: &mut usize,
         collect: bool,
     ) -> Res<Evaluation> {
-        let meta = object(field(fields, b"otlp")?)?;
-        let resource = attributes(field(&meta, b"resource")?)?;
-        let span = attributes(field(&meta, b"attributes")?)?;
-        let mut units = 2 + resource.len() + span.len() + self.size;
+        self.evaluate_with(fields, None, work, collect)
+    }
+
+    /// `evaluate/3` given the typed envelope's members when the caller
+    /// already has them from validation.
+    pub(crate) fn evaluate_with(
+        &self,
+        fields: &RawFields<'_>,
+        envelope: Option<&Envelope<'_>>,
+        work: &mut usize,
+        collect: bool,
+    ) -> Res<Evaluation> {
+        let parsed;
+        let meta = match envelope {
+            Some(envelope) => &envelope.members,
+            None => {
+                parsed = object(field(fields, b"otlp")?)?;
+                &parsed
+            }
+        };
+        // A validated envelope already counted its attributes; programs that
+        // read none of them need not build the maps.
+        let (resource, span, owned) = match envelope {
+            Some(envelope) if !self.attributes => (
+                Owner::new(),
+                Owner::new(),
+                envelope.resource + envelope.span,
+            ),
+            _ => {
+                let resource = attributes(field(meta, b"resource")?)?;
+                let span = attributes(field(meta, b"attributes")?)?;
+                let owned = resource.len() + span.len();
+                (resource, span, owned)
+            }
+        };
+        let mut units = 2 + owned + self.size;
         let events = if self.events {
             let mut events = Vec::new();
-            for owner in Parser::new(field(&meta, b"events")?)
+            for owner in Parser::new(field(meta, b"events")?)
                 .raw_array()
                 .map_err(|_| Error::Invalid)?
             {
@@ -243,9 +285,9 @@ impl Expression {
     }
 }
 struct Owners<'a, 'b> {
-    resource: &'a BTreeMap<String, &'b [u8]>,
-    span: &'a BTreeMap<String, &'b [u8]>,
-    events: &'a [BTreeMap<String, &'b [u8]>],
+    resource: &'a Owner<'b>,
+    span: &'a Owner<'b>,
+    events: &'a [Owner<'b>],
 }
 impl Owners<'_, '_> {
     fn select(
@@ -358,7 +400,7 @@ fn run(
                     let string_type = scope.ends_with(".string");
                     let mut found = None;
                     for event in owners.events {
-                        if let Some(raw) = event.get(key) {
+                        if let Some(raw) = event.get(key.as_str()) {
                             if attribute_matches(raw, string_type, op, wanted, regex.as_ref())? {
                                 found = Some(*raw);
                                 break;
@@ -374,7 +416,7 @@ fn run(
                     if let Some(attrs) = attrs.as_deref_mut() {
                         for (name, owner) in [("resource", owners.resource), ("span", owners.span)]
                         {
-                            if let Some(raw) = owner.get(key) {
+                            if let Some(raw) = owner.get(key.as_str()) {
                                 if attribute_matches(raw, string_type, op, wanted, regex.as_ref())?
                                 {
                                     attrs.insert((key.clone(), name.to_owned()), raw.to_vec());
@@ -386,8 +428,8 @@ fn run(
                     // does not match. Samples above retain both owners.
                     let matched = owners
                         .span
-                        .get(key)
-                        .or_else(|| owners.resource.get(key))
+                        .get(key.as_str())
+                        .or_else(|| owners.resource.get(key.as_str()))
                         .map_or(Ok(false), |raw| {
                             attribute_matches(raw, string_type, op, wanted, regex.as_ref())
                         })?;
@@ -398,7 +440,7 @@ fn run(
                     } else {
                         owners.span
                     };
-                    match owner.get(key) {
+                    match owner.get(key.as_str()) {
                         None => (false, None),
                         Some(raw) => {
                             let matched = attribute_matches(
@@ -555,17 +597,35 @@ fn attribute_matches(
         }
     }
 }
-pub(crate) fn attributes(raw: &[u8]) -> Res<BTreeMap<String, &[u8]>> {
+/// Typed attributes by key; keys borrow the payload unless escaped, since
+/// every scanned row builds these maps.
+pub(crate) type Owner<'a> = BTreeMap<Cow<'a, str>, &'a [u8]>;
+pub(crate) fn attributes(raw: &[u8]) -> Res<Owner<'_>> {
     let mut parser = Parser::new(raw);
     let mut out = BTreeMap::new();
     for pair in parser.raw_array().map_err(|_| Error::Invalid)? {
         let pair = object(pair)?;
-        let key = string(field(&pair, b"key")?)?;
+        let key = borrowed_string(field(&pair, b"key")?)?;
         if out.insert(key, field(&pair, b"value")?).is_some() {
             return Err(Error::Invalid);
         }
     }
     Ok(out)
+}
+// `string/1` without copying unescaped text.
+fn borrowed_string(raw: &[u8]) -> Res<Cow<'_, str>> {
+    let mut parser = Parser::new(raw);
+    let value = parser.string().map_err(|_| Error::Invalid)?;
+    parser.ws();
+    parser.end().map_err(|_| Error::Invalid)?;
+    match value {
+        Cow::Borrowed(bytes) => std::str::from_utf8(bytes)
+            .map(Cow::Borrowed)
+            .map_err(|_| Error::Invalid),
+        Cow::Owned(bytes) => String::from_utf8(bytes)
+            .map(Cow::Owned)
+            .map_err(|_| Error::Invalid),
+    }
 }
 fn compare(left: i64, right: i64, op: &str) -> bool {
     match op {
@@ -760,5 +820,56 @@ mod tests {
             ),
             [false, false, true, false]
         );
+    }
+
+    #[test]
+    fn validated_envelopes_evaluate_like_reparsing() {
+        let payload = |status: u8, events: &str, typed: &str| {
+            format!(
+                r#"{{"trace_id":"11111111111111111111111111111111","status":{{"code":{status}}},"name":"n","kind":2,"events":[{events}],"links":[],"otlp":{{"version":1,"resource":[{{"key":"service.name","value":{{"stringValue":"api"}}}},{{"key":"n","value":{{"intValue":"3"}}}}],"scope":[],"attributes":[{{"key":"http.route","value":{{"stringValue":"/a"}}}}],"events":[{typed}],"links":[]}}}}"#
+            )
+        };
+        let exception = r#"[{"key":"exception.type","value":{"stringValue":"E"}},{"key":"exception.message","value":{"stringValue":"m"}}]"#;
+        let payloads = [
+            payload(2, "", ""),
+            payload(0, "{}", exception),
+            payload(2, "{},{}", &format!("{exception},[]")),
+        ];
+        let programs = [
+            vec![leaf("intrinsic", "status", "=", "2")],
+            vec![leaf("event.string", "exception.type", "=", "E")],
+            vec![leaf("event.string", "exception.type", "!=", "")],
+            vec![
+                leaf("resource.string", "service.name", "=~", "a.*"),
+                leaf("span.int", "n", ">", "1"),
+                leaf("boolean", "", "||", ""),
+            ],
+            vec![leaf("none.string", "http.route", "=", "/a")],
+            vec![
+                leaf("intrinsic", "status", "=", "2"),
+                leaf("select", "resource", "service.name", ""),
+            ],
+        ];
+        for program in programs {
+            let expression = Expression::compile(program).unwrap();
+            for payload in &payloads {
+                let (fields, envelope) =
+                    crate::trace_metadata::validated_parts(payload.as_bytes()).unwrap();
+                let (mut reparsed, mut reused) = (0, 0);
+                for collect in [false, true] {
+                    let a = expression
+                        .evaluate(&fields, &mut reparsed, collect)
+                        .unwrap();
+                    let b = expression
+                        .evaluate_with(&fields, envelope.as_ref(), &mut reused, collect)
+                        .unwrap();
+                    assert_eq!(
+                        (a.matched, a.mask, a.attributes),
+                        (b.matched, b.mask, b.attributes)
+                    );
+                }
+                assert_eq!(reparsed, reused, "{payload}");
+            }
+        }
     }
 }

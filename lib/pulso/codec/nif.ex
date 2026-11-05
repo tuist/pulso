@@ -294,6 +294,10 @@ defmodule Pulso.Codec.NIF do
   def log_segment_reader_next(_reader, _min_records), do: :erlang.nif_error(:nif_not_loaded)
   def log_segment_parquet_row_count(_blob), do: :erlang.nif_error(:nif_not_loaded)
   def compact_trace_segments_v2(_blobs, _max_rows), do: :erlang.nif_error(:nif_not_loaded)
+
+  def compact_trace_segments_split(_blobs, _max_rows, _max_ids, _max_flagged_ids, _max_output_rows),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def trace_segment_parquet_row_count(_blob), do: :erlang.nif_error(:nif_not_loaded)
   def trace_query_new(_start, _finish, _filters, _fields, _max), do: :erlang.nif_error(:nif_not_loaded)
   def trace_query_new_trace(_trace_id, _retention_floor, _max), do: :erlang.nif_error(:nif_not_loaded)

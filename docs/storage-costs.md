@@ -201,9 +201,14 @@ segments are deleted after the grace period and a backup that records their
 retirement; with 7-day soft delete they stay billable for 7 more days, about
 a week of new data (≈ 0.3 TB, $6/month at that volume).
 
-Trace compaction requires bucket versioning; leave it off on Tigris. Trace
-segments are then one object per window, which coalescing already keeps small
-in number.
+Trace compaction (on by default) merges each hour's flushes into objects of one
+service, error/event class and bounded trace IDs, and uses the same manifest
+backups and held cleanup as logs and metrics, so it is safe on Tigris without
+bucket versioning. Its requests follow the flush rate, not span volume: with
+2 s flushes, the production load script (1,000 spans/s) measured about 0.4
+extra Class A and 2.9 extra Class B requests per second, about $5 and $4 a
+month. In exchange, hour-long trace searches read a few objects instead of
+thousands.
 
 ### Production settings for Tigris
 
@@ -217,7 +222,7 @@ metricsCompaction:
 logCompaction:
   enabled: true
 traceCompaction:
-  enabled: false               # needs bucket versioning
+  enabled: true
 manifestBackups:
   enabled: true
 objectCache:

@@ -4,13 +4,26 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
   alias Pulso.Codec.NIF
   alias Pulso.Storage.S3.TraceAttributeSummary
+  alias Pulso.Traces.SearchExpression
 
   @zero_id String.duplicate("0", 32)
   @max_bloom_bytes 8192
   @write_bloom_bytes 1024
   @max_lookup_ids 256
+  # Compaction outputs list up to this many exact hashes; readers before 1.36
+  # treat longer lists as unknown and read the object.
+  @max_exact_ids 1024
   @canonical_bytes 2048
-  defstruct [:services, :bits, :lookup_hashes, :lookup_bits, :attributes, pruning_safe?: false]
+  defstruct [
+    :services,
+    :bits,
+    :lookup_hashes,
+    :lookup_bits,
+    :attributes,
+    :statuses,
+    events?: true,
+    pruning_safe?: false
+  ]
 
   @type t :: %__MODULE__{
           services: [String.t()] | nil,
@@ -18,6 +31,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
           lookup_hashes: binary() | nil,
           lookup_bits: binary() | nil,
           attributes: TraceAttributeSummary.t(),
+          statuses: [0..2] | nil,
+          events?: boolean(),
           pruning_safe?: boolean()
         }
 
@@ -27,28 +42,56 @@ defmodule Pulso.Storage.S3.TraceSummary do
   def build(records, pruning_safe? \\ false) do
     services = Enum.reduce_while(records, MapSet.new(), &collect_service/2)
     ids = Enum.reduce_while(records, MapSet.new(), &collect_id/2)
-    %{summary(services, ids, pruning_safe?) | attributes: TraceAttributeSummary.build(records)}
+    statuses = records |> Enum.map(&status_code/1) |> Enum.uniq() |> Enum.sort()
+    classes = {statuses, Enum.any?(records, &events?/1)}
+
+    %{
+      summary(services, ids, pruning_safe?, classes, @max_lookup_ids)
+      | attributes: TraceAttributeSummary.build(records)
+    }
   end
 
+  defp status_code(%{status: %{"code" => code}}) when code in 0..2, do: code
+  defp status_code(_record), do: :unknown
+
+  # Event predicates match only events, so a source whose rows all have none
+  # holds no match. Rows without typed metadata never prove absence.
+  defp events?(%{events: [], otlp: %{"events" => []}}), do: false
+  defp events?(_record), do: true
+
   @doc false
-  def from_values(services, ids, pruning_safe? \\ false) do
+  def from_values(services, ids, pruning_safe? \\ false, classes \\ {nil, true}, exact \\ @max_lookup_ids) do
     services =
       if is_list(services),
         do: Enum.reduce_while(services, MapSet.new(), fn value, acc -> collect_service(%{service: value}, acc) end)
 
     ids = Enum.reduce_while(ids, MapSet.new(), fn id, acc -> collect_id(%{trace_id: id}, acc) end)
-    summary(services, ids, pruning_safe?)
+    summary(services, ids, pruning_safe?, classes, min(exact, @max_exact_ids))
   end
 
-  defp summary(services, ids, pruning_safe?) do
-    %__MODULE__{
+  # Status codes and event presence are kept only with the publication proof:
+  # they prune only sources whose every row has typed metadata.
+  defp summary(services, ids, pruning_safe?, {statuses, events?}, exact) do
+    proven? = pruning_safe? == true and is_list(statuses) and Enum.all?(statuses, &(&1 in 0..2))
+
+    struct!(
+      id_summary(ids, exact),
+      statuses: if(proven?, do: statuses),
+      events?: not proven? or events? != false,
       services: if(services, do: services |> Enum.map(&:binary.copy/1) |> Enum.sort()),
-      # Wide sets use a canonical bloom instead of retaining an incomplete
-      # prefix or two redundant blooms. Old readers treat absent b/h as unknown.
-      bits: if(ids && MapSet.size(ids) <= @max_lookup_ids, do: bloom(ids)),
-      lookup_hashes: if(ids, do: lookup_hashes(ids)),
-      lookup_bits: if(ids && MapSet.size(ids) > @max_lookup_ids, do: canonical_bloom(ids)),
       pruning_safe?: pruning_safe? == true
+    )
+  end
+
+  # Wide sets use a canonical bloom instead of retaining an incomplete
+  # prefix or two redundant blooms. Old readers treat absent b/h as unknown.
+  defp id_summary(nil, _exact), do: %__MODULE__{}
+
+  defp id_summary(ids, exact) do
+    %__MODULE__{
+      bits: if(MapSet.size(ids) <= @max_lookup_ids, do: bloom(ids)),
+      lookup_hashes: lookup_hashes(ids, exact),
+      lookup_bits: if(MapSet.size(ids) > exact, do: canonical_bloom(ids))
     }
   end
 
@@ -108,6 +151,13 @@ defmodule Pulso.Storage.S3.TraceSummary do
     end)
   end
 
+  def tempo_filters({:expression, program}) do
+    case requirements(program) do
+      [] -> []
+      requires -> [proven_only: true, trace_requires: requires]
+    end
+  end
+
   def tempo_filters(_expression), do: []
 
   def to_wire(nil), do: nil
@@ -117,8 +167,23 @@ defmodule Pulso.Storage.S3.TraceSummary do
     wire = if hashes, do: Map.put(wire, "h", Base.encode64(hashes)), else: wire
     wire = if canonical, do: Map.put(wire, "c", %{"v" => 1, "b" => Base.encode64(canonical)}), else: wire
     wire = if summary.attributes, do: Map.put(wire, "a", TraceAttributeSummary.to_wire(summary.attributes)), else: wire
+    wire = put_classes(wire, summary)
     if summary.pruning_safe? == true, do: Map.put(wire, "k", true), else: wire
   end
+
+  # `st`: every status code a row holds; `ne`: no row has an event.
+  defp put_classes(wire, %{statuses: [_ | _] = statuses, events?: events?}) do
+    wire = Map.put(wire, "st", statuses)
+    if events?, do: wire, else: Map.put(wire, "ne", true)
+  end
+
+  defp put_classes(wire, _summary), do: wire
+
+  defp parse_statuses([_ | _] = statuses) do
+    if length(statuses) <= 3 and Enum.all?(statuses, &(&1 in 0..2)), do: Enum.sort(Enum.uniq(statuses))
+  end
+
+  defp parse_statuses(_), do: nil
 
   def parse(%{"v" => 1} = wire) do
     %__MODULE__{
@@ -127,6 +192,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
       lookup_hashes: parse_hashes(wire["h"]),
       lookup_bits: parse_canonical(wire["c"]),
       attributes: TraceAttributeSummary.parse(wire["a"]),
+      statuses: parse_statuses(wire["st"]),
+      events?: not (is_list(parse_statuses(wire["st"])) and wire["ne"] == true),
       pruning_safe?: wire["k"] == true
     }
   end
@@ -160,8 +227,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
   # Complete bounded 64-bit SHA-256 prefixes allow a leaf bloom to be rebuilt
   # without guessing a union of incompatible adaptive segment bloom sizes.
   # Hash collisions only add reads. Legacy and over-budget sets stay unknown.
-  defp lookup_hashes(ids) do
-    if MapSet.size(ids) in 1..@max_lookup_ids do
+  defp lookup_hashes(ids, exact) do
+    if MapSet.size(ids) in 1..exact do
       ids |> Enum.map(&lookup_hash/1) |> Enum.uniq() |> Enum.sort() |> Enum.map(&<<&1::64>>) |> IO.iodata_to_binary()
     end
   end
@@ -173,7 +240,7 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
   defp parse_hashes(value) when is_binary(value) and byte_size(value) <= 10_924 do
     with {:ok, hashes} <- Base.decode64(value),
-         true <- byte_size(hashes) in 8..(@max_lookup_ids * 8) and rem(byte_size(hashes), 8) == 0 do
+         true <- byte_size(hashes) in 8..(@max_exact_ids * 8) and rem(byte_size(hashes), 8) == 0 do
       :binary.copy(hashes)
     else
       _ -> nil
@@ -196,8 +263,19 @@ defmodule Pulso.Storage.S3.TraceSummary do
         do: Map.put(page, "k", true),
         else: page
 
-    put_page_attributes(page, summaries)
+    page |> put_page_classes(summaries) |> put_page_attributes(summaries)
   end
+
+  defp put_page_classes(page, [_ | _] = summaries) do
+    if Enum.all?(summaries, &match?(%__MODULE__{pruning_safe?: true, statuses: [_ | _]}, &1)) do
+      statuses = summaries |> Enum.flat_map(& &1.statuses) |> Enum.uniq() |> Enum.sort()
+      put_classes(page, %{statuses: statuses, events?: Enum.any?(summaries, & &1.events?)})
+    else
+      page
+    end
+  end
+
+  defp put_page_classes(page, _summaries), do: page
 
   # References are capped at 4 KiB and lose their whole summary beyond it, so
   # attribute sets join only while the service/ID summary keeps room.
@@ -305,7 +383,8 @@ defmodule Pulso.Storage.S3.TraceSummary do
     (is_nil(service) or is_nil(services) or service in services) and page_id_matches?(bits, id) and
       page_context_matches?(bits, opts[:context_hashes]) and
       resource_services_match?(wire["k"] == true, services, opts) and
-      attributes_match?(wire["k"] == true, TraceAttributeSummary.parse(wire["a"]), opts)
+      attributes_match?(wire["k"] == true, TraceAttributeSummary.parse(wire["a"]), opts) and
+      classes_match?(wire["k"] == true, parse_statuses(wire["st"]), wire["ne"] != true, opts[:trace_requires])
   end
 
   def page_matches?(_wire, _opts), do: true
@@ -333,17 +412,15 @@ defmodule Pulso.Storage.S3.TraceSummary do
 
   def matches?(nil, _opts), do: true
 
-  def matches?(%__MODULE__{services: services, bits: bits, lookup_bits: canonical} = summary, opts) do
+  def matches?(%__MODULE__{services: services} = summary, opts) do
     service = Keyword.get(opts, :service)
     trace_id = Keyword.get(opts, :trace_id)
 
     (is_nil(service) or is_nil(services) or service in services) and
       resource_services_match?(summary.pruning_safe?, services, opts) and
       attributes_match?(summary.pruning_safe?, summary.attributes, opts) and
-      if(canonical,
-        do: page_id_matches?(canonical, trace_id),
-        else: is_nil(trace_id) or is_nil(bits) or member?(bits, trace_id)
-      )
+      classes_match?(summary.pruning_safe?, summary.statuses, summary.events?, opts[:trace_requires]) and
+      id_matches?(summary, trace_id)
   end
 
   # `query_traces` resource filters on service.name (exact `resource` strings,
@@ -368,6 +445,42 @@ defmodule Pulso.Storage.S3.TraceSummary do
   # compares the projections every row carries.
   defp attributes_match?(proven?, attributes, opts),
     do: (opts[:proven_only] == true and proven? != true) or TraceAttributeSummary.matches?(attributes, opts)
+
+  # `:trace_requires` lists what every matching span has: `:error` status or
+  # an `:event`. A proven source whose rows lack it holds no match.
+  defp classes_match?(true, statuses, events?, [_ | _] = requires) when is_list(statuses),
+    do:
+      Enum.all?(requires, fn
+        :error -> 2 in statuses
+        :event -> events?
+      end)
+
+  defp classes_match?(_proven, _statuses, _events?, _requires), do: true
+
+  @doc """
+  What every span matching the last spanset of a wire expression program has
+  (`:error` status, an `:event`), as `:trace_requires` for summary pruning:
+  `&&` requires either side's needs, `||` only those both sides share.
+  """
+  def requirements(program) do
+    case SearchExpression.split(program) do
+      {:ok, {[_ | _] = spansets, _relations, _select}} -> spansets |> List.last() |> needs([]) |> Enum.sort()
+      _ -> []
+    end
+  end
+
+  defp needs([], [needs]), do: MapSet.to_list(needs)
+  defp needs([], _stack), do: []
+
+  defp needs([{"boolean", "", op, ""} | rest], [rhs, lhs | stack]) do
+    combined = if op == "&&", do: MapSet.union(lhs, rhs), else: MapSet.intersection(lhs, rhs)
+    needs(rest, [combined | stack])
+  end
+
+  defp needs([{"intrinsic", "status", "=", "2"} | rest], stack), do: needs(rest, [MapSet.new([:error]) | stack])
+  defp needs([{"event." <> _, _key, _op, _value} | rest], stack), do: needs(rest, [MapSet.new([:event]) | stack])
+  defp needs([{"boolean", _, _, _} | _], _stack), do: []
+  defp needs([_leaf | rest], stack), do: needs(rest, [MapSet.new() | stack])
 
   defp service_name(%{"service.name" => value}) when is_binary(value), do: value
   defp service_name(_filters), do: nil
@@ -396,6 +509,18 @@ defmodule Pulso.Storage.S3.TraceSummary do
         matched
     end
   end
+
+  defp id_matches?(_summary, nil), do: true
+  defp id_matches?(%{lookup_bits: canonical}, id) when is_binary(canonical), do: page_id_matches?(canonical, id)
+  defp id_matches?(%{bits: bits}, id) when is_binary(bits), do: member?(bits, id)
+
+  # Compaction outputs above the adaptive bloom's 256 IDs list exact hashes.
+  defp id_matches?(%{lookup_hashes: hashes}, id) when is_binary(hashes) do
+    hash = lookup_hash(id)
+    Enum.any?(for(<<h::64 <- hashes>>, do: h), &(&1 == hash))
+  end
+
+  defp id_matches?(_summary, _id), do: true
 
   defp member?(bits, id) do
     size = byte_size(bits) * 8
