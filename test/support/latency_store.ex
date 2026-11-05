@@ -9,13 +9,24 @@ defmodule Pulso.Test.LatencyStore do
 
   import Plug.Conn
 
-  @doc "Create the tables a store needs; pass the result as the plug's options."
+  @doc """
+  Create the tables a store needs; pass the result as the plug's options.
+  With `restore: true`, objects saved by `save/1` in `:dir` are live again.
+  """
   def new(opts) do
     dir = Keyword.fetch!(opts, :dir)
     File.mkdir_p!(dir)
 
+    objects =
+      if Keyword.get(opts, :restore, false) do
+        {:ok, table} = :ets.file2tab(String.to_charlist(index_path(dir)))
+        table
+      else
+        :ets.new(:latency_store_objects, [:public, :ordered_set, read_concurrency: true])
+      end
+
     store = %{
-      objects: :ets.new(:latency_store_objects, [:public, :ordered_set, read_concurrency: true]),
+      objects: objects,
       stats: :ets.new(:latency_store_stats, [:public, :set, write_concurrency: true]),
       lock: :ets.new(:latency_store_locks, [:public, :set]),
       latency: :ets.new(:latency_store_latency, [:public, :set, read_concurrency: true]),
@@ -25,6 +36,14 @@ defmodule Pulso.Test.LatencyStore do
     set_latency(store, opts)
     store
   end
+
+  @doc "Write the object index next to the bodies, so `new(dir: dir, restore: true)` reopens the store."
+  def save(store), do: :ok = :ets.tab2file(store.objects, String.to_charlist(index_path(store.dir)))
+
+  @doc "Whether `dir` holds a saved store."
+  def saved?(dir), do: File.exists?(index_path(dir))
+
+  defp index_path(dir), do: Path.join(dir, "index.ets")
 
   @doc "Change request latencies (`:get_ms`, `:put_ms`, `:list_ms`, `:delete_ms` ranges) of a running store."
   def set_latency(store, opts) do

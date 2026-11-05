@@ -42,6 +42,19 @@ requests trade their slot for a bounded pending-bytes budget while they wait for
 the unchanged durable ACK. `AppendBuffer` flushes run in linked processes (up to
 16 per tenant/signal) so uploads overlap the serialized manifest CAS.
 
+PromQL aggregations directly over a selector or range function (`sum by (le)
+(rate(x_bucket[5m]))`) fold each series' result into their (group, step)
+states as it is computed (`Evaluator.fused_aggregate/4`), so they hold one
+point per group and step against `max_materialized_samples`, not every input
+series; tiered reads and label collisions keep the unfused path, with
+identical results. `test/pulso/promql/tuist_history_bench_test.exs`
+(`--include query_bench`, `Pulso.Test.TuistMetricHistory`) builds canary- or
+production-shaped remote-write histories in a saved `LatencyStore`, runs the
+real `CompactionWorker` over them and replays the Tuist panels and alerts with
+canary's and the recommended budgets. MCP `query_promql`/`query_logql` reject
+unreplaced Grafana `$__rate_interval`/`$__interval`/`$__range` variables with
+a replacement hint.
+
 Object-store cost is a design goal: requests, not bytes, dominate a per-request
 bill (`docs/storage-costs.md#cost-model`). `PULSO_INGEST_FLUSH_INTERVAL_MS`
 (0..10000) is both the unkeyed coalescing window and the minimum spacing between
