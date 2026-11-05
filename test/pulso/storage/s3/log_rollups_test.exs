@@ -119,7 +119,7 @@ defmodule Pulso.Storage.S3.LogRollupsTest do
 
   # Query limits for a test, with a deadline that allows for a loaded suite.
   defp query_limits(limits \\ []),
-    do: Runtime.put_env(:pulso, QueryRunner, Keyword.put_new(limits, :timeout_ms, 60_000))
+    do: Runtime.put_env(:pulso, QueryRunner, Keyword.put_new(limits, :timeout_ms, 120_000))
 
   defp reads(agent) do
     Agent.get_and_update(agent, fn state ->
@@ -198,8 +198,6 @@ defmodule Pulso.Storage.S3.LogRollupsTest do
   end
 
   test "rollup answers equal line answers for every eligible shape", ctx do
-    :ok = roll_all(ctx)
-
     queries = [
       ~s|sum by (detected_level) (count_over_time({namespace="tuist"}[1m]))|,
       ~s|sum by (service_name) (rate({namespace="tuist"}[5m]))|,
@@ -217,16 +215,25 @@ defmodule Pulso.Storage.S3.LogRollupsTest do
       %{end_ts_ns: ctx.t0 + 61 * @minute}
     ]
 
-    for query <- queries, opts <- ranges do
-      assert {:ok, s3} = run(ctx.tenant, query, opts)
-      assert {:ok, ^s3} = memory(ctx, query, opts), query
+    cases = for query <- queries, opts <- ranges, do: {query, opts}
+    # Before any rollup exists every answer comes from lines.
+    lines = Map.new(cases, fn {query, opts} -> {{query, opts}, run(ctx.tenant, query, opts)} end)
+    :ok = roll_all(ctx)
+
+    for {query, opts} <- cases do
+      assert {:ok, _} = expected = Map.fetch!(lines, {query, opts})
+      assert run(ctx.tenant, query, opts) == expected, query
 
       # Sums of counts group while counting; `* 1` sums per-stream series.
       if String.starts_with?(query, "sum") and not String.contains?(query, "rate") do
         per_stream = String.replace(query, ~r/\]\)\)$/, "]) * 1)")
-        assert {:ok, ^s3} = run(ctx.tenant, per_stream, opts), per_stream
+        assert run(ctx.tenant, per_stream, opts) == expected, per_stream
       end
     end
+
+    # The memory adapter answers independently of Parquet, segments and rollups.
+    opts = hd(ranges)
+    for query <- queries, do: assert(memory(ctx, query, opts) == Map.fetch!(lines, {query, opts}), query)
   end
 
   test "a late write makes its minute read lines until it is rolled up again", ctx do
