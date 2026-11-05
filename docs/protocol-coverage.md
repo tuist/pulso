@@ -1451,6 +1451,29 @@ bridge can supply OTLP/gRPC transport, but does not establish every processor,
 queue, retry, temporality or TLS/authentication profile. A Collector conversion
 must not be assumed to preserve fields without independent evidence.
 
+## Grafana dashboard and alert corpus
+
+The test suite replays a real production query corpus: 1,178 distinct queries
+(1,112 PromQL, 66 LogQL) from Tuist's 31 Grafana dashboards with PromQL/LogQL
+panels and all 170 of its alert rules. Each query is interpolated as Grafana
+does (`$__rate_interval`, `$__interval`, `$__range`, single, multi-value and
+All variables), then evaluated over synthetic data shaped like the queried
+metric names, labels and log lines. Every answer equals Prometheus 3.5.0 and
+Loki 3.7.9 on the same data. That includes `histogram_quantile`, `label_replace`,
+`group_left`/`group_right` joins, subqueries, `offset`, `bool`,
+`predict_linear`, `absent_over_time`, `topk`/`sort_desc`, and LogQL
+`regexp`/`pattern`/`logfmt`/`json` with `unwrap`, `keep` and label filters.
+The corpus compares the result sets, not the order in which series are returned.
+
+One known difference affects log-stream results only. Pulso adds `service`
+next to a pushed `service_name` label, and `detected_level` next to a pushed
+`level` label, with the same value. Loki returns only the pushed labels when
+ingest-time discovery is off. When discovery is on (Loki's and Grafana Cloud's
+default), Loki instead adds `service_name="unknown_service"` to streams without
+a service and a normalized `detected_level` (for example `warn` for `warning`),
+detected from log content per line. Pulso does not implement Loki's ingest-time
+discovery. Filters and metric queries on the pushed labels behave identically.
+
 ## Completeness and operational meaning
 
 - Unsupported OTLP point forms produce explicit **source-point** rejection counts

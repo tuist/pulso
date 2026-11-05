@@ -397,6 +397,15 @@ Operators must explicitly establish producer order and input availability. Use
 unique recording metric names per producer; competing producers or direct ingest
 can otherwise write conflicting samples under the ordinary metric query rules.
 
+To move Grafana-managed recordings, recreate each one as a native
+`promql_recording` with the same query, name and cadence. Their queries
+evaluate like Prometheus. A rule whose result exceeds 128 series, or whose
+encoded samples exceed 31 KiB, fails every evaluation and cannot be recorded
+natively yet. Splitting it into several rules with the same metric name is
+not supported, because recording names must be unique per producer. Recordings that read other
+recordings see their inputs from earlier ticks, up to one cadence old per hop,
+because rules are not ordered within a group.
+
 ## Management, preview and state
 
 | Method/path under `/api/v1/alerting` | Operation |
