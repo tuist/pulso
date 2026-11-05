@@ -215,8 +215,11 @@ defmodule Pulso.Storage.S3.LogRollups do
   end
 
   # Gap minutes in order while their segments' rows fit `max_rows`; the
-  # first minute is always taken.
+  # first minute is always taken. Segments without counts (written before
+  # 1.33) hold no line of a buildable minute (`buildable?/2`).
   defp take_minutes(minutes, raws, max_rows) do
+    raws = Enum.filter(raws, &is_map(&1.log_minutes))
+
     {taken, sources, _rows} =
       Enum.reduce_while(minutes, {[], %{}, 0}, fn minute, {taken, sources, rows} ->
         new = for s <- raws, Map.has_key?(s.log_minutes, minute), not Map.has_key?(sources, s.key), do: s

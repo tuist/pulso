@@ -236,6 +236,47 @@ defmodule Pulso.Storage.S3.LogRollupsTest do
     for query <- queries, do: assert(memory(ctx, query, opts) == Map.fetch!(lines, {query, opts}), query)
   end
 
+  test "segments written before 1.33 make only their own minutes read lines", ctx do
+    # A segment from an older release has no per-minute line counts (`lm`).
+    legacy = %Log{
+      timestamp_ns: ctx.t0 + 70 * @minute + 5,
+      service: "tuist-server",
+      body: "legacy",
+      resource: %{"namespace" => "tuist"},
+      attributes: %{"detected_level" => "info"}
+    }
+
+    :ok = S3.append(:logs, ctx.tenant, [legacy])
+    {:ok, manifest, _} = Retention.load(ctx.tenant, "logs", ctx.config)
+    assert [key] = for(s <- manifest.segments, s.min_ts == legacy.timestamp_ns, do: s.key)
+    segments = Enum.map(manifest.segments, &if(&1.key == key, do: %{&1 | log_minutes: nil}, else: &1))
+    manifest = %{manifest | segments: segments}
+
+    {:ok, _} =
+      ObjectStore.put(
+        ctx.config,
+        Manifest.manifest_key(ctx.tenant, "logs"),
+        IO.iodata_to_binary(Manifest.encode(manifest))
+      )
+
+    Runtime.put_env(:pulso, Storage, adapter: Memory)
+    :ok = Storage.append(:logs, ctx.tenant <> "-memory", [legacy])
+    Runtime.put_env(:pulso, Storage, adapter: S3)
+
+    # Its hour still gets a rollup for every other minute.
+    :ok = roll_all(ctx)
+    assert length(rollups(ctx)) == 3
+
+    query = ~s|sum by (detected_level) (count_over_time({namespace="tuist"}[1m]))|
+    opts = %{start_ts_ns: ctx.t0 + @hour, end_ts_ns: ctx.t0 + 2 * @hour, step_ns: @minute}
+    reads(ctx.agent)
+    assert {:ok, s3} = run(ctx.tenant, query, opts)
+    assert {:ok, ^s3} = memory(ctx, query, opts)
+    # Two hourly rollups, the legacy segment and the batches of its minute,
+    # not the hour's 120 batches.
+    assert reads(ctx.agent) in 3..8
+  end
+
   test "a late write makes its minute read lines until it is rolled up again", ctx do
     :ok = roll_all(ctx)
     late_ts = ctx.t0 + 70 * @minute + 5
