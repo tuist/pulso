@@ -104,7 +104,7 @@ defmodule Pulso.Metrics do
        "build, encode, page writes and the conditional root write, including conflict retries."}
   ]
   @root_size_labels Enum.map([65_536, 262_144, 1_048_576, 4_194_304, 16_777_216], &{&1, Integer.to_string(&1)})
-  @purposes ["none", "segment", "manifest", "metadata_page", "other"]
+  @purposes ["none", "segment", "manifest", "metadata_page", "backup", "other"]
   @outcomes ["ok", "error", "exception", "conflict", "not_modified", "not_found", "rejected"]
   @gauge_help %{
     "pulso_manifest_mailbox_messages" => "Messages in node-local manifest-owner mailboxes.",

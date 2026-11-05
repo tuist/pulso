@@ -713,12 +713,16 @@ heaps of 384 MiB), at the cost of serving one interactive query at a time.
 Once compaction or finalization has run, a prefix's manifest is the only
 record of which objects are live. With `PULSO_MANIFEST_BACKUP_ENABLED=true`
 (default; chart `manifestBackups.enabled`) the maintenance owner of each
-compacted prefix writes a complete copy of its manifest to
+compacted prefix writes a copy of its manifest to
 `tenants/<tenant>/v4/signal=<signal>/backups/<unix-ms>.json` every
-`PULSO_MANIFEST_BACKUP_INTERVAL_MS` (15 minutes) and keeps the newest 48.
+`PULSO_MANIFEST_BACKUP_INTERVAL_MS` (15 minutes) and keeps the newest 48. A
+paged (format 4) manifest is backed up as its root, which references immutable
+manifest pages, so a backup is one small object however long the history is.
 
 Cleanup only deletes an object whose retirement is recorded in the newest
-backup, so restoring the newest backup never references a deleted object.
+backup, and only deletes a superseded manifest page that the newest backup no
+longer references, so restoring the newest backup never references a deleted
+object or page. Older backups can reference pages that are gone.
 Deletions therefore lag the grace period by up to one backup interval. Backups
 live in the same bucket: they protect against a lost or corrupted manifest,
 not against losing the bucket. Prefixes with enforced retention are backed up
@@ -753,8 +757,11 @@ over hours of frequently pushed logs reads thousands of objects.
 Merges run natively without converting records: each merge reads at most 32
 segments, 8 MiB of input and 100,000 rows, keeps every record and its typed
 metadata exactly, and writes the same layout ingestion writes, ordered by service
-and time. A merge that would exceed its row or 32 MiB string ceiling is skipped
-rather than truncated. Older segments without typed OTLP metadata merge
+and time. A merge that would exceed its row ceiling is skipped rather than truncated.
+Segments whose decoded text would exceed the 32 MiB string ceiling together
+(log text often decodes to ten or more times its stored size) are left out of
+that merge whole; a segment that fits with no other is set aside for an hour,
+and the pass moves on to other merges. Older segments without typed OTLP metadata merge
 unchanged. Stream discovery, queries, keyed retries and retention read compacted
 segments like any other.
 

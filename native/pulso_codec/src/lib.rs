@@ -960,7 +960,9 @@ fn log_segment_reader_next<'a>(
 }
 
 /// Merge up to 32 log Parquet segments natively into one replacement:
-/// `{:ok, blob, min_ts, max_ts, count, services | nil}`. Mirrors
+/// `{:ok, blob, min_ts, max_ts, count, services | nil, included}`, where
+/// `included` lists the indices of the sources whose decoded strings fit the
+/// merge's bound together (see `segment_parquet::compact`). Mirrors
 /// `compact_trace_segments_v2`; records never become Erlang terms.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn compact_log_segments<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> Term<'a> {
@@ -968,13 +970,14 @@ fn compact_log_segments<'a>(env: Env<'a>, blobs: Term<'a>, max_rows: usize) -> T
         return atoms::fallback().encode(env);
     }
     match segment_parquet::compact(env, blobs, max_rows) {
-        Ok((blob, b, services)) => (
+        Ok((blob, b, services, included)) => (
             atoms::ok(),
             blob,
             integer(env, b.min_ts),
             integer(env, b.max_ts),
             b.count,
             services,
+            included,
         )
             .encode(env),
         Err(segment_parquet::CompactError::PayloadTooLarge) => {

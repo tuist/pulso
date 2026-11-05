@@ -180,7 +180,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
       last = backups |> Map.get_lazy({tenant, signal}, fn -> latest_backup(tenant, signal, config) end)
       last = if backup_due?(last, config), do: run_backup(tenant, signal, config, last), else: last
       config = Map.put(config, :manifest_backups, Map.put(backups, {tenant, signal}, last))
-      {if(last != :retention_managed, do: ManifestBackup.hold_ms(last, grace)), config}
+      {if(last != :retention_managed, do: ManifestBackup.hold_ms(last, grace, config)), config}
     else
       {nil, config}
     end

@@ -180,9 +180,9 @@ Detailed operation labels:
 - `kind=object`: the same eight object operations as the canonical view.
   Outcomes distinguish `ok`, `error`, `exception`, `conflict`, `not_found`, and
   `not_modified`. `purpose=manifest` identifies `/manifest.json` keys, `segment`
-  identifies `.parquet` keys, `metadata_page` identifies retention manifest pages
-  (`.json` objects under `index/`), and `other` covers listings, markers, and other
-  objects. Retention reads, paginated listings, tenant discovery, and admitted
+  identifies `.parquet` keys, `metadata_page` identifies manifest pages
+  (`.json` objects under `index/` or `journal/`), `backup` identifies manifest
+  backups (`backups/`), and `other` covers listings, markers, and other objects. Retention reads, paginated listings, tenant discovery, and admitted
   deletes reuse the `get_if_none_match`, `list`, `list_prefixes`, and `delete`
   operations. Other
   operation kinds use `purpose=none`. Only meaningful byte directions are emitted.

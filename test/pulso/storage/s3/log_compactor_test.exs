@@ -30,7 +30,8 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
         parts = Enum.chunk_every(records, max(1, div(length(records), :rand.uniform(5))))
         blobs = Enum.map(parts, fn part -> part |> NIF.encode_log_segment_parquet() |> elem(1) end)
 
-        assert {:ok, merged, min, max, count, services} = NIF.compact_log_segments(blobs, 100_000)
+        assert {:ok, merged, min, max, count, services, included} = NIF.compact_log_segments(blobs, 100_000)
+        assert included == Enum.to_list(0..(length(blobs) - 1))
 
         assert canonical(decode(merged)) == canonical(Enum.flat_map(blobs, &decode/1))
         assert {:ok, _, ^min, ^max, ^count} = NIF.encode_log_segment_parquet(records)
@@ -43,7 +44,7 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       b = [%Log{timestamp_ns: 1, service: "b", body: "z"}, %Log{timestamp_ns: 2, service: nil, body: "w"}]
       blobs = Enum.map([a, b], &elem(NIF.encode_log_segment_parquet(&1), 1))
 
-      assert {:ok, merged, 1, 9, 4, nil} = NIF.compact_log_segments(blobs, 10)
+      assert {:ok, merged, 1, 9, 4, nil, [0, 1]} = NIF.compact_log_segments(blobs, 10)
       assert Enum.map(decode(merged), &{&1.service, &1.timestamp_ns}) == [{nil, 2}, {"a", 9}, {"b", 1}, {"b", 3}]
     end
 
@@ -51,7 +52,7 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       legacy = File.read!("test/fixtures/logs/legacy_log.parquet")
       {:ok, current, _, _, _} = NIF.encode_log_segment_parquet([%Log{timestamp_ns: 5, service: "api", body: "new"}])
 
-      assert {:ok, merged, _, _, count, _} = NIF.compact_log_segments([legacy, current], 100_000)
+      assert {:ok, merged, _, _, count, _, [0, 1]} = NIF.compact_log_segments([legacy, current], 100_000)
       assert count == length(decode(legacy)) + 1
       assert canonical(decode(merged)) == canonical(decode(legacy) ++ decode(current))
     end
@@ -62,7 +63,27 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
 
       big = %Log{timestamp_ns: 1, body: String.duplicate("x", 9 * 1024 * 1024)}
       {:ok, large, _, _, _} = NIF.encode_log_segment_parquet([big])
-      assert {:error, :payload_too_large} = NIF.compact_log_segments([large, large, large, large], 100)
+      # Three fit the 32 MiB decoded-string bound together; the fourth is left out whole.
+      assert {:ok, _, 1, 1, 3, nil, [0, 1, 2]} = NIF.compact_log_segments([large, large, large, large], 100)
+    end
+
+    test "sources that do not fit are left out whole, and later smaller ones still join" do
+      big = %Log{timestamp_ns: 5, service: "big", body: String.duplicate("x", 9 * 1024 * 1024)}
+      {:ok, large, _, _, _} = NIF.encode_log_segment_parquet([big])
+      # A merge of highly compressible lines stays far below the small-segment
+      # size, so selection picks such outputs again, but two never fit together.
+      {:ok, merged, _, _, 3, _, [0, 1, 2]} = NIF.compact_log_segments([large, large, large], 100)
+      assert byte_size(merged) < 1024 * 1024
+
+      small = Enum.map(1..2, &%Log{timestamp_ns: &1, service: "s#{&1}", body: "line #{&1}"})
+      [a, b] = Enum.map(small, &elem(NIF.encode_log_segment_parquet([&1]), 1))
+
+      assert {:ok, _, 5, 5, 3, ["big"], [0]} = NIF.compact_log_segments([merged, merged], 100)
+
+      assert {:ok, out, 1, 5, 5, ["big", "s1", "s2"], [0, 1, 3]} =
+               NIF.compact_log_segments([a, merged, merged, b], 100)
+
+      assert Enum.map(decode(out), & &1.service) == ["big", "big", "big", "s1", "s2"]
     end
 
     test "corrupt or foreign segments are rejected" do
@@ -70,7 +91,7 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
       assert :fallback = NIF.compact_log_segments([metric], 100)
       # Its footer claims an impossible row count, refused before any decode.
       corrupt = File.read!("test/fixtures/logs/corrupt_footer.parquet")
-      refute match?({:ok, _, _, _, _, _}, NIF.compact_log_segments([corrupt], 100_000))
+      refute match?({:ok, _, _, _, _, _, _}, NIF.compact_log_segments([corrupt], 100_000))
       assert :fallback = NIF.compact_log_segments([], 0)
     end
   end
@@ -147,6 +168,28 @@ defmodule Pulso.Storage.S3.LogCompactorTest do
                S3.append(:logs, ctx.tenant, [record(1, "api", "a"), record(2, "api", "a")], idempotency_key: "batch")
 
       assert {:ok, ^before} = S3.query(:logs, ctx.tenant, [])
+    end
+
+    test "a group too large to merge is set aside, so later hours still compact", ctx do
+      hour = 3_600_000_000_000
+      big = &%Log{timestamp_ns: &1, service: "big", body: String.duplicate("x", 9 * 1024 * 1024)}
+
+      # Two merges of three highly compressible 9 MiB lines: each output stays
+      # under the small-segment size, so selection picks the pair, but their
+      # 54 MiB of decoded strings never fit one merge's 32 MiB bound.
+      for batch <- [1..3, 4..6] do
+        for ts <- batch, do: assert(:ok = S3.append(:logs, ctx.tenant, [big.(ts)]))
+        assert {:ok, %{merged: 3}} = LogCompactor.compact(ctx.tenant, ctx.config, max_segments: 3)
+      end
+
+      for ts <- [hour + 1, hour + 2], do: assert(:ok = S3.append(:logs, ctx.tenant, [record(ts, "api", "a")]))
+
+      # The oldest hour's pair is set aside and the next hour merges instead
+      # of the pass failing on the same pair every interval.
+      assert {:ok, %{merged: 2}} = LogCompactor.compact(ctx.tenant, ctx.config)
+      assert {:ok, %{merged: 0}} = LogCompactor.compact(ctx.tenant, ctx.config)
+      assert {:ok, entries} = S3.query(:logs, ctx.tenant, [])
+      assert length(entries) == 8
     end
 
     test "retention cleans flat log retirements even after log compaction is disabled", ctx do

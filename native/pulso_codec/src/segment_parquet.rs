@@ -1244,9 +1244,13 @@ pub enum CompactError {
     PayloadTooLarge,
 }
 
-/// A merged log segment: payload, encoder-compatible bounds, row count, and
-/// the complete nonempty service set (`None` when unknown).
-pub type Compacted<'a> = (Binary<'a>, Bounds, Option<Vec<String>>);
+/// A merged log segment: payload, encoder-compatible bounds, row count, the
+/// complete nonempty service set (`None` when unknown) and the indices of the
+/// sources it holds, ascending.
+pub type Compacted<'a> = (Binary<'a>, Bounds, Option<Vec<String>>, Vec<usize>);
+
+/// Decoded string bytes one merge may hold: twice an ingest segment's payload.
+pub const MAX_COMPACT_STRING_BYTES: usize = 2 * MAX_PAYLOAD;
 
 /// Merge log segments natively, never building Erlang terms for records.
 ///
@@ -1257,6 +1261,12 @@ pub type Compacted<'a> = (Binary<'a>, Bounds, Option<Vec<String>>);
 /// service summary follows `Segment.summarize_logs/2`: complete when every
 /// row has a nonempty service of at most 256 bytes and there are at most
 /// 128 distinct services, unknown otherwise.
+///
+/// Sources are taken in order while their decoded strings fit
+/// `MAX_COMPACT_STRING_BYTES` together; a source that would exceed it is
+/// left out whole (never truncated), and later, smaller ones may still fit.
+/// Only one source beyond the bound is ever decoded at a time. The merge
+/// fails with `PayloadTooLarge` only when no source with rows fits.
 pub fn compact<'a>(
     env: Env<'a>,
     blobs: Term<'a>,
@@ -1267,6 +1277,8 @@ pub fn compact<'a>(
 
     let schema = parquet_schema();
     let mut batches = Vec::new();
+    let mut included = Vec::new();
+    let mut declared_rows = 0usize;
     let mut rows = 0usize;
     let mut string_bytes = 0usize;
     let mut bounds = Bounds {
@@ -1276,9 +1288,10 @@ pub fn compact<'a>(
     };
     let mut services = Some(BTreeSet::new());
 
-    for term in blobs
+    for (index, term) in blobs
         .decode::<ListIterator>()
         .map_err(|_| CompactError::Invalid)?
+        .enumerate()
     {
         let blob: Binary = term.decode().map_err(|_| CompactError::Invalid)?;
         let builder =
@@ -1286,7 +1299,10 @@ pub fn compact<'a>(
                 .map_err(|_| CompactError::Invalid)?;
         let declared = usize::try_from(builder.metadata().file_metadata().num_rows())
             .map_err(|_| CompactError::Invalid)?;
-        if rows.checked_add(declared).is_none_or(|n| n > max_rows) {
+        declared_rows = declared_rows
+            .checked_add(declared)
+            .ok_or(CompactError::TooMany)?;
+        if declared_rows > max_rows {
             return Err(CompactError::TooMany);
         }
         let legacy = builder.schema().fields().len() + 1 == schema.fields().len()
@@ -1299,6 +1315,10 @@ pub fn compact<'a>(
         if !legacy && builder.schema().fields() != schema.fields() {
             return Err(CompactError::Invalid);
         }
+        let mut source = Vec::new();
+        let mut source_rows = 0usize;
+        let mut source_bytes = 0usize;
+        let mut fits = true;
         for batch in builder
             .with_batch_size(8192)
             .build()
@@ -1317,20 +1337,27 @@ pub fn compact<'a>(
                 RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
                     .map_err(|_| CompactError::Invalid)?
             };
-            rows += batch.num_rows();
-            if rows > max_rows {
+            source_rows += batch.num_rows();
+            if rows + source_rows > max_rows {
                 return Err(CompactError::TooMany);
             }
             for column in batch.columns() {
                 if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
-                    string_bytes += strings.value_data().len();
+                    source_bytes += strings.value_data().len();
                 }
             }
-            if string_bytes > 2 * MAX_PAYLOAD {
-                return Err(CompactError::PayloadTooLarge);
+            if string_bytes + source_bytes > MAX_COMPACT_STRING_BYTES {
+                fits = false;
+                break;
             }
-            let ts = downcast_int64(&batch, "timestamp_ns").map_err(|_| CompactError::Invalid)?;
-            let service = downcast_string(&batch, "service").map_err(|_| CompactError::Invalid)?;
+            source.push(batch);
+        }
+        if !fits {
+            continue;
+        }
+        for batch in &source {
+            let ts = downcast_int64(batch, "timestamp_ns").map_err(|_| CompactError::Invalid)?;
+            let service = downcast_string(batch, "service").map_err(|_| CompactError::Invalid)?;
             for i in 0..batch.num_rows() {
                 let value = if ts.is_null(i) {
                     0
@@ -1351,8 +1378,15 @@ pub fn compact<'a>(
                     }
                 });
             }
-            batches.push(batch);
         }
+        rows += source_rows;
+        string_bytes += source_bytes;
+        batches.extend(source);
+        included.push(index);
+    }
+
+    if included.is_empty() && declared_rows > 0 {
+        return Err(CompactError::PayloadTooLarge);
     }
 
     if bounds.count == 0 {
@@ -1381,7 +1415,7 @@ pub fn compact<'a>(
     writer.write(&sorted).map_err(|_| CompactError::Invalid)?;
     writer.close().map_err(|_| CompactError::Invalid)?;
     let services = services.map(|set| set.into_iter().collect());
-    Ok((buf.0.finish(env), bounds, services))
+    Ok((buf.0.finish(env), bounds, services, included))
 }
 
 // -- streaming decode ------------------------------------------------------

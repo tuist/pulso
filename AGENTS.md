@@ -104,7 +104,17 @@ hides older data, `JournalManifest.expire_plan/7` (planned outside the owner,
 `max_ts < rf` and drop forgotten pages; cleanup waits for
 `ManifestBackup.ensure_recent/3`, and finalization skips expired hours.
 `bucketed` (or flat manifests) still materializes into format 3 within the
-legacy byte limit. `pulso_manifest_commit_duration_seconds{signal,format,root_bytes_le}`,
+legacy byte limit. Format-4 maintenance does no page I/O inside the
+`ManifestOwner`: merges, hour finalization and cleanup plan page rewrites
+against a snapshot (`JournalManifest.plan_replace/8`, `plan_cleanup/5`,
+siblings rewritten eight at a time) and the owner swaps unchanged top-level
+refs in memory; unconfirmed merges are checked against a fresh root before
+their upload and planned pages are discarded. Format-4 backups copy the root
+(pages are immutable); cleanup holds deletions with `ManifestBackup.hold_ms/3`
+(min of compaction and page grace). Native log merges take the sources whose
+decoded strings fit 32 MiB together (`compact_log_segments` returns their
+indices); groups that never fit are set aside node-locally for an hour.
+Journal pages count as `purpose="metadata_page"`, backups as `backup`. `pulso_manifest_commit_duration_seconds{signal,format,root_bytes_le}`,
 `pulso_manifest_roots` and page-cache gauges watch it. Total bucket metadata
 still grows until retention. See `docs/configuration.md#manifest-format`.
 

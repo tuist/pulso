@@ -29,6 +29,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestOwner
+  alias Pulso.Storage.S3.MetadataCache
   alias Pulso.Storage.S3.PagedManifest
   alias Pulso.Storage.S3.Retention
   alias Pulso.Storage.S3.TraceAttributeSummary
@@ -45,21 +46,38 @@ defmodule Pulso.Storage.S3.SignalCompactor do
          :ok <- migration_gate(manifest, config),
          :ok <- validate_retained_grace(manifest, config, opts),
          {:ok, candidates} <- compaction_candidates(manifest, tenant, config) do
-      compact_selected(select(candidates, opts), candidates, manifest, tenant, config, opts)
+      mergeable = %{candidates | segments: Enum.reject(candidates.segments, &unmergeable?(&1.key))}
+      compact_mergeable(mergeable, candidates, manifest, tenant, config, opts, {3, nil})
     end
   end
 
-  defp compact_selected([], candidates, manifest, tenant, config, _opts) do
-    with :ok <- advance_empty_cursor(manifest, candidates, tenant, config),
-         do: {:ok, %{segments_before: length(manifest.segments), merged: 0}}
-  end
+  # A merge whose sources cannot fit together (log text can decode to many
+  # times its stored size) sets them aside and selects again, a few times per
+  # call, so one oversized group never stops the prefix's other merges. When
+  # nothing else merges, the call still reports the oversized group's error.
+  defp compact_mergeable(mergeable, candidates, manifest, tenant, config, opts, {attempts, failure}) do
+    case select(mergeable, opts) do
+      [] ->
+        with :ok <- advance_empty_cursor(manifest, candidates, tenant, config),
+             do: failure || {:ok, %{segments_before: length(manifest.segments), merged: 0}}
 
-  defp compact_selected(sources, candidates, manifest, tenant, config, opts) do
-    result = merge_and_publish(tenant, config, manifest, sources, opts)
-    # Rotation is only an optimization. Never mask the original failure if a
-    # competing writer prevents progress; publication remains independently CAS-fenced.
-    if match?({:error, _}, result), do: advance_empty_cursor(manifest, candidates, tenant, config)
-    result
+      sources ->
+        case merge_and_publish(tenant, config, manifest, sources, opts) do
+          {:error, :payload_too_large} = error when attempts > 1 ->
+            keys = MapSet.new(sources, & &1.key)
+            rest = %{mergeable | segments: Enum.reject(mergeable.segments, &MapSet.member?(keys, &1.key))}
+            compact_mergeable(rest, candidates, manifest, tenant, config, opts, {attempts - 1, failure || error})
+
+          # Rotation is only an optimization. Never mask the original failure if a
+          # competing writer prevents progress; publication remains independently CAS-fenced.
+          {:error, _} = error ->
+            advance_empty_cursor(manifest, candidates, tenant, config)
+            error
+
+          result ->
+            result
+        end
+    end
   end
 
   @doc false
@@ -120,7 +138,8 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp merge_and_publish(tenant, config, manifest, sources, opts) do
     with :ok <- validate_sources(tenant, sources, config),
          {:ok, records} <- read_sources(config, sources),
-         {:ok, payload, min_ts, max_ts, row_count, summary} <- encode_replacement(config, records, opts) do
+         {:ok, payload, min_ts, max_ts, row_count, summary, sources} <-
+           encode_replacement(config, records, sources, opts) do
       # A distinct suffix prevents prefix migration from adopting an unpublished
       # replacement after a crash. A manifest must exist before compaction starts.
       suffix = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
@@ -144,8 +163,9 @@ defmodule Pulso.Storage.S3.SignalCompactor do
       # Ambiguous publications retain their upload: the manifest may reference it.
       # Definitive conflicts are reclaimed by publish_replacement/5.
     else
+      # Log merges choose the subset that fits themselves (merge_logs/2).
       {:error, reason} = error when reason in [:payload_too_large, :query_sample_limit] ->
-        if length(sources) > 2 do
+        if length(sources) > 2 and not (reason == :payload_too_large and signal(config) == :logs) do
           # Encoding failed before any upload. Shrink the source set, never
           # truncate rows. A compressed-byte estimate cannot bound metadata.
           merge_and_publish(tenant, config, manifest, Enum.take(sources, max(2, div(length(sources), 2))), opts)
@@ -237,10 +257,10 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp encode_replacement(%{compaction_signal: :traces}, blobs, opts) do
+  defp encode_replacement(%{compaction_signal: :traces}, blobs, sources, opts) do
     case NIF.compact_trace_segments_v2(blobs, min(100_000, Keyword.get(opts, :max_rows, 100_000))) do
       {:ok, payload, min, max, count, {services, ids, proof}} ->
-        {:ok, payload, min, max, count, TraceSummary.from_values(services, ids, proof)}
+        {:ok, payload, min, max, count, TraceSummary.from_values(services, ids, proof), sources}
 
       {:error, _} = error ->
         error
@@ -250,17 +270,60 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end
   end
 
-  defp encode_replacement(%{compaction_signal: :logs}, blobs, opts) do
-    case NIF.compact_log_segments(blobs, min(100_000, Keyword.get(opts, :max_rows, 100_000))) do
-      {:ok, payload, min, max, count, services} -> {:ok, payload, min, max, count, services}
-      {:error, _} = error -> error
-      _ -> {:error, {:encode_failed, :parquet_encoder_rejected_input}}
+  defp encode_replacement(%{compaction_signal: :logs}, blobs, sources, opts),
+    do: merge_logs(Enum.zip(blobs, sources), min(100_000, Keyword.get(opts, :max_rows, 100_000)))
+
+  defp encode_replacement(_config, records, sources, _opts) do
+    with {:ok, payload, min, max} <- S3.encode_segment(:metrics, records),
+         do: {:ok, payload, min, max, length(records), nil, sources}
+  end
+
+  # Selection bounds compressed bytes, but the native merge bounds decoded
+  # strings (32 MiB), and log text often compresses tenfold or more. The merge
+  # takes the sources that fit, in order, and reports which; it needs two. A
+  # source that pairs with none of the others is set aside and the rest are
+  # tried again from the blobs already read. Sources left without any partner
+  # are remembered node-locally, so later passes select other merges instead
+  # of reading and failing on the same ones every interval.
+  defp merge_logs(pairs, _max_rows) when length(pairs) < 2 do
+    Enum.each(pairs, fn {_blob, source} -> remember_unmergeable(source.key) end)
+    {:error, :payload_too_large}
+  end
+
+  defp merge_logs(pairs, max_rows) do
+    case NIF.compact_log_segments(Enum.map(pairs, &elem(&1, 0)), max_rows) do
+      {:ok, payload, min, max, count, services, included} when length(included) >= 2 ->
+        {:ok, payload, min, max, count, services, Enum.map(included, &elem(Enum.at(pairs, &1), 1))}
+
+      {:ok, _payload, _min, _max, _count, _services, [alone]} ->
+        {_blob, source} = Enum.at(pairs, alone)
+        remember_unmergeable(source.key)
+        merge_logs(List.delete_at(pairs, alone), max_rows)
+
+      # No source fits even alone.
+      {:error, :payload_too_large} ->
+        Enum.each(pairs, fn {_blob, source} -> remember_unmergeable(source.key) end)
+        {:error, :payload_too_large}
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, {:encode_failed, :parquet_encoder_rejected_input}}
     end
   end
 
-  defp encode_replacement(_config, records, _opts) do
-    with {:ok, payload, min, max} <- S3.encode_segment(:metrics, records),
-         do: {:ok, payload, min, max, length(records), nil}
+  @unmergeable_ms 3_600_000
+  defp unmergeable_ref(key), do: %{"k" => "unmergeable:" <> key, "b" => 1}
+
+  defp remember_unmergeable(key),
+    do: MetadataCache.put(unmergeable_ref(key), System.monotonic_time(:millisecond) + @unmergeable_ms)
+
+  defp unmergeable?(key) do
+    case MetadataCache.get(unmergeable_ref(key)) do
+      {:ok, until} -> until > System.monotonic_time(:millisecond)
+      :miss -> false
+    end
   end
 
   defp summarize_replacement(segment, %{compaction_signal: :traces}, _records, summary),
@@ -291,19 +354,74 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp merge_source_summaries(segment, _config, _sources), do: segment
 
   # Through the manifest owner, so local appends cannot slip in between the
-  # read of the root and its conditional write. Every attempt first checks for
-  # an earlier publication whose response was lost.
+  # read of the root and its conditional write. A format-4 replacement is
+  # planned first against a fresh snapshot, outside the owner: its page reads
+  # and rewritten page writes would otherwise hold every append of the prefix
+  # for their whole duration (at object-store latency each). The owner only
+  # commits the plan in memory. Every attempt first checks for an earlier
+  # publication whose response was lost.
   defp publish(tenant, config, sources, replacement, grace) do
-    transaction = &replacement_write(&1, tenant, config, sources, replacement, grace)
+    signal = signal_string(config)
 
-    case ManifestOwner.transact(tenant, signal_string(config), config, transaction) do
-      {:ok, :ok} -> :ok
-      {:error, :cas_retries_exhausted} -> resolve_exhausted(tenant, config, replacement)
-      error -> error
+    with {:ok, plan} <- plan_publication(tenant, config, sources, replacement, grace) do
+      transaction = &replacement_write(&1, tenant, config, sources, replacement, grace, plan)
+
+      case ManifestOwner.transact(tenant, signal, config, transaction) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, :cas_retries_exhausted} = error ->
+          resolve_unconfirmed(tenant, config, replacement, plan, error)
+
+        {:error, {:unconfirmed, reason}} ->
+          resolve_unconfirmed(tenant, config, replacement, plan, {:error, {:unpublished_replacement, reason}})
+
+        error ->
+          error
+      end
     end
   end
 
-  defp replacement_write(current, tenant, config, sources, replacement, grace) do
+  # Planned against the node's cached root: a stale one only makes the commit
+  # conflict, never publish the wrong change.
+  defp plan_publication(tenant, config, sources, replacement, grace) do
+    case ManifestOwner.ensure_loaded(tenant, signal_string(config), config) do
+      {:ok, %{manifest: %{version: 4} = snapshot}} ->
+        deadline = System.system_time(:millisecond) + grace
+        signal = signal_string(config)
+
+        case JournalManifest.plan_replace(snapshot, sources, [replacement], 2, deadline, tenant, signal, config) do
+          {:ok, plan} -> {:ok, plan}
+          {:error, reason} -> {:error, {:unpublished_replacement, reason}}
+        end
+
+      {:ok, _other} ->
+        {:ok, nil}
+
+      error ->
+        error
+    end
+  end
+
+  # A format-4 commit only reads the root in memory: the replacement listed in
+  # the tail is a lost earlier response; anything else is confirmed outside.
+  defp replacement_write(%{version: 4} = current, tenant, config, _sources, replacement, _grace, plan)
+       when plan != nil do
+    signal = signal_string(config)
+
+    if Enum.any?(current.segments, &(&1.key == replacement.key)) do
+      {:done, :ok}
+    else
+      with {:ok, updated} <- JournalManifest.commit_replace(current, plan, tenant, signal, config),
+           {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config) do
+        {:write, sealed, payload, :ok}
+      else
+        {:error, reason} -> {:error, {:unconfirmed, reason}}
+      end
+    end
+  end
+
+  defp replacement_write(current, tenant, config, sources, replacement, grace, _plan) do
     case published?(current, replacement.key, tenant, config) do
       {:ok, true} ->
         {:done, :ok}
@@ -323,12 +441,12 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   defp prepared_write({:error, reason}), do: {:error, {:unpublished_replacement, reason}}
 
   # The last conditional response can also have been lost after success.
-  # Resolve it before declaring exhaustion or reclaiming this unique upload.
-  defp resolve_exhausted(tenant, config, replacement) do
+  # Resolve it against a fresh root before reclaiming this unique upload and
+  # the pages planned for it, which no published root references then.
+  defp resolve_unconfirmed(tenant, config, replacement, plan, error) do
     with {:ok, current, _etag} <- load(tenant, config),
-         {:ok, published} <- published?(current, replacement.key, tenant, config) do
-      if published, do: :ok, else: {:error, :cas_retries_exhausted}
-    end
+         {:ok, published} <- published?(current, replacement.key, tenant, config),
+         do: JournalManifest.settle_unconfirmed(published, plan, config, error)
   end
 
   defp published?(%{version: 3} = root, key, tenant, config) do
@@ -487,7 +605,7 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   # compaction once their reader grace has passed. A gc page is deleted only
   # after every page it lists, so a missing gc page means its work is done.
   # `:now_ms` holds deletions back, for example until a manifest backup
-  # records the retirements (`Pulso.Storage.S3.ManifestBackup.hold_ms/2`).
+  # records the retirements (`Pulso.Storage.S3.ManifestBackup.hold_ms/3`).
   defp now(opts), do: Keyword.get(opts, :now_ms, System.system_time(:millisecond))
 
   defp cleanup_paged(root, tenant, maximum, config, now) do
@@ -507,13 +625,23 @@ defmodule Pulso.Storage.S3.SignalCompactor do
 
       if retired == [] and pages == [] and gc_refs == [],
         do: {:ok, 0},
-        else: finish_paged_cleanup(tenant, config, {deleted, pages, gc_refs, cursor}, errors)
+        else:
+          finish_paged_cleanup(
+            root,
+            tenant,
+            config,
+            %{deleted: deleted, pages: pages, gc_refs: gc_refs, cursor: cursor},
+            errors
+          )
     end
   end
 
-  defp finish_paged_cleanup(tenant, config, {deleted, _, _, _} = work, errors) do
-    with :ok <- publish_paged_cleanup(tenant, config, work) do
-      if errors == [], do: {:ok, length(deleted)}, else: {:error, {:cleanup_failed, Enum.reverse(errors)}}
+  # Rewrites of the pages holding deleted retirements are written here,
+  # outside the manifest owner, which only swaps references.
+  defp finish_paged_cleanup(root, tenant, config, work, errors) do
+    with {:ok, changes} <- JournalManifest.plan_cleanup(root, work.deleted, tenant, signal_string(config), config),
+         :ok <- publish_paged_cleanup(tenant, config, Map.put(work, :changes, changes)) do
+      if errors == [], do: {:ok, length(work.deleted)}, else: {:error, {:cleanup_failed, Enum.reverse(errors)}}
     end
   end
 
@@ -528,13 +656,13 @@ defmodule Pulso.Storage.S3.SignalCompactor do
     end)
   end
 
-  defp publish_paged_cleanup(tenant, config, {deleted, pages, gc_refs, cursor}) do
+  defp publish_paged_cleanup(tenant, config, work) do
     signal = signal_string(config)
 
     transaction = fn
       %{version: 4} = current ->
         current
-        |> JournalManifest.apply_cleanup(deleted, pages, gc_refs, cursor, tenant, signal, config)
+        |> JournalManifest.apply_cleanup(work, tenant, signal, config)
         |> cleanup_write(current, tenant, signal, config)
 
       # Retention converted the root meanwhile; it owns cleanup now.

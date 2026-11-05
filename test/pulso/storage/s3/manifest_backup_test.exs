@@ -5,6 +5,7 @@ defmodule Pulso.Storage.S3.ManifestBackupTest do
   alias Pulso.Record.MetricSample
   alias Pulso.Runtime
   alias Pulso.Storage.S3
+  alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.ManifestSupervision
@@ -102,8 +103,9 @@ defmodule Pulso.Storage.S3.ManifestBackupTest do
     :ok = ObjectStore.delete(ctx.config, Manifest.manifest_key(ctx.tenant, "metrics"))
 
     assert {:ok, %{segments: 2, adopted: 1}} = ManifestBackup.restore(ctx.tenant, "metrics", ctx.config)
-    assert {:ok, %Manifest{version: 2, segments: restored}, _etag} = Retention.load(ctx.tenant, "metrics", ctx.config)
-    assert length(restored) == 2
+    # A format-4 root is backed up and restored as itself, not flattened.
+    assert {:ok, %Manifest{version: 4} = restored, _etag} = Retention.load(ctx.tenant, "metrics", ctx.config)
+    assert JournalManifest.referenced(restored) == 2
     assert samples(ctx) == [1.0, 2.0, 3.0, 4.0]
   end
 

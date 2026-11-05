@@ -1461,6 +1461,19 @@ object-store latency and gave up with `cas_retries_exhausted`. Writes from
 other instances still race through the root's conditional write; the owner
 reloads and reruns the change up to five times.
 
+On format-4 roots the transaction itself does no page I/O. Merges, hour
+finalization and cleanup plan their page rewrites against a fresh snapshot
+first, outside the owner (`JournalManifest.plan_replace/8`,
+`plan_cleanup/5`), writing the new leaf and index pages there; the owner only
+substitutes the planned top-level references when they are unchanged (page
+keys are unique, so an unchanged reference proves an unchanged subtree), as
+retention expiry already did. A merge whose references moved fails as a
+conflict and is confirmed against a fresh root before its upload and planned
+pages are deleted; a cleanup drops the moved rewrites and a later pass marks
+those deletions again. Page reads and writes inside the owner held every
+append of the prefix for one round trip per rewritten page, which on a busy
+log prefix exceeded the 19 s ingest timeout.
+
 A merge selects at least two segments from the same hour partition, up to 32
 segments, 8 MiB of encoded input, and 100,000 samples. Each candidate must be at
 most 1 MiB and have known byte and row counts. Native metric codecs preserve every
@@ -1505,9 +1518,10 @@ If a manifest is missing and compacted objects exist, reads and ingest return
 `:compacted_manifest_missing` rather than reconstructing incomplete or duplicate
 data. Recovery restores the manifest from object-store version history or from
 Pulso's own backups (`Pulso.Storage.S3.ManifestBackup`): the maintenance owner
-writes a flat copy under `.../backups/` every interval, and cleanup passes
-`now_ms = backup_time + grace - 1`, so it only deletes objects retired before
-the newest backup. Restoring that backup therefore never references a deleted
+writes a copy under `.../backups/` every interval (a flat root whole, a format-4
+root as itself, whose pages are immutable), and cleanup passes
+`now_ms = backup_time + min(grace, page grace) - 1`, so it only deletes objects
+retired, and pages superseded, before the newest backup. Restoring that backup therefore never references a deleted
 object; ingested segments written after it are adopted by key (`-rand-`/`-idem-`
 only), and later compaction or finalization outputs are left orphaned because
 their sources still exist. `-final-`, `-rollup-`, `-edge-` keys and a `backups/`

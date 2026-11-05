@@ -202,14 +202,20 @@ defmodule Pulso.ObjectStore do
     end
   end
 
+  # Manifest pages are `.json` objects under `index/` (format 3) or
+  # `journal/` (format 4); manifest backups live under `backups/`.
+  defp purpose(key) do
+    cond do
+      String.ends_with?(key, "/manifest.json") -> "manifest"
+      String.ends_with?(key, ".json") and String.contains?(key, ["/index/", "/journal/"]) -> "metadata_page"
+      String.contains?(key, "/backups/") -> "backup"
+      String.ends_with?(key, ".parquet") -> "segment"
+      true -> "other"
+    end
+  end
+
   defp observe(operation, key, write_bytes, fun) do
-    purpose =
-      cond do
-        String.ends_with?(key, "/manifest.json") -> "manifest"
-        String.contains?(key, "/index/") and String.ends_with?(key, ".json") -> "metadata_page"
-        String.ends_with?(key, ".parquet") -> "segment"
-        true -> "other"
-      end
+    purpose = purpose(key)
 
     Pulso.Metrics.measure(
       :object,

@@ -427,7 +427,7 @@ defmodule Pulso.Storage.S3.Retention do
   defp backup_hold(%Manifest{version: 4}, tenant, signal, config, opts) do
     if days(config, signal) > 0 and Map.get(config, :manifest_backup_enabled, true) do
       with {:ok, taken} <- ManifestBackup.ensure_recent(tenant, signal, config) do
-        hold = ManifestBackup.hold_ms(taken, hold_grace(config, signal))
+        hold = ManifestBackup.hold_ms(taken, hold_grace(config, signal), config)
         {:ok, Keyword.update(opts, :now_ms, hold, &min(&1, hold))}
       end
     else

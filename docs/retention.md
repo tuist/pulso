@@ -495,8 +495,9 @@ Watch collector drop counters while switching to `enforce`.
 
 Format-4 prefixes are covered by [manifest backups](configuration.md#manifest-backups):
 the retention worker takes one every 15 minutes, and cleanup deletes an expired
-object only after a backup records its retirement. A restored backup has no
-floor; the next retention pass sets it again and retires anything below it.
+object only after a backup records its retirement. A backup is a copy of the
+format-4 root, including its floor; it costs one GET and one PUT however long
+the history is.
 
 For format 3: after conversion, the root manifest and the pages it references are the only
 record of which objects are live, and the floor is irreversible.

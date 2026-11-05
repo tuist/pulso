@@ -382,6 +382,10 @@ defmodule Pulso.Storage.S3.JournalManifest do
     end
   end
 
+  @doc "The segments a root does not know at all (neither active nor retired), reading pages once."
+  def absent(%Manifest{version: @version} = root, segments, tenant, signal, config),
+    do: with_ops(fn -> Enum.filter(segments, &(do_lookup(root, &1, tenant, signal, config) == :absent)) end)
+
   defp find(refs, key, max_ts, tenant, signal, config) do
     Enum.find_value(refs, :absent, fn ref ->
       if covers?(ref, max_ts), do: find_in(ref, key, max_ts, tenant, signal, config)
@@ -592,7 +596,8 @@ defmodule Pulso.Storage.S3.JournalManifest do
   @doc """
   Retire active sources and add their replacement in one root transition.
   Fails with `:compaction_conflict` unless every source is still active and
-  the replacement is unknown.
+  the replacement is unknown. Equivalent to `plan_replace/8` followed by
+  `commit_replace/5` on the same root.
   """
   def replace(%Manifest{version: @version} = root, source_keys, replacement, deadline, tenant, signal, config),
     do: with_ops(fn -> do_replace(root, source_keys, [replacement], 2, deadline, tenant, signal, config) end)
@@ -602,6 +607,31 @@ defmodule Pulso.Storage.S3.JournalManifest do
     do: with_ops(fn -> do_replace(root, source_keys, replacements, 1, deadline, tenant, signal, config) end)
 
   defp do_replace(root, source_keys, replacements, minimum, deadline, tenant, signal, config) do
+    plan = do_plan_replace(root, source_keys, replacements, minimum, deadline, tenant, signal, config)
+    do_commit_replace(root, plan, tenant, signal, config)
+  end
+
+  @doc """
+  Plan a replacement (compaction, hour finalization) against a snapshot of
+  the root, outside the manifest owner: every page read and every rewritten
+  page write happens here. `commit_replace/5` then applies the plan to the
+  owner's current root in memory. Returns `{:ok, plan}`; `plan.written` lists
+  the pages written for it, which nothing references until a commit lands.
+  """
+  def plan_replace(
+        %Manifest{version: @version} = root,
+        source_keys,
+        replacements,
+        minimum,
+        deadline,
+        tenant,
+        signal,
+        config
+      ),
+      do:
+        with_ops(fn -> do_plan_replace(root, source_keys, replacements, minimum, deadline, tenant, signal, config) end)
+
+  defp do_plan_replace(root, source_keys, replacements, minimum, deadline, tenant, signal, config) do
     keys = Enum.uniq(source_keys)
     Enum.each(replacements, &validate_segment!(&1, tenant, signal))
     if length(keys) < minimum, do: fail(:compaction_conflict)
@@ -617,16 +647,76 @@ defmodule Pulso.Storage.S3.JournalManifest do
         do: fail(:compaction_conflict)
     end)
 
-    inline_set = MapSet.new(inline)
+    changes = plan_retire_paged(root, paged, deadline, tenant, signal, config)
+
+    %{
+      inline: inline,
+      replacements: replacements,
+      deadline: deadline,
+      changes: changes,
+      written: Enum.flat_map(changes, & &1.written)
+    }
+  end
+
+  @doc """
+  Apply a `plan_replace/8` plan to the current root without any I/O beyond a
+  possible gc page. Fails with `:compaction_conflict` when the root moved
+  under the plan: an inline source left the tail, a replacement is already
+  listed there, or a top-level page the plan rewrites was replaced. Page keys
+  are unique, so an unchanged top-level reference proves its whole subtree is
+  the one planned against.
+  """
+  def commit_replace(%Manifest{version: @version} = root, plan, tenant, signal, config),
+    do: with_ops(fn -> do_commit_replace(root, plan, tenant, signal, config) end)
+
+  defp do_commit_replace(root, plan, tenant, signal, config) do
+    tail = MapSet.new(root.segments, & &1.key)
+    if not Enum.all?(plan.inline, &MapSet.member?(tail, &1)), do: fail(:compaction_conflict)
+
+    if Enum.any?(plan.replacements, &(MapSet.member?(tail, &1.key) or Map.has_key?(root.retired, &1.key))),
+      do: fail(:compaction_conflict)
+
+    {root, applied, stale} = substitute(root, plan.changes)
+    if stale != [], do: fail(:compaction_conflict)
+
+    inline_set = MapSet.new(plan.inline)
 
     root = %{
       root
       | segments: Enum.reject(root.segments, &MapSet.member?(inline_set, &1.key)),
-        retired: Enum.reduce(inline, root.retired, &Map.put(&2, &1, Retirement.new(deadline)))
+        retired: Enum.reduce(plan.inline, root.retired, &Map.put(&2, &1, Retirement.new(plan.deadline)))
     }
 
-    root = retire_paged(root, paged, deadline, tenant, signal, config)
-    root |> Manifest.merge(replacements) |> touch()
+    grace = Map.get(config, :manifest_page_grace_ms, @default_grace_ms)
+    superseded = Enum.flat_map(applied, & &1.superseded)
+
+    root =
+      supersede(root, superseded, max(plan.deadline, System.system_time(:millisecond) + grace), tenant, signal, config)
+
+    root |> Manifest.merge(plan.replacements) |> touch()
+  end
+
+  @doc """
+  Delete the pages a plan wrote, best effort, once the caller has proved no
+  published root references them (the plan was never committed).
+  """
+  def discard_plan(%{written: written}, config) do
+    written
+    |> Pulso.Runtime.Task.async_stream(&ObjectStore.delete(config, &1), max_concurrency: 8, timeout: :infinity)
+    |> Stream.run()
+  end
+
+  @doc """
+  The outcome of a replacement whose commit was not confirmed, once a fresh
+  root shows whether it was `published`: `:ok`, or `error` after discarding
+  the plan's pages (a nil plan wrote none).
+  """
+  def settle_unconfirmed(true, _plan, _config, _error), do: :ok
+  def settle_unconfirmed(false, nil, _config, error), do: error
+
+  def settle_unconfirmed(false, plan, config, error) do
+    discard_plan(plan, config)
+    error
   end
 
   defp lookup!(root, key, max_ts, tenant, signal, config) do
@@ -637,9 +727,9 @@ defmodule Pulso.Storage.S3.JournalManifest do
     end
   end
 
-  defp retire_paged(root, [], _deadline, _tenant, _signal, _config), do: root
+  defp plan_retire_paged(_root, [], _deadline, _tenant, _signal, _config), do: []
 
-  defp retire_paged(root, keys, deadline, tenant, signal, config) do
+  defp plan_retire_paged(root, keys, deadline, tenant, signal, config) do
     targets = MapSet.new(keys)
 
     update = fn leaf ->
@@ -656,7 +746,7 @@ defmodule Pulso.Storage.S3.JournalManifest do
       end
     end
 
-    rewrite_root(root, Enum.map(keys, &key_max_ts!/1), update, tenant, signal, config, deadline)
+    plan_rewrite(root, Enum.map(keys, &key_max_ts!/1), update, tenant, signal, config)
   end
 
   # ---- cleanup -------------------------------------------------------------
@@ -726,39 +816,58 @@ defmodule Pulso.Storage.S3.JournalManifest do
     do: due_retired(read_index(ref, tenant, signal, config, deadline()), now, left, tenant, signal, config)
 
   @doc """
-  Record a cleanup pass against the current root: retirements whose revision
-  is unchanged become deleted, deleted superseded pages are forgotten. Pages
-  rewritten for this are themselves superseded.
+  Plan the page rewrites a cleanup pass needs, outside the manifest owner:
+  deleted retirements that live in pages of `root` (not its inline tail) are
+  marked deleted in rewritten leaves. Pass the result to `apply_cleanup/5`.
   """
-  def apply_cleanup(%Manifest{version: @version} = root, deleted, pages, gc_refs, cursor, tenant, signal, config),
-    do: with_ops(fn -> do_apply_cleanup(root, deleted, pages, gc_refs, cursor, tenant, signal, config) end)
+  def plan_cleanup(%Manifest{version: @version} = root, deleted, tenant, signal, config),
+    do: with_ops(fn -> do_plan_cleanup(root, deleted, tenant, signal, config) end)
 
-  defp do_apply_cleanup(root, deleted, pages, gc_refs, cursor, tenant, signal, config) do
-    root = if cursor, do: %{root | paging: Map.put(root.paging, "rc", cursor)}, else: root
+  defp do_plan_cleanup(root, deleted, tenant, signal, config) do
     observed = Map.new(deleted)
-    mark = fn retired -> Map.new(retired, &mark_deleted(&1, observed)) end
-    root = %{root | retired: mark.(root.retired)}
     paged = Enum.reject(deleted, fn {key, _} -> Map.has_key?(root.retired, key) end)
 
-    root =
-      if paged == [],
-        do: root,
-        else:
-          rewrite_root(
-            root,
-            Enum.map(paged, fn {key, _} -> key_max_ts!(key) end),
-            &%{&1 | retired: mark.(&1.retired)},
-            tenant,
-            signal,
-            config
-          )
+    if paged == [],
+      do: [],
+      else:
+        plan_rewrite(
+          root,
+          Enum.map(paged, fn {key, _} -> key_max_ts!(key) end),
+          &%{&1 | retired: Map.new(&1.retired, fn entry -> mark_deleted(entry, observed) end)},
+          tenant,
+          signal,
+          config
+        )
+  end
 
-    pages = MapSet.new(pages)
-    gc_refs = MapSet.new(gc_refs)
+  @doc """
+  Record a cleanup pass (`work`: `deleted`, `pages`, `gc_refs`, `cursor` and
+  the `changes` from `plan_cleanup/5`) against the current root, in memory: inline
+  retirements whose revision is unchanged become deleted, page rewrites
+  planned by `plan_cleanup/5` replace their top-level references when those
+  are unchanged, and deleted superseded pages are forgotten. A planned
+  rewrite whose reference moved meanwhile is dropped (its pages superseded);
+  its objects are already gone, so a later pass marks them again.
+  """
+  def apply_cleanup(%Manifest{version: @version} = root, work, tenant, signal, config),
+    do: with_ops(fn -> do_apply_cleanup(root, work, tenant, signal, config) end)
+
+  defp do_apply_cleanup(root, work, tenant, signal, config) do
+    root = if work.cursor, do: %{root | paging: Map.put(root.paging, "rc", work.cursor)}, else: root
+    observed = Map.new(work.deleted)
+    root = %{root | retired: Map.new(root.retired, &mark_deleted(&1, observed))}
+    {root, applied, stale} = substitute(root, work.changes)
+
+    pages = MapSet.new(work.pages)
+    gc_refs = MapSet.new(work.gc_refs)
     p = root.paging
     g = Enum.reject(p["g"], fn [key, _] -> MapSet.member?(pages, key) end)
     gr = Enum.reject(p["gr"], &MapSet.member?(gc_refs, &1["k"]))
-    %{root | paging: %{p | "g" => g, "gr" => gr}}
+    root = %{root | paging: %{p | "g" => g, "gr" => gr}}
+
+    superseded = Enum.flat_map(applied, & &1.superseded) ++ Enum.flat_map(stale, & &1.written)
+    grace = Map.get(config, :manifest_page_grace_ms, @default_grace_ms)
+    supersede(root, superseded, System.system_time(:millisecond) + grace, tenant, signal, config)
   end
 
   defp mark_deleted({key, retirement}, observed) do
@@ -884,23 +993,13 @@ defmodule Pulso.Storage.S3.JournalManifest do
   defp do_apply_expiry(root, floor, deadline, changes, tenant, signal, config) do
     floor = max(retention_floor(root) || 0, floor)
     {expired, kept} = Enum.split_with(root.segments, &(&1.max_ts < floor))
-    present = MapSet.new(root.paging["refs"], & &1["k"])
-    {applied, stale} = Enum.split_with(changes, &MapSet.member?(present, &1.key))
-    replacements = Map.new(applied, &{&1.key, &1.ref})
-
-    refs =
-      Enum.flat_map(root.paging["refs"], fn ref ->
-        case Map.fetch(replacements, ref["k"]) do
-          {:ok, replacement} -> List.wrap(replacement)
-          :error -> [ref]
-        end
-      end)
+    {root, applied, stale} = substitute(root, changes)
 
     root = %{
       root
       | segments: kept,
         retired: root.retired |> forget(floor) |> retire(expired, deadline),
-        paging: root.paging |> Map.put("refs", refs) |> Map.put("rf", floor)
+        paging: Map.put(root.paging, "rf", floor)
     }
 
     superseded = Enum.flat_map(applied, & &1.superseded) ++ Enum.flat_map(stale, & &1.written)
@@ -918,37 +1017,92 @@ defmodule Pulso.Storage.S3.JournalManifest do
 
   # Rewrite every leaf that can hold one of `timestamps`, copying the path to
   # the root; unchanged subtrees keep their references.
-  defp rewrite_root(root, timestamps, update, tenant, signal, config, at_least \\ 0) do
-    pred = fn ref -> Enum.any?(timestamps, &covers?(ref, &1)) end
-    {refs, superseded} = rewrite(root.paging["refs"], pred, update, tenant, signal, config)
-    root = %{root | paging: %{root.paging | "refs" => refs}}
+  defp rewrite_root(root, timestamps, update, tenant, signal, config) do
+    changes = plan_rewrite(root, timestamps, update, tenant, signal, config)
+    {root, applied, []} = substitute(root, changes)
     grace = Map.get(config, :manifest_page_grace_ms, @default_grace_ms)
-    supersede(root, superseded, max(at_least, System.system_time(:millisecond) + grace), tenant, signal, config)
+    superseded = Enum.flat_map(applied, & &1.superseded)
+    supersede(root, superseded, System.system_time(:millisecond) + grace, tenant, signal, config)
   end
 
+  # The rewrite as changes to top-level references, each
+  # `%{key, ref, superseded, written}`, without touching the root: page reads
+  # and writes happen here, so they can run outside the manifest owner.
+  defp plan_rewrite(root, timestamps, update, tenant, signal, config) do
+    pred = fn ref -> Enum.any?(timestamps, &covers?(ref, &1)) end
+    refs = root.paging["refs"]
+    {updated, _superseded, _written, changes} = rewrite(refs, pred, update, tenant, signal, config)
+
+    for {ref, new, {superseded, written}} <- Enum.zip([refs, updated, changes]),
+        superseded != [],
+        do: %{key: ref["k"], ref: new, superseded: superseded, written: written}
+  end
+
+  # Substitute planned top-level references that are still current. Returns
+  # `{root, applied, stale}`; a stale change's reference was replaced since
+  # planning, so its written pages are unreferenced.
+  defp substitute(root, changes) do
+    present = MapSet.new(root.paging["refs"], & &1["k"])
+    {applied, stale} = Enum.split_with(changes, &MapSet.member?(present, &1.key))
+    replacements = Map.new(applied, &{&1.key, &1.ref})
+
+    refs =
+      Enum.flat_map(root.paging["refs"], fn ref ->
+        case Map.fetch(replacements, ref["k"]) do
+          {:ok, replacement} -> List.wrap(replacement)
+          :error -> [ref]
+        end
+      end)
+
+    {%{root | paging: %{root.paging | "refs" => refs}}, applied, stale}
+  end
+
+  # Sibling subtrees are rewritten concurrently, eight at a time per level:
+  # a cleanup batch touches dozens of leaves, one read and one write each at
+  # object-store latency. Returns the new references, everything superseded
+  # and written, and each reference's own `{superseded, written}`.
   defp rewrite(refs, pred, update, tenant, signal, config) do
-    Enum.map_reduce(refs, [], fn ref, superseded ->
-      if pred.(ref),
-        do: rewrite_ref(ref, superseded, pred, update, tenant, signal, config),
-        else: {ref, superseded}
-    end)
+    changes =
+      refs
+      |> Enum.filter(pred)
+      |> concurrently(&{&1["k"], rewrite_ref(&1, pred, update, tenant, signal, config)}, 8)
+      |> Map.new()
+
+    {updated, per_ref} =
+      Enum.map_reduce(refs, [], fn ref, per_ref ->
+        case Map.fetch(changes, ref["k"]) do
+          {:ok, {new, superseded, written}} -> {new, [{superseded, written} | per_ref]}
+          :error -> {ref, [{[], []} | per_ref]}
+        end
+      end)
+
+    per_ref = Enum.reverse(per_ref)
+    {updated, Enum.flat_map(per_ref, &elem(&1, 0)), Enum.flat_map(per_ref, &elem(&1, 1)), per_ref}
   end
 
-  defp rewrite_ref(%{"h" => 0} = ref, superseded, _pred, update, tenant, signal, config) do
+  defp rewrite_ref(%{"h" => 0} = ref, _pred, update, tenant, signal, config) do
     leaf = read_leaf(ref, tenant, signal, config, deadline())
 
     case update.(leaf) do
-      ^leaf -> {ref, superseded}
-      updated -> {leaf_ref(updated, tenant, signal, config), [ref["k"] | superseded]}
+      ^leaf ->
+        {ref, [], []}
+
+      updated ->
+        new = leaf_ref(updated, tenant, signal, config)
+        {new, [ref["k"]], [new["k"]]}
     end
   end
 
-  defp rewrite_ref(ref, superseded, pred, update, tenant, signal, config) do
+  defp rewrite_ref(ref, pred, update, tenant, signal, config) do
     children = read_index(ref, tenant, signal, config, deadline())
 
     case rewrite(children, pred, update, tenant, signal, config) do
-      {^children, []} -> {ref, superseded}
-      {updated, below} -> {index_ref(updated, tenant, signal, config), [ref["k"] | below ++ superseded]}
+      {_children, [], _written, _per_ref} ->
+        {ref, [], []}
+
+      {updated, superseded, written, _per_ref} ->
+        new = index_ref(updated, tenant, signal, config)
+        {new, [ref["k"] | superseded], [new["k"] | written]}
     end
   end
 

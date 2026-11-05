@@ -3,24 +3,28 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   Pulso-side manifest backups, for object stores without bucket versioning.
 
   Once compaction or hour finalization has run, a prefix's manifest is the
-  only record of which objects are live. `backup/4` writes a self-contained
-  flat copy of the current manifest (format 4 pages included) to
-  `tenants/<t>/v4/signal=<s>/backups/<unix_ms>.json` and keeps the newest
-  `:keep` (48) copies.
+  only record of which objects are live. `backup/4` writes a copy of the
+  current manifest to `tenants/<t>/v4/signal=<s>/backups/<unix_ms>.json` and
+  keeps the newest `:keep` (48) copies. A flat root is copied whole. A
+  format-4 root is copied as it is: its pages are immutable, so the copy costs
+  one PUT whatever the history, and it needs no memory proportional to the
+  history (materializing every page into one flat document read hundreds of
+  pages and exceeded maintenance heap limits on large prefixes).
 
   Maintenance holds deletions back so the newest backup stays restorable:
-  cleanup only deletes objects retired before that backup was taken
-  (`hold_ms/2`). An object retired later is still active in the backup and
-  is kept until a newer backup records its retirement.
+  cleanup only deletes objects retired, and manifest pages superseded, before
+  that backup was taken (`hold_ms/3`). An object retired or a page superseded
+  later is still referenced by the backup and is kept until a newer backup
+  records the change.
 
   `restore/4` rebuilds a lost manifest from the newest backup and adopts the
-  ingested segments written after it (keys a backup does not list). Outputs
+  ingested segments written after it (keys the backup does not know). Outputs
   of compaction and finalization written after the backup are not adopted;
   their sources were not deleted, so no acknowledged data is lost or
   duplicated. Prefixes with bucketed (format-3) retention are not backed up;
   format-4 prefixes with retention are, and the retention worker takes their
   backups (`ensure_recent/3`). A backup is a flat copy without the retention
-  floor; the next retention pass sets it again.
+  floor; a format-4 copy keeps the floor it had.
   """
 
   alias Pulso.ObjectStore
@@ -32,7 +36,6 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   alias Pulso.Storage.S3.Retention
 
   @width 20
-  @materialize_bytes 512 * 1_048_576
 
   def prefix(tenant, signal), do: "tenants/#{tenant}/v4/signal=#{signal}/backups/"
 
@@ -45,16 +48,13 @@ defmodule Pulso.Storage.S3.ManifestBackup do
       case flatten(root, tenant, signal, config) do
         {:ok, flat} -> write(tenant, signal, config, flat, Keyword.get(opts, :keep, 48))
         :retention_managed -> {:ok, :retention_managed}
-        error -> error
       end
     end
   end
 
   defp flatten(%{version: 3}, _tenant, _signal, _config), do: :retention_managed
 
-  defp flatten(%{version: 4} = root, tenant, signal, config),
-    do: JournalManifest.materialize(root, tenant, signal, config, @materialize_bytes)
-
+  defp flatten(%{version: 4} = root, _tenant, _signal, _config), do: {:ok, root}
   defp flatten(root, _tenant, _signal, _config), do: {:ok, %{root | version: max(root.version, 2)}}
 
   defp write(tenant, signal, config, flat, keep) do
@@ -64,7 +64,7 @@ defmodule Pulso.Storage.S3.ManifestBackup do
 
     with {:ok, _etag} <- ObjectStore.put(config, key, body) do
       prune(tenant, signal, config, keep)
-      {:ok, %{key: key, taken_ms: now, segments: length(flat.segments)}}
+      {:ok, %{key: key, taken_ms: now, segments: JournalManifest.referenced(flat)}}
     end
   end
 
@@ -155,6 +155,15 @@ defmodule Pulso.Storage.S3.ManifestBackup do
   def hold_ms(taken_ms, grace_ms), do: min(System.system_time(:millisecond), taken_ms + grace_ms - 1)
 
   @doc """
+  `hold_ms/2` for a cleanup that also deletes superseded manifest pages: their
+  deadlines are supersession time plus `:manifest_page_grace_ms`, so the hold
+  uses the smaller of the two graces. A format-4 backup references the pages
+  that were current when it was taken.
+  """
+  def hold_ms(taken_ms, grace_ms, config),
+    do: hold_ms(taken_ms, min(grace_ms, Map.get(config, :manifest_page_grace_ms, 3_600_000)))
+
+  @doc """
   Rebuild a missing manifest from the newest backup. Refuses to overwrite an
   existing manifest unless `force: true`. Returns `{:ok, %{backup, segments, adopted}}`.
   """
@@ -164,9 +173,8 @@ defmodule Pulso.Storage.S3.ManifestBackup do
          {:ok, key} <- newest(keys),
          {:ok, body} <- ObjectStore.get(config, key),
          {:ok, manifest} <- Manifest.decode(body),
-         {:ok, adopted} <- adoptable(tenant, signal, config, manifest) do
-      restored = Manifest.merge(%{manifest | version: max(manifest.version, 2)}, adopted)
-      payload = restored |> Manifest.encode() |> IO.iodata_to_binary()
+         {:ok, adopted} <- adoptable(tenant, signal, config, manifest),
+         {:ok, restored, payload} <- restored(manifest, adopted, tenant, signal, config) do
       manifest_key = Manifest.manifest_key(tenant, signal)
 
       result =
@@ -175,8 +183,20 @@ defmodule Pulso.Storage.S3.ManifestBackup do
           else: ObjectStore.put_if_none_match(config, manifest_key, payload)
 
       with {:ok, _etag} <- result,
-           do: {:ok, %{backup: key, segments: length(restored.segments), adopted: length(adopted)}}
+           do: {:ok, %{backup: key, segments: JournalManifest.referenced(restored), adopted: length(adopted)}}
     end
+  end
+
+  defp restored(%{version: 4} = root, adopted, tenant, signal, config) do
+    with {:ok, :ok} <- JournalManifest.validate_context(root, tenant, signal),
+         {:ok, updated} <- JournalManifest.register(root, adopted, tenant, signal, config),
+         {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, signal, config),
+         do: {:ok, sealed, payload}
+  end
+
+  defp restored(manifest, adopted, _tenant, _signal, _config) do
+    restored = Manifest.merge(%{manifest | version: max(manifest.version, 2)}, adopted)
+    {:ok, restored, restored |> Manifest.encode() |> IO.iodata_to_binary()}
   end
 
   defp newest([]), do: {:error, :no_manifest_backup}
@@ -192,19 +212,22 @@ defmodule Pulso.Storage.S3.ManifestBackup do
 
   # Ingested segments the backup does not know: written after it was taken.
   defp adoptable(tenant, signal, config, manifest) do
-    known = MapSet.new(Enum.map(manifest.segments, & &1.key) ++ Map.keys(manifest.retired))
     scope = "tenants/#{tenant}/v4/signal=#{signal}/"
 
     with {:ok, keys} <- ObjectStore.list(config, scope) do
-      adopted =
-        for key <- keys,
-            ingested?(key, scope),
-            not MapSet.member?(known, key),
-            {:ok, segment} <- [ManifestOwner.segment_from_key(key)],
-            do: segment
+      candidates =
+        for key <- keys, ingested?(key, scope), {:ok, segment} <- [ManifestOwner.segment_from_key(key)], do: segment
 
-      {:ok, adopted}
+      unknown(manifest, candidates, tenant, signal, config)
     end
+  end
+
+  defp unknown(%{version: 4} = root, candidates, tenant, signal, config),
+    do: JournalManifest.absent(root, candidates, tenant, signal, config)
+
+  defp unknown(manifest, candidates, _tenant, _signal, _config) do
+    known = MapSet.new(Enum.map(manifest.segments, & &1.key) ++ Map.keys(manifest.retired))
+    {:ok, Enum.reject(candidates, &MapSet.member?(known, &1.key))}
   end
 
   defp ingested?(key, scope) do

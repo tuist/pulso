@@ -146,15 +146,25 @@ defmodule Pulso.Storage.S3.RetentionWorker do
     end
   end
 
+  # Bucket cleanup and sweeps only act on format-3 roots; for other formats
+  # they would just read the root again, so skip them when advance reports one.
   defp run_managed_stages(tenant, signal, config) do
-    results = [
-      Retention.advance(tenant, signal, config),
-      Retention.cleanup(tenant, signal, config),
-      Retention.cleanup_retired(tenant, signal, config),
-      Retention.sweep(tenant, signal, config)
-    ]
+    advanced = Retention.advance(tenant, signal, config)
 
-    Enum.find(results, &actionable_error?/1) || :ok
+    rest =
+      case advanced do
+        {:ok, %{format: format}} when format != 3 ->
+          [Retention.cleanup_retired(tenant, signal, config)]
+
+        _ ->
+          [
+            Retention.cleanup(tenant, signal, config),
+            Retention.cleanup_retired(tenant, signal, config),
+            Retention.sweep(tenant, signal, config)
+          ]
+      end
+
+    Enum.find([advanced | rest], &actionable_error?/1) || :ok
   end
 
   defp actionable_error?({:error, reason}) when reason in [:not_found, :retention_migration_required], do: false

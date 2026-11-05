@@ -56,11 +56,15 @@ defmodule Pulso.Test.CompactionStore do
     end
   end
 
+  # `:segment` holds ingested segments, `:replacement` compaction outputs and
+  # `:page` format-4 manifest pages.
   defp barrier_owner(state, method, key, selector) do
     Map.get(state.barriers, {method, selector}) ||
-      if(String.ends_with?(key, ".parquet") and selector != :replacement,
-        do: Map.get(state.barriers, {method, :segment})
-      )
+      cond do
+        String.ends_with?(key, ".parquet") and selector != :replacement -> Map.get(state.barriers, {method, :segment})
+        String.contains?(key, "/journal/") -> Map.get(state.barriers, {method, :page})
+        true -> nil
+      end
   end
 
   # Faults exercise the native client's real retry and conditional-write path.

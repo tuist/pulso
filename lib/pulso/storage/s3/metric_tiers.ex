@@ -232,36 +232,84 @@ defmodule Pulso.Storage.S3.MetricTiers do
     error
   end
 
+  # As for compaction (`SignalCompactor`), a format-4 replacement is planned
+  # outside the manifest owner, which only commits it in memory.
   defp publish(tenant, config, sources, outputs, grace) do
     marker = List.first(outputs)
 
-    transaction = fn current ->
-      case published?(current, marker, tenant, config) do
-        {:ok, true} -> {:done, :ok}
-        {:ok, false} -> current |> prepare(sources, outputs, grace, tenant, config) |> write()
-        error -> error
+    with {:ok, plan} <- plan(tenant, config, sources, outputs, grace) do
+      transaction = &transaction(&1, {sources, outputs, grace, plan}, tenant, config)
+
+      case ManifestOwner.transact(tenant, "metrics", config, transaction) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, :cas_retries_exhausted} = error ->
+          resolve_unconfirmed(tenant, config, marker, plan, error)
+
+        {:error, {:unconfirmed, reason}} ->
+          resolve_unconfirmed(tenant, config, marker, plan, {:error, {:unpublished, reason}})
+
+        error ->
+          error
       end
     end
+  end
 
-    case ManifestOwner.transact(tenant, "metrics", config, transaction) do
-      {:ok, :ok} -> :ok
-      {:error, :cas_retries_exhausted} = error -> resolve_exhausted(tenant, config, marker, error)
+  defp transaction(current, {sources, outputs, grace, plan}, tenant, config) do
+    case published_inline?(current, List.first(outputs), plan, tenant, config) do
+      {:ok, true} -> {:done, :ok}
+      {:ok, false} -> current |> prepare(sources, outputs, grace, plan, tenant, config) |> write(plan)
       error -> error
     end
   end
 
-  # The last conditional response may have been lost after success.
-  defp resolve_exhausted(tenant, config, marker, error) do
-    with {:ok, current, _etag} <- Retention.load(tenant, "metrics", config),
-         {:ok, published} <- published?(current, marker, tenant, config),
-         do: if(published, do: :ok, else: error)
+  # Planned against the node's cached root, as compaction does.
+  defp plan(tenant, config, sources, outputs, grace) do
+    case ManifestOwner.ensure_loaded(tenant, "metrics", config) do
+      {:ok, %{manifest: %{version: 4} = snapshot}} ->
+        deadline = System.system_time(:millisecond) + grace
+
+        case JournalManifest.plan_replace(snapshot, sources, outputs, 1, deadline, tenant, "metrics", config) do
+          {:ok, plan} -> {:ok, plan}
+          {:error, reason} -> {:error, {:unpublished, reason}}
+        end
+
+      {:ok, _other} ->
+        {:ok, nil}
+
+      error ->
+        error
+    end
   end
 
-  defp write({:ok, updated}), do: {:write, updated, updated |> Manifest.encode() |> IO.iodata_to_binary(), :ok}
-  defp write({:ok, sealed, payload}), do: {:write, sealed, payload, :ok}
-  defp write({:error, reason}), do: {:error, {:unpublished, reason}}
+  # Inside the owner a planned commit reads only the root: an output in the
+  # tail is a lost earlier response, anything else is confirmed outside.
+  defp published_inline?(%{version: 4} = current, marker, plan, _tenant, _config) when plan != nil,
+    do: {:ok, Enum.any?(current.segments, &(&1.key == marker.key))}
 
-  defp prepare(%{version: 4} = root, sources, outputs, grace, tenant, config) do
+  defp published_inline?(current, marker, _plan, tenant, config), do: published?(current, marker, tenant, config)
+
+  # The last conditional response may have been lost after success.
+  defp resolve_unconfirmed(tenant, config, marker, plan, error) do
+    with {:ok, current, _etag} <- Retention.load(tenant, "metrics", config),
+         {:ok, published} <- published?(current, marker, tenant, config),
+         do: JournalManifest.settle_unconfirmed(published, plan, config, error)
+  end
+
+  defp write({:ok, updated}, _plan), do: {:write, updated, updated |> Manifest.encode() |> IO.iodata_to_binary(), :ok}
+
+  defp write({:ok, sealed, payload}, _plan), do: {:write, sealed, payload, :ok}
+  defp write({:error, reason}, nil), do: {:error, {:unpublished, reason}}
+  defp write({:error, reason}, _plan), do: {:error, {:unconfirmed, reason}}
+
+  defp prepare(%{version: 4} = root, _sources, _outputs, _grace, plan, tenant, config) when plan != nil do
+    with {:ok, updated} <- JournalManifest.commit_replace(root, plan, tenant, "metrics", config),
+         {:ok, {sealed, payload, _}} <- JournalManifest.seal(updated, tenant, "metrics", config),
+         do: {:ok, sealed, payload}
+  end
+
+  defp prepare(%{version: 4} = root, sources, outputs, grace, nil, tenant, config) do
     deadline = System.system_time(:millisecond) + grace
 
     with {:ok, updated} <- JournalManifest.replace_all(root, sources, outputs, deadline, tenant, "metrics", config),
@@ -269,9 +317,9 @@ defmodule Pulso.Storage.S3.MetricTiers do
          do: {:ok, sealed, payload}
   end
 
-  defp prepare(%{version: 3}, _sources, _outputs, _grace, _tenant, _config), do: {:error, :retention_managed}
+  defp prepare(%{version: 3}, _sources, _outputs, _grace, _plan, _tenant, _config), do: {:error, :retention_managed}
 
-  defp prepare(root, sources, outputs, grace, _tenant, _config),
+  defp prepare(root, sources, outputs, grace, _plan, _tenant, _config),
     do: Manifest.replace_all(root, sources, outputs, System.system_time(:millisecond) + grace)
 
   defp published?(_root, nil, _tenant, _config), do: {:ok, false}
