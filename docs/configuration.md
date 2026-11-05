@@ -525,8 +525,14 @@ segment PUT and root write: about 2 to 3 s at the median and 3 to 5 s at p99
 on Tigris. Collectors must tolerate that latency: keep remote-write shards and
 OTLP exporter consumers concurrent, and make sure a Loki client's batch size
 divided by the acknowledgment time exceeds its log rate, because a Loki client
-sends one batch at a time per endpoint. Longer windows, up to 10 s, cut requests
-further and add latency in proportion. A short window such as `20` favors latency: it
+sends one batch at a time per endpoint. Longer windows, up to 10 s, cut root
+writes further and add latency in proportion. At Tuist production volume `4000`
+cut Class A requests by another 30%, but only with
+`PULSO_INGEST_MAX_PENDING_BYTES` raised to 160 MiB; with the default budget,
+waiting requests filled every slot and drew `429`s. `5000` wrote more segments
+than `4000`, not fewer, and its slowest acknowledgments passed the 10 s default
+OTLP exporter timeout (see
+[longer ingest windows](storage-costs.md#longer-ingest-windows)). A short window such as `20` favors latency: it
 shares segments only between requests that arrive together.
 
 Flushes are pipelined. A batch is flushed when its window expires or when it

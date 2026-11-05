@@ -214,8 +214,9 @@ thousands.
 
 ```yaml
 ingestBatching:
-  flushIntervalMs: 2000        # ~2 Class A requests per window per signal
+  flushIntervalMs: 2000        # 4000 saves ~$15/month; see "Longer ingest windows"
   maxConcurrentRequests: 256   # the derived 28 slots return 429s at 70 pushes/s
+  maxPendingBytes: 67108864    # 167772160 with a 4000 ms window
 metricsCompaction:
   enabled: true
   finalize: true
@@ -329,6 +330,39 @@ an hour: about one hour of this node's segments. Both runs saturate two vCPU;
 the two slower panels are CPU-bound, and without GET waits compaction got
 through more work in the same time (0.21 against 0.16 merge PUTs/s), which
 likely took CPU from them. More CPU, not a larger cache, is the lever there.
+
+### Longer ingest windows
+
+With the object cache, writes dominate the request bill, and the window sets
+the write rate. The same 75-minute load on 1.36, disk cache on, trace
+compaction off, at three windows:
+
+| | 2 s | 4 s, pending 64 MiB | 4 s, pending 160 MiB | 5 s, pending 160 MiB |
+| --- | --- | --- | --- | --- |
+| Class A requests/s | 3.96 ($51/month) | 2.72 ($35/month) | 2.76 ($36/month) | 3.28 ($42/month) |
+| Root writes/s | 1.47 | 0.74 | 0.74 | 0.60 |
+| Ingest segment PUTs/s | 1.52 | 1.08 | 1.06 | 1.81 |
+| Retryable `429`s (75 min) | 0 | 6,300 | 0 | 0 |
+| Acknowledgment p99, worst signal | 4.8 s | 7.8 s | 7.6 s | 9.9 s |
+| Slowest acknowledgment | 6.2 s | 10.6 s | 10.2 s | 11.7 s |
+| Log volume by level p50 | 1.5 s (150/150) | 1.5 s (150/150) | 1.5 s (150/150) | 1.8 s (119/150, `max_scan_rows`) |
+| Tempo search p50 (failures) | 4.8 s (9) | 7.2 s (16) | 7.6 s (10) | 5.1 s (34) |
+| RSS p50 / max | 668 / 884 MiB | 748 / 959 MiB | 736 / 941 MiB | 837 / 1,068 MiB |
+
+The two 4 s runs differ in admission: 256 slots and the default 64 MiB
+pending budget, against 512 slots and 160 MiB
+(`ingestBatching.maxConcurrentRequests`, `ingestBatching.maxPendingBytes`).
+Requests wait longer for publication; once the 64 MiB budget was full they
+kept their slots, filled all 256 and drew `429`s. With 160 MiB at most 71
+slots were in use, which points to the pending budget. 5 s buys fewer root writes but more segment PUTs, so
+Class A rises again, and its slowest acknowledgments exceed the 10 s default
+timeout of OTLP exporters.
+
+Use 4 s with a 160 MiB pending budget when a few seconds of extra ingest
+delay are acceptable: it saves about $15 a month per ingest node at this
+volume. Data then becomes queryable, and alert rules see it, about 2 s
+later; raise OTLP exporter timeouts to 30 s. During an incident, a shorter
+window needs a rollout, so keep 2 s if fresh data matters more than cost.
 
 ### Parsed-field log alerts
 
