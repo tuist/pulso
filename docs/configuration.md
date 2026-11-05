@@ -770,6 +770,44 @@ you need the subquery itself, set `PULSO_QUERY_MAX_SAMPLES=1000000`,
 `PULSO_QUERY_MAX_HEAP_MB=384` and `PULSO_QUERY_MAX_CONCURRENT=1` (three query
 heaps of 384 MiB), at the cost of serving one interactive query at a time.
 
+### Histogram panels over many hours
+
+`rate(x_bucket[5m])` and similar short windows never contain a whole hour, so
+they read every sample of their range, finalized or not. A classic histogram
+has one series per bucket and label combination: 1,440 bucket series scraped
+every minute select about 520,000 samples over 6 hours and 2 million over 24
+hours. A 6-hour `histogram_quantile` over them needs a sample budget of about
+600,000 and a 384 MiB query heap; a 24-hour one does not fit a 2 GiB node.
+Aggregations fold their input as it is computed, so what binds is the samples a
+selector reads, not the series the panel shows.
+
+Measured with `test/pulso/promql/tuist_history_bench_test.exs` (`--include
+query_bench`) on a history shaped like Tuist's canary (150,000 series scraped
+every minute, one segment per 2-second remote-write batch, Tigris latency), 15
+dashboard panels and 146 alert rules, with the default query budgets:
+
+| | Compaction off | Compaction and finalization |
+|---|---|---|
+| 1-hour panels answered | 12 of 15, 0.5–2.6 s, up to 195 GETs | 15 of 15, 0.9–2.1 s, 14–28 GETs |
+| 6-hour panels answered | 4 of 15 | 11 of 15 (histogram and error-rate panels exceed `max_samples`) |
+| 24-hour panels answered | none | 7 of 15 |
+| Alert rules answered | 122 of 146, p90 1.9 s | 134 of 146, p90 1.1 s |
+
+With compaction off, a 1-hour `up` or `node_*` panel reads every batch of the
+hour (over 1,024 segments or 128 MiB); grouping the current hour by metric
+name is what lets it skip other metrics' rows. Reads of grouped and finalized
+segments are latency-bound: `PULSO_QUERY_PREFETCH=8` cut day-long alerts from
+9.7 s to 5.8 s, and at 400,000 series scraped every 30 s (about five times the
+samples per batch) `PULSO_QUERY_PREFETCH=16` brought every 1-hour panel except the histogram ones
+from up to 4.1 s to under 2.6 s. At that volume even 1-hour classic histogram
+panels select about 1.8 million samples and need recording rules.
+
+For such panels, record what the panel draws with a
+[recording group](alerting.md), for example
+`histogram_quantile(0.99, sum by (method, path, le) (rate(x_bucket[5m])))`,
+and point long-range panels at the recorded series: one per route instead of
+one per pod, route and bucket.
+
 ## Manifest backups
 
 Once compaction or finalization has run, a prefix's manifest is the only

@@ -402,6 +402,24 @@ read natively in about 2.5 s: a 6 h alert selects 2.3 million lines and a
 timeout. Windows that long at that volume need precomputed results, such as
 metrics recorded from the logs, not a larger budget.
 
+### What metrics compaction and finalization cost
+
+`test/pulso/promql/tuist_history_bench_test.exs` counts the requests the
+maintenance worker makes per hour over a remote-write history, one segment per
+2-second batch (about 3,640 Class A requests an hour for ingest either way):
+
+| Metrics volume | Maintenance Class A per hour | Class B per hour | Per month |
+| --- | ---: | ---: | ---: |
+| 150,000 series every 60 s (about 5,000 samples per batch) | 1,300 | 2,800 | $4.70 + $1.00 |
+| 400,000 series every 30 s (about 26,000 samples per batch) | 3,800–4,400 | 4,500–6,000 | $14–16 + $1.60–2.20 |
+
+The second volume was measured over less than two hours, hence the ranges.
+These counts predate the [object cache](configuration.md#object-cache): with
+it, maintenance reads of recently written segments are cache hits rather than
+Class B requests.
+Queries pay it back in Class B: a 1-hour panel that read 65 to 1,690 segments
+without compaction reads 14 to 28 with it.
+
 ## Avoiding amplification
 
 By default Pulso writes one immutable Parquet segment per nonempty append and

@@ -140,8 +140,8 @@ defmodule Pulso.PromQL.TuistHistoryBenchTest do
       access_key_id: "bench",
       secret_access_key: "bench",
       allow_http: true,
-      # The production default (PULSO_QUERY_PREFETCH).
-      query_prefetch: 4
+      # The production default (PULSO_QUERY_PREFETCH), or PULSO_BENCH_PREFETCH.
+      query_prefetch: env_int("PULSO_BENCH_PREFETCH", 4)
     }
 
     Runtime.put_env(:pulso, S3, config)
