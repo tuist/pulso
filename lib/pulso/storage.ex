@@ -31,6 +31,7 @@ defmodule Pulso.Storage do
   alias Pulso.Storage.S3
   alias Pulso.Traces.Assembly
   alias Pulso.Traces.Search
+  alias Pulso.Traces.SearchExpression
   alias Pulso.Traces.TempoDiscovery
   alias Pulso.Traces.TempoSearch
 
@@ -95,6 +96,7 @@ defmodule Pulso.Storage do
   @callback search_traces_json(tenant, list(), query_opts) :: {:ok, binary()} | {:error, term()}
   @callback tempo_search_json(tenant, list(), query_opts) :: {:ok, binary()} | {:error, term()}
   @callback tempo_expression_search_json(tenant, list(), query_opts) :: {:ok, binary()} | {:error, term()}
+  @callback tempo_traceql_search_json(tenant, list(), query_opts) :: {:ok, binary()} | {:error, term()}
   @callback tempo_discovery_json(tenant, String.t(), String.t(), query_opts) :: {:ok, binary()} | {:error, term()}
   @callback tempo_windowed_discovery_json(
               tenant,
@@ -181,6 +183,7 @@ defmodule Pulso.Storage do
                       search_traces_json: 3,
                       tempo_search_json: 3,
                       tempo_expression_search_json: 3,
+                      tempo_traceql_search_json: 3,
                       tempo_discovery_json: 4,
                       tempo_windowed_discovery_json: 7,
                       tempo_unscoped_tag_values_json: 3,
@@ -640,9 +643,13 @@ defmodule Pulso.Storage do
   end
 
   # Never pass a new expression to an old adapter that might drop OR/types.
+  # Event scopes, structural operators and select need an explicit callback.
   defp searched_tempo_json(backend, tenant, {:expression, program} = expression, opts) do
-    if function_exported?(backend, :tempo_expression_search_json, 3) do
-      backend.tempo_expression_search_json(tenant, program, opts)
+    callback =
+      if SearchExpression.extended?(program), do: :tempo_traceql_search_json, else: :tempo_expression_search_json
+
+    if function_exported?(backend, callback, 3) do
+      apply(backend, callback, [tenant, program, opts])
     else
       scan = opts |> Keyword.drop([:start_ts, :end_ts, :limit])
       maximum = min(opts[:max_scan_rows] || 1_000_000, 1_000_000)

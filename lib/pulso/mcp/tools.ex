@@ -29,6 +29,7 @@ defmodule Pulso.MCP.Tools do
   alias Pulso.Record.Span
   alias Pulso.Storage
   alias Pulso.Storage.S3
+  alias Pulso.Traces.Metrics
   alias Pulso.Traces.RegexFilters
   alias Pulso.Traces.Selector
   alias Pulso.Traces.TempoDiscovery
@@ -152,7 +153,7 @@ defmodule Pulso.MCP.Tools do
       "name" => "search_trace_metadata",
       "annotations" => @read_only_annotations,
       "description" =>
-        "Search complete retained trace context with a bounded same-span selector; results are the most recent traces and with (most_recent=true) is optional. Positive scoped original-string equality/regex AND selectors retain source planning. Boolean expressions add original-string !=/!~, original-int64 comparisons, status/span:status =/!= unset/ok/error and own-span duration/span:duration comparisons with nonnegative duration literals. Unscoped .key uses the original span value if present, otherwise the resource value; a wrong-typed or nonmatching span value still overrides the resource. Unscoped samples may include independently matching values from both owners, even when another OR branch selects the span. && and || have equal precedence and group left-to-right; use parentheses. All conditions apply to one span, not different spans of a trace. Missing/differently typed attributes never match negative predicates; integer literals do not coerce doubles. New expressions disable service/ID planning and admit all retained sources under existing input limits plus 20M prefilter owner/attribute/instruction work units per scan attempt, both candidate/context passes. Max16 predicates/8 regexes/16 nested groups/16KiB; unsupported grammar fails whole, never drops filters. Window-local search/discovery retain narrower grammar. Inclusive trace-start/end overlap, not span-start filtering; matching spans may be outside the window. Returns Tempo search metadata, root summaries, service stats and sampled spansets, after ordering by full stored trace start. Not exporter completeness or full TraceQL. S3 exact resource.service.name equality can omit publication-proven rich sources from candidate discovery, then recover complete context through conservative trace-ID summaries without service/time restriction. Unknown/legacy sources always read; no inferred original types. Catalog remains metadata-byte/page/heap bounded with hard 8192-reference maximum, not promised capacity. Actual sources cumulatively spend 1024 inputs, 32MiB compressed bytes and 1000000 raw rows. Native index-probe exhaustion falls back to reading; context may exhaust budgets late and all errors fail whole. Captured sources replay without a second GET; candidate IDs stay capped at 65536 including outside-window matches. Unread proven-irrelevant objects are not integrity-scrubbed. All context is recovered before window/order/limit; smaller windows alone do not reduce it. Requires complete-context search capability5 and discovery12 on matching application/native artifacts. Legacy uncertainty on overlapping traces, conflicting root summaries and budgets fail the whole query. Representative posting/index/capacity and deployed Grafana acceptance remain pending.",
+        "Search complete retained trace context with bounded TraceQL; results are the most recent traces and with (most_recent=true) is optional. event.<key> predicates match when any event of the span carries a matching original value (exception.type, exception.message, ...). Spansets can be joined by structural operators >> (descendant), > (child), << (ancestor), < (parent) and ~ (sibling), up to four spansets; results and samples are the last spanset's spans. A trailing | select(attr, ...) adds those attributes (resource./span./event./unscoped, name, status, kind) to sampled spans. Positive scoped original-string equality/regex AND selectors retain source planning. Boolean expressions add original-string !=/!~, original-int64 comparisons, status/span:status =/!= unset/ok/error and own-span duration/span:duration comparisons with nonnegative duration literals. Unscoped .key uses the original span value if present, otherwise the resource value; a wrong-typed or nonmatching span value still overrides the resource. Unscoped samples may include independently matching values from both owners, even when another OR branch selects the span. && and || have equal precedence and group left-to-right; use parentheses. All conditions apply to one span, not different spans of a trace. Missing/differently typed attributes never match negative predicates; integer literals do not coerce doubles. New expressions disable service/ID planning and admit all retained sources under existing input limits plus 20M prefilter owner/attribute/instruction work units per scan attempt, both candidate/context passes. Max16 predicates/8 regexes/16 nested groups/16KiB; unsupported grammar fails whole, never drops filters. Window-local search/discovery retain narrower grammar. Inclusive trace-start/end overlap, not span-start filtering; matching spans may be outside the window. Returns Tempo search metadata, root summaries, service stats and sampled spansets, after ordering by full stored trace start. Not exporter completeness or full TraceQL. S3 exact resource.service.name equality can omit publication-proven rich sources from candidate discovery, then recover complete context through conservative trace-ID summaries without service/time restriction. Unknown/legacy sources always read; no inferred original types. Catalog remains metadata-byte/page/heap bounded with hard 8192-reference maximum, not promised capacity. Actual sources cumulatively spend 1024 inputs, 32MiB compressed bytes and 1000000 raw rows. Native index-probe exhaustion falls back to reading; context may exhaust budgets late and all errors fail whole. Captured sources replay without a second GET; candidate IDs stay capped at 65536 including outside-window matches. Unread proven-irrelevant objects are not integrity-scrubbed. All context is recovered before window/order/limit; smaller windows alone do not reduce it. Requires complete-context search capability5 and discovery12 on matching application/native artifacts. Legacy uncertainty on overlapping traces, conflicting root summaries and budgets fail the whole query. Representative posting/index/capacity and deployed Grafana acceptance remain pending.",
       "inputSchema" => %{
         "type" => "object",
         "additionalProperties" => false,
@@ -163,6 +164,24 @@ defmodule Pulso.MCP.Tools do
           "end_ts_ns" => Map.put(@duration_schema, "minimum", 1),
           "limit" => %{"type" => "integer", "minimum" => 1, "maximum" => 1000},
           "spss" => %{"type" => "integer", "minimum" => 1, "maximum" => 100}
+        },
+        "required" => ["tenant", "query", "start_ts_ns", "end_ts_ns"]
+      }
+    },
+    %{
+      "name" => "traceql_metrics",
+      "annotations" => @read_only_annotations,
+      "description" =>
+        "TraceQL metrics over stored spans, as Tempo's /api/metrics/query_range and /api/metrics/query: a span selector piped into rate(), count_over_time(), min/max/sum/avg_over_time(attr), quantile_over_time(attr, q...) or histogram_over_time(attr), optionally by(...) and topk/bottomk. Selectors use the bounded search expression grammar, including status/span:status, duration and event.<key> (any event of the span with a matching original value). Structural operators and select are search-only. Omit step_ns for an instant query over the whole window. Returns Tempo's metrics JSON. Requires PULSO_TEMPO_SEARCH_ENABLED.",
+      "inputSchema" => %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "properties" => %{
+          "tenant" => %{"type" => "string", "minLength" => 1},
+          "query" => %{"type" => "string", "minLength" => 1, "maxLength" => 16_384},
+          "start_ts_ns" => @timestamp_schema,
+          "end_ts_ns" => @timestamp_schema,
+          "step_ns" => %{"type" => "integer", "minimum" => 1, "maximum" => 9_223_372_036_854_775_807}
         },
         "required" => ["tenant", "query", "start_ts_ns", "end_ts_ns"]
       }
@@ -515,6 +534,15 @@ defmodule Pulso.MCP.Tools do
     ]
 
     with {:ok, json} <- TempoSearch.query(tenant, args["query"], opts),
+         do: {:ok, [%{"type" => "text", "text" => json}]}
+  end
+
+  defp execute("traceql_metrics", %{"tenant" => tenant} = args) do
+    instant = not Map.has_key?(args, "step_ns")
+    window = {args["start_ts_ns"], args["end_ts_ns"], args["step_ns"]}
+
+    with :ok <- TempoSearch.available(),
+         {:ok, json} <- Metrics.query(tenant, args["query"], window, instant),
          do: {:ok, [%{"type" => "text", "text" => json}]}
   end
 

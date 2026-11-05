@@ -29,9 +29,15 @@ defmodule Pulso.Traces.TempoFilter do
     if Regex.match?(~r/\A\{\s*\}\z/u, query) do
       {:ok, nil}
     else
+      # Trace-by-ID filters keep or drop single spans: no joins or selection.
       with {:ok, {:expression, program}} <- SearchExpression.parse(query),
            {:ok, {:expression, prepared}} <- Evaluator.prepare(program),
-           do: {:ok, prepared}
+           false <- Evaluator.structural?(prepared) or prepared.select != [] do
+        {:ok, prepared}
+      else
+        true -> {:error, :unsupported_trace_selector}
+        error -> error
+      end
     end
   end
 

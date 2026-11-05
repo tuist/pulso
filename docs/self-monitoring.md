@@ -169,7 +169,7 @@ Detailed operation labels:
   `ok`. Parser failures count before controllers run. Each request counts once.
 - `kind=query`: `http_promql`, `http_logql`, `http_labels`, and tool names
   `query_logs`, `query_metrics`, `query_traces`, `query_logql`, `query_promql`,
-  `discover_metrics`, `get_trace`, `search_traces`, `search_trace_metadata`,
+  `discover_metrics`, `get_trace`, `search_traces`, `search_trace_metadata`, `traceql_metrics`,
   `discover_trace_tags`, `discover_trace_tag_values`, `query_errors`,
   `list_error_issues`, `list_error_changes`, `list_indexed_error_issues`. Capability-scoped alert tool
   attempts share the bounded label `alert_tool`, not user-supplied rule/tool names. Tool errors count

@@ -52,7 +52,9 @@ defmodule Pulso.Traces.TempoSearch do
     opts = Keyword.merge([limit: 100, spss: 3], opts)
 
     with :ok <- bounds(spans, opts),
-         {:ok, groups} <- collect(spans, predicates, opts),
+         {:ok, predicates} <- prepare_predicates(predicates),
+         {:ok, groups, work} <- collect(spans, predicates, opts),
+         {:ok, groups} <- resolve(groups, predicates, opts, work),
          {:ok, rows} <- selected(groups, opts),
          body = Pulso.JSON.encode!(%{"traces" => rows}),
          true <- byte_size(body) <= @max do
@@ -75,8 +77,7 @@ defmodule Pulso.Traces.TempoSearch do
   end
 
   defp collect(spans, predicates, opts) do
-    with {:ok, predicates} <- prepare_predicates(predicates),
-         {:ok, ids, work} <- candidates(spans, predicates, opts),
+    with {:ok, ids, work} <- candidates(spans, predicates, opts),
          do: collect_candidates(spans, predicates, opts, ids, work)
   end
 
@@ -131,7 +132,7 @@ defmodule Pulso.Traces.TempoSearch do
       end
     end)
     |> case do
-      {:ok, groups, _, _} -> {:ok, groups}
+      {:ok, groups, _, work} -> {:ok, groups, work}
       error -> error
     end
   end
@@ -166,6 +167,7 @@ defmodule Pulso.Traces.TempoSearch do
       conflict: false,
       matched: 0,
       samples: [],
+      links: [],
       services: %{}
     }
 
@@ -184,6 +186,15 @@ defmodule Pulso.Traces.TempoSearch do
       group = %{group | services: services} |> root(span, service)
 
       observe_sample(span, group, predicates, spss, work)
+    end
+  end
+
+  # Structural matches need the complete trace: keep each span's links and
+  # resolve them once every retained span is observed.
+  defp observe_sample(span, group, {:expression, compiled}, _spss, work) when compiled.relations != [] do
+    with {:ok, matched, mask, attributes, work} <- Evaluator.evaluate_mask(span, compiled, work) do
+      link = {span.span_id, span.parent_span_id, mask, if(matched, do: sample(span, attributes))}
+      {:ok, %{group | links: [link | group.links]}, work}
     end
   end
 
@@ -278,9 +289,38 @@ defmodule Pulso.Traces.TempoSearch do
 
     services = Enum.reduce(group.services, 0, fn {name, _}, n -> n + byte_size(name) + 32 end)
 
+    services =
+      Enum.reduce(group.links, services, fn {_, _, _, sample}, n ->
+        n + 48 + if(sample, do: byte_size(Pulso.JSON.encode!(sample)), else: 0)
+      end)
+
     Enum.reduce(group.samples, root + services, fn sample, n ->
       n + byte_size(Pulso.JSON.encode!(sample)) + byte_size(sample["spanID"]) + 32
     end)
+  end
+
+  defp resolve(groups, {:expression, compiled}, opts, work) when compiled.relations != [] do
+    Enum.reduce_while(groups, {:ok, %{}, work}, fn {id, group}, {:ok, acc, work} ->
+      links = Enum.reverse(group.links)
+      work = work + length(links) * length(compiled.relations)
+
+      if work > 20_000_000,
+        do: {:halt, {:error, :query_resource_limit}},
+        else: {:cont, {:ok, Map.put(acc, id, resolve_group(group, links, compiled.relations, opts[:spss])), work}}
+    end)
+    |> case do
+      {:ok, groups, _} -> {:ok, groups}
+      error -> error
+    end
+  end
+
+  defp resolve(groups, _predicates, _opts, _work), do: {:ok, groups}
+
+  defp resolve_group(group, links, relations, spss) do
+    kept = Evaluator.structural(relations, Enum.map(links, fn {id, parent, mask, _} -> {id, parent, mask} end))
+    samples = for {{_, _, _, sample}, true} <- Enum.zip(links, kept), do: sample
+    ordered = Enum.sort_by(samples, &{String.to_integer(&1["startTimeUnixNano"]), &1["spanID"]})
+    %{group | links: [], matched: length(samples), samples: Enum.take(ordered, spss)}
   end
 
   defp selected(groups, opts) do

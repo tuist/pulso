@@ -247,7 +247,7 @@ fn lookup(scope: &str, key: &str) -> Res<Lookup> {
 
 #[rustler::nif]
 fn trace_metrics_api_version() -> u32 {
-    5
+    6
 }
 
 /// `program` is a `tempo_expression` program or nil; `op` an operation name;
@@ -270,7 +270,11 @@ fn trace_metrics_new<'a>(
 ) -> Term<'a> {
     let build = || {
         let program = match program.decode::<Vec<(String, String, String, String)>>() {
-            Ok(program) => Some(Expression::compile(program).ok_or(Error::Invalid)?),
+            Ok(program) => Some(
+                Expression::compile(program)
+                    .filter(Expression::span_local)
+                    .ok_or(Error::Invalid)?,
+            ),
             Err(_) if program.decode::<ListIterator>().is_err() => None,
             Err(_) => return Err(Error::Invalid),
         };

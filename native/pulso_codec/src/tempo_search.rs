@@ -27,6 +27,15 @@ struct Summary {
     root_id: Option<String>,
     root_service_known: bool,
     root_flags: BTreeMap<String, bool>,
+    // Structural queries resolve matches once the trace's context is complete.
+    links: Vec<Link>,
+}
+struct Link {
+    id: u64,
+    parent: Option<u64>,
+    mask: u8,
+    start: i64,
+    sample: Option<Vec<u8>>,
 }
 struct RootQuery {
     service: bool,
@@ -104,7 +113,7 @@ pub(crate) fn predicates(input: Vec<(String, String, String, String)>) -> Res<Ve
 }
 #[rustler::nif]
 fn tempo_search_api_version() -> u32 {
-    6
+    7
 }
 #[rustler::nif(schedule = "DirtyCpu")]
 fn tempo_search_new<'a>(
@@ -427,6 +436,7 @@ fn finish<'a>(env: Env<'a>, search: ResourceArc<Search>) -> Res<(Binary<'a>, Opt
         return Err(Error::Invalid);
     }
     state.assemble_candidates()?;
+    state.resolve_links()?;
     let rows = state.selected()?;
     let kth = (rows.len() == state.limit)
         .then(|| rows.last().map(|(_, s)| s.start))
@@ -651,6 +661,13 @@ impl State {
                 }
             }
         }
+        if self
+            .expression
+            .as_ref()
+            .is_some_and(|e| !e.relations().is_empty())
+        {
+            return self.observe_link(id, start, end, fields);
+        }
         let collect = if self.expression.is_some() {
             let sid = string(field(fields, b"span_id")?)?;
             summary.samples.len() < self.spss
@@ -718,6 +735,92 @@ impl State {
         }
         if self.retained > MAX {
             return Err(Error::Budget);
+        }
+        Ok(())
+    }
+    // Every retained span of a candidate trace with its spanset mask; samples
+    // only for spans of the last spanset, which a structural query returns.
+    fn observe_link(
+        &mut self,
+        id: &str,
+        start: i64,
+        end: i64,
+        fields: &crate::json_read::RawFields<'_>,
+    ) -> Res<()> {
+        let expression = self.expression.as_ref().ok_or(Error::Invalid)?;
+        let evaluation = expression.evaluate(fields, &mut self.expression_work, true)?;
+        let sid = string(field(fields, b"span_id")?)?;
+        let span = u64::from_str_radix(&sid, 16).map_err(|_| Error::Invalid)?;
+        let parent = match field(fields, b"parent_span_id")? {
+            b"null" => None,
+            raw => Some(u64::from_str_radix(&string(raw)?, 16).map_err(|_| Error::Invalid)?),
+        };
+        let sample = if evaluation.matched {
+            let mut json = Vec::new();
+            sample(&mut json, start, end, &sid, &evaluation.attributes);
+            if json.len() > MAX {
+                return Err(Error::Budget);
+            }
+            Some(json)
+        } else {
+            None
+        };
+        self.retained += 48 + sample.as_ref().map_or(0, Vec::len);
+        if self.retained > MAX {
+            return Err(Error::Budget);
+        }
+        self.traces
+            .get_mut(id)
+            .ok_or(Error::Invalid)?
+            .links
+            .push(Link {
+                id: span,
+                parent,
+                mask: evaluation.mask,
+                start,
+                sample,
+            });
+        Ok(())
+    }
+    // Structural matches need every retained span of a trace: resolve them
+    // once all context is observed, before overlap, ordering and limits.
+    fn resolve_links(&mut self) -> Res<()> {
+        let Some(expression) = &self.expression else {
+            return Ok(());
+        };
+        let relations = expression.relations();
+        if relations.is_empty() {
+            return Ok(());
+        }
+        for summary in self.traces.values_mut() {
+            let links = std::mem::take(&mut summary.links);
+            if links.is_empty() {
+                continue;
+            }
+            self.expression_work = links
+                .len()
+                .checked_mul(relations.len())
+                .and_then(|units| self.expression_work.checked_add(units))
+                .ok_or(Error::Budget)?;
+            if self.expression_work > crate::tempo_expression::WORK_MAX {
+                return Err(Error::Budget);
+            }
+            let spans: Vec<_> = links.iter().map(|l| (l.id, l.parent, l.mask)).collect();
+            let kept = crate::tempo_expression::structural(relations, &spans);
+            let mut samples = Vec::new();
+            for (link, kept) in links.into_iter().zip(kept) {
+                if kept {
+                    summary.matched += 1;
+                    samples.push(Sample {
+                        start: link.start,
+                        id: format!("{:016x}", link.id),
+                        json: link.sample.ok_or(Error::Invalid)?,
+                    });
+                }
+            }
+            samples.sort_by(|a, b| (a.start, &a.id).cmp(&(b.start, &b.id)));
+            samples.truncate(self.spss);
+            summary.samples = samples;
         }
         Ok(())
     }

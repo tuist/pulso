@@ -2016,7 +2016,7 @@ defmodule PulsoWeb.TempoUpstreamIntegrationTest do
         end
 
       assert result == %{"series" => expected}
-      assert NIF.trace_metrics_api_version() == 5
+      assert NIF.trace_metrics_api_version() == 6
     end
   end
 

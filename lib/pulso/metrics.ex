@@ -51,6 +51,7 @@ defmodule Pulso.Metrics do
       "get_trace",
       "search_traces",
       "search_trace_metadata",
+      "traceql_metrics",
       "discover_trace_tags",
       "discover_trace_tag_values",
       "alert_tool",

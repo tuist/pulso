@@ -136,8 +136,22 @@ Journal pages count as `purpose="metadata_page"`, backups as `backup`. `pulso_ma
 `pulso_manifest_roots` and page-cache gauges watch it. Total bucket metadata
 still grows until retention. See `docs/configuration.md#manifest-format`.
 
-Current trace search capability is **6**, tuple `{2,1,3,6,12}`, superseding the
-search4/search5 snapshot references below. `/api/search` (`search_trace_metadata`)
+Retained-context search now takes `event.<key>` predicates (any event of the
+span), up to four spansets joined by `>>`/`>`/`<<`/`<`/`~` (resolved per
+candidate trace over parent span IDs after complete context, native
+`tempo_expression::structural` mirrored by `Evaluator.structural/2`) and a
+trailing `| select(...)`; wire programs add `{"spanset", "", op, ""}` and
+`{"select", scope, key, ""}` entries, and adapters need the separate
+`tempo_traceql_search_json/3` callback. TraceQL metrics accept `event.`
+predicates (structural/select reject); MCP `traceql_metrics` mirrors
+`/api/metrics/query{,_range}`. Event value sets deliberately stay out of
+segment summaries. `test/pulso_web/controllers/tuist_dashboards_test.exs` runs
+the Tuist dashboard queries; `tuist_dashboards_bench_test.exs` (`--include
+query_bench`) times them at 140-190 ms GETs. Search capability **7**, trace
+metrics capability **6**.
+
+Current trace search capability was **6**, tuple `{2,1,3,6,12}` (now
+`{2,1,3,7,12}`), superseding the search4/search5 snapshot references below. `/api/search` (`search_trace_metadata`)
 plans candidates newest first in rounds of 4, 16, 64... (`S3.tempo_search/5`),
 prunes proven sources by the `query_traces` service/attribute value sets
 (`TraceSummary.tempo_filters/1`, `proven_only`), selects context by ID summaries
@@ -856,7 +870,7 @@ even logically equivalent ones, fail permanently with HTTP409 `keyed_content_mis
 never overwrite or infer semantic/hash equality. Object-store ABI is `{1,1,1,1}`
 (retention, keyed publication, snapshot GET, async requests); every writer, including recording evaluators,
 must upgrade/drain because local startup does not fence older unconditional
-writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,6,12}` and metric
+writers. See `docs/keyed-ingestion.md`. Codec trace `{2,1,3,7,12}` and metric
 `{2,2,1,1,1}` are the current codec requirements; footer reads do not change keyed encoder bytes.
 Remote-write 2.0 legacy series-created and modern per-point starts retain optional
 signed-int64 `start_timestamp_ms` without synthetic zeros or start-aware rates.

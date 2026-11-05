@@ -249,7 +249,7 @@ remain unsupported.
 
 ## Typed-metadata upgrade boundary
 
-Current required native trace tuple is `{2,1,3,6,12}`. Before accepting non-finite
+Current required native trace tuple is `{2,1,3,7,12}`. Before accepting non-finite
 values, upgrade all participants; old readers/compactors reject them. NaN
 normalizes by class, not payload bits. Service promotion now requires original
 `stringValue`, also removing prior byte-service promotion; drain those keyed
@@ -443,7 +443,7 @@ Record-based reference adapters have no source indexes or native compressed-inpu
 owner caps. Dirty native work can outlive deadlines; exceptions/panics rely on
 resource cleanup and lock contention remains a generic resource error.
 
-Require complete-context search capability **6**, current tuple **`{2,1,3,6,12}`**, on
+Require complete-context search capability **6**, current tuple **`{2,1,3,7,12}`**, on
 all serving application/native artifacts before use; discovery capability is
 **12**. Startup verifies only local artifacts, not other running nodes. Smaller
 windows/result limits do not themselves reduce retained context. Broad, legacy,
@@ -666,7 +666,7 @@ metadata always fails. Empty matches return an empty list only after the admitte
 scan completes. Source routing/windows and raw provider/footer bounds are unchanged;
 this does not use metadata search's service/ID optimizer.
 
-Require discovery capability **12**, tuple **`{2,1,3,6,12}`**, across all serving apps
+Require discovery capability **12**, tuple **`{2,1,3,7,12}`**, across all serving apps
 and native artifacts. Non-window adapters need explicit query-aware unscoped
 execution or a bounded reference scan; old unfiltered callbacks cannot receive
 queries. Windowed filtered-unscoped execution requires separate explicit support,
@@ -770,7 +770,7 @@ Parquet/engine cases cover all five scopes, shared keys with different owners,
 multiple events/links under one parent, typed extremes/empty values and parent
 filters. Actual public protobuf decoders also consumed all 68 current results.
 Install matching native artifacts: discovery capability is **12** (startup
-tuple `{2,1,3,6,12}`); no physical column changes are introduced. Upgrade/drain every
+tuple `{2,1,3,7,12}`); no physical column changes are introduced. Upgrade/drain every
 instance serving discovery before clients use event-time/filtered-unscoped/time-windowed/float/stored-intrinsic values through a shared pool.
 Startup only checks the local artifact; it does not fence older running nodes.
 
@@ -842,7 +842,7 @@ support**; they never pass through that older generic callback. Non-window callb
 support does not establish window support. Flat-record/old adapters reject rather
 than ignore time or invent segment boundaries. There is no storage-format or
 mutable coordination change. Upgrade/drain **every** serving app/native participant
-to capability **12**, tuple **`{2,1,3,6,12}`**, before use.
+to capability **12**, tuple **`{2,1,3,7,12}`**, before use.
 
 ### Stored intrinsic string values
 
@@ -938,7 +938,7 @@ because windows include whole sources and compaction can broaden them. Filters
 reduce returned values but **not** requested-owner work or provider/header costs.
 Inspect the tagged reason: dictionary/row/work exhaustion is not stored corruption.
 
-Requires current discovery **12**, tuple **`{2,1,3,6,12}`**, on every serving app/native
+Requires current discovery **12**, tuple **`{2,1,3,7,12}`**, on every serving app/native
 participant. Explicit event-time execution or a bounded reference is required;
 old stored-string callbacks cannot receive the new target. Windowed event-time
 execution needs separate explicit support and cannot use an old generic window
@@ -1020,7 +1020,7 @@ The global **2M work / 5000 values / independent 1 MiB dictionary and encoded-re
 limits still reject whole requests. Filters do not evade prefilter work or raw I/O.
 No native bound is a node/deployment-wide capacity guarantee.
 
-Requires current discovery **12**, tuple **`{2,1,3,6,12}`**, across every serving
+Requires current discovery **12**, tuple **`{2,1,3,7,12}`**, across every serving
 app/native participant. New explicit root execution or bounded complete reference
 is required; windowed roots need dedicated window-aware support with source
 boundaries. Old span-local string or generic window callbacks never receive
@@ -1087,7 +1087,7 @@ and narrow source windows can help without a guarantee, and do not avoid raw
 provider/header costs or prefilter work. Compaction can broaden candidate sources.
 This is not representative indexed capacity or transparent production autocomplete.
 
-Current discovery **12**, tuple **`{2,1,3,6,12}`**, is required across every serving
+Current discovery **12**, tuple **`{2,1,3,7,12}`**, is required across every serving
 app/native participant. New explicit trace-duration execution or a bounded complete
 sentinel reference is required; windows need dedicated support preserving source
 boundaries. Old root/string/generic-window callbacks never receive this mode.
@@ -1160,7 +1160,7 @@ without backend clients established the seven v2 static shortcuts and public
 protobuf decoders consumed all eight name/value responses. This is not a running
 Grafana/Tempo deployment acceptance result. Upgrade every instance serving
 discovery before clients use the new mode in a shared pool. Matching native
-artifacts require tuple `{2,1,3,6,12}`; static vocabulary itself does not alter
+artifacts require tuple `{2,1,3,7,12}`; static vocabulary itself does not alter
 native or storage formats. Startup does not fence older application nodes.
 
 ### Tempo v1 trace lookup
@@ -1299,7 +1299,7 @@ bytes as empty string, projects nanosecond times to float milliseconds and expos
 large int64s to downstream JavaScript-number limitations. Keep Pulso metadata/wire
 as the fidelity boundary rather than treating a frame as an original OTLP record.
 Install matching native artifacts: complete-context search capability is now 5
-(metadata 2/export 3/discovery 12), tuple `{2,1,3,6,12}`. Startup checks reject
+(metadata 2/export 3/discovery 12), tuple `{2,1,3,7,12}`. Startup checks reject
 previous bindings; unscoped search adds no storage-format change. Upgrade or drain **every node serving
 Tempo endpoints** before pointing Grafana at the pool: a rolling mix with the
 previous exporter can still omit default status and intermittently crash client

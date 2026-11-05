@@ -330,6 +330,9 @@ defmodule Pulso.Storage.S3 do
   def tempo_expression_search_json(tenant, program, opts), do: tempo_search_json(tenant, {:expression, program}, opts)
 
   @impl Pulso.Storage
+  def tempo_traceql_search_json(tenant, program, opts), do: tempo_search_json(tenant, {:expression, program}, opts)
+
+  @impl Pulso.Storage
   def tempo_search_json(tenant, predicates, opts) do
     opts = opts |> Keyword.drop([:start_ts, :end_ts])
     opts = Keyword.put(opts, :max_scan_rows, min(opts[:max_scan_rows] || 1_000_000, 1_000_000))
