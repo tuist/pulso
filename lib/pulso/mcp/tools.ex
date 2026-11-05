@@ -665,6 +665,9 @@ defmodule Pulso.MCP.Tools do
     with {:ok, ast} <- parse_query(query),
          {:ok, envelope} <- run_logql(ast, tenant, opts) do
       {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(envelope)}]}
+    else
+      {:error, {:invalid_arguments, {:logql_parse_error, _}}} = error -> grafana_variable_error(query) || error
+      error -> error
     end
   end
 
@@ -681,8 +684,38 @@ defmodule Pulso.MCP.Tools do
         {:ok, ms} -> Map.put(opts, :step_ns, ms * 1_000_000)
       end
 
-    query |> Pulso.PromQL.Evaluator.query(tenant, opts) |> promql_result()
+    case Pulso.PromQL.Evaluator.query(query, tenant, opts) do
+      {:error, :invalid_or_unsupported_query} = error -> grafana_variable_error(query) || promql_result(error)
+      result -> promql_result(result)
+    end
   end
+
+  # Grafana replaces its interval and range variables before it sends a query,
+  # from settings Pulso cannot see (the data source's scrape interval, the
+  # panel's width, the alert's interval). A query that fails to parse because
+  # of one says how to replace it rather than guessing a value.
+  @grafana_variable ~r/\$\{?(__rate_interval|__interval_ms|__interval|__auto|__range_ms|__range_s|__range)\b/
+  defp grafana_variable_error(query) do
+    case Regex.run(@grafana_variable, query) do
+      [_, name] ->
+        {:error,
+         {:invalid_arguments,
+          "the query uses Grafana's $#{name}, which Grafana replaces before it sends a query; " <>
+            "replace it with #{grafana_variable_hint(name)}"}}
+
+      nil ->
+        nil
+    end
+  end
+
+  defp grafana_variable_hint("__rate_interval"),
+    do:
+      "a duration of at least four scrape intervals, such as [1m] for a 15s scrape (Grafana uses max(step + scrape interval, 4 × scrape interval))"
+
+  defp grafana_variable_hint(name) when name in ["__interval", "__interval_ms", "__auto"],
+    do: "the step, such as 1m (or 60000 for $__interval_ms)"
+
+  defp grafana_variable_hint(_range), do: "the dashboard's time range, such as 1h (3600 for $__range_s)"
 
   defp promql_result({:ok, result}), do: {:ok, [%{"type" => "text", "text" => Pulso.JSON.encode!(result)}]}
   defp promql_result({:error, :invalid_stored_sample}), do: {:error, :metric_data_invalid}

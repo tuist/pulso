@@ -73,6 +73,27 @@ defmodule Pulso.MCP.ToolsTest do
     assert text =~ "PULSO_QUERY_MAX_SAMPLES"
   end
 
+  test "queries that still hold Grafana's interval and range variables say how to replace them" do
+    query = "sum by(instance) (rate(cache_prom_ex_phoenix_http_requests_total[$__rate_interval]))"
+
+    assert {:error, {:invalid_arguments, message}} =
+             Tools.call("query_promql", %{"tenant" => "acme", "query" => query})
+
+    assert message =~ "Grafana's $__rate_interval"
+    assert message =~ "[1m]"
+
+    assert {:error, {:invalid_arguments, message}} =
+             Tools.call("query_logql", %{"tenant" => "acme", "query" => ~s|count_over_time({job="x"}[${__interval}])|})
+
+    assert message =~ "Grafana's $__interval,"
+
+    # A Grafana-looking string inside a valid query is just a label value.
+    assert {:ok, _} = Tools.call("query_promql", %{"tenant" => "acme", "query" => ~s|up{job="$__range"}|})
+
+    assert {:error, {:invalid_arguments, :invalid_or_unsupported_query}} =
+             Tools.call("query_promql", %{"tenant" => "acme", "query" => "rate(up[$window])"})
+  end
+
   test "lists log, metric, trace and error query tools" do
     tools = Tools.list()
     names = Enum.map(tools, & &1["name"])

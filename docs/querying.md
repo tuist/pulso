@@ -46,6 +46,15 @@ investigations. See [durable replay and freshness rules](reliability.md#consume-
 `tools/list` returns each tool's full input schema. Invalid arguments, such as a
 reversed time range, return an explicit error instead of an empty result.
 
+`query_promql` and `query_logql` take queries as Prometheus and Loki receive
+them, not as they are written in Grafana. Grafana replaces `$__rate_interval`,
+`$__interval`, `$__interval_ms`, `$__auto` and `$__range` before it sends a
+query, using its data source's scrape interval and the panel's step and time
+range, which Pulso does not know. A query that still contains one is rejected
+with an error naming the variable and what to put in its place, for example
+`[1m]` for `$__rate_interval` with a 15 s scrape interval (Grafana uses
+max(step + scrape interval, 4 × scrape interval)).
+
 ## Tempo trace lookup
 
 `GET /api/traces/<hex-trace-id>` returns an experimental Tempo v1 trace envelope
