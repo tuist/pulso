@@ -120,16 +120,18 @@ defmodule Pulso.PromQL.Number do
   defp magnitude(:nan), do: :nan
   defp magnitude(value), do: if(sign(value) < 0, do: negate(value), else: value)
 
-  def average([first | rest]) do
-    state = %{sum: first, correction: 0.0, count: 1, mean: 0.0, incremental?: false}
-    state = Enum.reduce(rest, state, &average_step/2)
+  def average([first | rest]), do: rest |> Enum.reduce(average_start(first), &average_step/2) |> average_value()
 
+  @doc "`average/1` one value at a time: `average_start/1`, `average_step/2`, then `average_value/1`."
+  def average_start(first), do: %{sum: first, correction: 0.0, count: 1, mean: 0.0, incremental?: false}
+
+  def average_value(state) do
     if state.incremental?,
       do: add(state.mean, state.correction),
       else: add(divide(state.sum, state.count), divide(state.correction, state.count))
   end
 
-  defp average_step(value, state) do
+  def average_step(value, state) do
     state = %{state | count: state.count + 1}
     state = average_sum(value, state)
 

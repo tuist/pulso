@@ -872,10 +872,25 @@ defmodule Pulso.PromQL.Operations do
   defp value([{_, value}]), do: value
   defp at(index, ts), do: Map.get(index, ts, [])
 
+  # Each step's samples in series order, built without an intermediate list
+  # of every sample.
   defp by_time(series) do
-    rows = for {labels, samples} <- series, {ts, value} <- samples, do: {ts, {labels, value}}
-    Evaluator.charge(:work, length(rows))
-    Enum.group_by(rows, &elem(&1, 0), &elem(&1, 1))
+    {index, count} =
+      series
+      |> Enum.reverse()
+      |> Enum.reduce({%{}, 0}, fn {labels, samples}, acc ->
+        Enum.reduce(samples, acc, &index_sample(labels, &1, &2))
+      end)
+
+    Evaluator.charge(:work, count)
+    index
+  end
+
+  defp index_sample(labels, {ts, value}, {index, count}) do
+    case index do
+      %{^ts => rows} -> {%{index | ts => [{labels, value} | rows]}, count + 1}
+      _ -> {Map.put(index, ts, [{labels, value}]), count + 1}
+    end
   end
 
   defp at_steps(steps, fun) do

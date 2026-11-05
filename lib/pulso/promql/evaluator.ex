@@ -505,23 +505,14 @@ defmodule Pulso.PromQL.Evaluator do
     end
   end
 
-  defp evaluate_node({:aggregate, op, grouping, inner}, tenant, steps) do
-    with {:ok, series, warnings} <- evaluate(inner, tenant, steps) do
-      grouped =
-        for {labels, samples} <- series,
-            {ts, value} <- samples,
-            do: {{group_key(labels, grouping), ts}, {value, Map.get(labels, "__name__", "")}}
+  defp evaluate_node({:aggregate, op, grouping, inner} = expr, tenant, steps) do
+    case fused_source(inner) do
+      nil ->
+        with {:ok, series, warnings} <- evaluate(inner, tenant, steps),
+             do: {:ok, aggregate_series(op, grouping, series), warnings}
 
-      charge(:work, length(grouped))
-
-      result =
-        grouped
-        |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-        |> Enum.flat_map(&aggregate_point(op, &1))
-        |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-        |> Enum.map(fn {labels, samples} -> {labels, Enum.sort(samples)} end)
-
-      {:ok, result, warnings}
+      source ->
+        fused_aggregate(expr, source, tenant, steps)
     end
   end
 
@@ -591,6 +582,77 @@ defmodule Pulso.PromQL.Evaluator do
         error -> {:halt, error}
       end
     end)
+  end
+
+  # An aggregation directly over a selector or a range function of one (as in
+  # `sum by (le) (rate(x_bucket[5m]))`) folds each series' result into the
+  # aggregation as it is computed, instead of first holding every series'
+  # result: the query holds one point per group and step, not per series and
+  # step. Results are those of the unfused evaluation, bit for bit.
+  defp fused_source({:selector, matchers, offset}), do: {matchers, offset, Process.get(:promql_lookback_ns), :latest}
+
+  defp fused_source({:function, op, {:range, matchers, window, offset}}) when op != :absent_over_time and is_atom(op),
+    do: {matchers, offset, window, op}
+
+  defp fused_source({:call, name, [{:range, matchers, window, offset}]})
+       when is_map_key(@range_functions, name) and name != "absent_over_time",
+       do: {matchers, offset, window, Map.fetch!(@range_functions, name)}
+
+  defp fused_source(_), do: nil
+
+  defp fused_aggregate({:aggregate, op, grouping, _inner}, {matchers, offset, window, fop}, tenant, steps) do
+    request = selector_request(matchers, offset, window, steps, fop)
+    context = {steps, offset, window, fop}
+
+    if elem(request, 1) > elem(request, 2) do
+      {:ok, [], []}
+    else
+      with {:ok, groups, warnings} <- selector_series(tenant, request),
+           {:ok, result, extra} <- fold_selected(groups, tenant, request, context, op, grouping) do
+        {:ok, result, warnings ++ extra}
+      end
+    end
+  end
+
+  # Tiered reads, and series whose results share labels (which select/6 would
+  # coalesce), take the unfused path over the same selected series.
+  defp fold_selected(groups, tenant, request, {steps, offset, window, fop} = context, op, grouping) do
+    if is_list(groups) and unique_results?(groups, fop) do
+      fold_groups(Enum.reverse(groups), steps, offset, window, fop, op, grouping)
+    else
+      with {:ok, result, extra} <- evaluate_selected(groups, tenant, request, context),
+           do: {:ok, aggregate_series(op, grouping, Operations.coalesce(result)), extra}
+    end
+  end
+
+  defp unique_results?(groups, op) do
+    labels = for {labels, _} <- groups, do: result_labels(labels, op)
+    length(Enum.uniq(labels)) == length(labels)
+  end
+
+  # The labels of a selector's or range function's result series.
+  defp result_labels(labels, op) when op in [:latest, :first_over_time, :last_over_time], do: labels
+  defp result_labels(labels, _op), do: Map.delete(labels, "__name__")
+
+  # Charges what evaluate_groups/6, coalesce/1 and aggregate_series/3 charge
+  # in the unfused evaluation; the intermediate budget bounds the results
+  # emitted so far plus the states of the group being folded.
+  defp fold_groups(groups, steps, offset, window, fop, op, grouping) do
+    limits = limits()
+    held = Map.get(Process.get(:promql_budget), :held, 0)
+    key = &group_key(result_labels(elem(&1, 0), fop), grouping)
+
+    evaluate = fn group, work ->
+      check_deadline()
+      evaluate_series(group, steps, offset, window, fop, work, limits.work)
+    end
+
+    with {:ok, result, points, work} <- fold_aggregation(op, groups, key, evaluate, {held, limits.materialized}) do
+      charge(:work, work)
+      charge(:work, points)
+      charge(:work, points)
+      {:ok, result, []}
+    end
   end
 
   defp select(tenant, matchers, offset, window, steps, op) do
@@ -1167,8 +1229,7 @@ defmodule Pulso.PromQL.Evaluator do
 
     case result do
       {:ok, state} ->
-        labels = if op in [:latest, :first_over_time, :last_over_time], do: labels, else: Map.delete(labels, "__name__")
-        {:ok, {labels, Enum.reverse(state.values)}, state.work}
+        {:ok, {result_labels(labels, op), Enum.reverse(state.values)}, state.work}
 
       error ->
         error
@@ -1670,30 +1731,112 @@ defmodule Pulso.PromQL.Evaluator do
   defp sample_priority(_, :nan), do: true
   defp sample_priority(a, b), do: not Number.less?(a, b)
 
-  defp aggregate_point(op, {{labels, ts}, values}) do
-    case aggregate_values(op, values) do
-      nil -> []
-      value -> [{labels, {ts, value}}]
+  # Aggregation folds its input one output group at a time: each group's
+  # series, in input order, into a state per step, which becomes the
+  # group's samples before the next group starts. No grouped copy of the
+  # input and only one group's states are held at once; groups come out in
+  # the order of `Enum.group_by/2` over their labels.
+  defp aggregate_series(op, grouping, series) do
+    key = &group_key(elem(&1, 0), grouping)
+    {:ok, result, points, _} = fold_aggregation(op, series, key, &{:ok, &1, &2}, nil)
+    charge(:work, points)
+    result
+  end
+
+  defp fold_aggregation(op, items, key, evaluate, bound) do
+    items
+    |> Enum.group_by(key)
+    |> Enum.reduce_while({:ok, [], 0, 0, 0}, fn {labels, members}, {:ok, result, points, work, emitted} ->
+      op
+      |> fold_group(members, evaluate, {work, %{}, 0}, bound, emitted)
+      |> add_group(op, labels, result, points, emitted)
+    end)
+    |> case do
+      {:ok, result, points, work, _emitted} -> {:ok, Enum.reverse(result), points, work}
+      error -> error
     end
+  end
+
+  defp fold_group(_op, [], _evaluate, {work, states, points}, _bound, _emitted), do: {:ok, states, points, work}
+
+  defp fold_group(op, [item | rest], evaluate, {work, states, points}, bound, emitted) do
+    case evaluate.(item, work) do
+      {:ok, {labels, samples}, work} ->
+        name = Map.get(labels, "__name__", "")
+        states = Enum.reduce(samples, states, &fold_step(op, &1, &2, name))
+
+        with :ok <- check_held(bound, emitted + map_size(states)),
+             do: fold_group(op, rest, evaluate, {work, states, points + length(samples)}, bound, emitted)
+
+      error ->
+        error
+    end
+  end
+
+  defp add_group({:ok, states, n, work}, op, labels, result, points, emitted) do
+    samples = for {ts, state} <- Enum.sort(states), value = fold_result(op, state), value != nil, do: {ts, value}
+    result = if samples == [], do: result, else: [{labels, samples} | result]
+    {:cont, {:ok, result, points + n, work, emitted + length(samples)}}
+  end
+
+  defp add_group(error, _op, _labels, _result, _points, _emitted), do: {:halt, error}
+
+  defp fold_step(op, {ts, value}, states, name) do
+    case states do
+      %{^ts => state} -> %{states | ts => fold_value(op, state, value, name)}
+      _ -> Map.put(states, ts, fold_value(op, {nil, [], 0}, value, name))
+    end
+  end
+
+  defp check_held({held, max}, count) when held + count > max do
+    QueryLimit.record(:max_materialized_samples, max, held + count)
+    {:error, :query_intermediate_limit}
+  end
+
+  defp check_held(_bound, _count), do: :ok
+
+  # `{float state, histograms with their metric names (newest first), count}`.
+  defp fold_value(_op, {floats, histograms, count}, %Histogram{} = h, name),
+    do: {floats, [{h, name} | histograms], count + 1}
+
+  defp fold_value(op, {floats, histograms, count}, value, _name),
+    do: {fold_float(op, floats, value), histograms, count + 1}
+
+  defp fold_float(op, _state, _value) when op in [:count, :group], do: nil
+  defp fold_float(:sum, nil, value), do: Number.compensated_add(value, 0.0, 0.0)
+  defp fold_float(:sum, {sum, correction}, value), do: Number.compensated_add(value, sum, correction)
+  defp fold_float(:avg, nil, value), do: Number.average_start(value)
+  defp fold_float(:avg, state, value), do: Number.average_step(value, state)
+  defp fold_float(:min, state, value), do: Number.min(value, state || :nan)
+  defp fold_float(:max, state, value), do: Number.max(value, state || :nan)
+  defp fold_float(op, state, value) when op in [:stdvar, :stddev], do: welford(state || {0, 0.0, 0.0}, value)
+
+  # Mimir's aggregation uses ordinary Welford updates, distinct from the
+  # compensated range-vector algorithm. Nonfinite singletons yield NaN.
+  defp welford({count, mean, sum}, value) do
+    delta = Number.binary("-", value, mean)
+    mean = Number.add(mean, Number.divide(delta, count + 1))
+    sum = Number.add(sum, Number.multiply(delta, Number.binary("-", value, mean)))
+    {count + 1, mean, sum}
   end
 
   # As in Prometheus: `count` and `group` take every sample; `sum` and `avg`
   # combine groups of only histograms (mixed groups have no result); every
   # other aggregation ignores histograms.
-  defp aggregate_values(op, values) when op in [:count, :group], do: aggregate(op, values)
+  defp fold_result(:count, {_, _, count}), do: count * 1.0
+  defp fold_result(:group, _state), do: 1.0
 
-  defp aggregate_values(op, values) do
-    {histograms, floats} = Enum.split_with(values, &match?({%Histogram{}, _}, &1))
-    floats = Enum.map(floats, &elem(&1, 0))
+  defp fold_result(op, {floats, histograms, _count}) do
+    histograms = Enum.reverse(histograms)
 
     if histograms != [] and op in [:stddev, :stdvar, :min, :max],
       do: info("PromQL info: ignored histogram in #{op} aggregation")
 
     cond do
       histograms == [] ->
-        aggregate(op, floats)
+        float_result(op, floats)
 
-      op in [:sum, :avg] and floats == [] ->
+      op in [:sum, :avg] and floats == nil ->
         note_histogram_aggregation(histograms)
         NativeRange.aggregate(op, Enum.map(histograms, &elem(&1, 0)))
 
@@ -1701,11 +1844,24 @@ defmodule Pulso.PromQL.Evaluator do
         warning("PromQL warning: encountered a mix of histograms and floats for aggregation")
         nil
 
-      floats == [] ->
+      floats == nil ->
         nil
 
       true ->
-        aggregate(op, floats)
+        float_result(op, floats)
+    end
+  end
+
+  defp float_result(:sum, {sum, correction}), do: Number.add(sum, correction)
+  defp float_result(:avg, state), do: Number.average_value(state)
+  defp float_result(op, value) when op in [:min, :max], do: value
+  defp float_result(:stdvar, {count, _, sum}), do: Number.divide(sum, count)
+
+  defp float_result(:stddev, state) do
+    case float_result(:stdvar, state) do
+      value when is_number(value) and value >= 0 -> :math.sqrt(value)
+      :infinity -> :infinity
+      _ -> :nan
     end
   end
 
@@ -1713,30 +1869,6 @@ defmodule Pulso.PromQL.Evaluator do
   defp aggregate(:avg, values), do: Number.average(values)
   defp aggregate(:min, values), do: Enum.reduce(values, :nan, &Number.min/2)
   defp aggregate(:max, values), do: Enum.reduce(values, :nan, &Number.max/2)
-  defp aggregate(:count, values), do: length(values) * 1.0
-  defp aggregate(:group, _values), do: 1.0
-
-  defp aggregate(:stdvar, values) do
-    # Mimir's aggregation uses ordinary Welford updates, distinct from the
-    # compensated range-vector algorithm. Nonfinite singletons yield NaN.
-    {count, _, sum} =
-      Enum.reduce(values, {0, 0.0, 0.0}, fn value, {count, mean, sum} ->
-        delta = Number.binary("-", value, mean)
-        mean = Number.add(mean, Number.divide(delta, count + 1))
-        sum = Number.add(sum, Number.multiply(delta, Number.binary("-", value, mean)))
-        {count + 1, mean, sum}
-      end)
-
-    Number.divide(sum, count)
-  end
-
-  defp aggregate(:stddev, values) do
-    case aggregate(:stdvar, values) do
-      value when is_number(value) and value >= 0 -> :math.sqrt(value)
-      :infinity -> :infinity
-      _ -> :nan
-    end
-  end
 
   defp absent_labels({:selector, matchers, _}), do: absence_labels(matchers)
   defp absent_labels({:range, matchers, _, _}), do: absence_labels(matchers)

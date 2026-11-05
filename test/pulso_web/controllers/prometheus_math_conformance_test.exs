@@ -3353,8 +3353,11 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
       assert :ok = Storage.append(:metrics, "aggregate-cost", samples)
       queries = ["stddev(cost)", "stdvar(cost)", "quantile(0.25,cost)", ~s|count_values("v",cost)|]
 
-      # The selector holds eight points; most results are one.
-      for query <- queries, limits <- [[max_samples: 1], [max_work: 1], [max_materialized_samples: 7]] do
+      # The selector holds eight points; most results are one. stddev and
+      # stdvar fold each series in as it is selected and hold one state.
+      for query <- queries,
+          limits <- [[max_samples: 1], [max_work: 1], [max_materialized_samples: 7]],
+          limits != [max_materialized_samples: 7] or String.starts_with?(query, ~w(quantile count_values)) do
         Runtime.put_env(:pulso, Evaluator, limits)
 
         conn =
@@ -3367,6 +3370,9 @@ defmodule PulsoWeb.PrometheusMathConformanceTest do
                  "error" => "query exceeded " <> _
                } = json_response(conn, 422)
       end
+
+      Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 1)
+      assert {:ok, _} = Evaluator.query("stddev(cost)", "aggregate-cost", %{end_ts_ns: 0})
 
       Runtime.put_env(:pulso, Evaluator, max_work: 40)
       assert {:ok, _} = Evaluator.query("cost", "aggregate-cost", %{end_ts_ns: 0})

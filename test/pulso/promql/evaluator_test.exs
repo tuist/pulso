@@ -279,10 +279,11 @@ defmodule Pulso.PromQL.EvaluatorTest do
     for i <- 1..10, do: append("c", Enum.map(0..9, &{&1 * 10, &1 * 10 * i}), %{"i" => "#{i}"})
     opts = %{start_ts_ns: 30_000_000_000, end_ts_ns: 90_000_000_000, step_ns: 10_000_000_000}
 
-    # rate() holds 10 series x 7 steps = 70 points; sum() returns 7 of them.
-    # Counting every point produced would need 77, and counting intermediates
-    # as results 70.
-    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 70)
+    # sum() folds each rate() series as it is computed, so it holds its 7
+    # (group, step) states, not 10 series x 7 steps = 70 points. Counting
+    # every point produced would need 77, and counting intermediates as
+    # results 70.
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 7)
     assert {:ok, result} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
     assert [%{"values" => values}] = result["data"]["result"]
     assert Enum.map(values, &List.last/1) == List.duplicate("55", 7)
@@ -290,14 +291,41 @@ defmodule Pulso.PromQL.EvaluatorTest do
     Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 6, max_materialized_samples: 70)
     assert {:error, :query_result_limit} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
 
-    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 69)
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 6)
     assert {:error, :query_intermediate_limit} = Evaluator.query("sum(rate(c[30s]))", "acme", opts)
+
+    # Without a fusable source the inner result is held: 70 points.
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 7, max_materialized_samples: 69)
+    assert {:error, :query_intermediate_limit} = Evaluator.query("sum(rate(c[30s]) * 1)", "acme", opts)
 
     # Both operands of a binary operation are held at once: 70 + 70.
     Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 70, max_materialized_samples: 139)
     assert {:error, :query_intermediate_limit} = Evaluator.query("rate(c[30s]) + rate(c[20s])", "acme", opts)
     Pulso.Runtime.put_env(:pulso, Evaluator, max_result_points: 70, max_materialized_samples: 140)
     assert {:ok, _} = Evaluator.query("rate(c[30s]) + rate(c[20s])", "acme", opts)
+  end
+
+  test "topk over histogram_quantile holds the summed buckets, not every pod's rates" do
+    # Two routes x three buckets x four pods: rate() yields 24 series, the
+    # sum by (path, le) 6. Pod p adds p * n per 10 s to a bucket of count n,
+    # so /a's buckets hold 1:2:3 of its observations and /b's 1:3:3.
+    counts = %{"/a" => [{"1", 1}, {"2", 2}, {"+Inf", 3}], "/b" => [{"1", 1}, {"2", 3}, {"+Inf", 3}]}
+
+    for {path, buckets} <- counts, {le, n} <- buckets, pod <- 1..4 do
+      append("d_bucket", Enum.map(0..9, &{&1 * 10, &1 * n * pod}), %{"path" => path, "le" => le, "pod" => "#{pod}"})
+    end
+
+    opts = %{start_ts_ns: 30_000_000_000, end_ts_ns: 90_000_000_000, step_ns: 10_000_000_000}
+    query = "topk(1, histogram_quantile(0.5, sum by (path, le) (rate(d_bucket[30s]))))"
+
+    # 6 summed series x 7 steps = 42 held, under the 24 x 7 = 168 rate points.
+    Pulso.Runtime.put_env(:pulso, Evaluator, max_materialized_samples: 84)
+    assert {:ok, result} = Evaluator.query(query, "acme", opts)
+    assert [%{"metric" => metric, "values" => values}] = result["data"]["result"]
+    # /a's median falls halfway into (1, 2]: 1.5; /b's a quarter in: 1.25.
+    assert metric == %{"path" => "/a"}
+    assert length(values) == 7
+    for [_, value] <- values, do: assert_in_delta(String.to_float(value), 1.5, 1.0e-9)
   end
 
   test "sample, work, and result limits return errors instead of partial aggregates" do
