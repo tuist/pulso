@@ -23,6 +23,8 @@ defmodule Pulso.SelfMetrics do
       :worker_cleanup,
       :worker_discovery,
       :worker_finalize,
+      :worker_consolidate,
+      :worker_log_rollup,
       :worker_backup
     ]
   }

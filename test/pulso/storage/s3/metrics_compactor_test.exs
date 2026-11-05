@@ -1282,6 +1282,31 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert CompactionOwnership.members(ctx.config) == [node()]
   end
 
+  test "a stalled metrics operation does not delay log maintenance", ctx do
+    for ts <- 1..2, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, ts / 1)]))
+    log = &%Log{timestamp_ns: &1, service: "api", body: "line"}
+    for ts <- 1..2, do: assert(:ok = S3.append(:logs, ctx.tenant, [log.(ts)]))
+    source = hd(load(ctx).segments).key
+    parent = self()
+    Agent.update(ctx.agent, &%{&1 | barriers: %{{"GET", source} => parent}})
+    stop_supervised!(CompactionOwnership)
+    stop_supervised!(CompactionTasks)
+    config = Map.merge(ctx.config, %{log_compaction_enabled: true, compaction_interval_ms: 3_600_000})
+    start_supervised!({CompactionSupervision, config})
+
+    send(Pulso.Runtime.whereis(CompactionWorker), :compact)
+    assert_receive {:storage_barrier, storage, "GET", ^source}, 30_000
+    logs_worker = Pulso.Runtime.whereis(Module.concat(CompactionWorker, "logs"))
+    send(logs_worker, :compact)
+    _ = :sys.get_state(logs_worker, 30_000)
+    {:ok, _, body} = ObjectStore.get_if_none_match(ctx.config, Manifest.manifest_key(ctx.tenant, "logs"), nil)
+    assert {:ok, %{segments: [_]}} = Manifest.decode(body)
+
+    send(storage, {:release_storage, source})
+    _ = :sys.get_state(Pulso.Runtime.whereis(CompactionWorker), 30_000)
+    assert [_] = load(ctx).segments
+  end
+
   test "store identities isolate eligibility and discovery failures retry without touching sources", ctx do
     for ts <- 1..3, do: assert(:ok = S3.append(:metrics, ctx.tenant, [sample(ts, 1.0)]))
     worker = start_supervised!({CompactionWorker, ctx.config})

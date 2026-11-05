@@ -24,6 +24,7 @@ mod json_write;
 mod labels;
 mod log_discovery;
 mod log_metric;
+mod log_rollup;
 mod loki;
 mod metric_discovery;
 mod metric_footer;
@@ -146,6 +147,10 @@ fn malloc_trim() -> bool {
 mod atoms {
     rustler::atoms! {
         done,
+        final_ = "final",
+        before,
+        after,
+        rollup,
         exemplars,
         histogram,
         more,
@@ -1492,7 +1497,7 @@ fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
 
 #[rustler::nif]
 fn metric_tier_api_version() -> u32 {
-    1
+    2
 }
 
 /// Rows of the segments overlapping one hour, accumulated natively one
@@ -1510,11 +1515,21 @@ fn metric_finalize_new<'a>(
     end: i64,
     max_rows: usize,
     expected_rows: usize,
+    partition: Term<'a>,
 ) -> Term<'a> {
+    // nil, or `{index, count}`: keep only rows whose metric name hashes there.
+    let partition = if partition == rustler::types::atom::nil().to_term(env) {
+        None
+    } else {
+        match partition.decode::<(u32, u32)>() {
+            Ok((index, count)) if count > 0 && index < count => Some((index, count)),
+            _ => return atoms::fallback().encode(env),
+        }
+    };
     if start >= end || max_rows == 0 {
         return atoms::fallback().encode(env);
     }
-    let builder = metric_tiers::Builder::new(start, end, max_rows, expected_rows);
+    let builder = metric_tiers::Builder::new(start, end, max_rows, expected_rows, partition);
     (
         atoms::ok(),
         rustler::ResourceArc::new(MetricFinalizer(std::sync::Mutex::new(Some(builder)))),
@@ -1552,8 +1567,8 @@ fn metric_finalize_add<'a>(
     }
 }
 
-/// `{:ok, finals, before | nil, after | nil, rollups}`, each output
-/// `{payload, min_ts, max_ts, rows, [labels]}` with one label map per series.
+/// Order the accumulated rows and plan the outputs; `:ok`. Each output is
+/// then encoded by one `metric_finalize_next` call.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn metric_finalize_finish<'a>(
     env: Env<'a>,
@@ -1562,25 +1577,50 @@ fn metric_finalize_finish<'a>(
     rollup_target_rows: usize,
     max_names: usize,
 ) -> Term<'a> {
-    let Some(builder) = finalizer.0.lock().ok().and_then(|mut guard| guard.take()) else {
+    let Ok(mut guard) = finalizer.0.lock() else {
         return atoms::fallback().encode(env);
     };
-    match builder.finish(
-        env,
-        target_rows,
-        rollup_target_rows,
-        max_names.clamp(1, 128),
-    ) {
-        Ok((finished, series)) => {
+    let Some(builder) = guard.as_mut() else {
+        return atoms::fallback().encode(env);
+    };
+    builder.prepare(target_rows, rollup_target_rows, max_names.clamp(1, 128));
+    atoms::ok().encode(env)
+}
+
+/// `{:ok, kind, {payload, min_ts, max_ts, rows, [labels]}}` for the next
+/// planned output, with kind `:final`, `:before`, `:after` or `:rollup` and
+/// one label map per series, or `:done`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn metric_finalize_next<'a>(
+    env: Env<'a>,
+    finalizer: rustler::ResourceArc<MetricFinalizer>,
+) -> Term<'a> {
+    let Ok(mut guard) = finalizer.0.lock() else {
+        return atoms::fallback().encode(env);
+    };
+    let Some(builder) = guard.as_mut() else {
+        return atoms::fallback().encode(env);
+    };
+    match builder.next(env) {
+        Ok(Some((kind, output))) => {
             let mut cache = Vec::new();
-            let mut output = |o: metric_tiers::Output<'a>| tier_output(env, o, &series, &mut cache);
-            let finals: Vec<Term> = finished.finals.into_iter().map(&mut output).collect();
-            let before = finished.before.map(&mut output);
-            let after = finished.after.map(&mut output);
-            let rollups: Vec<Term> = finished.rollups.into_iter().map(&mut output).collect();
-            (atoms::ok(), finals, before, after, rollups).encode(env)
+            let output = tier_output(env, output, builder.series(), &mut cache);
+            let kind = match kind {
+                metric_tiers::Kind::Final => atoms::final_(),
+                metric_tiers::Kind::Before => atoms::before(),
+                metric_tiers::Kind::After => atoms::after(),
+                metric_tiers::Kind::Rollup => atoms::rollup(),
+            };
+            (atoms::ok(), kind, output).encode(env)
         }
-        Err(reason) => tier_error(env, reason),
+        Ok(None) => {
+            guard.take();
+            atoms::done().encode(env)
+        }
+        Err(reason) => {
+            guard.take();
+            tier_error(env, reason)
+        }
     }
 }
 

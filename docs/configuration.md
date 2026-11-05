@@ -42,6 +42,7 @@ read instance profiles, cloud workload identity, or other ambient cloud credenti
 | `PULSO_MANIFEST_BACKUP_INTERVAL_MS` | `900000` | How often each compacted prefix is backed up, `60000..86400000`. |
 | `PULSO_TEMPO_SEARCH_ENABLED` | `false` | Opt in to experimental Tempo `/api/search`, resource/span/instrumentation/event/link tag discovery (names/values optionally filtered on parent-span strings; filtered names are complete conservative hints, not matching-key proofs) and corresponding MCP tools. Complete-context search plans candidate sources newest first in growing rounds, prunes publication-proven sources whose service and resource/span attribute value sets cannot match, and selects context by conservative trace-ID summaries; unknown/legacy sources are never pruned, without time clipping. Retained catalog metadata/page/heap bounds can bind before the hard 8192-reference ceiling; actual fetched inputs of a planning round cumulatively cap at 1024 / 32 MiB / 1,000,000 raw rows, plus 65,536 matching-or-legacy-unknown IDs and independent output bounds. Index-probe exhaustion reads conservatively and can fail late; unread irrelevant objects are not scrubbed. Requires metadata2/export3/search6/discovery12, tuple `{2,1,3,6,12}`, on every serving artifact. Representative postings/capacity/client acceptance remains pending. Discovery does not use this service/ID plan. Discovery also caps requested-owner-plus-attribute work at 2,000,000 per scan attempt before filtering, lowering flat-scope capacity as attribute counts grow. Search always returns the most recent matching traces, so `with (most_recent=true)` is optional (Grafana omits it); bounded same-span negated-regex/status/int64 OR/span-duration and unscoped span-first expressions skip summary pruning but use the same newest-first planning, with an additional 20M prefilter work ceiling per scan attempt; see [expression semantics](trace-query-expressions.md). Static intrinsic names/seven v2 enum-or-empty vocabularies require the same gate/admission/auth but read no storage and prove no stored presence. Default names combine all five namespaces plus static v2 suggestions under one 2M-work/5000-scope-name-pair budget (20 intrinsic reservations apply even for v1 flattening), with service.name hints even unfiltered and without original attrs; storage errors fail whole rather than emitting partial suggestions. None values combine resource/span/instrumentation originals, not all name scopes. Bounded resource/span string filters select one parent before three-owner union/work, a complete extension rather than Tempo's ignored-query behavior. Same-key equality, nonstring/nested/intrinsic filters reject; values retain original types, matching complex targets fail, and legacy/corruption fail even on nonmatches. Filtered-none needs query-aware unscoped execution or bounded reference, plus separate explicit windowed-filtered-none support; old unfiltered/window callbacks cannot silently ignore the new mode. Floats (including non-finite classes) and seven stored intrinsic strings and event:timeSinceStart exact signed int nanosecond offsets read bounded data, accepting same-parent string filters; event-time filters are a disclosed complete extension versus upstream's empty path. Effective event time0 may yield negative offsets; no events invent no values. Invalid requested event times fail even on nonmatches and parent+all event attrs charge before filtering. New explicit event-time and separate windowed-event-time execution is required, never old string/window callbacks. These are distinct from storage-free static vocabulary. Paired positive discovery time bounds select retention-visible immutable segment envelopes, not span starts; all raw header/provider costs still apply, no indexed I/O gain or cross-window dictionary cache. Compaction can broaden suggestions, excluded payloads are not integrity-scrubbed. Matching capability-12 artifacts are required on every serving instance; flat/old adapters reject unsupported windows. Root name/service dictionaries select parent trace IDs then recover complete retained context, including roots outside predicate/window. Missing/ambiguous roots or missing original string root service fail409 whole, never default/skip. In-flight children-before-root and retention-straddling/multi-root traces can make broad/recent autocomplete unusable; this is a strict default-off extension, not transparent replacement. Root S3 input is the whole retained tenant, capped1024 objects/32MiB compressed/1M raw rows regardless of window/matches; no service/ID planner, local replay decodes all sources without another GET and cross-checks header/body rows. 65,536 candidates/16MiB bookkeeping,2M resource/span/link owner+attr work plus normal dictionary/result limits; dedicated root/window support required. Canonical trace:duration also measures complete retained max-end/min-start, without requiring roots. It may grow during ingest or shrink with retention, not exporter duration. Unfiltered emits int nanoseconds; any supported parent filter emits Go-style duration strings (including µs); both sort lexically. Do not cache across filter/type changes. Root capture/input/replay limits remain; duration work is2 resource/span owners+attrs,65,536 groups/80B per-summary charge within16MiB charged bookkeeping (not total native memory),5000 values/independent1MiB dictionaries/results. Broad nanosecond dictionaries commonly fail422. Dedicated duration/window support fences old root/string callbacks. Static duration/span:duration/traceDuration empty vocabularies remain unchanged. Zero/partial discovery windows, stored span-duration intrinsics, exact upstream distinct-omission/dynamic dedicated-column parity, full TraceQL and deployed-client parity remain unsupported. HTTP metadata search accepts omitted bounds or paired zeros for all retained context with unchanged ceilings; partial search windows reject. See [Tempo search](traces.md#experimental-tempo-search). |
 | `PULSO_LOG_COMPACTION_ENABLED` | `false` | Merge small log segments natively in the background. Read [Log compaction](#log-compaction) first. |
+| `PULSO_LOG_ROLLUPS_ENABLED` | `true` | With log compaction, write per-minute line and byte counts per stream so volume panels read counts instead of lines. See [Log volume rollups](#log-volume-rollups). |
 | `PULSO_TRACE_COMPACTION_ENABLED` | `false` | Experimental native trace merges and retirement cleanup. Requires all readers/writers/compactors upgraded and bucket versioning; see [trace compaction](traces.md#optional-native-compaction). |
 | `PULSO_SENTRY_PROJECTS_JSON` | `{}` | Ingest-only Sentry project map: numeric ID to `tenant`, `service`, `public_key_hashes` (1–8 lowercase SHA-256 digests), optional `allowed_domains` (up to 32 patterns of 1–256 UTF-8 bytes). Omitted origin policy is unrestricted; `[]` rejects Origin-bearing requests but permits authenticated SDKs without Origin. At most 256 projects. Empty disables ingestion. See [error tracking](error-tracking.md). |
 | `PULSO_ERROR_PROJECTION_ENABLED` | `false` | Enable the experimental S3-derived issue index, bounded error-rate detector and replayable change feed. Independent of ingestion and diagnosis; see [error monitoring](error-monitoring.md). |
@@ -699,7 +700,27 @@ query over a budget reports what it needed, for example
 
 Finalization catches up on existing history up to six hours per tenant and
 maintenance pass (every minute), oldest first. Until an hour has been
-finalized, ranges over it read every series' rows as before.
+finalized, ranges over it read its grouped segments (below).
+
+### The current hour
+
+Remote-write batches hold samples of every metric, so a metric-name filter
+cannot skip any of them. With finalization enabled, each maintenance pass also
+groups the settled raw segments (older than 15 seconds) of an unfinished hour by
+metric name into `-group-` segments of 500,000 to 1,000,000 rows, oldest first,
+up to eight per pass. A 1-hour panel then reads its metric's rows from each
+group plus the last few unsettled batches, instead of every batch of the hour.
+
+An hour larger than about 3,000,000 rows (three quarters of the 4,000,000-row
+finalization ceiling) is finalized in passes over equal ranges of metric-name
+hashes, each reading only the sources that hold its names and uploading its
+outputs before the next pass, so a 2 GiB node finalizes hours of tens of
+millions of rows. A pass that still exceeds the ceiling restarts the hour with
+twice the passes.
+
+This changes the native metric tier API to 2: upgrade every compacting
+instance's application and native library together. Readers of older versions
+read `-group-` segments like any other segment.
 
 Subqueries over days (`[7d:5m]`) evaluate their inner expression at every step
 over samples and cannot use rollups: the week-long subquery in the table selects
@@ -772,6 +793,26 @@ A merge fetches its sources eight at a time. Cleanup deletes merged originals
 after their grace period, eight at a time and 128 per batch, and repeats full
 batches up to four times per pass so deletions keep pace with merges.
 
+### Log volume rollups
+
+With log compaction and `PULSO_LOG_ROLLUPS_ENABLED=true` (default; chart
+`logCompaction.rollups`), each maintenance pass also writes per-minute rollups
+for settled minutes (ended at least 30 seconds ago, within the last two
+hours; older history keeps reading lines): one row per stream (resource, attributes, service and
+level) and minute with its line and byte counts. Up to eight rollups are built
+per pass, and a settled hour's rollups are merged into one object.
+Each signal's maintenance runs in its own worker, so finalizing a metrics hour
+does not delay log rollups.
+
+LogQL `count_over_time`, `bytes_over_time`, `rate` and `bytes_rate` over a
+selector without line filters, parsers or other pipeline stages, with every
+range and step a whole number of minutes (as Grafana aligns them), read
+rollups instead of lines. A minute is answered from its rollup only when the
+rollup counts exactly the lines its segments hold; minutes with late writes,
+without a rollup or not yet settled read lines as before, and both kinds of
+minute charge `PULSO_QUERY_MAX_SCAN_ROWS` with the rows they read. Answers are
+identical either way. Other queries and older readers ignore rollup objects.
+
 ## Retention
 
 By default Pulso keeps data indefinitely. Experimental event-time retention
@@ -798,6 +839,7 @@ these variables (through `extraEnv` in the Helm chart):
 | `PULSO_QUERY_MAX_SCAN_BYTES` | `134217728` | Stored bytes a query may read. |
 | `PULSO_QUERY_TIMEOUT_MS` | `10000` | Wall-clock limit for one query, including object-store reads (1000 to 300000). Queries past it fail with a timeout. Keep it below the client's own timeout (Grafana's datasource default is 30 s). |
 | `PULSO_QUERY_MAX_CONCURRENT` | derived, else `3` | Interactive queries (HTTP and MCP) a node runs at once, `1..64`; more wait for a slot or fail as overloaded. Native alert evaluation and reliability callbacks run one each outside these slots. |
+| `PULSO_QUERY_QUEUE_MS` | `5000` | How long a query waits for a free node, tenant or class slot before failing with `429`, `0..60000`. Grafana sends a dashboard's panels at once; the wait is bounded by the query timeout less one second. `0` refuses at once. |
 | `PULSO_QUERY_MAX_HEAP_MB` | derived, else `128` | Process heap ceiling of one query worker, `16..16384`. A query past it fails with a resource-limit error. Off-heap segment reads (up to the prefetch depth) and native accumulators come on top, so size memory for about (`PULSO_QUERY_MAX_CONCURRENT` + 2) × this plus prefetched segments, and lower both on small nodes. |
 | `PULSO_QUERY_PREFETCH` | `4` | Segments fetched ahead of the one being processed, hiding object-store latency. A query that scans many segments is latency-bound: with 25 ms per request, scanning 1,000 segments took about 25 s at 1, 5.8 s at 4 and 2.8 s at 8, with no more requests or memory. Larger values can read up to that many minus one segments more when a query stops early or exhausts a budget, and hold that many segments in memory per query. PromQL metric scans and log scans that cannot stop early (LogQL metric queries and unlimited log queries) read further ahead, up to 32 segments, while the segments they read keep at most 16 MiB in flight. Limited log and trace queries start at this depth and read as far ahead as they have already read, within the same bounds. A value of `1` disables read-ahead. |
 
@@ -834,6 +876,8 @@ per million samples.
 ## Fixed limits
 
 Each node admits `PULSO_QUERY_MAX_CONCURRENT` interactive queries (three by
-default), at most two per tenant, and bounds each query's duration and memory. Requests are capped at 4 MiB on the wire and
+default), at most two per tenant (raise it with `PULSO_TENANT_LIMITS_JSON`
+`query_max_concurrent`), queues the rest for up to `PULSO_QUERY_QUEUE_MS`, and
+bounds each query's duration and memory. Requests are capped at 4 MiB on the wire and
 16 MiB after decompression. Requests over these limits fail with an explicit
 error rather than a partial result.

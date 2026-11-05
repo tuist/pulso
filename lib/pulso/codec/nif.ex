@@ -64,6 +64,15 @@ defmodule Pulso.Codec.NIF do
   def log_discovery_api_version, do: :erlang.nif_error(:nif_not_loaded)
   def log_metric_api_version, do: :erlang.nif_error(:nif_not_loaded)
   def log_metric_scan_new(_stages, _value, _drop, _grouping, _max_samples), do: :erlang.nif_error(:nif_not_loaded)
+  def log_metric_binned_new(_value, _grouping, _max_samples), do: :erlang.nif_error(:nif_not_loaded)
+
+  def log_metric_scan_rollup(_scan, _blob, _buckets, _service, _matchers), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Per-minute log rollups (`Pulso.Storage.S3.LogRollups`); tier API 2.
+  def log_rollup_new(_start, _end, _buckets), do: :erlang.nif_error(:nif_not_loaded)
+  def log_rollup_add(_rollup, _blob, _segment?, _buckets), do: :erlang.nif_error(:nif_not_loaded)
+  def log_rollup_finish(_rollup, _sources), do: :erlang.nif_error(:nif_not_loaded)
+  def log_rollup_sources(_blob), do: :erlang.nif_error(:nif_not_loaded)
 
   def log_metric_scan_add(_scan, _blob, _start, _finish, _service, _matchers, _line_filters),
     do: :erlang.nif_error(:nif_not_loaded)
@@ -184,21 +193,23 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != 1,
+    if version != 2,
       do:
         raise(
-          "codec native artifact cannot finalize metric hours or read metric rollups; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+          "codec native artifact cannot finalize partitioned metric hours, consolidate metric segments, read metric rollups or build and read log rollups; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
         )
 
     :ok
   end
 
   def metric_tier_api_version, do: :erlang.nif_error(:nif_not_loaded)
-  def metric_finalize_new(_start, _end, _max_rows, _expected_rows), do: :erlang.nif_error(:nif_not_loaded)
+  def metric_finalize_new(_start, _end, _max_rows, _expected_rows, _partition), do: :erlang.nif_error(:nif_not_loaded)
   def metric_finalize_add(_finalizer, _blob), do: :erlang.nif_error(:nif_not_loaded)
 
   def metric_finalize_finish(_finalizer, _target_rows, _rollup_target_rows, _max_names),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  def metric_finalize_next(_finalizer), do: :erlang.nif_error(:nif_not_loaded)
 
   def decode_metric_rollups(_blob, _start, _finish, _matchers), do: :erlang.nif_error(:nif_not_loaded)
 

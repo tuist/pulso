@@ -218,8 +218,26 @@ retention:
   metricsDays: 90
 ```
 
-Also give dashboards enough query slots (`PULSO_QUERY_MAX_CONCURRENT`): the
-default of 3 per node answered `429` to concurrent panels in the load test.
+On a 2 GiB node, size query budgets for 1-hour dashboards over hundreds of
+thousands of series (`rate(m[5m])` over an hour selects about 130 samples per
+series; 1,000 series exceed the 100,000-sample default):
+
+```yaml
+resources:
+  limits:
+    memory: 2Gi
+extraEnv:
+  - {name: PULSO_QUERY_MAX_CONCURRENT, value: "3"}       # plus 2 background workers: 5 heaps of 160 MiB
+  - {name: PULSO_QUERY_QUEUE_MS, value: "5000"}          # dashboards send panels at once; wait, do not 429
+  - {name: PULSO_QUERY_MAX_HEAP_MB, value: "160"}
+  - {name: PULSO_QUERY_MAX_SAMPLES, value: "300000"}     # about 450 B of heap each
+  - {name: PULSO_QUERY_MAX_SCAN_BYTES, value: "268435456"}
+  - {name: PULSO_QUERY_TIMEOUT_MS, value: "15000"}
+```
+
+Five full query heaps (800 MiB) plus the ~660 MiB peak the load test measured
+stay below the 85% memory-pressure threshold of 2 GiB. Raise
+`PULSO_QUERY_MAX_CONCURRENT` only with memory.
 
 ### Measured at production volume
 
@@ -249,6 +267,22 @@ stay referenced for the one-hour grace period and finalized hours add rollups.
 A 75-minute run does not separate those two effects, so treat 2 TB/month as an
 upper bound on storage growth and watch `pulso_manifest_referenced_bytes` in
 production.
+
+1.33 groups the current hour's settled metric batches by name, writes log
+minute rollups and queues queries for a slot. With the settings above, a
+60-minute run (crossing an hour boundary) answered every one-hour dashboard
+panel (out of 120 each):
+
+| Panel | 1.31.0 (20 min) | 1.33 (60 min) |
+| --- | --- | --- |
+| `sum by (job) (rate(m[5m]))`, 1 h at 60 s | 10/40, p50 2.3 s (`max_scan_bytes`) | 120/120, p50 2.2 s, p99 10.5 s |
+| `topk(10, sum by (instance) (rate(m[5m])))` | 33/40, p50 2.7 s | 120/120, p50 1.1 s, p99 3.7 s |
+| `count(m)` | 33/40, p50 2.7 s | 120/120, p50 0.9 s, p99 2.1 s |
+| `sum by (detected_level) (count_over_time(...[1m]))`, 1 h | 8/40, p50 2.8 s (`max_scan_rows`) | 120/120, p50 1.6 s, p99 2.8 s |
+| `{service_name=...} \|= "level=error"`, 15 min | 40/40, p50 0.2 s | 120/120, p50 0.2 s |
+
+Ingest stayed fully acknowledged (p99 2.8–4.4 s), RSS p50 496 MiB and max 660
+MiB, at 4.3 Class A requests/s.
 
 ## Avoiding amplification
 

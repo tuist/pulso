@@ -246,6 +246,9 @@ metric_footer_pruning_enabled = env_var.("PULSO_METRICS_FOOTER_PRUNING_ENABLED",
 # With metrics compaction, settled hours are rewritten into metric-grouped
 # segments plus hourly rollups for long range functions.
 metric_finalize_enabled = env_var.("PULSO_METRICS_FINALIZE_ENABLED", "true") in ["1", "true", "yes"]
+# With log compaction, settled minutes get per-stream line/byte rollups that
+# answer minute-aligned count_over_time/bytes_over_time/rate/bytes_rate.
+log_rollup_enabled = env_var.("PULSO_LOG_ROLLUPS_ENABLED", "true") in ["1", "true", "yes"]
 # Pulso-side manifest backups for buckets without versioning; maintenance
 # cleanup waits for a backup that records each retirement.
 manifest_backup_enabled = env_var.("PULSO_MANIFEST_BACKUP_ENABLED", "true") in ["1", "true", "yes"]
@@ -543,6 +546,7 @@ case config_env() do
       trace_compaction_enabled: trace_compaction_enabled,
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
+      log_rollup_enabled: log_rollup_enabled,
       manifest_backup_enabled: manifest_backup_enabled,
       manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
@@ -614,6 +618,7 @@ case config_env() do
       trace_compaction_enabled: trace_compaction_enabled,
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
+      log_rollup_enabled: log_rollup_enabled,
       manifest_backup_enabled: manifest_backup_enabled,
       manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
@@ -633,6 +638,8 @@ end
 
 # Shared by dev and prod; merged into the S3 adapter configuration above.
 if config_env() in [:dev, :prod] do
+  # Tests keep immediate refusal unless they configure a queue themselves.
+  config :pulso, Pulso.QueryRunner, queue_ms: parse_integer.("PULSO_QUERY_QUEUE_MS", 5_000, 0..60_000)
   config :pulso, S3, retention_config
 end
 

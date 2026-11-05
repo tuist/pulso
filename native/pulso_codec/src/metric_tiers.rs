@@ -45,6 +45,8 @@ pub const FLAG_CONFLICT: i32 = 2;
 pub const FLAG_NEGATIVE_ZERO_RESET: i32 = 4;
 
 const NO_EXTRA: u32 = u32::MAX;
+// A dictionary key whose series belongs to another partition.
+const SKIPPED: u32 = u32::MAX - 1;
 const MAX_SERIES: usize = 4_000_000;
 const NEGATIVE_ZERO: u64 = 0x8000_0000_0000_0000;
 
@@ -78,11 +80,16 @@ struct Extra {
     exemplars: Option<Vec<u8>>,
 }
 
-/// Interned label sets, one per distinct canonical byte sequence.
+/// Interned label sets, one per distinct canonical byte sequence. The bytes
+/// are stored once, shared by the lookup table; the JSON and hash a segment
+/// stores are derived per output (`encoded`), so a batch holding hundreds of
+/// thousands of series keeps only their canonical bytes and name ranges.
 #[derive(Default)]
 pub struct Series {
-    labels: Vec<Arc<EncodedLabels>>,
-    index: HashMap<Vec<u8>, u32>,
+    canonical: Vec<Arc<[u8]>>,
+    // Byte range of the `__name__` value within the canonical bytes.
+    names: Vec<(u32, u32)>,
+    index: HashMap<Arc<[u8]>, u32>,
 }
 
 impl Series {
@@ -90,26 +97,37 @@ impl Series {
         if let Some(index) = self.index.get(canonical) {
             return Ok(*index);
         }
-        if self.labels.len() >= MAX_SERIES {
+        if self.canonical.len() >= MAX_SERIES {
             return Err(TierError::TooLarge);
         }
-        let labels = EncodedLabels::from_canonical(canonical).ok_or(TierError::Invalid)?;
-        let index = self.labels.len() as u32;
-        self.labels.push(Arc::new(labels));
-        self.index.insert(canonical.to_vec(), index);
+        let name = validated_name(canonical)?;
+        let index = self.canonical.len() as u32;
+        let shared: Arc<[u8]> = Arc::from(canonical);
+        self.canonical.push(Arc::clone(&shared));
+        self.names.push(name);
+        self.index.insert(shared, index);
         Ok(index)
     }
 
     pub fn canonical(&self, index: u32) -> &[u8] {
-        &self.labels[index as usize].canonical
+        &self.canonical[index as usize]
     }
 
-    // Rank of each series ordered by (metric name, canonical labels).
+    // Rank of each series ordered by (metric name hash, metric name,
+    // canonical labels): outputs then cover contiguous name-hash ranges, so
+    // a partitioned finalization (`name_partition`) reads each grouped
+    // segment in one partition, two at a boundary.
     fn ranks(&self) -> Vec<u32> {
-        let mut order: Vec<u32> = (0..self.labels.len() as u32).collect();
+        let mut order: Vec<u32> = (0..self.canonical.len() as u32).collect();
+        let hashes: Vec<u64> = (0..self.canonical.len() as u32)
+            .map(|i| name_hash(self.name(i)))
+            .collect();
         order.sort_by(|a, b| {
-            let (a, b) = (&self.labels[*a as usize], &self.labels[*b as usize]);
-            (&a.metric_name, &a.canonical).cmp(&(&b.metric_name, &b.canonical))
+            (hashes[*a as usize], self.name(*a), self.canonical(*a)).cmp(&(
+                hashes[*b as usize],
+                self.name(*b),
+                self.canonical(*b),
+            ))
         });
         let mut ranks = vec![0u32; order.len()];
         for (rank, index) in order.into_iter().enumerate() {
@@ -119,8 +137,39 @@ impl Series {
     }
 
     fn name(&self, index: u32) -> &[u8] {
-        &self.labels[index as usize].metric_name
+        let (start, end) = self.names[index as usize];
+        &self.canonical[index as usize][start as usize..end as usize]
     }
+
+    // The labels a segment stores for this series (name, JSON and hash).
+    fn encoded(&self, index: u32) -> Result<Arc<EncodedLabels>, TierError> {
+        EncodedLabels::from_canonical(self.canonical(index))
+            .map(Arc::new)
+            .ok_or(TierError::Invalid)
+    }
+}
+
+// Validate canonical label bytes as `EncodedLabels::from_canonical` does and
+// return the byte range of the metric name.
+fn validated_name(canonical: &[u8]) -> Result<(u32, u32), TierError> {
+    let mut pairs = Vec::new();
+    mp::parse_canonical_pairs(canonical, &mut pairs).map_err(|_| TierError::Invalid)?;
+    if pairs.windows(2).any(|w| w[0].0 >= w[1].0)
+        || pairs.iter().any(|(n, v)| {
+            simdutf8::basic::from_utf8(n).is_err() || simdutf8::basic::from_utf8(v).is_err()
+        })
+    {
+        return Err(TierError::Invalid);
+    }
+    let base = canonical.as_ptr() as usize;
+    Ok(pairs
+        .iter()
+        .find(|(name, _)| *name == b"__name__")
+        .map(|(_, value)| {
+            let start = (value.as_ptr() as usize - base) as u32;
+            (start, start + value.len() as u32)
+        })
+        .unwrap_or((0, 0)))
 }
 
 /// One encoded output: payload, time bounds, rows and its distinct series.
@@ -132,37 +181,96 @@ pub struct Output<'a> {
     pub series: Vec<u32>,
 }
 
-pub struct Finished<'a> {
-    pub finals: Vec<Output<'a>>,
-    pub before: Option<Output<'a>>,
-    pub after: Option<Output<'a>>,
-    pub rollups: Vec<Output<'a>>,
+/// What an output holds: rows of the hour grouped by metric, rows before or
+/// after the hour, or rollup rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Final,
+    Before,
+    After,
+    Rollup,
 }
 
-/// Accumulates every row of the segments overlapping `[start, end)`.
+enum Pending {
+    Rows(Kind, std::ops::Range<usize>),
+    Rollups(std::ops::Range<usize>),
+}
+
+struct Plan {
+    pending: std::collections::VecDeque<Pending>,
+    inside: usize,
+    rollup_target_rows: usize,
+    max_names: usize,
+    aggregates: Option<Vec<Aggregate>>,
+}
+
+/// 64-bit FNV-1a of a metric name, finished with MurmurHash3's fmix64 so
+/// similar names spread over the high bits that select a partition: the
+/// order and partitioning key of finalized and grouped outputs.
+/// `Pulso.Storage.S3.MetricTiers` computes the same function to choose each
+/// partition's sources.
+pub fn name_hash(name: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
+}
+
+/// The partition of `count` equal name-hash ranges holding `name`.
+pub fn name_partition(name: &[u8], count: u32) -> u32 {
+    ((u128::from(name_hash(name)) * u128::from(count)) >> 64) as u32
+}
+
+// The `__name__` value of a canonical label set (empty when absent).
+fn canonical_name(canonical: &[u8]) -> Result<&[u8], TierError> {
+    let (start, end) = validated_name(canonical)?;
+    Ok(&canonical[start as usize..end as usize])
+}
+
+/// Accumulates every row of the segments overlapping `[start, end)`, or with
+/// a partition `(index, count)` only the rows whose metric name falls in it.
 pub struct Builder {
     start: i64,
     end: i64,
     max_rows: usize,
+    partition: Option<(u32, u32)>,
     pub series: Series,
     rows: Vec<CompactRow>,
     extras: Vec<Extra>,
+    plan: Option<Plan>,
 }
 
 impl Builder {
-    pub fn new(start: i64, end: i64, max_rows: usize, expected_rows: usize) -> Self {
+    pub fn new(
+        start: i64,
+        end: i64,
+        max_rows: usize,
+        expected_rows: usize,
+        partition: Option<(u32, u32)>,
+    ) -> Self {
         Builder {
             start,
             end,
             max_rows,
+            partition,
             series: Series::default(),
             rows: Vec::with_capacity(expected_rows.min(max_rows)),
             extras: Vec::new(),
+            plan: None,
         }
     }
 
     /// Append every row of one metric segment; returns the rows read.
     pub fn add(&mut self, bytes: Bytes) -> Result<usize, TierError> {
+        if self.plan.is_some() {
+            return Err(TierError::Invalid);
+        }
         let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
             .map_err(|_| TierError::Invalid)?;
         let [otlp_column, histogram_column, exemplars_column, start_column] =
@@ -214,13 +322,24 @@ impl Builder {
                 let key = labels.key(row).ok_or(TierError::Invalid)?;
                 let series = match interned.get(key).copied() {
                     Some(u32::MAX) => {
-                        let index = self.series.intern(dictionary.value(key))?;
+                        let canonical = dictionary.value(key);
+                        let index = match self.partition {
+                            Some((index, count))
+                                if name_partition(canonical_name(canonical)?, count) != index =>
+                            {
+                                SKIPPED
+                            }
+                            _ => self.series.intern(canonical)?,
+                        };
                         interned[key] = index;
                         index
                     }
                     Some(index) => index,
                     None => return Err(TierError::Invalid),
                 };
+                if series == SKIPPED {
+                    continue;
+                }
                 if self.rows.len() >= self.max_rows {
                     return Err(TierError::TooLarge);
                 }
@@ -265,15 +384,11 @@ impl Builder {
         Ok(added)
     }
 
-    /// Encode the hour's rows grouped by metric, the rows outside the hour,
-    /// and the hour's rollup rows.
-    pub fn finish<'a>(
-        mut self,
-        env: Env<'a>,
-        target_rows: usize,
-        rollup_target_rows: usize,
-        max_names: usize,
-    ) -> Result<(Finished<'a>, Series), TierError> {
+    /// Order the rows and plan the outputs: the hour's rows grouped by
+    /// metric, the rows before and after the hour, then the hour's rollup
+    /// rows (none when `rollup_target_rows` is 0). `next` encodes them one at
+    /// a time, so only one output's encoding is alive at once.
+    pub fn prepare(&mut self, target_rows: usize, rollup_target_rows: usize, max_names: usize) {
         let ranks = self.series.ranks();
         let (start, end) = (self.start, self.end);
         let class = |ts: i64| -> u8 {
@@ -297,41 +412,67 @@ impl Builder {
         });
         let inside = self.rows.partition_point(|r| class(r.ts) == 0);
         let before = inside + self.rows[inside..].partition_point(|r| class(r.ts) == 1);
-        let mut finals = Vec::new();
-        for range in groups(
+        let mut pending: std::collections::VecDeque<Pending> = groups(
             &self.rows[..inside],
             &self.series,
             |r| r.series,
             target_rows,
             max_names,
-        ) {
-            finals.push(self.encode_range(env, range)?);
+        )
+        .into_iter()
+        .map(|range| Pending::Rows(Kind::Final, range))
+        .collect();
+        if before > inside {
+            pending.push_back(Pending::Rows(Kind::Before, inside..before));
         }
-        let earlier = (before > inside)
-            .then(|| self.encode_range(env, inside..before))
-            .transpose()?;
-        let later = (self.rows.len() > before)
-            .then(|| self.encode_range(env, before..self.rows.len()))
-            .transpose()?;
-        let aggregates = self.rollup_rows(&self.rows[..inside]);
-        drop(std::mem::take(&mut self.rows));
-        let mut rollups = Vec::new();
-        for range in groups(
-            &aggregates,
-            &self.series,
-            |a| a.series,
+        if self.rows.len() > before {
+            pending.push_back(Pending::Rows(Kind::After, before..self.rows.len()));
+        }
+        self.plan = Some(Plan {
+            pending,
+            inside,
             rollup_target_rows,
             max_names,
-        ) {
-            rollups.push(encode_rollups(env, &aggregates[range], &self.series)?);
+            aggregates: None,
+        });
+    }
+
+    /// The next planned output, or None when every output is encoded.
+    pub fn next<'a>(&mut self, env: Env<'a>) -> Result<Option<(Kind, Output<'a>)>, TierError> {
+        loop {
+            let plan = self.plan.as_mut().ok_or(TierError::Invalid)?;
+            match plan.pending.pop_front() {
+                Some(Pending::Rows(kind, range)) => {
+                    return Ok(Some((kind, self.encode_range(env, range)?)));
+                }
+                Some(Pending::Rollups(range)) => {
+                    let aggregates = plan.aggregates.as_ref().ok_or(TierError::Invalid)?;
+                    let output = encode_rollups(env, &aggregates[range], &self.series)?;
+                    return Ok(Some((Kind::Rollup, output)));
+                }
+                None if plan.aggregates.is_none() => {
+                    // Every row output is written: summarize, then free the rows.
+                    let (inside, target, max_names) =
+                        (plan.inside, plan.rollup_target_rows, plan.max_names);
+                    let aggregates = if target == 0 {
+                        Vec::new()
+                    } else {
+                        self.rollup_rows(&self.rows[..inside])
+                    };
+                    drop(std::mem::take(&mut self.rows));
+                    drop(std::mem::take(&mut self.extras));
+                    let ranges = groups(&aggregates, &self.series, |a| a.series, target, max_names);
+                    let plan = self.plan.as_mut().ok_or(TierError::Invalid)?;
+                    plan.pending.extend(ranges.into_iter().map(Pending::Rollups));
+                    plan.aggregates = Some(aggregates);
+                }
+                None => return Ok(None),
+            }
         }
-        let finished = Finished {
-            finals,
-            before: earlier,
-            after: later,
-            rollups,
-        };
-        Ok((finished, self.series))
+    }
+
+    pub fn series(&self) -> &Series {
+        &self.series
     }
 
     fn encode_range<'a>(
@@ -342,17 +483,27 @@ impl Builder {
         let rows = &self.rows[range];
         let mut series = Vec::new();
         let mut encoded = Vec::with_capacity(rows.len());
+        // Rows are ordered by series: derive each series' labels once.
+        let mut current: Option<(u32, Arc<EncodedLabels>)> = None;
         for row in rows {
             if series.last() != Some(&row.series) {
                 series.push(row.series);
             }
+            let labels = match &current {
+                Some((index, labels)) if *index == row.series => Arc::clone(labels),
+                _ => {
+                    let labels = self.series.encoded(row.series)?;
+                    current = Some((row.series, Arc::clone(&labels)));
+                    labels
+                }
+            };
             let extra = (row.extra != NO_EXTRA).then(|| &self.extras[row.extra as usize]);
             encoded.push(Row {
                 series_id: row.series_id,
                 timestamp_ns: row.ts,
                 start_timestamp_ms: extra.and_then(|e| e.start),
                 value: f64::from_bits(row.value),
-                labels: Arc::clone(&self.series.labels[row.series as usize]),
+                labels,
                 otlp: extra.and_then(|e| e.otlp.clone()),
                 histogram: extra.and_then(|e| e.histogram.clone()),
                 exemplars: extra.and_then(|e| e.exemplars.clone()),
@@ -642,9 +793,8 @@ pub fn encode_rollups<'a>(
     let mut resets = BinaryBuilder::with_capacity(n, 0);
     let mut distinct = Vec::new();
     for a in aggregates {
-        let labels = &series.labels[a.series as usize];
-        names.append_value(String::from_utf8_lossy(&labels.metric_name));
-        canonical.append_value(&labels.canonical);
+        names.append_value(String::from_utf8_lossy(series.name(a.series)));
+        canonical.append_value(series.canonical(a.series));
         if a.reset_values.is_empty() {
             resets.append_null();
         } else {

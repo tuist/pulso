@@ -926,7 +926,14 @@ defmodule PulsoWeb.LokiQueryController do
   defp render_query_error(conn, reason) when reason in [:query_execution_failed, :query_resource_limit],
     do: error_json(conn, :internal_server_error, "query_failed", "Query execution failed.")
 
-  defp render_query_error(conn, :query_scan_limit) do
+  defp render_query_error(conn, reason)
+       when reason in [
+              :query_scan_limit,
+              :query_sample_limit,
+              :query_result_limit,
+              :query_work_limit,
+              :query_intermediate_limit
+            ] do
     message =
       case QueryLimit.describe(QueryLimit.take()) do
         nil -> "Query exceeded its resource budget."
@@ -935,10 +942,6 @@ defmodule PulsoWeb.LokiQueryController do
 
     error_json(conn, :unprocessable_entity, "query_limit", message)
   end
-
-  defp render_query_error(conn, reason)
-       when reason in [:query_sample_limit, :query_result_limit, :query_work_limit, :query_intermediate_limit],
-       do: error_json(conn, :unprocessable_entity, "query_limit", "Query exceeded its resource budget.")
 
   defp render_query_error(conn, {:storage_error, _}),
     do: error_json(conn, :service_unavailable, "storage_unavailable", "Storage is unavailable.")

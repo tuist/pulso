@@ -27,6 +27,44 @@ defmodule Pulso.LogQL.NativeRange do
   `:fallback` when the query or its data needs the Elixir pipeline.
   """
   def collect(inner, spec, tenant, query_opts) do
+    case binned(inner, spec, tenant, query_opts) do
+      :skip -> collect_samples(inner, spec, tenant, query_opts)
+      result -> result
+    end
+  end
+
+  @binned_ops [:count_over_time, :bytes_over_time, :rate, :bytes_rate]
+
+  # Line and byte counts over minute-aligned windows of a plain selector sum
+  # per-minute bins, read from log rollups where valid and from lines
+  # elsewhere (`Pulso.Storage.log_binned_scan/3`). Each series' samples are
+  # `{:binned, packed}`: one `{bucket_end, count | bytes}` per minute.
+  defp binned(inner, spec, tenant, query_opts) do
+    with true <- Map.get(spec, :binnable, false),
+         true <- spec.op in @binned_ops and is_nil(spec.unwrap),
+         true <- Map.get(spec, :post_filter, []) == [] and not Map.get(spec, :preserve_errors, false),
+         true <- Storage.native_log_binned?(),
+         :ok <- QueryValidation.validate(inner),
+         {storage_opts, []} <- Evaluator.push_down(inner, query_opts),
+         false <- Keyword.has_key?(storage_opts, :line_filters),
+         {:ok, scan} <-
+           native(
+             NIF.log_metric_binned_new(binned_value(spec.op), grouping(spec.grouping), Budget.remaining(:log_samples))
+           ) do
+      case scan(tenant, storage_opts, scan, &Storage.log_binned_scan/3) do
+        {:ok, series} -> {:ok, Map.new(series, fn {labels, {:packed, packed}} -> {labels, {:binned, packed}} end)}
+        other -> other
+      end
+    else
+      {:error, _} = error -> error
+      _ -> :skip
+    end
+  end
+
+  defp binned_value(op) when op in [:bytes_over_time, :bytes_rate], do: :bytes
+  defp binned_value(_op), do: :count
+
+  defp collect_samples(inner, spec, tenant, query_opts) do
     with true <- spec.op in @ops,
          true <- Map.get(spec, :post_filter, []) == [],
          false <- Map.get(spec, :preserve_errors, false),
@@ -45,15 +83,15 @@ defmodule Pulso.LogQL.NativeRange do
                Budget.remaining(:log_samples)
              )
            ) do
-      scan(tenant, storage_opts, scan)
+      scan(tenant, storage_opts, scan, &Storage.log_metric_scan/3)
     else
       {:error, _} = error -> error
       _ -> :fallback
     end
   end
 
-  defp scan(tenant, storage_opts, scan) do
-    case Storage.log_metric_scan(tenant, storage_opts, scan) do
+  defp scan(tenant, storage_opts, scan, read) do
+    case read.(tenant, storage_opts, scan) do
       {:ok, {selected, kept}} ->
         Budget.charge(:log_samples, kept)
         Budget.charge(:work, selected)
@@ -67,6 +105,7 @@ defmodule Pulso.LogQL.NativeRange do
         {:error, :query_sample_limit}
 
       {:error, :native_fallback} ->
+        _ = NIF.log_metric_scan_abort(scan)
         :fallback
 
       {:error, _} = error ->

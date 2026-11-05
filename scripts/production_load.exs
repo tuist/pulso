@@ -27,7 +27,8 @@
 #   LOAD_SERIES (400000), LOAD_SCRAPE_SECONDS (30), LOAD_METRICS_RPS (20)
 #   LOAD_LOG_LINES (3400 per second), LOAD_LOG_RPS (40)
 #   LOAD_SPANS (1000 per second), LOAD_TRACE_RPS (10)
-#   LOAD_QUERY_INTERVAL_SECONDS (30), LOAD_S3_GET_MS (140..190), LOAD_S3_PUT_MS (220..350)
+#   LOAD_QUERY_INTERVAL_SECONDS (30), LOAD_QUERY_CONCURRENCY (2), LOAD_ALIGN_QUERIES (true)
+#   LOAD_S3_GET_MS (140..190), LOAD_S3_PUT_MS (220..350)
 #   LOAD_S3_DIR (/tmp/pulso-load-s3), LOAD_TENANT (tuist), LOAD_TOKEN (load-token)
 
 defmodule Pulso.ProductionLoad do
@@ -360,8 +361,11 @@ defmodule Pulso.ProductionLoad do
 
   # ---- dashboard queries ------------------------------------------------------
 
-  # Panels shaped like Tuist's dashboards, refreshed every interval.
+  # Panels shaped like Tuist's dashboards, refreshed every interval. Range
+  # panels end on a multiple of their step, as Grafana aligns them
+  # (LOAD_ALIGN_QUERIES=false sends the raw time instead).
   defp queries(now_s) do
+    now_s = if env("LOAD_ALIGN_QUERIES", "true") == "true", do: now_s - rem(now_s, 60), else: now_s
     hour = now_s - 3600
 
     [
@@ -392,6 +396,7 @@ defmodule Pulso.ProductionLoad do
 
           status =
             case Req.get(ctx.url <> path, params: params, headers: ctx.headers, retry: false, finch: [name: LoadFinch], receive_timeout: 120_000) do
+              {:ok, %{status: status} = response} when status >= 400 -> failure(status, response.body)
               {:ok, response} -> response.status
               {:error, _} -> :transport_error
             end
@@ -405,6 +410,17 @@ defmodule Pulso.ProductionLoad do
 
       wait_until(at + interval)
       query_loop(ctx, interval)
+    end
+  end
+
+  # A failed panel is reported with the query limit it hit, such as
+  # "422 max_scan_bytes", so the report shows which budget binds.
+  defp failure(status, body) do
+    text = if is_binary(body), do: body, else: JSON.encode!(body)
+
+    case Regex.run(~r/(max_[a-z_]+|metadata|memory|timeout)/, text) do
+      [_, limit] -> "#{status} #{limit}"
+      _ -> status
     end
   end
 

@@ -46,6 +46,36 @@ defmodule Pulso.QueryRunnerTest do
     assert {:ok, :released} = QueryRunner.run("shared", :raw, fn _ -> {:ok, :released} end)
   end
 
+  test "with a queue, a query beyond the tenant's slots waits for one instead of being refused" do
+    Pulso.Runtime.put_env(
+      :pulso,
+      QueryRunner,
+      Keyword.put(Pulso.Runtime.get_env(:pulso, QueryRunner, []), :queue_ms, 4_000)
+    )
+
+    caller = self()
+    supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.Queued})
+
+    [first, _second] =
+      for n <- 1..2 do
+        {:ok, _} =
+          Task.Supervisor.start_child(supervisor, fn ->
+            QueryRunner.run("queued", :promql, fn _ ->
+              send(caller, {:holding, n, self()})
+              receive do: (:release -> {:ok, n})
+            end)
+          end)
+
+        assert_receive {:holding, ^n, worker}, 5_000
+        worker
+      end
+
+    queued = Task.async(fn -> QueryRunner.run("queued", :promql, fn _ -> {:ok, :queued} end) end)
+    refute Task.yield(queued, 200)
+    send(first, :release)
+    assert {:ok, :queued} = Task.await(queued, 5_000)
+  end
+
   test "the limit a worker hit is reported to the calling process" do
     assert {:error, :query_scan_limit} =
              QueryRunner.run("limits", :promql, fn _ ->

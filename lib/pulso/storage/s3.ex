@@ -87,6 +87,7 @@ defmodule Pulso.Storage.S3 do
   alias Pulso.Storage.S3.AppendBuffer
   alias Pulso.Storage.S3.JournalManifest
   alias Pulso.Storage.S3.KeyedPublication
+  alias Pulso.Storage.S3.LogRollups
   alias Pulso.Storage.S3.Manifest
   alias Pulso.Storage.S3.Manifest.Segment
   alias Pulso.Storage.S3.ManifestCache
@@ -408,6 +409,116 @@ defmodule Pulso.Storage.S3 do
     query(:logs, tenant, Keyword.put(Keyword.delete(opts, :limit), :log_metric, scan))
   end
 
+  # Minutes answered by valid log rollups (`LogRollups.plan/5`) are read
+  # from them; every other range is read from log lines into the same bins.
+  # Scan budgets charge the rollups' rows, segments and bytes plus what the
+  # line reads charge. `start_ts - 1` and `end_ts` fall on minutes.
+  @impl Pulso.Storage
+  def log_binned_scan(tenant, opts, scan) do
+    with :ok <- validate_tenant(tenant),
+         :ok <- check_deadline(opts[:deadline_ms]) do
+      config = config!()
+
+      timeout =
+        if opts[:deadline_ms],
+          do: max(0, opts[:deadline_ms] - System.monotonic_time(:millisecond)),
+          else: Map.get(config, :retention_timeout_ms, 30_000)
+
+      config
+      |> Map.put(:retention_timeout_ms, timeout)
+      |> PagedManifest.with_budget(fn -> binned_plan(tenant, opts, config) end)
+      |> budget_result(opts)
+      |> case do
+        {:ok, plan} -> binned_read(tenant, plan, opts, scan, config)
+        error -> error
+      end
+    end
+  end
+
+  defp binned_plan(tenant, opts, config) do
+    {start, finish} = {opts[:start_ts], opts[:end_ts]}
+
+    with {:ok, entry} <- query_manifest(tenant, "logs", config, opts),
+         manifest = entry.manifest,
+         # Every segment, whatever its streams: rollup counts cover all lines.
+         {:ok, raws} <- query_segments(manifest, :logs, start, finish, [], tenant, config),
+         {:ok, rollups} <- query_segments(manifest, :logs, start, finish, [log_rollups: true], tenant, config) do
+      {:ok, LogRollups.plan(raws, rollups, start, retained_start(manifest, start), finish)}
+    end
+  end
+
+  defp binned_read(tenant, plan, opts, scan, config) do
+    rollups = Enum.map(plan.rollups, &elem(&1, 0))
+
+    # Rows are charged as read: only the planned minutes' rows of a rollup.
+    with :ok <- check_scan_budget(rollups, Keyword.delete(opts, :max_scan_rows)),
+         {:ok, consumed} <- read_rollups(plan.rollups, opts, scan, config),
+         :ok <- check_rollup_rows(consumed.budget.max_scan_rows, opts) do
+      plan.gaps
+      |> Enum.reduce_while({:ok, consumed}, &read_gap(tenant, opts, scan, &1, &2))
+      |> case do
+        {:ok, acc} -> {:ok, {acc.selected, acc.kept}}
+        error -> error
+      end
+    end
+  end
+
+  # Lines of minutes no rollup answers, within the budget the rollups left.
+  defp read_gap(tenant, opts, scan, {from, to}, {:ok, acc}) do
+    gap_opts = opts |> remaining_budget(acc.budget) |> Keyword.merge(start_ts: from, end_ts: to)
+
+    case log_metric_scan(tenant, gap_opts, scan) do
+      {:ok, {selected, kept}} -> {:cont, {:ok, %{acc | selected: acc.selected + selected, kept: acc.kept + kept}}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp read_rollups(planned, opts, scan, config) do
+    service = Keyword.get(opts, :service)
+    matchers = Keyword.get(opts, :matchers, [])
+    initial = %{selected: 0, kept: 0, budget: %{max_scan_segments: 0, max_scan_bytes: 0, max_scan_rows: 0}}
+
+    planned
+    |> Pulso.Runtime.Task.async_stream(fn {rollup, buckets} -> {ObjectStore.get(config, rollup.key), buckets} end,
+      max_concurrency: max(Map.get(config, :query_prefetch, 4), 1),
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while({:ok, initial}, fn
+      {:ok, {{:ok, blob}, buckets}}, {:ok, acc} ->
+        with :ok <- check_deadline(opts[:deadline_ms]),
+             {:ok, rows} <- rollup_rows(NIF.log_metric_scan_rollup(scan, blob, buckets, service, matchers)) do
+          budget = %{
+            max_scan_segments: acc.budget.max_scan_segments + 1,
+            max_scan_bytes: acc.budget.max_scan_bytes + byte_size(blob),
+            max_scan_rows: acc.budget.max_scan_rows + rows
+          }
+
+          {:cont, {:ok, %{acc | selected: acc.selected + rows, kept: acc.kept + rows, budget: budget}}}
+        else
+          error -> {:halt, error}
+        end
+
+      # A rollup retired after planning: the caller evaluates from lines.
+      {:ok, {{:error, :not_found}, _}}, _acc ->
+        {:halt, {:error, :native_fallback}}
+
+      {:ok, {{:error, _} = error, _}}, _acc ->
+        {:halt, error}
+    end)
+  end
+
+  defp check_rollup_rows(rows, opts) do
+    if exceeds_budget?(rows, opts[:max_scan_rows]),
+      do: QueryLimit.exceeded(:max_scan_rows, opts[:max_scan_rows], rows, :visited),
+      else: :ok
+  end
+
+  defp rollup_rows({:ok, rows}), do: {:ok, rows}
+  defp rollup_rows({:error, :pipeline_error}), do: {:error, :pipeline_error}
+  defp rollup_rows({:error, :query_resource_limit}), do: {:error, :query_resource_limit}
+  defp rollup_rows(_), do: {:error, :native_fallback}
+
   @impl Pulso.Storage
   def put_metric_metadata(tenant, entries, today), do: MetricMetadataStore.put(config!(), tenant, entries, today)
 
@@ -647,15 +758,15 @@ defmodule Pulso.Storage.S3 do
   end
 
   # Whole hours in [from, to) answered from hourly rollups: those with a
-  # matching rollup object and no matching raw segment (a write that arrived
-  # after finalization). Their finalized segments are not read.
+  # matching rollup object and no matching raw or grouped segment (a write
+  # that arrived after finalization). Their finalized segments are not read.
   defp tier_candidates(wanted, manifest, {from, to}, opts, tenant, config) do
     rollup_opts = Keyword.put(opts, :metric_tier, :rollup)
 
     with {:ok, rollups} <- query_segments(manifest, :metrics, from, to - 1, rollup_opts, tenant, config) do
       blocked =
         for s <- wanted.samples,
-            Segment.metric_tier(s) == :raw,
+            Segment.metric_tier(s) in [:raw, :grouped],
             hour <- raw_hours(s, from, to),
             into: MapSet.new(),
             do: hour

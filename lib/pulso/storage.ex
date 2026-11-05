@@ -158,6 +158,8 @@ defmodule Pulso.Storage do
               {:ok, %{segments: non_neg_integer(), entries: non_neg_integer(), bytes: non_neg_integer()}}
               | {:error, term()}
   @callback fold_logs(tenant, query_opts, acc, (list(), acc -> acc)) :: {:ok, acc} | {:error, term()} when acc: term()
+  @callback log_binned_scan(tenant, query_opts, reference()) ::
+              {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
   @callback log_metric_scan(tenant, query_opts, reference()) ::
               {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
   @callback trace_metrics_scan(tenant, query_opts, reference()) :: {:ok, non_neg_integer()} | {:error, term()}
@@ -167,6 +169,7 @@ defmodule Pulso.Storage do
   @optional_callbacks follow_logs: 2,
                       metric_discovery_json: 5,
                       log_metric_scan: 3,
+                      log_binned_scan: 3,
                       trace_metrics_scan: 3,
                       put_metric_metadata: 3,
                       metric_metadata: 1,
@@ -361,6 +364,21 @@ defmodule Pulso.Storage do
     backend = adapter()
     Code.ensure_loaded!(backend)
     function_exported?(backend, :log_metric_scan, 3)
+  end
+
+  @doc "Whether the adapter answers minute-binned log counts (`log_binned_scan/3`)."
+  def native_log_binned? do
+    backend = adapter()
+    Code.ensure_loaded!(backend)
+    function_exported?(backend, :log_binned_scan, 3)
+  end
+
+  @doc """
+  Feed a minute-binned native scan (`Pulso.Codec.NIF.log_metric_binned_new/3`)
+  from log rollups where they are valid and from log segments elsewhere.
+  """
+  def log_binned_scan(tenant, opts, scan) do
+    Pulso.SelfMetrics.track(:query, :storage_logs, fn -> adapter().log_binned_scan(tenant, opts, scan) end)
   end
 
   @doc "Feed the matching log segments to a native range scan."

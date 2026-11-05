@@ -14,6 +14,9 @@ defmodule Pulso.Storage.S3.CompactionOwnership do
   def group(config, "traces"), do: {group(config), :traces}
   def group(config, "logs"), do: {group(config), :logs}
 
+  # A maintenance lane (`CompactionSupervision`) owns only its own signal.
+  def signals(%{maintenance_signal: signal}), do: [signal]
+
   def signals(config) do
     metric_default = not Map.has_key?(config, :trace_compaction_enabled)
 

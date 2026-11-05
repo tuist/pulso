@@ -1570,6 +1570,37 @@ the raw sign behaviour). Flags or histogram samples fall back to a raw read.
 Other functions read finalized samples. Retention-managed (format 3) prefixes
 are not finalized yet.
 
+Before an hour settles, each remote-write batch holds a slice of every metric,
+so name summaries cannot prune it and a 1-hour panel reads every batch (a
+production hour is ~1,800 segments, ~48M rows). `MetricTiers.consolidate/3`
+regroups settled raw segments of the open hour, oldest first, into `-group-`
+segments of 0.5–1M rows sorted by metric (tier `:grouped`, read and finalized
+like raw), using the same native builder without rollups. Finalization of an
+hour above 3/4 of `max_rows` runs in passes over equal ranges of a 64-bit
+metric-name hash (`name_partition/2`, mirrored natively); a source is read
+only by the passes its listed names fall in, outputs stream one at a time, and
+an uneven pass restarts the hour with twice the passes. Tier API 2.
+
+Each enabled signal has its own maintenance worker and task supervisor
+(`CompactionSupervision` lanes, per-signal ownership groups), so a
+minutes-long finalization at the top of the hour does not stall log rollups,
+log compaction or the next hour's consolidation. Each lane runs its own
+discovery pass.
+
+### Log minute rollups
+
+`count_over_time` panels read every line. Log segment summaries carry `lm`,
+the line count per minute (at most 128 minutes, merged by compaction).
+`Pulso.Storage.S3.LogRollups` writes `-rollup-` log objects for settled
+minutes: one row per (minute, resource, attributes, service, severity) with
+line and byte counts and a traced count, built natively (`log_rollup.rs`) from
+the minute's segments; a settled hour's minute rollups are merged into one.
+The query planner keeps a minute's rollup only when its count equals the sum
+of the overlapping segments' `lm` for that minute, so late or unsummarized
+writes make that minute a gap read from lines. `NativeRange` uses the binned
+path only when every window is minute-aligned and the pipeline is empty;
+rollup rows charge `max_scan_rows`, and other log queries exclude rollup keys.
+
 ## Format 4 manifests
 
 A flat manifest lists every segment ever published, including permanent

@@ -19,6 +19,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   alias Pulso.Storage.S3.CompactionSupervision
   alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.LogCompactor
+  alias Pulso.Storage.S3.LogRollups
   alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.MetricsCompactor
   alias Pulso.Storage.S3.MetricTiers
@@ -26,7 +27,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
 
   require Logger
 
-  def start_link(config), do: GenServer.start_link(__MODULE__, config, name: __MODULE__)
+  def start_link(config), do: GenServer.start_link(__MODULE__, config, name: Map.get(config, :worker_name, __MODULE__))
+
+  # A lane (see `CompactionSupervision`) runs its operations under its own
+  # task supervisor.
+  defp tasks(config), do: Map.get(config, :compaction_tasks, CompactionTasks)
 
   @doc false
   def children(config) do
@@ -38,7 +43,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
 
   @impl true
   def init(config) do
-    if Task.Supervisor.children(CompactionTasks) == [], do: :ok = CompactionOwnership.join(config)
+    if Task.Supervisor.children(tasks(config)) == [], do: :ok = CompactionOwnership.join(config)
     schedule(config)
     {:ok, config}
   end
@@ -48,7 +53,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
     # Timed-out work may still be inside a native call. Do not rejoin or admit
     # more work until the operation actually leaves the dedicated supervisor.
     config =
-      if Task.Supervisor.children(CompactionTasks) == [] do
+      if Task.Supervisor.children(tasks(config)) == [] do
         :ok = CompactionOwnership.join_once(config)
         run_pass(config)
       else
@@ -131,12 +136,77 @@ defmodule Pulso.Storage.S3.CompactionWorker do
 
   defp finalize_hours(result, tenant, "metrics", config) do
     # Metrics maintenance only runs with metrics compaction enabled (CompactionOwnership.signals/1).
-    if Map.get(config, :metric_finalize_enabled, true),
-      do: finalize_next(result, tenant, config, Map.get(config, :metric_finalize_max_hours, 6)),
+    if Map.get(config, :metric_finalize_enabled, true) do
+      consolidated = consolidate_next(tenant, config, Map.get(config, :metric_consolidate_max_batches, 8))
+
+      if consolidated == :timeout,
+        do: {{:error, :timeout}, config},
+        else: finalize_next(result, tenant, config, Map.get(config, :metric_finalize_max_hours, 6))
+    else
+      {result, config}
+    end
+  end
+
+  defp finalize_hours(result, tenant, "logs", config) do
+    if Map.get(config, :log_rollup_enabled, true),
+      do: {result, roll_logs(tenant, config, Map.get(config, :log_rollup_max_builds, 8))},
       else: {result, config}
   end
 
   defp finalize_hours(result, _tenant, _signal, config), do: {result, config}
+
+  # Per-minute log rollups for settled minutes (`LogRollups`), several per
+  # pass so a busy tenant keeps up; a failing minute is skipped for an hour.
+  defp roll_logs(_tenant, config, 0), do: config
+
+  defp roll_logs(tenant, config, remaining) do
+    now = System.monotonic_time(:millisecond)
+
+    skips =
+      config |> Map.get(:log_rollup_skip, %{}) |> Map.get(tenant, %{}) |> Map.reject(fn {_, until} -> until <= now end)
+
+    opts = Keyword.put(Map.get(config, :log_rollup_options, []), :skip, MapSet.new(Map.keys(skips)))
+    put = &Map.put(config, :log_rollup_skip, Map.put(Map.get(config, :log_rollup_skip, %{}), tenant, &1))
+
+    case run_operation(fn -> LogRollups.roll(tenant, config, opts) end, {"logs", tenant}, "log_rollup", config) do
+      {:ok, %{from: from}} when is_integer(from) ->
+        if CompactionOwnership.local_owner?(tenant, "logs", config),
+          do: roll_logs(tenant, put.(skips), remaining - 1),
+          else: put.(skips)
+
+      {:error, {minute, _reason}} when is_integer(minute) ->
+        roll_logs(tenant, put.(Map.put(skips, minute, now + 3_600_000)), remaining - 1)
+
+      _ ->
+        put.(skips)
+    end
+  end
+
+  # Group settled raw segments of unfinished hours by metric name, batch by
+  # batch, so selectors over the current hour read only their metrics' rows.
+  defp consolidate_next(_tenant, _config, 0), do: :ok
+
+  defp consolidate_next(tenant, config, remaining) do
+    opts = Map.get(config, :metric_finalize_options, [])
+
+    case run_operation(
+           fn -> MetricTiers.consolidate(tenant, config, opts) end,
+           {"metrics", tenant},
+           "consolidate",
+           config
+         ) do
+      {:ok, %{hour: hour}} when is_integer(hour) ->
+        if CompactionOwnership.local_owner?(tenant, "metrics", config),
+          do: consolidate_next(tenant, config, remaining - 1),
+          else: :ok
+
+      {:error, :timeout} ->
+        :timeout
+
+      _ ->
+        :ok
+    end
+  end
 
   defp finalize_next(result, _tenant, config, 0), do: {result, config}
 
@@ -280,11 +350,13 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp metric_dimension("cleanup"), do: :worker_cleanup
   defp metric_dimension("discovery"), do: :worker_discovery
   defp metric_dimension("finalize"), do: :worker_finalize
+  defp metric_dimension("consolidate"), do: :worker_consolidate
+  defp metric_dimension("log_rollup"), do: :worker_log_rollup
   defp metric_dimension("backup"), do: :worker_backup
 
   defp do_run_operation(operation, subject, name, config) do
     task =
-      Task.Supervisor.async_nolink(CompactionTasks, fn ->
+      Task.Supervisor.async_nolink(tasks(config), fn ->
         Process.set_label({:pulso, :maintenance})
         execute_operation(operation, subject, name)
       end)
@@ -308,7 +380,11 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   end
 
   defp operation_timeout(config, "discovery"), do: Map.get(config, :compaction_discovery_timeout_ms, 60_000)
-  defp operation_timeout(config, "finalize"), do: Map.get(config, :metric_finalize_timeout_ms, 120_000)
+  # A production hour (tens of millions of rows) finalizes in several
+  # partitions within one call.
+  defp operation_timeout(config, "finalize"), do: Map.get(config, :metric_finalize_timeout_ms, 900_000)
+  defp operation_timeout(config, "consolidate"), do: Map.get(config, :metric_consolidate_timeout_ms, 120_000)
+  defp operation_timeout(config, "log_rollup"), do: Map.get(config, :log_rollup_timeout_ms, 120_000)
   defp operation_timeout(config, "backup"), do: Map.get(config, :manifest_backup_timeout_ms, 120_000)
   defp operation_timeout(config, _operation), do: Map.get(config, :compaction_timeout_ms, 30_000)
 

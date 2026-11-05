@@ -145,6 +145,8 @@ metricsCompaction:
   # With compaction, rewrite each settled hour into segments grouped by metric
   # name plus hourly rollups, so long ranges read only their metric's rows and
   # 1-day to 7-day range functions read one rollup row per series and hour.
+  # Also groups settled raw segments of the current hour by metric name, so
+  # 1-hour panels read their metric's rows instead of every batch.
   finalize: true
 
 manifestBackups:
@@ -230,6 +232,10 @@ logCompaction:
   # Native merges of small log segments, which keep log queries from reading
   # one object per push. Upgrade all readers/writers/compactors first.
   enabled: false
+  # With compaction, write per-minute line/byte counts per stream for settled
+  # minutes, so count_over_time/bytes_over_time/rate panels without line
+  # filters read the counts instead of every line.
+  rollups: true
 
 traceCompaction:
   # Experimental native merges. Upgrade all readers/writers/compactors and enable bucket versioning
@@ -587,7 +593,8 @@ clustering:
 # slots from limits.memory (docs/configuration.md#node-memory-envelope), so
 # raising memory raises concurrency; overload beyond the slots is a retryable
 # 429. Override slots with ingestBatching.maxConcurrentRequests, or
-# PULSO_QUERY_MAX_CONCURRENT / PULSO_QUERY_MAX_HEAP_MB via extraEnv. Above 85%
+# PULSO_QUERY_MAX_CONCURRENT / PULSO_QUERY_MAX_HEAP_MB via extraEnv; queries
+# beyond the slots wait up to PULSO_QUERY_QUEUE_MS (5000) first. Above 85%
 # of limits.memory the node evicts caches and refuses new interactive queries
 # (PULSO_MEMORY_PRESSURE_PERCENT, docs/scaling.md#memory-pressure).
 resources:

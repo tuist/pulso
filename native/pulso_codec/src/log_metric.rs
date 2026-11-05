@@ -142,6 +142,9 @@ struct State {
     max_samples: u64,
     // Pattern scans train this miner on every selected line instead.
     patterns: Option<crate::patterns::Miner>,
+    // Binned scans (`log_metric_binned_new`) sum counts or bytes per minute
+    // bucket end instead of keeping one sample per line.
+    bins: Option<HashMap<SeriesKey, HashMap<i64, i64>>>,
 }
 
 pub struct Scan(Mutex<Option<State>>);
@@ -347,9 +350,90 @@ fn log_metric_scan_new<'a>(
             samples: 0,
             max_samples,
             patterns: None,
+            bins: None,
         })))))
     };
     result(env, build())
+}
+
+/// A scan without pipeline stages that sums `value` (`:count` or `:bytes`)
+/// per series and minute bucket end (`crate::log_rollup::bucket_end`), fed by
+/// log segments (`log_metric_scan_add`) and rollups (`log_metric_scan_rollup`).
+/// `max_samples` bounds the buckets kept.
+#[rustler::nif]
+fn log_metric_binned_new<'a>(env: Env<'a>, value: Term<'a>, grouping: Term<'a>, max_samples: u64) -> Term<'a> {
+    let build = || {
+        let value = match value.decode::<rustler::Atom>() {
+            Ok(atom) if atom == atoms::count() => Value::Count,
+            Ok(atom) if atom == atoms::bytes() => Value::Bytes,
+            _ => return Err(Error::Fallback),
+        };
+        let grouping = decode_grouping(grouping)?;
+        Ok(ResourceArc::new(Scan(Mutex::new(Some(State {
+            stages: Vec::new(),
+            value,
+            drop: None,
+            grouping,
+            series: HashMap::new(),
+            samples: 0,
+            max_samples,
+            patterns: None,
+            bins: Some(HashMap::new()),
+        })))))
+    };
+    result(env, build())
+}
+
+fn decode_grouping(grouping: Term<'_>) -> Res<Grouping> {
+    if grouping.decode::<rustler::Atom>().ok() == Some(atoms::nil()) {
+        return Ok(Grouping::All);
+    }
+    let (mode, list): (rustler::Atom, Term) = grouping.decode().map_err(|_| Error::Fallback)?;
+    if mode == atoms::by() {
+        Ok(Grouping::By(names(list)?))
+    } else if mode == atoms::without() {
+        Ok(Grouping::Without(names(list)?))
+    } else {
+        Err(Error::Fallback)
+    }
+}
+
+/// Fold the rows of one log rollup whose bucket ends are in `buckets` into a
+/// binned scan: `{:ok, rows}`. Answers `:fallback` when a row counts lines
+/// with trace or span IDs and the grouping may keep those labels.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_metric_scan_rollup<'a>(
+    env: Env<'a>,
+    scan: ResourceArc<Scan>,
+    blob: Binary<'a>,
+    buckets: Vec<i64>,
+    service: Term<'a>,
+    matchers: Term<'a>,
+) -> Term<'a> {
+    let add = || {
+        let service = match service.decode::<Binary>() {
+            Ok(service) => Some(service.as_slice().to_vec()),
+            Err(_) if service.decode::<rustler::Atom>().ok() == Some(atoms::nil()) => None,
+            Err(_) => return Err(Error::Fallback),
+        };
+        let matchers = crate::decode_matchers(matchers).map_err(|_| Error::Fallback)?;
+        let buckets: HashSet<i64> = buckets.into_iter().collect();
+        let mut guard = scan.0.lock().map_err(|_| Error::Fallback)?;
+        let state = guard.as_mut().ok_or(Error::Fallback)?;
+        let selection = Selection {
+            start: i64::MIN,
+            end: i64::MAX,
+            service,
+            matchers,
+            line_filters: Vec::new(),
+        };
+        let outcome = state.add_rollup(crate::erlang_bytes::from_binary(blob), &buckets, &selection);
+        if outcome.is_err() {
+            guard.take();
+        }
+        outcome
+    };
+    result(env, add())
 }
 
 /// Fold one segment: `{:ok, {rows_selected, rows_kept}}`: rows the storage
@@ -404,8 +488,16 @@ fn log_metric_scan_finish<'a>(env: Env<'a>, scan: ResourceArc<Scan>) -> Term<'a>
             .map_err(|_| Error::Fallback)?
             .take()
             .ok_or(Error::Fallback)?;
-        let mut out = Vec::with_capacity(state.series.len());
-        for (labels, mut samples) in state.series {
+        let series = match state.bins {
+            // One `(bucket_end, Int(sum))` sample per bucket.
+            Some(bins) => bins
+                .into_iter()
+                .map(|(labels, bins)| (labels, bins.into_iter().map(|(b, v)| (b, Sample::Int(v))).collect()))
+                .collect(),
+            None => state.series,
+        };
+        let mut out = Vec::with_capacity(series.len());
+        for (labels, mut samples) in series {
             samples.sort_by(|a, b| descending(*a, *b));
             let mut packed = NewBinary::new(env, samples.len() * 17);
             for (i, (ts, sample)) in samples.iter().enumerate() {
@@ -451,6 +543,7 @@ fn log_pattern_scan_new(start: i64, step: i64) -> ResourceArc<Scan> {
         samples: 0,
         max_samples: u64::MAX,
         patterns: Some(crate::patterns::Miner::new(start, step)),
+        bins: None,
     }))))
 }
 
@@ -719,12 +812,31 @@ impl State {
         if labels.get("__error__").is_some_and(|e| !e.is_empty()) {
             return Err(Error::Pipeline);
         }
+        if self.bins.is_some() {
+            let amount = match &self.value {
+                Value::Bytes => i64::try_from(line.len()).map_err(|_| Error::Fallback)?,
+                _ => 1,
+            };
+            let key = self.key(labels);
+            self.add_bin(key, crate::log_rollup::bucket_end(ts), amount)?;
+            return Ok(true);
+        }
         let sample = match &self.value {
             Value::Count => Sample::Float(1.0),
             Value::Bytes => Sample::Int(i64::try_from(line.len()).map_err(|_| Error::Fallback)?),
             Value::Unwrap(_) => unwrap_value(unwrapped)?,
         };
-        let key: Vec<(String, String)> = labels
+        let key = self.key(labels);
+        self.samples += 1;
+        if self.samples as u64 > self.max_samples {
+            return Err(Error::Limit);
+        }
+        self.series.entry(key).or_default().push((ts, sample));
+        Ok(true)
+    }
+
+    fn key(&self, labels: &Labels) -> SeriesKey {
+        labels
             .iter()
             .filter(|(k, _)| self.drop.as_deref() != Some(k.as_str()))
             .filter(|(k, _)| match &self.grouping {
@@ -733,13 +845,92 @@ impl State {
                 Grouping::Without(names) => !names.iter().any(|n| n == *k),
             })
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        self.samples += 1;
-        if self.samples as u64 > self.max_samples {
-            return Err(Error::Limit);
+            .collect()
+    }
+
+    // Each distinct (series, bucket) counts once against the sample budget.
+    fn add_bin(&mut self, key: SeriesKey, bucket: i64, amount: i64) -> Res<()> {
+        let bins = self.bins.as_mut().ok_or(Error::Fallback)?;
+        let series = bins.entry(key).or_default();
+        match series.get_mut(&bucket) {
+            Some(value) => *value += amount,
+            None => {
+                self.samples += 1;
+                if self.samples as u64 > self.max_samples {
+                    return Err(Error::Limit);
+                }
+                series.insert(bucket, amount);
+            }
         }
-        self.series.entry(key).or_default().push((ts, sample));
-        Ok(true)
+        Ok(())
+    }
+
+    // Whether series keys can never hold the dedicated trace/span ID labels.
+    fn drops_ids(&self) -> bool {
+        matches!(&self.grouping, Grouping::By(names)
+            if !names.iter().any(|n| matches!(n.as_str(), "trace_id" | "span_id" | "trace_id_extracted" | "span_id_extracted")))
+    }
+
+    fn add_rollup(&mut self, bytes: Bytes, buckets: &HashSet<i64>, selection: &Selection) -> Res<usize> {
+        if self.bins.is_none() {
+            return Err(Error::Fallback);
+        }
+        let drops_ids = self.drops_ids();
+        let mut rows = 0;
+        // Rows are in bucket order, so streams repeat across buckets: build
+        // each stream's series key once.
+        let mut keys: HashMap<crate::log_rollup::Stream, Option<SeriesKey>> = HashMap::new();
+        let mut failure: Option<Error> = None;
+        crate::log_rollup::read(bytes, |bucket, stream, cell| {
+            if !buckets.contains(&bucket) {
+                return Ok(());
+            }
+            rows += 1;
+            if cell.traced > 0 && !drops_ids {
+                return Err(crate::log_rollup::RollupError::Fallback);
+            }
+            let key = match keys.get(&stream) {
+                Some(key) => key.clone(),
+                None => {
+                    let key = self.rollup_key(&stream, selection).map_err(|error| {
+                        failure = Some(error);
+                        crate::log_rollup::RollupError::Fallback
+                    })?;
+                    keys.insert(stream, key.clone());
+                    key
+                }
+            };
+            if let Some(key) = key {
+                let amount = match self.value {
+                    Value::Bytes => cell.bytes,
+                    _ => cell.count,
+                };
+                self.add_bin(key, bucket, amount).map_err(|e| match e {
+                    Error::Limit => crate::log_rollup::RollupError::TooLarge,
+                    _ => crate::log_rollup::RollupError::Fallback,
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| match (e, failure.take()) {
+            (_, Some(error)) => error,
+            (crate::log_rollup::RollupError::TooLarge, None) => Error::Limit,
+            (crate::log_rollup::RollupError::Fallback, None) => Error::Fallback,
+        })?;
+        Ok(rows)
+    }
+
+    // The series key of a selected rollup stream, None when unselected.
+    fn rollup_key(&self, stream: &crate::log_rollup::Stream, selection: &Selection) -> Res<Option<SeriesKey>> {
+        let (service, level) = (stream.service.as_deref(), stream.level.as_deref());
+        if !selected(selection, stream.resource.as_bytes(), service, level) {
+            return Ok(None);
+        }
+        let base = entry_labels(&stream.resource, &stream.attributes, service, level, None, None)?;
+        if base.labels.get("__error__").is_some_and(|e| !e.is_empty()) {
+            return Err(Error::Pipeline);
+        }
+        Ok(Some(self.key(&base.labels)))
     }
 }
 
@@ -787,6 +978,19 @@ fn selected(
             None => m.evaluate_absent(),
         }
     })
+}
+
+/// Whether a stream's labels can be built natively, as `log_rollup` requires
+/// of every stream it counts.
+pub(crate) fn validate_labels(
+    resource: &str,
+    attributes: &str,
+    service: Option<&str>,
+    level: Option<&str>,
+) -> Result<(), ()> {
+    entry_labels(resource, attributes, service, level, None, None)
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 // Stream labels precede sorted metadata. Collisions get one suffix; an already

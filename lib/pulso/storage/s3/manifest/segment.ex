@@ -28,7 +28,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     :log_services,
     :metric_labels,
     :trace_summary,
-    :log_labels
+    :log_labels,
+    :log_minutes
   ]
 
   @type t :: %__MODULE__{
@@ -42,7 +43,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
           log_services: [String.t()] | nil,
           metric_labels: %{String.t() => [String.t()]} | nil,
           trace_summary: TraceSummary.t() | nil,
-          log_labels: %{String.t() => [String.t()]} | nil
+          log_labels: %{String.t() => [String.t()]} | nil,
+          log_minutes: %{integer() => pos_integer()} | nil
         }
 
   @doc """
@@ -101,6 +103,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     base = if segment.log_services, do: Map.put(base, "ls", segment.log_services), else: base
     base = if segment.metric_labels, do: Map.put(base, "l", segment.metric_labels), else: base
     base = if segment.log_labels, do: Map.put(base, "el", segment.log_labels), else: base
+    base = if segment.log_minutes, do: Map.put(base, "lm", minutes_to_wire(segment.log_minutes)), else: base
     if segment.trace_summary, do: Map.put(base, "t", TraceSummary.to_wire(segment.trace_summary)), else: base
   end
 
@@ -127,11 +130,54 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
        log_services: valid_services(wire["ls"]),
        metric_labels: MetricLabelSummary.parse(wire["l"]),
        trace_summary: TraceSummary.parse(wire["t"]),
-       log_labels: MetricLabelSummary.parse(wire["el"])
+       log_labels: MetricLabelSummary.parse(wire["el"]),
+       log_minutes: valid_minutes(wire["lm"])
      }}
   end
 
   def from_wire(_), do: {:error, :invalid_segment}
+
+  # ---- per-minute log line counts --------------------------------------------
+
+  @minute_ns 60_000_000_000
+  @max_minutes 128
+
+  @doc """
+  The minute bucket of a log timestamp: the bucket numbered `m` holds the
+  lines with `(m - 1) * 60s < ts <= m * 60s`, the window shape of a LogQL
+  range ending on a minute (`native/pulso_codec/src/log_rollup.rs`).
+  """
+  def log_minute(ts) when is_integer(ts), do: Integer.floor_div(ts - 1, @minute_ns) + 1
+  def minute_ns, do: @minute_ns
+
+  @doc """
+  Exact line counts per minute bucket of `timestamps`, or nil above
+  #{@max_minutes} buckets. Log rollups (`Pulso.Storage.S3.LogRollups`) are
+  valid for a minute only while these counts sum to theirs.
+  """
+  def log_minutes(timestamps) do
+    counts = Enum.frequencies_by(timestamps, &log_minute/1)
+    if map_size(counts) <= @max_minutes, do: counts
+  end
+
+  @doc "Line counts of a segment holding exactly the rows of segments with `minutes`."
+  def merge_log_minutes(minutes) do
+    if !Enum.any?(minutes, &is_nil/1) do
+      merged = Enum.reduce(minutes, %{}, &Map.merge(&2, &1, fn _minute, a, b -> a + b end))
+      if map_size(merged) <= @max_minutes * 2, do: merged
+    end
+  end
+
+  defp minutes_to_wire(minutes), do: minutes |> Enum.sort() |> Enum.map(fn {m, c} -> [m, c] end)
+
+  defp valid_minutes(pairs) when is_list(pairs) and length(pairs) <= @max_minutes * 2 do
+    Enum.reduce_while(pairs, %{}, fn
+      [m, c], acc when is_integer(m) and is_integer(c) and c > 0 -> {:cont, Map.put(acc, m, c)}
+      _, _ -> {:halt, nil}
+    end)
+  end
+
+  defp valid_minutes(_), do: nil
 
   @doc """
   Does this segment's `[min_ts, max_ts]` intersect `[start_ts, end_ts]`?
@@ -242,8 +288,11 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   @doc """
   Storage tier of a metric segment, from its key: `:rollup` for hourly
-  rollup objects, `:final` for segments of a finalized hour, else `:raw`
+  rollup objects, `:final` for segments of a finalized hour, `:grouped` for
+  name-grouped consolidations of part of an unfinished hour, else `:raw`
   (ingested, compacted, or the out-of-hour `-edge-` rows of a finalization).
+  Readers before `:grouped` existed treat those segments as raw, which they
+  read correctly.
   """
   def metric_tier(%__MODULE__{key: key}), do: key_tier(key)
 
@@ -253,6 +302,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
     cond do
       String.contains?(base, "-rollup-") -> :rollup
       String.contains?(base, "-final-") -> :final
+      String.contains?(base, "-group-") -> :grouped
       true -> :raw
     end
   end
@@ -345,7 +395,8 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
         |> MetricLabelSummary.build(@log_label_names)
       end
 
-    %{segment | log_services: services, log_labels: labels}
+    minutes = if Enum.all?(records, &is_integer(&1.timestamp_ns)), do: log_minutes(Enum.map(records, & &1.timestamp_ns))
+    %{segment | log_services: services, log_labels: labels, log_minutes: minutes}
   end
 
   @doc "Stream-label summary of a segment holding exactly the rows of segments with `summaries`."
@@ -360,6 +411,9 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   """
   @page_summary_bytes 2048
   def log_page_summary(segments) do
+    # Rollups are planned with `log_rollups: true`, which ignores summaries.
+    segments = Enum.reject(segments, &(key_tier(&1.key) == :rollup))
+
     services =
       if Enum.all?(segments, &is_list(&1.log_services)) do
         services = segments |> Enum.flat_map(& &1.log_services) |> Enum.uniq() |> Enum.sort()
@@ -374,12 +428,14 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   end
 
   @doc "Whether a page with `log_page_summary/1` summary `wire` may hold a segment matching `opts`."
-  def log_page_matches?(%{"v" => 1} = wire, opts),
-    do:
-      matches_log_service?(
+  def log_page_matches?(%{"v" => 1} = wire, opts) do
+    # A page summary never describes the rollups it may also hold.
+    opts[:log_rollups] == true or
+      summary_matches?(
         %__MODULE__{log_services: valid_services(wire["ls"]), log_labels: MetricLabelSummary.parse(wire["el"])},
         opts
       )
+  end
 
   def log_page_matches?(_wire, _opts), do: true
 
@@ -407,6 +463,13 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   (the native matcher's own regex engine); without it they never prune.
   """
   def matches_log_service?(%__MODULE__{} = segment, opts) do
+    # Log rollups (`-rollup-` keys) are read only by rollup planning.
+    if opts[:log_rollups], do: key_tier(segment.key) == :rollup, else: log_segment_matches?(segment, opts)
+  end
+
+  defp log_segment_matches?(segment, opts), do: key_tier(segment.key) != :rollup and summary_matches?(segment, opts)
+
+  defp summary_matches?(segment, opts) do
     service_matches?(segment.log_services, opts) and
       log_labels_match?(segment.log_labels, Keyword.get(opts, :matchers, []), opts[:log_label_regexes] || %{})
   end

@@ -337,7 +337,11 @@ defmodule Pulso.Storage.S3.SignalCompactor do
   # A replacement holds exactly its sources' rows, so the union of their
   # complete stream-label sets is complete for it too.
   defp merge_source_summaries(segment, %{compaction_signal: :logs}, sources),
-    do: %{segment | log_labels: Segment.merge_log_labels(Enum.map(sources, & &1.log_labels))}
+    do: %{
+      segment
+      | log_labels: Segment.merge_log_labels(Enum.map(sources, & &1.log_labels)),
+        log_minutes: Segment.merge_log_minutes(Enum.map(sources, & &1.log_minutes))
+    }
 
   # Likewise for trace attribute value sets.
   defp merge_source_summaries(

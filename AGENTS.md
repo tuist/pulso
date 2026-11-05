@@ -47,6 +47,24 @@ bit-identical to raw (`test/pulso/promql/tiered_reads_test.exs` pins 1h/24h/7d
 segment and row counts). `Pulso.Storage.S3.ManifestBackup` writes manifest
 copies under `.../backups/` and holds cleanup until a backup records each
 retirement; `restore/4` recovers a lost manifest without bucket versioning.
+Unsettled hours: `MetricTiers.consolidate/3` regroups settled (15 s) raw
+segments of an open hour into metric-grouped `-group-` segments (key tier
+`:grouped`, read like raw) so 1h panels stop reading every remote-write batch;
+hours over 3/4 of `max_rows` finalize in name-hash partitions
+(`name_partition/2` mirrors native FNV-1a+fmix64), streamed one output at a time
+(tier API 2). `Pulso.Storage.S3.LogRollups` (native `log_rollup.rs`,
+`PULSO_LOG_ROLLUPS_ENABLED`) writes per-minute per-stream count/bytes rollups;
+`NativeRange` answers minute-aligned filterless count/bytes/rate log metrics
+from them via `Storage.log_binned_scan/3`, only for minutes whose rollup count
+equals the segments' `lm` minute counts, reading lines elsewhere.
+`MetricEval` pushes a plain `sum by (...)` of count/bytes_over_time over a
+stage-free selector into the range grouping (exact integer sums), so volume
+panels hold one series per group, not per stream (`max_result_points`).
+`QueryRunner` queues for a slot up to `PULSO_QUERY_QUEUE_MS` (dev/prod 5000,
+tests 0) instead of answering 429 at once; each signal's maintenance runs in
+its own `CompactionSupervision` lane.
+`test/pulso/promql/current_hour_reads_test.exs` and
+`test/pulso/storage/s3/log_rollups_test.exs` pin segment/row counts.
 
 Limited LogQL log queries (no `interval`) plan only the first
 `max_scan_segments + 1` candidates in their direction (`log_window`: newest

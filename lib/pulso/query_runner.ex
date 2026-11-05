@@ -17,6 +17,8 @@ defmodule Pulso.QueryRunner do
   alias Pulso.Runtime.Registry
   alias Pulso.Runtime.Task
 
+  @queue_poll_ms 20
+
   def run(tenant, class, fun, opts \\ %{}) when is_binary(tenant) and is_function(fun, 1) do
     with {:ok, timeout} <- timeout(opts) do
       started = System.monotonic_time(:millisecond)
@@ -38,11 +40,14 @@ defmodule Pulso.QueryRunner do
             scope = if class == :reliability_callback, do: {:reliability_callback, tenant}, else: tenant
 
             per_tenant = Pulso.TenantLimits.get(tenant, :query_max_concurrent) || config(:max_per_tenant, 2)
+            # Dashboards send their panels at once: wait up to `:queue_ms` for a
+            # free slot (leaving time to answer) instead of refusing at once.
+            queue_until = min(started + config(:queue_ms, 0), deadline - 1_000)
 
             result =
-              with :ok <- acquire({scope}, per_tenant),
-                   :ok <- acquire_interactive(class),
-                   :ok <- acquire({:class, class}, class_limit(class)) do
+              with :ok <- acquire({scope}, per_tenant, queue_until),
+                   :ok <- acquire_interactive(class, queue_until),
+                   :ok <- acquire({:class, class}, class_limit(class), queue_until) do
                 fun.(deadline)
               end
 
@@ -129,11 +134,16 @@ defmodule Pulso.QueryRunner do
   @doc "This node's interactive query slot count."
   def max_interactive, do: config(:max_interactive, 3)
 
-  defp acquire(key, max) do
+  defp acquire(key, max, queue_until) do
     with {:error, :query_overloaded} = error <-
            if(is_integer(max) and max >= 1, do: acquire_slot(key, max, 0), else: {:error, :query_overloaded}) do
-      Pulso.SelfMetrics.admission_rejection(:query, rejection_reason(key))
-      error
+      if System.monotonic_time(:millisecond) + @queue_poll_ms <= queue_until do
+        Process.sleep(@queue_poll_ms)
+        acquire(key, max, queue_until)
+      else
+        Pulso.SelfMetrics.admission_rejection(:query, rejection_reason(key))
+        error
+      end
     end
   end
 
@@ -157,16 +167,16 @@ defmodule Pulso.QueryRunner do
 
   defp config(key, default), do: Keyword.get(Runtime.get_env(:pulso, __MODULE__, []), key, default)
 
-  defp acquire_interactive(class) when class in [:alerting, :reliability_callback], do: :ok
+  defp acquire_interactive(class, _queue_until) when class in [:alerting, :reliability_callback], do: :ok
 
   # Under node memory pressure new interactive queries are refused (retryable)
   # so ingest keeps its memory; alerting and reliability workers still run.
-  defp acquire_interactive(_class) do
+  defp acquire_interactive(_class, queue_until) do
     if Pulso.MemoryPressure.active?() do
       Pulso.SelfMetrics.admission_rejection(:query, :memory)
       {:error, :query_overloaded}
     else
-      acquire({:class, :interactive}, max_interactive())
+      acquire({:class, :interactive}, max_interactive(), queue_until)
     end
   end
 

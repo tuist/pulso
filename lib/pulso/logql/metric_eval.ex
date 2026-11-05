@@ -127,7 +127,14 @@ defmodule Pulso.LogQL.MetricEval do
     kind = result_kind(opts)
     offset = offset || 0
     times = if kind == :matrix, do: steps(opts), else: [evaluation_ts(opts)]
-    spec = %{op: op, param: param, unwrap: extract_unwrap(agg.inner), grouping: agg.grouping}
+
+    spec = %{
+      op: op,
+      param: param,
+      unwrap: extract_unwrap(agg.inner),
+      grouping: agg.grouping,
+      binnable: minute_windows?(times, range, offset)
+    }
 
     if times == [] do
       {:ok, kind, []}
@@ -148,6 +155,26 @@ defmodule Pulso.LogQL.MetricEval do
   # Exact ranking is the bounded implementation here, not a count-min sketch.
   # All input samples and intermediate points still spend the ordinary budgets.
   defp do_eval(%AST.VectorAgg{op: :approx_topk} = agg, tenant, opts), do: do_eval(%{agg | op: :topk}, tenant, opts)
+
+  # A sum of line or byte counts over a plain selector groups while counting:
+  # integer sums are exact in any order, and without pipeline stages no
+  # error labels exist, so the inner series key is the outer group's. One
+  # series per group instead of per stream keeps volume panels over thousands
+  # of streams within the point budgets. Rates stay per stream: dividing
+  # before or after summing can differ in the last bit.
+  defp do_eval(
+         %AST.VectorAgg{
+           op: :sum,
+           grouping: g,
+           inner: %AST.RangeAgg{op: op, grouping: nil, inner: %AST.LogQuery{stages: []}} = range
+         } = agg,
+         tenant,
+         opts
+       )
+       when op in [:count_over_time, :bytes_over_time] do
+    # The inner grouping is no longer nil, so this reaches the general sum.
+    do_eval(%{agg | inner: %{range | grouping: g || %AST.Grouping{mode: :by, labels: []}}}, tenant, opts)
+  end
 
   defp do_eval(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
     with {:ok, kind, inner_series} <- eval(inner, tenant, opts) do
@@ -383,20 +410,22 @@ defmodule Pulso.LogQL.MetricEval do
   # Samples are a tuple of `{ts, tie, value}` (Elixir pipeline) or native
   # `{:packed, binary}` of `<<ts::64, tag::8, value::64>>` records, which stay
   # off the process heap: windows decode only the slice they read.
-  defp ordered({:packed, _} = packed), do: packed
+  # `{:binned, binary}` packs the same records, one per minute bucket end
+  # with an integer count or byte total (`Pulso.LogQL.NativeRange`).
+  defp ordered({kind, _} = packed) when kind in [:packed, :binned], do: packed
   defp ordered(samples), do: samples |> Enum.sort(:desc) |> List.to_tuple()
 
-  defp size({:packed, binary}), do: div(byte_size(binary), 17)
+  defp size({kind, binary}) when kind in [:packed, :binned], do: div(byte_size(binary), 17)
   defp size(samples), do: tuple_size(samples)
 
-  defp ts_at({:packed, binary}, i) do
+  defp ts_at({kind, binary}, i) when kind in [:packed, :binned] do
     <<ts::signed-64>> = binary_part(binary, i * 17, 8)
     ts
   end
 
   defp ts_at(samples, i), do: elem(elem(samples, i), 0)
 
-  defp value_at({:packed, binary}, i) do
+  defp value_at({kind, binary}, i) when kind in [:packed, :binned] do
     case binary_part(binary, i * 17 + 8, 9) do
       <<0, value::float-64>> -> value
       <<1, _::binary>> -> :error
@@ -447,6 +476,20 @@ defmodule Pulso.LogQL.MetricEval do
   defp range_series(_labels, [], _kind), do: []
   defp range_series(labels, points, :matrix), do: [{labels, points}]
   defp range_series(labels, [point], :vector), do: [{labels, point}]
+
+  # Binned windows sum their buckets' line counts or bytes; the results equal
+  # the per-line folds below.
+  defp aggregate(%{op: op}, {:binned, _} = samples, first, last, _start, _finish)
+       when op in [:count_over_time, :bytes_over_time], do: samples |> slice(first, last) |> Enum.sum() |> Kernel.*(1.0)
+
+  defp aggregate(%{op: :rate}, {:binned, _} = samples, first, last, start, finish),
+    do: Number.binary("/", Enum.sum(slice(samples, first, last)) * 1.0, (finish - start + 1) / 1_000_000_000)
+
+  defp aggregate(%{op: :bytes_rate}, {:binned, _} = samples, first, last, start, finish) do
+    seconds = (finish - start + 1) / 1_000_000_000
+    total = samples |> slice(first, last) |> Enum.sum()
+    if seconds > 0, do: total / seconds, else: 0.0
+  end
 
   defp aggregate(%{op: :count_over_time}, _samples, first, last, _start, _finish), do: (last - first + 1) * 1.0
 
@@ -814,6 +857,12 @@ defmodule Pulso.LogQL.MetricEval do
   end
 
   defp evaluation_ts(opts), do: Map.get(opts, :end_ts_ns) || 0
+
+  # Every window `(t - offset - range, t - offset]` is a run of whole minute
+  # buckets, so per-minute counts answer it exactly.
+  @minute_ns 60_000_000_000
+  defp minute_windows?(times, range, offset),
+    do: rem(range, @minute_ns) == 0 and range > 0 and Enum.all?(times, &(rem(&1 - offset, @minute_ns) == 0))
 
   # ---------------------------------------------------------------------------
   # Numeric helpers
