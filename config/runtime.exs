@@ -217,6 +217,9 @@ metric_finalize_enabled = env_var.("PULSO_METRICS_FINALIZE_ENABLED", "true") in 
 # With log compaction, settled minutes get per-stream line/byte rollups that
 # answer minute-aligned count_over_time/bytes_over_time/rate/bytes_rate.
 log_rollup_enabled = env_var.("PULSO_LOG_ROLLUPS_ENABLED", "true") in ["1", "true", "yes"]
+# With log compaction, settled hours (and busy unfinished ones, batch by
+# batch) are regrouped by stream so stream selectors read only their streams.
+log_finalize_enabled = env_var.("PULSO_LOG_STREAM_GROUPING_ENABLED", "true") in ["1", "true", "yes"]
 # Pulso-side manifest backups for buckets without versioning; maintenance
 # cleanup waits for a backup that records each retirement.
 manifest_backup_enabled = env_var.("PULSO_MANIFEST_BACKUP_ENABLED", "true") in ["1", "true", "yes"]
@@ -526,6 +529,7 @@ case config_env() do
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
       log_rollup_enabled: log_rollup_enabled,
+      log_finalize_enabled: log_finalize_enabled,
       manifest_backup_enabled: manifest_backup_enabled,
       manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),
@@ -598,6 +602,7 @@ case config_env() do
       log_compaction_enabled: log_compaction_enabled,
       metric_finalize_enabled: metric_finalize_enabled,
       log_rollup_enabled: log_rollup_enabled,
+      log_finalize_enabled: log_finalize_enabled,
       manifest_backup_enabled: manifest_backup_enabled,
       manifest_backup_interval_ms: parse_integer.("PULSO_MANIFEST_BACKUP_INTERVAL_MS", 900_000, 60_000..86_400_000),
       query_prefetch: parse_integer.("PULSO_QUERY_PREFETCH", 4, 1..64),

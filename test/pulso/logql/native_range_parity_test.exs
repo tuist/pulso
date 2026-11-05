@@ -8,6 +8,7 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
   alias Pulso.PromQL.Evaluator
   alias Pulso.Record.Log
   alias Pulso.Storage
+  alias Pulso.Storage.Memory
   alias Pulso.Test.MetricEvalReference
   alias Pulso.Test.NativeQueryStorage
 
@@ -62,10 +63,16 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
         ~s/!~ "n=1[0-9]" | logfmt | code != "404" and pod != "p3"/,
         ~s/| logfmt | msg =~ "hello.*" or level="info"/,
         ~s/| trace_id!="" | logfmt/,
-        ~s/| span_id=~"s.*" | logfmt | trace_id=~".+"/
+        ~s/| span_id=~"s.*" | logfmt | trace_id=~".+"/,
+        ~s/| logfmt | keep app, code, dur, trace_id | code != "404"/,
+        ~s/| logfmt | __error__="" | keep pod, dur/
       ])
 
-    unwrap = if unwrap?, do: Enum.random([" | unwrap dur", " | logfmt | unwrap dur"]), else: ""
+    unwrap =
+      if unwrap?,
+        do: Enum.random([" | unwrap dur", " | logfmt | unwrap dur", ~s/ | unwrap dur | __error__=""/]),
+        else: ""
+
     selector = Enum.random([~s/{app=~"a|b"}/, ~s/{app="a", service_name="api"}/, ~s/{pod!="p2"}/])
     param = if op == "quantile_over_time", do: "0.75, ", else: ""
 
@@ -86,6 +93,22 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
     Process.delete(:promql_deadline_ms)
     Process.put(:query_deadline_ms, System.monotonic_time(:millisecond) + 120_000)
     module.evaluate(ast, tenant, opts)
+  end
+
+  # The frozen reference predates post-unwrap filters: compare those with the
+  # Elixir pipeline over the same records (the memory adapter never scans natively).
+  defp expected(ast, text, tenant, opts) do
+    if String.contains?(text, ~s/unwrap dur | __error__=""/) do
+      Pulso.Runtime.put_env(:pulso, Storage, adapter: Memory)
+
+      try do
+        evaluate(MetricEval, ast, tenant, opts)
+      after
+        Pulso.Runtime.put_env(:pulso, Storage, adapter: NativeQueryStorage)
+      end
+    else
+      evaluate(MetricEvalReference, ast, tenant, opts)
+    end
   end
 
   defp canonical({:ok, {kind, series}}),
@@ -112,7 +135,7 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
           %{end_ts_ns: Enum.random(30..130) * @second}
         ])
 
-      expected = evaluate(MetricEvalReference, ast, tenant, opts)
+      expected = expected(ast, text, tenant, opts)
       actual = evaluate(MetricEval, ast, tenant, opts)
 
       assert canonical(actual) == canonical(expected), """
@@ -290,5 +313,50 @@ defmodule Pulso.LogQL.NativeRangeParityTest do
     end
 
     refute_received :native_log_metric_scan
+  end
+
+  test "keep and post-unwrap error filters of Tuist's web-vitals alerts run natively" do
+    tenant = "native-keep-#{System.unique_integer([:positive])}"
+
+    :ok =
+      Storage.append(:logs, tenant, [
+        %Log{
+          timestamp_ns: 1 * @second,
+          body: "kind=m env=prod session=s1 lcp=1200",
+          resource: %{"app" => "w", "pod" => "p1"}
+        },
+        %Log{
+          timestamp_ns: 2 * @second,
+          body: "kind=m env=prod session=s1 lcp=oops",
+          resource: %{"app" => "w", "pod" => "p1"}
+        },
+        %Log{
+          timestamp_ns: 3 * @second,
+          body: "kind=m env=dev session=s2 lcp=3400",
+          resource: %{"app" => "w", "pod" => "p2"}
+        },
+        %Log{
+          timestamp_ns: 4 * @second,
+          body: "kind=x env=prod session=s3 lcp=9000",
+          resource: %{"app" => "w", "pod" => "p2"}
+        }
+      ])
+
+    opts = %{end_ts_ns: 30 * @second}
+
+    for {text, expected} <- [
+          # keep drops the stream labels and every unlisted parsed label.
+          {~s/count by (env) (sum by (env, session) (count_over_time({app="w"} | logfmt | kind="m" | __error__="" | keep env, session [1m])))/,
+           [{%{"env" => "dev"}, 1.0}, {%{"env" => "prod"}, 1.0}]},
+          {~s/sum(count_over_time({app="w"} | logfmt | keep env [1m])) by (pod)/, [{%{}, 4.0}]},
+          # The unconvertible lcp is dropped, not an extraction error.
+          {~s/max_over_time({app="w"} | logfmt | kind="m" | unwrap lcp | __error__="" [1m]) by (env)/,
+           [{%{"env" => "dev"}, 3400.0}, {%{"env" => "prod"}, 1200.0}]}
+        ] do
+      {:ok, ast} = Parser.parse(text)
+      assert {:ok, {:vector, series}} = evaluate(MetricEval, ast, tenant, opts), text
+      assert series |> Enum.map(fn {labels, {_, v}} -> {labels, v} end) |> Enum.sort() == expected, text
+      assert_received :native_log_metric_scan, text
+    end
   end
 end

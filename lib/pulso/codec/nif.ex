@@ -33,8 +33,8 @@ defmodule Pulso.Codec.NIF do
         ErlangError -> :unavailable
       end
 
-    if version != {1, 1, 18} do
-      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values before prior pipeline errors, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership, preserve scalar class complements or expose correlation IDs as LogQL metadata; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
+    if version != {1, 1, 19} do
+      raise "codec native artifact cannot preserve OTLP log metadata, discover log stream labels, mine log patterns, skip absent unwrap values before prior pipeline errors, preserve typed label-filter errors, decode logfmt fields and parser label ownership, count/replace template regex matches, preserve erased regexp captures, nest flag-separated repetitions, support numeric/repeated selector capture names and numeric parser labels, admit Unicode 17 property names and membership, preserve scalar class complements, expose correlation IDs as LogQL metadata or run keep and post-unwrap error filters natively; rebuild with PULSO_NIF_FORCE_BUILD=1 or install the matching release artifacts"
     end
 
     :ok
@@ -201,6 +201,30 @@ defmodule Pulso.Codec.NIF do
 
     :ok
   end
+
+  @doc false
+  # Stream-grouped log segments (`Pulso.Storage.S3.LogTiers`).
+  def ensure_log_tier_api! do
+    version =
+      try do
+        log_tier_api_version()
+      rescue
+        ErlangError -> :unavailable
+      end
+
+    if version != 1,
+      do:
+        raise(
+          "codec native artifact cannot group log segments by service; rebuild with PULSO_NIF_FORCE_BUILD=1 or install matching release artifacts"
+        )
+
+    :ok
+  end
+
+  def log_tier_api_version, do: :erlang.nif_error(:nif_not_loaded)
+  def log_group_new(_target_rows, _target_bytes, _pack_bytes, _max_held), do: :erlang.nif_error(:nif_not_loaded)
+  def log_group_add(_grouper, _blob), do: :erlang.nif_error(:nif_not_loaded)
+  def log_group_next(_grouper, _finish), do: :erlang.nif_error(:nif_not_loaded)
 
   def metric_tier_api_version, do: :erlang.nif_error(:nif_not_loaded)
   def metric_finalize_new(_start, _end, _max_rows, _expected_rows, _partition), do: :erlang.nif_error(:nif_not_loaded)

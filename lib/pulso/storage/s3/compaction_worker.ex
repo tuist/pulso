@@ -20,6 +20,7 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   alias Pulso.Storage.S3.CompactionTasks
   alias Pulso.Storage.S3.LogCompactor
   alias Pulso.Storage.S3.LogRollups
+  alias Pulso.Storage.S3.LogTiers
   alias Pulso.Storage.S3.ManifestBackup
   alias Pulso.Storage.S3.MetricsCompactor
   alias Pulso.Storage.S3.MetricTiers
@@ -148,12 +149,78 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   end
 
   defp finalize_hours(result, tenant, "logs", config) do
-    if Map.get(config, :log_rollup_enabled, true),
+    {result, config} =
+      if Map.get(config, :log_finalize_enabled, true),
+        do: group_logs(result, tenant, config),
+        else: {result, config}
+
+    if Map.get(config, :log_rollup_enabled, true) and result != {:error, :timeout},
       do: {result, roll_logs(tenant, config, Map.get(config, :log_rollup_max_builds, 8))},
       else: {result, config}
   end
 
   defp finalize_hours(result, _tenant, _signal, config), do: {result, config}
+
+  # Group settled log segments by stream (`LogTiers`): busy unfinished hours
+  # batch by batch, then settled hours, oldest first, up to
+  # `:log_finalize_max_hours` per pass. An hour that fails is skipped for an
+  # hour so it cannot block the others.
+  defp group_logs(result, tenant, config) do
+    opts = Map.get(config, :log_finalize_options, [])
+
+    case consolidate_logs(tenant, config, opts, Map.get(config, :log_consolidate_max_batches, 8)) do
+      :timeout -> {{:error, :timeout}, config}
+      :ok -> finalize_logs(result, tenant, config, opts, Map.get(config, :log_finalize_max_hours, 6))
+    end
+  end
+
+  defp consolidate_logs(_tenant, _config, _opts, 0), do: :ok
+
+  defp consolidate_logs(tenant, config, opts, remaining) do
+    case run_operation(
+           fn -> LogTiers.consolidate(tenant, config, opts) end,
+           {"logs", tenant},
+           "log_consolidate",
+           config
+         ) do
+      {:ok, %{hour: hour}} when is_integer(hour) ->
+        if CompactionOwnership.local_owner?(tenant, "logs", config),
+          do: consolidate_logs(tenant, config, opts, remaining - 1),
+          else: :ok
+
+      {:error, :timeout} ->
+        :timeout
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp finalize_logs(result, _tenant, config, _opts, 0), do: {result, config}
+
+  defp finalize_logs(result, tenant, config, opts, remaining) do
+    now = System.monotonic_time(:millisecond)
+    skips = config |> Map.get(:log_finalize_skip, %{}) |> Map.get(tenant, %{})
+    skips = Map.reject(skips, fn {_hour, until} -> until <= now end)
+    hour_opts = Keyword.put(opts, :skip_hours, MapSet.new(Map.keys(skips)))
+    put_skips = &Map.put(config, :log_finalize_skip, Map.put(Map.get(config, :log_finalize_skip, %{}), tenant, &1))
+
+    case run_operation(fn -> LogTiers.finalize(tenant, config, hour_opts) end, {"logs", tenant}, "log_finalize", config) do
+      {:ok, %{hour: hour}} when is_integer(hour) ->
+        if CompactionOwnership.local_owner?(tenant, "logs", config),
+          do: finalize_logs(result, tenant, put_skips.(skips), opts, remaining - 1),
+          else: {result, put_skips.(skips)}
+
+      {:error, {hour, _reason}} when is_integer(hour) ->
+        finalize_logs(result, tenant, put_skips.(Map.put(skips, hour, now + 3_600_000)), opts, remaining - 1)
+
+      {:error, :timeout} = timeout ->
+        {timeout, put_skips.(skips)}
+
+      _ ->
+        {result, put_skips.(skips)}
+    end
+  end
 
   # Per-minute log rollups for settled minutes (`LogRollups`), several per
   # pass so a busy tenant keeps up; a failing minute is skipped for an hour.
@@ -352,6 +419,8 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp metric_dimension("finalize"), do: :worker_finalize
   defp metric_dimension("consolidate"), do: :worker_consolidate
   defp metric_dimension("log_rollup"), do: :worker_log_rollup
+  defp metric_dimension("log_finalize"), do: :worker_log_finalize
+  defp metric_dimension("log_consolidate"), do: :worker_log_consolidate
   defp metric_dimension("backup"), do: :worker_backup
 
   defp do_run_operation(operation, subject, name, config) do
@@ -385,6 +454,9 @@ defmodule Pulso.Storage.S3.CompactionWorker do
   defp operation_timeout(config, "finalize"), do: Map.get(config, :metric_finalize_timeout_ms, 900_000)
   defp operation_timeout(config, "consolidate"), do: Map.get(config, :metric_consolidate_timeout_ms, 120_000)
   defp operation_timeout(config, "log_rollup"), do: Map.get(config, :log_rollup_timeout_ms, 120_000)
+  # A production hour of logs (millions of lines) is rewritten in one call.
+  defp operation_timeout(config, "log_finalize"), do: Map.get(config, :log_finalize_timeout_ms, 900_000)
+  defp operation_timeout(config, "log_consolidate"), do: Map.get(config, :log_consolidate_timeout_ms, 120_000)
   defp operation_timeout(config, "backup"), do: Map.get(config, :manifest_backup_timeout_ms, 120_000)
   defp operation_timeout(config, _operation), do: Map.get(config, :compaction_timeout_ms, 30_000)
 

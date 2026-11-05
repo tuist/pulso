@@ -373,7 +373,7 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
   # Stream labels summarized per log segment, in priority order: the label
   # summary's byte budget drops later names first. These are the labels Loki
   # pushes from Alloy/Promtail commonly carry, plus Pulso's error labels.
-  @log_label_names ~w(error_source error_project cluster namespace container service_name env job pod)
+  @log_label_names ~w(error_source error_project cluster namespace container service_name env job pod app instance)
 
   @doc "Attach a complete bounded set of nonempty promoted log services, or leave it unknown."
   def summarize_logs(segment, records) do
@@ -397,6 +397,40 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
     minutes = if Enum.all?(records, &is_integer(&1.timestamp_ns)), do: log_minutes(Enum.map(records, & &1.timestamp_ns))
     %{segment | log_services: services, log_labels: labels, log_minutes: minutes}
+  end
+
+  @doc """
+  Summaries of a stream-grouped log segment from what the native grouper
+  reports (`Pulso.Storage.S3.LogTiers`): its complete service set, its
+  distinct `{service, resource_json}` streams and line counts per minute,
+  each `nil` when unknown. Labels are read as `summarize_logs/2` reads them.
+  """
+  def summarize_log_streams(segment, services, streams, minutes) do
+    resources = streams && Enum.map(streams, fn {service, resource} -> {service, decode_resource(resource)} end)
+
+    labels =
+      if resources && Enum.all?(resources, &is_map(elem(&1, 1))) do
+        resources
+        |> Enum.map(fn {service, resource} ->
+          record = %{service: service, resource: resource}
+          %{labels: Map.new(@log_label_names, &{&1, log_label_value(record, &1)})}
+        end)
+        |> MetricLabelSummary.build(@log_label_names)
+      end
+
+    %{
+      segment
+      | log_services: services && valid_services(services),
+        log_labels: labels,
+        log_minutes: minutes && Map.new(minutes)
+    }
+  end
+
+  defp decode_resource(json) do
+    case Pulso.JSON.decode(json) do
+      {:ok, %{} = resource} -> resource
+      _ -> nil
+    end
   end
 
   @doc "Stream-label summary of a segment holding exactly the rows of segments with `summaries`."
@@ -469,9 +503,16 @@ defmodule Pulso.Storage.S3.Manifest.Segment do
 
   defp log_segment_matches?(segment, opts), do: key_tier(segment.key) != :rollup and summary_matches?(segment, opts)
 
+  # The pushed-down service (`opts[:service]`) is also a `service_name`
+  # equality: the label summary's effective values cover every stored
+  # service, so it prunes segments whose service set is unknown because some
+  # of their lines have no service.
   defp summary_matches?(segment, opts) do
+    matchers = Keyword.get(opts, :matchers, [])
+    matchers = if service = opts[:service], do: [{"service_name", :eq, service} | matchers], else: matchers
+
     service_matches?(segment.log_services, opts) and
-      log_labels_match?(segment.log_labels, Keyword.get(opts, :matchers, []), opts[:log_label_regexes] || %{})
+      log_labels_match?(segment.log_labels, matchers, opts[:log_label_regexes] || %{})
   end
 
   @doc """

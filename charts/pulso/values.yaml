@@ -251,6 +251,13 @@ logCompaction:
   # minutes, so count_over_time/bytes_over_time/rate panels without line
   # filters read the counts instead of every line.
   rollups: true
+  # With compaction, regroup log segments by stream: each settled hour once
+  # (10 minutes after it ends), and settled batches of a busy unfinished hour.
+  # Stream selectors then read only their stream's segments, so parsed-field
+  # alerts and panels over 6h-24h stop reading every stream's lines. Upgrade
+  # every pod first: older releases replay grouped segments in live tail.
+  # See docs/configuration.md#stream-grouped-log-segments.
+  groupByStream: true
 
 traceCompaction:
   # Experimental native merges. Upgrade all readers/writers/compactors and enable bucket versioning

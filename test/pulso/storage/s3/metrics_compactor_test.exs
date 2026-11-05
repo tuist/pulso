@@ -155,7 +155,10 @@ defmodule Pulso.Storage.S3.MetricsCompactorTest do
     assert {:ok, [%Log{service: "wanted"}]} = S3.query(:logs, ctx.tenant, matchers: [{"service_name", :eq, "wanted"}])
     assert {:error, _} = S3.query(:logs, ctx.tenant, [])
 
-    legacy = %{entry.manifest | segments: Enum.map(entry.manifest.segments, &%{&1 | log_services: nil})}
+    legacy = %{
+      entry.manifest
+      | segments: Enum.map(entry.manifest.segments, &%{&1 | log_services: nil, log_labels: nil})
+    }
 
     assert {:ok, _} =
              ObjectStore.put(

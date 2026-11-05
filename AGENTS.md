@@ -77,6 +77,23 @@ its own `CompactionSupervision` lane.
 `test/pulso/promql/current_hour_reads_test.exs` and
 `test/pulso/storage/s3/log_rollups_test.exs` pin segment/row counts.
 
+Log reads charge `max_scan_rows` with the rows their stream selector and
+leading line filters select (`charge_matched_rows`, as metric samples since
+1.29.8); discovery still charges stored rows. With log compaction,
+`Pulso.Storage.S3.LogTiers` (native `log_tiers.rs`, tier API 1,
+`PULSO_LOG_STREAM_GROUPING_ENABLED`, chart `logCompaction.groupByStream`)
+regroups settled log segments by service (service-less rows by resource):
+settled hours into `-final-`, busy open hours' settled batches into `-group-`
+(services at 100k rows/32 MiB alone, smaller ones packed to 8 MiB), with
+complete service/label/`lm` summaries. The pushed-down `opts[:service]` also
+prunes through the `service_name` label summary, so packs with service-less
+streams stay prunable; `app`/`instance` are summarized log labels. Tail skips
+grouped/final keys. `MetricEval` groups `sum by` count/bytes_over_time while
+counting even with parser/filter stages (not `__error__`-preserving ones).
+`test/pulso/storage/s3/log_tiers_test.exs` pins rows/reads;
+`test/pulso/logql/parsed_field_bench_test.exs` (`--include query_bench`)
+replays Tuist's RUM alerts and cache panels at Tigris latency.
+
 Limited LogQL log queries (no `interval`) plan only the first
 `max_scan_segments + 1` candidates in their direction (`log_window`: newest
 `max_ts` backward, oldest `min_ts` forward; format 4 reads leaves in bound
@@ -192,7 +209,9 @@ group labels, broadcast only truly ungrouped series, omit NaNs and fail whole on
 storage/budget errors without resetting scan budgets. Upgrade all serving
 app/native pairs; trace/storage/keyed tuples are unchanged. See `docs/querying.md`.
 
-Current log codec tuple is `{1,1,18}`, superseding the log API snapshots below.
+Current log codec tuple is `{1,1,19}` (native `keep` of plain names without a
+later parser, and post-unwrap `__error__=""` as `{:unwrap, label, :drop_errors}`),
+superseding the log API snapshots below.
 Missing/empty unwrap targets discard prior pipeline errors before observation
 validation on both native and Elixir paths; usable targets and count/bytes
 observations retain their error guards. Selected scan/pipeline work still charges.

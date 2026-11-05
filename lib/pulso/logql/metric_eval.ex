@@ -156,37 +156,35 @@ defmodule Pulso.LogQL.MetricEval do
   # All input samples and intermediate points still spend the ordinary budgets.
   defp do_eval(%AST.VectorAgg{op: :approx_topk} = agg, tenant, opts), do: do_eval(%{agg | op: :topk}, tenant, opts)
 
-  # A sum of line or byte counts over a plain selector groups while counting:
-  # integer sums are exact in any order, and without pipeline stages no
-  # error labels exist, so the inner series key is the outer group's. One
-  # series per group instead of per stream keeps volume panels over thousands
-  # of streams within the point budgets. Rates stay per stream: dividing
-  # before or after summing can differ in the last bit.
+  # A sum of line or byte counts groups while counting: integer sums are
+  # exact in any order, and the inner series key is the outer group's. One
+  # series per group instead of per stream (or, after a parser, per distinct
+  # parsed label set) keeps volume panels over thousands of streams and
+  # parsed-field alerts over high-cardinality fields within the point and
+  # heap budgets. A pipeline qualifies while every kept line with an error
+  # label still fails the query (no explicit error selection) and no stage
+  # can rename or remove error labels; grouping by an error label does not.
+  # Rates stay per stream: dividing before or after summing can differ in the
+  # last bit.
   defp do_eval(
          %AST.VectorAgg{
            op: :sum,
            grouping: g,
-           inner: %AST.RangeAgg{op: op, grouping: nil, inner: %AST.LogQuery{stages: []}} = range
+           inner: %AST.RangeAgg{op: op, grouping: nil, inner: %AST.LogQuery{stages: stages}} = range
          } = agg,
          tenant,
          opts
        )
        when op in [:count_over_time, :bytes_over_time] do
-    # The inner grouping is no longer nil, so this reaches the general sum.
-    do_eval(%{agg | inner: %{range | grouping: g || %AST.Grouping{mode: :by, labels: []}}}, tenant, opts)
-  end
-
-  defp do_eval(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
-    with {:ok, kind, inner_series} <- eval(inner, tenant, opts) do
-      grouped =
-        case kind do
-          :matrix -> aggregate_matrix(inner_series, op, g, param)
-          :vector -> aggregate_vector(inner_series, op, g, param)
-        end
-
-      {:ok, kind, grouped}
+    if groupable?(stages, g) do
+      # The inner grouping is no longer nil, so this reaches the general sum.
+      do_eval(%{agg | inner: %{range | grouping: g || %AST.Grouping{mode: :by, labels: []}}}, tenant, opts)
+    else
+      vector_agg(agg, tenant, opts)
     end
   end
+
+  defp do_eval(%AST.VectorAgg{} = agg, tenant, opts), do: vector_agg(agg, tenant, opts)
 
   defp do_eval(%AST.LabelReplace{} = expr, tenant, opts) do
     with {:ok, kind, series} <- eval(expr.inner, tenant, opts) do
@@ -223,6 +221,37 @@ defmodule Pulso.LogQL.MetricEval do
       result = result_series(series, kind)
       {:ok, kind, result}
     end
+  end
+
+  defp vector_agg(%AST.VectorAgg{op: op, inner: inner, grouping: g, param: param}, tenant, opts) do
+    with {:ok, kind, inner_series} <- eval(inner, tenant, opts) do
+      grouped =
+        case kind do
+          :matrix -> aggregate_matrix(inner_series, op, g, param)
+          :vector -> aggregate_vector(inner_series, op, g, param)
+        end
+
+      {:ok, kind, grouped}
+    end
+  end
+
+  @groupable_stages [
+    AST.LineFilter,
+    AST.LogfmtParser,
+    AST.JsonParser,
+    AST.RegexpParser,
+    AST.PatternParser,
+    AST.UnpackParser,
+    AST.LabelFilter,
+    AST.LineFormat,
+    AST.Decolorize
+  ]
+
+  defp groupable?(stages, grouping) do
+    labels = if grouping, do: grouping.labels, else: []
+
+    Enum.all?(stages, &(&1.__struct__ in @groupable_stages)) and not Pipeline.preserves_errors?(stages) and
+      not Enum.any?(labels, &(&1 in ["__error__", "__error_details__"]))
   end
 
   # Loki defines division by either signed zero as NaN, unlike PromQL's

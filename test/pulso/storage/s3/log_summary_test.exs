@@ -190,8 +190,14 @@ defmodule Pulso.Storage.S3.LogSummaryTest do
     # Without compiled regexes, or for a pattern the engine rejects, a regex never prunes.
     assert Segment.matches_log_service?(summary, matchers: [{"cluster", :re, StreamMatchers.anchor("prod")}])
     assert keep?.([{"cluster", :re, StreamMatchers.anchor("(")}])
-    # Unsummarized names never prune.
-    assert keep?.([{"app", :eq, "anything"}])
+    # Alloy's docker labels are summarized too; unsummarized names never prune.
+    refute keep?.([{"app", :eq, "docker"}])
+    assert keep?.([{"region", :eq, "anything"}])
+    # The service set is unknown (a line has no service), but a pushed-down
+    # service equality still prunes through the effective service_name values.
+    assert summary.log_services == nil
+    refute Segment.matches_log_service?(summary, service: "worker")
+    assert Segment.matches_log_service?(summary, service: "server")
   end
 
   test "randomized stream-label pruning never excludes a segment whose native decoder returns matching rows" do

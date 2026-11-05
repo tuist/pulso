@@ -14,6 +14,7 @@ defmodule Pulso.LogQL.NativeRange do
   alias Pulso.Codec.NIF
   alias Pulso.LogQL.AST
   alias Pulso.LogQL.Evaluator
+  alias Pulso.LogQL.Pipeline
   alias Pulso.LogQL.QueryValidation
   alias Pulso.LogQL.StreamMatchers
   alias Pulso.PromQL.Evaluator, as: Budget
@@ -66,13 +67,13 @@ defmodule Pulso.LogQL.NativeRange do
 
   defp collect_samples(inner, spec, tenant, query_opts) do
     with true <- spec.op in @ops,
-         true <- Map.get(spec, :post_filter, []) == [],
+         {:ok, drop_errors?} <- post_filter(Map.get(spec, :post_filter, []), spec),
          false <- Map.get(spec, :preserve_errors, false),
          true <- Storage.native_log_metric?(),
          :ok <- QueryValidation.validate(inner),
          {storage_opts, stages} = Evaluator.push_down(inner, query_opts),
          {:ok, program} <- encode_stages(stages),
-         {:ok, value} <- value(spec),
+         {:ok, value} <- value(spec, drop_errors?),
          {:ok, scan} <-
            native(
              NIF.log_metric_scan_new(
@@ -120,6 +121,26 @@ defmodule Pulso.LogQL.NativeRange do
   defp native({:ok, scan}), do: {:ok, scan}
   defp native(_), do: :fallback
 
+  # Post-unwrap `__error__=""` filters only drop errored observations, which
+  # the native scan does itself; any other post-unwrap stage runs in Elixir.
+  defp post_filter([], _spec), do: {:ok, false}
+
+  defp post_filter(filters, %{unwrap: %AST.Unwrap{}}) do
+    error_free = Pipeline.compile([%AST.LabelFilter{expr: {:cmp, "__error__", :eq, {:string, ""}}}])
+    if Enum.all?(filters, &(&1 in error_free)), do: {:ok, true}, else: :fallback
+  end
+
+  defp post_filter(_filters, _spec), do: :fallback
+
+  defp value(spec, false), do: value(spec)
+
+  defp value(spec, true) do
+    case value(spec) do
+      {:ok, {:unwrap, label}} -> {:ok, {:unwrap, label, :drop_errors}}
+      _ -> :fallback
+    end
+  end
+
   defp value(%{op: op}) when op in [:bytes_over_time, :bytes_rate], do: {:ok, :bytes}
   defp value(%{op: :count_over_time}), do: {:ok, :count}
   defp value(%{unwrap: nil}), do: {:ok, :count}
@@ -140,9 +161,19 @@ defmodule Pulso.LogQL.NativeRange do
       end
     end)
     |> case do
-      {:ok, encoded} -> {:ok, Enum.reverse(encoded)}
+      {:ok, encoded} -> if parser_after_keep?(encoded), do: :fallback, else: {:ok, Enum.reverse(encoded)}
       other -> other
     end
+  end
+
+  # `keep` also narrows which stream labels later parsers must not overwrite;
+  # the native parsers keep the original owners, so a parser after it falls back.
+  # `encoded` is in reverse order.
+  defp parser_after_keep?(encoded) do
+    encoded
+    |> Enum.reverse()
+    |> Enum.drop_while(&(not match?({:keep, _}, &1)))
+    |> Enum.any?(&(&1 == :logfmt or match?({:regexp, _}, &1)))
   end
 
   defp stage(%AST.LineFilter{op: op, value: {:string, s}}) when op in [:contains, :not_contains], do: {op, s}
@@ -155,6 +186,10 @@ defmodule Pulso.LogQL.NativeRange do
       nil -> nil
       encoded -> {:label_filter, encoded}
     end
+  end
+
+  defp stage(%AST.Keep{entries: entries}) do
+    if Enum.all?(entries, &match?({_, :any}, &1)), do: {:keep, Enum.map(entries, &elem(&1, 0))}
   end
 
   defp stage(_), do: nil

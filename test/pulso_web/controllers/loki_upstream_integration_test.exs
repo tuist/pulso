@@ -11353,7 +11353,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     for {limits, status, error} <- [
           {[max_per_tenant: 0], 429, "query_overloaded"},
-          {[max_scan_rows: 1], 422, "query_limit"}
+          {[max_scan_rows: 0], 422, "query_limit"}
         ] do
       Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
 
@@ -11498,7 +11498,7 @@ defmodule PulsoWeb.LokiUpstreamIntegrationTest do
 
     for {limits, status, error} <- [
           {[max_per_tenant: 0], 429, "query_overloaded"},
-          {[max_scan_rows: 1], 422, "query_limit"}
+          {[max_scan_rows: 0], 422, "query_limit"}
         ] do
       Runtime.put_env(:pulso, Pulso.QueryRunner, limits)
 

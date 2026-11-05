@@ -607,7 +607,10 @@ defmodule Pulso.Storage.S3 do
 
   # Do not replay replacements. Settle is event-time based, not proof that a
   # follower observed originals; late publication/poll failure can still miss rows.
-  defp compaction_output?(key), do: key |> Path.basename() |> String.contains?("-compact-")
+  defp compaction_output?(key) do
+    base = Path.basename(key)
+    String.contains?(base, "-compact-") or Segment.key_tier(key) in [:grouped, :final]
+  end
 
   @impl Pulso.Storage
   def log_discovery_json(tenant, mode, key, opts) do
@@ -894,9 +897,10 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  # Rows of other series in the same segment are skipped natively by their
-  # dictionary-encoded labels; the bytes and segments budgets bound reading
-  # them. The rows budget counts the rows a selector matched and decoded.
+  # Rows of other series (metrics) or streams (logs) in the same segment are
+  # skipped natively by their label columns; the bytes and segments budgets
+  # bound reading them. The rows budget counts the rows a selector matched
+  # and decoded, for logs also after the pushed-down line filters.
   defp charge_matched_rows(state, matched, opts) do
     rows = state.rows + matched
 
@@ -1334,9 +1338,17 @@ defmodule Pulso.Storage.S3 do
     if limited_span_query?(opts), do: :ok, else: check_scan_budget(segments, opts)
   end
 
-  # Limited log queries charge only the segments they actually visit.
+  # Limited log queries charge only the segments they actually visit. Log
+  # reads charge max_scan_rows with the rows their stream selector and line
+  # filters select, known only once decoded: compacted segments mix every
+  # stream of an hour, and the native reader skips other streams' rows by
+  # their columns. Discovery keeps every stored row it reads.
   defp check_scan_budget(:logs, segments, opts) do
-    if opts[:log_window], do: :ok, else: check_scan_budget(segments, opts)
+    cond do
+      opts[:log_window] -> :ok
+      opts[:log_discovery] -> check_scan_budget(segments, opts)
+      true -> check_scan_budget(segments, Keyword.delete(opts, :max_scan_rows))
+    end
   end
 
   # Metric sample reads charge max_scan_rows with the rows their selectors
@@ -2179,6 +2191,7 @@ defmodule Pulso.Storage.S3 do
   defp remember(state, _key, _blob), do: state
 
   defp stored_rows(%{signal: :metrics, metric_discovery?: false}, _segment), do: 0
+  defp stored_rows(%{signal: :logs, log_discovery?: false}, _segment), do: 0
   defp stored_rows(_ctx, segment), do: segment.row_count || 0
 
   defp scan_bytes(%MetricFooterReader{charge: cost}), do: cost
@@ -2245,6 +2258,9 @@ defmodule Pulso.Storage.S3 do
   end
 
   defp scan_row_count(%{signal: :metrics, metric_discovery?: false}, _segment, _blob), do: {:ok, 0}
+  # Log reads charge the rows their stream selector and line filters select
+  # (charge_matched_rows/3), once known.
+  defp scan_row_count(%{signal: :logs, log_discovery?: false}, _segment, _blob), do: {:ok, 0}
 
   defp scan_row_count(%{signal: :traces} = ctx, segment, blob) do
     # Whole-trace assembly and grouping cannot trust an undercounted manifest.
@@ -2339,7 +2355,11 @@ defmodule Pulso.Storage.S3 do
     case NIF.log_metric_scan_add(scan, blob, ctx.start_ts, ctx.end_ts, service, matchers, line_filters) do
       {:ok, {selected, kept}} ->
         {total_selected, total_kept} = state.fold
-        {:cont, {:ok, %{state | fold: {total_selected + selected, total_kept + kept}}}}
+
+        case charge_matched_rows(state, selected, ctx.opts) do
+          {:ok, state} -> {:cont, {:ok, %{state | fold: {total_selected + selected, total_kept + kept}}}}
+          error -> {:halt, error}
+        end
 
       {:error, _} = error ->
         {:halt, error}
@@ -2352,13 +2372,12 @@ defmodule Pulso.Storage.S3 do
   # Fold each decoded segment into the caller's accumulator and release it,
   # so memory follows one segment rather than the whole result.
   defp continue_or_halt(state, blob, index, %{log_fold: {fun, _initial}} = ctx) do
-    case fold_segment(blob, ctx, fun, state.fold, 0) do
-      {:ok, acc, count} ->
-        state = %{state | fold: acc, count: state.count + count}
-        if fold_done?(ctx, acc, index), do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
-
-      {:error, _} = error ->
-        {:halt, error}
+    with {:ok, acc, count} <- fold_segment(blob, ctx, fun, state.fold, 0),
+         {:ok, state} <- charge_matched_rows(state, count, ctx.opts) do
+      state = %{state | fold: acc, count: state.count + count}
+      if fold_done?(ctx, acc, index), do: {:halt, {:ok, state}}, else: {:cont, {:ok, state}}
+    else
+      {:error, _} = error -> {:halt, error}
     end
   end
 
@@ -2396,7 +2415,9 @@ defmodule Pulso.Storage.S3 do
     end
   end
 
-  defp matched_rows(:metrics, state, batch, opts), do: charge_matched_rows(state, length(batch), opts)
+  defp matched_rows(signal, state, batch, opts) when signal in [:metrics, :logs],
+    do: charge_matched_rows(state, length(batch), opts)
+
   defp matched_rows(_signal, state, _batch, _opts), do: {:ok, state}
 
   defp trace_start_floor(state, %{signal: :traces, limit: limit, start_ts: start_ts})

@@ -1272,15 +1272,13 @@ pub fn compact<'a>(
     blobs: Term<'a>,
     max_rows: usize,
 ) -> Result<Compacted<'a>, CompactError> {
-    use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch, SortColumn};
     use std::collections::BTreeSet;
 
-    let schema = parquet_schema();
     let mut batches = Vec::new();
     let mut included = Vec::new();
     let mut declared_rows = 0usize;
     let mut rows = 0usize;
-    let mut string_bytes = 0usize;
+    let mut held_bytes = 0usize;
     let mut bounds = Bounds {
         min_ts: i128::MAX,
         max_ts: i128::MIN,
@@ -1294,59 +1292,26 @@ pub fn compact<'a>(
         .enumerate()
     {
         let blob: Binary = term.decode().map_err(|_| CompactError::Invalid)?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(crate::erlang_bytes::from_binary(blob))
-                .map_err(|_| CompactError::Invalid)?;
-        let declared = usize::try_from(builder.metadata().file_metadata().num_rows())
-            .map_err(|_| CompactError::Invalid)?;
+        let (declared, source_batches) =
+            segment_batches(crate::erlang_bytes::from_binary(blob), 8192)?;
         declared_rows = declared_rows
             .checked_add(declared)
             .ok_or(CompactError::TooMany)?;
         if declared_rows > max_rows {
             return Err(CompactError::TooMany);
         }
-        let legacy = builder.schema().fields().len() + 1 == schema.fields().len()
-            && builder
-                .schema()
-                .fields()
-                .iter()
-                .zip(schema.fields())
-                .all(|(a, b)| a == b);
-        if !legacy && builder.schema().fields() != schema.fields() {
-            return Err(CompactError::Invalid);
-        }
         let mut source = Vec::new();
         let mut source_rows = 0usize;
         let mut source_bytes = 0usize;
         let mut fits = true;
-        for batch in builder
-            .with_batch_size(8192)
-            .build()
-            .map_err(|_| CompactError::Invalid)?
-        {
-            let batch = batch.map_err(|_| CompactError::Invalid)?;
-            let batch = if legacy {
-                let mut columns = batch.columns().to_vec();
-                columns.push(arrow::array::new_null_array(
-                    &DataType::Utf8,
-                    batch.num_rows(),
-                ));
-                RecordBatch::try_new(Arc::clone(&schema), columns)
-                    .map_err(|_| CompactError::Invalid)?
-            } else {
-                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
-                    .map_err(|_| CompactError::Invalid)?
-            };
+        for batch in source_batches {
+            let batch = batch?;
             source_rows += batch.num_rows();
             if rows + source_rows > max_rows {
                 return Err(CompactError::TooMany);
             }
-            for column in batch.columns() {
-                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
-                    source_bytes += strings.value_data().len();
-                }
-            }
-            if string_bytes + source_bytes > MAX_COMPACT_STRING_BYTES {
+            source_bytes += string_bytes(&batch);
+            if held_bytes + source_bytes > MAX_COMPACT_STRING_BYTES {
                 fits = false;
                 break;
             }
@@ -1380,7 +1345,7 @@ pub fn compact<'a>(
             }
         }
         rows += source_rows;
-        string_bytes += source_bytes;
+        held_bytes += source_bytes;
         batches.extend(source);
         included.push(index);
     }
@@ -1393,6 +1358,80 @@ pub fn compact<'a>(
         bounds.min_ts = 0;
         bounds.max_ts = 0;
     }
+    let payload = encode_sorted(env, batches, rows)?;
+    let services = services.map(|set| set.into_iter().collect());
+    Ok((payload, bounds, services, included))
+}
+
+/// The record batches of a stored log segment in the encoder's schema, with
+/// its declared row count. Legacy ten-column segments gain a null `otlp`
+/// column, which decodes exactly as the legacy layout.
+pub(crate) fn segment_batches(
+    bytes: Bytes,
+    batch_rows: usize,
+) -> Result<
+    (
+        usize,
+        impl Iterator<Item = Result<RecordBatch, CompactError>>,
+    ),
+    CompactError,
+> {
+    let schema = parquet_schema();
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|_| CompactError::Invalid)?;
+    let declared = usize::try_from(builder.metadata().file_metadata().num_rows())
+        .map_err(|_| CompactError::Invalid)?;
+    let legacy = builder.schema().fields().len() + 1 == schema.fields().len()
+        && builder
+            .schema()
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .all(|(a, b)| a == b);
+    if !legacy && builder.schema().fields() != schema.fields() {
+        return Err(CompactError::Invalid);
+    }
+    let reader = builder
+        .with_batch_size(batch_rows)
+        .build()
+        .map_err(|_| CompactError::Invalid)?;
+    Ok((
+        declared,
+        reader.map(move |batch| {
+            let batch = batch.map_err(|_| CompactError::Invalid)?;
+            let mut columns = batch.columns().to_vec();
+            if legacy {
+                columns.push(arrow::array::new_null_array(
+                    &DataType::Utf8,
+                    batch.num_rows(),
+                ));
+            }
+            RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|_| CompactError::Invalid)
+        }),
+    ))
+}
+
+/// Decoded string bytes a batch holds.
+pub(crate) fn string_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .filter_map(|column| column.as_any().downcast_ref::<StringArray>())
+        .map(|strings| strings.value_data().len())
+        .sum()
+}
+
+/// One log segment holding `batches` (`rows` rows in all), re-sorted by
+/// `(service, timestamp_ns)` with nulls first, the encoder's order, and
+/// written with the encoder's writer properties.
+pub(crate) fn encode_sorted<'a>(
+    env: Env<'a>,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+) -> Result<Binary<'a>, CompactError> {
+    use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch, SortColumn};
+
+    let schema = parquet_schema();
     let merged = concat_batches(&schema, &batches).map_err(|_| CompactError::Invalid)?;
     drop(batches);
     let sort: Vec<SortColumn> = ["service", "timestamp_ns"]
@@ -1414,8 +1453,7 @@ pub fn compact<'a>(
         .map_err(|_| CompactError::Invalid)?;
     writer.write(&sorted).map_err(|_| CompactError::Invalid)?;
     writer.close().map_err(|_| CompactError::Invalid)?;
-    let services = services.map(|set| set.into_iter().collect());
-    Ok((buf.0.finish(env), bounds, services, included))
+    Ok(buf.0.finish(env))
 }
 
 // -- streaming decode ------------------------------------------------------

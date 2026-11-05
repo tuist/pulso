@@ -158,6 +158,8 @@ spec:
               value: {{ .Values.logCompaction.enabled | quote }}
             - name: PULSO_LOG_ROLLUPS_ENABLED
               value: {{ .Values.logCompaction.rollups | quote }}
+            - name: PULSO_LOG_STREAM_GROUPING_ENABLED
+              value: {{ .Values.logCompaction.groupByStream | quote }}
             - name: PULSO_SENTRY_PROJECTS_JSON
               value: {{ .Values.sentry.projects | toJson | quote }}
             - name: PULSO_ERROR_PROJECTION_ENABLED

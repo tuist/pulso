@@ -1601,6 +1601,37 @@ writes make that minute a gap read from lines. `NativeRange` uses the binned
 path only when every window is minute-aligned and the pipeline is empty;
 rollup rows charge `max_scan_rows`, and other log queries exclude rollup keys.
 
+### Stream-grouped log segments
+
+Compacted log segments mix every stream of their slice of time, so a stream
+selector cannot skip any of them, and per-minute rollups cannot serve
+pipelines with parsers or line filters. Log reads therefore charge
+`max_scan_rows` with the rows the stream selector and leading line filters
+select (as metric sample reads do), not every stored row; segment and byte
+budgets bound the rest. Discovery still charges stored rows.
+
+`Pulso.Storage.S3.LogTiers` (native `log_tiers.rs`, tier API 1) then
+regroups settled log segments by service, or by stored resource for rows
+without one: `finalize/3` rewrites a settled hour's raw and `-group-`
+segments into `-final-` ones, and `consolidate/3` rewrites settled raw
+segments of a busy open hour into `-group-` ones. A service at
+`target_rows`/`target_bytes` fills segments alone; smaller ones are packed up
+to `pack_bytes` in group order. Rows stay native and keep their order and
+encoding; outputs carry complete service, stream-label and `lm` summaries
+and are published by `MetricTiers.publish/6` in one manifest transition.
+The pushed-down service equality also prunes through the `service_name`
+label summary, whose effective values cover every stored service, so packs
+holding service-less streams stay prunable. Log compaction never merges
+grouped or final segments, and live tail does not replay them.
+
+This is the cheapest of the alternatives considered. Value sets or Bloom
+filters of parsed keys (`kind`, `app_environment`) would not prune: every
+line of the service carries the same few values, as Loki's bloom gateways
+skip chunks only for high-cardinality structured metadata. Rollups keyed by
+declared parsed fields would need per-query declarations. Grouping by
+stream at maintenance is the same layout Loki chunks, VictoriaLogs stream
+blocks and Quickwit's partitioned splits give their stream filters.
+
 ## Format 4 manifests
 
 A flat manifest lists every segment ever published, including permanent

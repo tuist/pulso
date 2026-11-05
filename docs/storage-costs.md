@@ -325,6 +325,44 @@ the two slower panels are CPU-bound, and without GET waits compaction got
 through more work in the same time (0.21 against 0.16 merge PUTs/s), which
 likely took CPU from them. More CPU, not a larger cache, is the lever there.
 
+### Parsed-field log alerts
+
+Alerts and panels that parse lines (`| logfmt | kind="measurement" | ...`)
+over hours of one service used to fail: every log segment holds a slice of
+time of every stream, and `PULSO_QUERY_MAX_SCAN_ROWS` was charged with every
+stored line of every segment read. 1.37 charges only the lines the stream
+selector and leading line filters select, and
+[stream-grouped log segments](configuration.md#stream-grouped-log-segments)
+let a service selector skip other services' segments once an hour is settled.
+The table below replays Tuist's web-vitals alerts (logfmt over
+`{service_name="tuist-web"}`, 2 of about 52 lines/s) and docker cache-usage
+panels against a Tigris-latency store (140–190 ms per GET), 24 hours at canary
+volume (4.5 million lines), cold reads:
+
+| Query | 1.34 | 1.37, before hours are grouped | 1.37, grouped |
+| --- | --- | --- | --- |
+| 24 h web-vitals alerts (11) | `422 max_scan_rows` | 2.3–4.8 s, 48 GETs, 91 MB | 1.4–2.7 s, 24 GETs, 4 MB |
+| 6 h web-vitals alerts (9) | `422 max_scan_rows` | 0.8–0.9 s, 12 GETs, 23 MB | 0.6 s, 6 GETs, 1 MB |
+| Cache-usage panels, 1 h | 0.6 s, 2 GETs | 0.6 s, 2 GETs | 0.5 s, 1 GET |
+| Cache-usage panels, 6 h / 24 h | `422 max_scan_rows` | 1.7–2.1 s / 6.4–7.1 s | 1.5–1.9 s / 5.8–8.1 s |
+
+The cache-usage panels select every line of the docker streams (about 12
+lines/s) with a line filter and the `pattern` parser, which runs in Elixir, so
+their 24 h range stays close to the 10 s query timeout.
+
+Grouping an hour reads it once and rewrites it once: 24 canary hours took 48
+GETs and 183 PUTs (about 8 Class A requests an hour). At 53 times that
+volume an hour of 9.9 million lines took 36 s, 230 GETs and 154 PUTs: about
+$0.60 a month of Class A and $0.10 of Class B requests. The rewritten
+originals are deleted after the compaction grace, so storage does not grow.
+
+Grouping does not change how many lines such a query must read. At 53 times
+canary volume one hour of the web-vitals service is 381,000 lines (8 MB),
+read natively in about 2.5 s: a 6 h alert selects 2.3 million lines and a
+24 h alert 9.2 million, beyond the default row budget and the 10 s query
+timeout. Windows that long at that volume need precomputed results, such as
+metrics recorded from the logs, not a larger budget.
+
 ## Avoiding amplification
 
 By default Pulso writes one immutable Parquet segment per nonempty append and

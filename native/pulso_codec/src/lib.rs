@@ -25,6 +25,7 @@ mod labels;
 mod log_discovery;
 mod log_metric;
 mod log_rollup;
+mod log_tiers;
 mod loki;
 mod metric_discovery;
 mod metric_footer;
@@ -147,6 +148,7 @@ fn malloc_trim() -> bool {
 mod atoms {
     rustler::atoms! {
         done,
+        none,
         final_ = "final",
         before,
         after,
@@ -1490,6 +1492,119 @@ fn encode_metric_samples<'a>(env: Env<'a>, samples: Term<'a>) -> Term<'a> {
         Ok(buf) => (atoms::ok(), buf).encode(env),
         Err(crate::term_json::EncodeError::TooBig) => error(env, atoms::query_result_limit()),
         Err(_) => atoms::fallback().encode(env),
+    }
+}
+
+// ---- stream-grouped log segments -------------------------------------------
+
+#[rustler::nif]
+fn log_tier_api_version() -> u32 {
+    1
+}
+
+/// Rows of many log segments regrouped by service or stream (`log_tiers::Grouper`).
+pub struct LogGrouper(std::sync::Mutex<Option<log_tiers::Grouper>>);
+
+#[rustler::resource_impl]
+impl rustler::Resource for LogGrouper {}
+
+#[rustler::nif]
+fn log_group_new<'a>(
+    env: Env<'a>,
+    target_rows: usize,
+    target_bytes: usize,
+    pack_bytes: usize,
+    max_held: usize,
+) -> Term<'a> {
+    if target_rows == 0 || target_rows > 100_000 || target_bytes == 0 || pack_bytes == 0 {
+        return atoms::fallback().encode(env);
+    }
+    let grouper = log_tiers::Grouper::new(
+        target_rows,
+        target_bytes.min(segment_parquet::MAX_COMPACT_STRING_BYTES),
+        pack_bytes,
+        max_held,
+    );
+    (
+        atoms::ok(),
+        rustler::ResourceArc::new(LogGrouper(std::sync::Mutex::new(Some(grouper)))),
+    )
+        .encode(env)
+}
+
+/// `{:ok, rows}` once one log segment's rows are held by group.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_group_add<'a>(
+    env: Env<'a>,
+    grouper: rustler::ResourceArc<LogGrouper>,
+    blob: Binary<'a>,
+) -> Term<'a> {
+    let Ok(mut guard) = grouper.0.lock() else {
+        return atoms::fallback().encode(env);
+    };
+    let Some(state) = guard.as_mut() else {
+        return atoms::fallback().encode(env);
+    };
+    match state.add(erlang_bytes::from_binary(blob)) {
+        Ok(rows) => (atoms::ok(), rows).encode(env),
+        Err(_) => {
+            // A partly added source can never be published.
+            guard.take();
+            error(env, atoms::invalid_segment())
+        }
+    }
+}
+
+/// The next output: `{:ok, {payload, min_ts, max_ts, rows, services | nil,
+/// [{service | nil, resource}] | nil, [{minute, count}] | nil}}`, `:none`
+/// while no output is due (only without `finish`), or `:done`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn log_group_next<'a>(
+    env: Env<'a>,
+    grouper: rustler::ResourceArc<LogGrouper>,
+    finish: bool,
+) -> Term<'a> {
+    let Ok(mut guard) = grouper.0.lock() else {
+        return atoms::fallback().encode(env);
+    };
+    let Some(state) = guard.as_mut() else {
+        return atoms::fallback().encode(env);
+    };
+    match state.next(env, finish) {
+        Ok(Some(output)) => {
+            let nil = rustler::types::atom::nil().to_term(env);
+            let services = output.services.map_or(nil, |s| s.encode(env));
+            let streams = output.streams.map_or(nil, |streams| {
+                streams
+                    .iter()
+                    .map(|(service, resource)| {
+                        let service = service.as_ref().map_or(nil, |s| s.encode(env));
+                        (service, resource).encode(env)
+                    })
+                    .collect::<Vec<Term>>()
+                    .encode(env)
+            });
+            let minutes = output.minutes.map_or(nil, |m| m.encode(env));
+            let output = (
+                output.payload,
+                output.min_ts,
+                output.max_ts,
+                output.rows,
+                services,
+                streams,
+                minutes,
+            );
+            (atoms::ok(), output).encode(env)
+        }
+        Ok(None) if finish => {
+            guard.take();
+            atoms::done().encode(env)
+        }
+        Ok(None) => atoms::none().encode(env),
+        Err(_) => {
+            guard.take();
+            atoms::fallback().encode(env)
+        }
     }
 }
 

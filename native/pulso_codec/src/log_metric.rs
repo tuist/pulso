@@ -25,7 +25,7 @@ use std::sync::Mutex;
 mod atoms {
     rustler::atoms! { ok, error, fallback, nil, contains, not_contains, match_re, not_match_re,
     logfmt, regexp, label_filter, and, or, eq, neq, re, nre, num, lt, lte, gt, gte, count, bytes,
-    unwrap, by, without, pipeline_error, query_resource_limit }
+    unwrap, by, without, pipeline_error, query_resource_limit, keep, drop_errors }
 }
 
 const COLUMNS: [&str; 8] = [
@@ -108,6 +108,8 @@ enum Stage {
         names: Vec<(String, usize)>,
     },
     Labels(Filter),
+    // `keep` of plain names: every other label but the error labels leaves.
+    Keep(Vec<String>),
 }
 
 enum Value {
@@ -135,6 +137,9 @@ struct State {
     stages: Vec<Stage>,
     value: Value,
     drop: Option<String>,
+    // A post-unwrap `__error__=""` filter: observations whose labels carry an
+    // error, from an earlier stage or the conversion, are dropped uncharged.
+    drop_errors: bool,
     grouping: Grouping,
     series: HashMap<SeriesKey, Vec<(i64, Sample)>>,
     samples: usize,
@@ -271,6 +276,8 @@ fn stage(term: Term<'_>) -> Res<Stage> {
         })
     } else if tag == atoms::label_filter() {
         Ok(Stage::Labels(filter(parts[1], 0)?))
+    } else if tag == atoms::keep() {
+        Ok(Stage::Keep(names(parts[1])?))
     } else {
         Err(Error::Fallback)
     }
@@ -285,11 +292,12 @@ fn names(term: Term<'_>) -> Res<Vec<String>> {
 
 #[rustler::nif]
 fn log_metric_api_version() -> u32 {
-    18
+    19
 }
 
-/// `stages` is the pipeline after pushdown; `value` is `:count`, `:bytes` or
-/// `{:unwrap, label}`; `drop` the unwrapped label removed from series keys or
+/// `stages` is the pipeline after pushdown; `value` is `:count`, `:bytes`,
+/// `{:unwrap, label}` or `{:unwrap, label, :drop_errors}` (followed by
+/// `__error__=""` filters); `drop` the unwrapped label removed from series keys or
 /// nil; `grouping` nil, `{:by, names}` or `{:without, names}`; `max_samples`
 /// the retained samples allowed before the scan fails with a resource limit.
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -307,6 +315,7 @@ fn log_metric_scan_new<'a>(
             .map_err(|_| Error::Fallback)?
             .map(stage)
             .collect::<Res<Vec<_>>>()?;
+        let mut drop_errors = false;
         let value = if let Ok(atom) = value.decode::<rustler::Atom>() {
             if atom == atoms::count() {
                 Value::Count
@@ -316,12 +325,24 @@ fn log_metric_scan_new<'a>(
                 return Err(Error::Fallback);
             }
         } else {
-            let (tag, label): (rustler::Atom, Term) =
-                value.decode().map_err(|_| Error::Fallback)?;
+            let parts: Vec<Term> =
+                rustler::types::tuple::get_tuple(value).map_err(|_| Error::Fallback)?;
+            let tag: rustler::Atom = parts
+                .first()
+                .ok_or(Error::Fallback)?
+                .decode()
+                .map_err(|_| Error::Fallback)?;
+            match parts.len() {
+                2 => {}
+                3 if parts[2].decode::<rustler::Atom>().ok() == Some(atoms::drop_errors()) => {
+                    drop_errors = true;
+                }
+                _ => return Err(Error::Fallback),
+            }
             if tag != atoms::unwrap() {
                 return Err(Error::Fallback);
             }
-            Value::Unwrap(text(label)?)
+            Value::Unwrap(text(parts[1])?)
         };
         let drop = if drop.decode::<rustler::Atom>().ok() == Some(atoms::nil()) {
             None
@@ -345,6 +366,7 @@ fn log_metric_scan_new<'a>(
             stages,
             value,
             drop,
+            drop_errors,
             grouping,
             series: HashMap::new(),
             samples: 0,
@@ -378,6 +400,7 @@ fn log_metric_binned_new<'a>(
             stages: Vec::new(),
             value,
             drop: None,
+            drop_errors: false,
             grouping,
             series: HashMap::new(),
             samples: 0,
@@ -549,6 +572,7 @@ fn log_pattern_scan_new(start: i64, step: i64) -> ResourceArc<Scan> {
         stages: Vec::new(),
         value: Value::Count,
         drop: None,
+        drop_errors: false,
         grouping: Grouping::All,
         series: HashMap::new(),
         samples: 0,
@@ -804,6 +828,9 @@ impl State {
                         return Ok(None);
                     }
                 }
+                Stage::Keep(names) => labels.to_mut().retain(|k, _| {
+                    k == "__error__" || k == "__error_details__" || names.iter().any(|n| n == k)
+                }),
             }
         }
         Ok(Some(labels))
@@ -821,7 +848,11 @@ impl State {
             None
         };
         if labels.get("__error__").is_some_and(|e| !e.is_empty()) {
-            return Err(Error::Pipeline);
+            return if self.drop_errors {
+                Ok(false)
+            } else {
+                Err(Error::Pipeline)
+            };
         }
         if self.bins.is_some() {
             let amount = match &self.value {
@@ -837,6 +868,9 @@ impl State {
             Value::Bytes => Sample::Int(i64::try_from(line.len()).map_err(|_| Error::Fallback)?),
             Value::Unwrap(_) => unwrap_value(unwrapped)?,
         };
+        if self.drop_errors && matches!(sample, Sample::Error) {
+            return Ok(false);
+        }
         let key = self.key(labels);
         self.samples += 1;
         if self.samples as u64 > self.max_samples {

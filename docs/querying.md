@@ -2130,7 +2130,8 @@ wording and positions remain incomplete.
 
 Upgrade every serving app/native pair together before relying on these parser
 collision, logfmt, quantity and filter-error semantics. The required log codec
-tuple is `{1,1,18}`; older artifacts fail startup. They do not change stored
+tuple is `{1,1,19}` (19 adds native `keep` and post-unwrap `__error__=""`
+filters); older artifacts fail startup. They do not change stored
 records or keyed encoder bytes.
 
 ### How log queries choose segments
@@ -2167,7 +2168,11 @@ GET per segment read. Pulso reads fewer segments in three ways:
   (see `PULSO_QUERY_PREFETCH` in [configuration](configuration.md#query-budgets)).
 
 Line filters do not prune segments; they are evaluated natively on every row
-of every segment the selector keeps. For alert rules over many uncompacted
+of every segment the selector keeps. `PULSO_QUERY_MAX_SCAN_ROWS` counts the
+lines a log query's stream selector and leading line filters select, not every
+line stored in the segments it reads, and with
+[stream-grouped log segments](configuration.md#stream-grouped-log-segments) a
+service selector reads only its service's segments of settled hours. For alert rules over many uncompacted
 segments, enable [log compaction](configuration.md#log-compaction) and
 [ingest coalescing](configuration.md#ingest-coalescing) to reduce how many
 objects a range covers.
@@ -2260,8 +2265,10 @@ Metric queries such as `rate`, `count_over_time`, `bytes_over_time`,
 `quantile_over_time` or `sum_over_time(... | unwrap ...)` reduce each selected
 line to one sample of its series while reading, so their memory follows the
 number of series and samples rather than the log volume. When the pipeline only
-uses line filters, `logfmt`, `regexp`, string, regex or number label filters
-and a plain `unwrap`, it runs natively without creating per-line Erlang terms;
+uses line filters, `logfmt`, `regexp`, string, regex or number label filters,
+`keep` of plain label names (with no parser after it) and a plain `unwrap`,
+optionally followed by `| __error__=""`, it runs natively without creating
+per-line Erlang terms;
 other pipelines, and lines whose labels or bodies are not plain strings, use the
 equivalent Elixir pipeline with the same results. Every kept line counts
 against `PULSO_QUERY_MAX_LOG_SAMPLES` and every selected line as work (see
@@ -2617,7 +2624,7 @@ shared schema admission; counting allocates no name metadata. Existing program,
 scan, work and heap limits also apply.
 
 Upgrade every query-serving app/native pair before relying on these forms.
-The required log capability tuple is `{1,1,18}` for missing unwrap values before
+The required log capability tuple is `{1,1,19}` for missing unwrap values before
 prior pipeline-error checks, correlation-ID metadata,
 scalar class complements, Unicode property admission and numeric/repeated capture names;
 trace/metric capability tuples, storage formats and keyed bytes are unchanged.

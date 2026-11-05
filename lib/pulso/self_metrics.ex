@@ -25,6 +25,8 @@ defmodule Pulso.SelfMetrics do
       :worker_finalize,
       :worker_consolidate,
       :worker_log_rollup,
+      :worker_log_finalize,
+      :worker_log_consolidate,
       :worker_backup
     ]
   }
