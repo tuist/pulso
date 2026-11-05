@@ -8,6 +8,7 @@ defmodule Pulso.Alerting.Repository do
   @page_limit 32
   @receipt_limit 128
   @max_object_bytes 1_048_576
+  @inline_limit 131_072
 
   def load(tenant, id, opts \\ []) do
     with :ok <- identifiers(tenant, id),
@@ -141,14 +142,21 @@ defmodule Pulso.Alerting.Repository do
     queue = Map.get(head, "recording_queue", [])
     head = Map.put(head, "recording_series", result["next_series"])
 
+    head =
+      if Map.has_key?(result, "rule_health"),
+        do: Map.put(head, "recording_rules", result["rule_health"]),
+        else: head
+
     object =
-      Map.merge(Map.delete(result, "next_series"), %{
+      Map.merge(Map.drop(result, ["next_series", "rule_health"]), %{
         "schema_version" => 1,
         "tenant" => head["tenant"],
         "id" => head["id"],
         "generation" => head["generation"],
         "revision" => head["revision"]
       })
+
+    bytes = Canonical.encode(object)
 
     cond do
       result["samples"] == [] ->
@@ -157,14 +165,35 @@ defmodule Pulso.Alerting.Repository do
       length(queue) >= 64 ->
         {:error, :recording_backlog}
 
-      byte_size(Canonical.encode(object)) > 65_536 ->
+      byte_size(bytes) > @max_object_bytes ->
         {:error, :invalid_recording_result}
+
+      # A small group intent rides in the head write that commits it, saving
+      # one Class A PUT per tick and leaving no object behind once published.
+      # Single recordings keep immutable objects that older readers accept.
+      Map.has_key?(head, "recording_rules") and inline_bytes(queue) + byte_size(bytes) <= @inline_limit ->
+        ref = %{"digest" => Canonical.digest(bytes), "bytes" => byte_size(bytes), "inline" => object}
+        {:ok, Map.put(head, "recording_queue", queue ++ [ref])}
 
       true ->
         with {:ok, ref} <- immutable(head["tenant"], head["id"], head["generation"], "recordings", object, opts),
              do: {:ok, Map.put(head, "recording_queue", queue ++ [ref])}
     end
   end
+
+  defp inline_bytes(queue), do: Enum.sum(for %{"inline" => _, "bytes" => bytes} <- queue, do: bytes)
+
+  @doc "A committed recording intent, carried inline by the head or stored as an immutable object."
+  def recording_object(tenant, id, %{"inline" => object, "digest" => digest, "bytes" => size}, _opts) do
+    bytes = Canonical.encode(object)
+
+    if is_map(object) and byte_size(bytes) == size and Canonical.digest(bytes) == digest and
+         object["tenant"] == tenant and object["id"] == id,
+       do: {:ok, object},
+       else: {:error, :integrity_error}
+  end
+
+  def recording_object(tenant, id, ref, opts), do: revision(tenant, id, ref, opts)
 
   @doc false
   def ack_recording(tenant, id, ref, opts \\ []) do
@@ -354,6 +383,12 @@ defmodule Pulso.Alerting.Repository do
       "request_digest" => snapshot["request_digest"],
       "revision" => ref
     }
+
+    # Per-rule group diagnostics describe the previous revision's rules.
+    head = Map.delete(head, "recording_rules")
+
+    head =
+      if snapshot["rule"]["kind"] == "promql_recording_group", do: Map.put(head, "recording_rules", []), else: head
 
     Map.merge(head, %{
       "generation" => snapshot["generation"],
@@ -728,21 +763,25 @@ defmodule Pulso.Alerting.Repository do
     ])
   end
 
-  defp recording_queue?(queue, tenant, id) when is_list(queue) and length(queue) <= 64 do
-    Enum.all?(queue, fn
-      %{"key" => key, "digest" => digest, "bytes" => bytes} when is_binary(key) and is_binary(digest) ->
-        String.starts_with?(key, base(tenant, id) <> "/g/") and
-          Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) and
-          String.ends_with?(key, "/recordings/#{digest}.json") and is_integer(bytes) and bytes in 1..65_536
-
-      _ ->
-        false
-    end)
-  end
+  defp recording_queue?(queue, tenant, id) when is_list(queue) and length(queue) <= 64,
+    do: Enum.all?(queue, &recording_ref?(&1, tenant, id))
 
   defp recording_queue?(_, _, _), do: false
 
-  defp recording_series?(series), do: bounded_list?(series, 128) and Enum.all?(series, &Rule.labels?/1)
+  defp recording_ref?(%{"inline" => object, "digest" => digest, "bytes" => bytes} = ref, _tenant, _id)
+       when map_size(ref) == 3 and is_map(object) and is_binary(digest) and is_integer(bytes),
+       do: Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) and bytes in 1..@inline_limit
+
+  defp recording_ref?(%{"key" => key, "digest" => digest, "bytes" => bytes}, tenant, id)
+       when is_binary(key) and is_binary(digest) and is_integer(bytes) do
+    String.starts_with?(key, base(tenant, id) <> "/g/") and Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) and
+      String.ends_with?(key, "/recordings/#{digest}.json") and bytes in 1..@max_object_bytes
+  end
+
+  defp recording_ref?(_, _, _), do: false
+
+  defp recording_series?(series),
+    do: bounded_list?(series, Recording.limits("promql_recording_group").samples) and Enum.all?(series, &Rule.labels?/1)
 
   defp valid_generation?(value), do: is_binary(value) and byte_size(value) == 32
   defp nonnegative?(value, minimum), do: is_integer(value) and value >= minimum

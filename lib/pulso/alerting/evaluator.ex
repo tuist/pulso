@@ -6,6 +6,16 @@ defmodule Pulso.Alerting.Evaluator do
   alias Pulso.PromQL.Evaluator
   alias Pulso.PromQL.Number
 
+  @recording_kinds ["promql_recording", "promql_recording_group"]
+  # Retryable conditions skip the whole tick; nothing is published or marked stale.
+  @transient [
+    :query_overloaded,
+    :query_timeout,
+    :manifest_freshness_unavailable,
+    :signal_authority_missing,
+    :expression_timeout
+  ]
+
   def evaluate(principal, id, opts \\ []) do
     with :ok <- Principal.authorize(principal, "alert:evaluate"),
          :ok <- Principal.authorize(principal, "alert:read"),
@@ -14,7 +24,7 @@ defmodule Pulso.Alerting.Evaluator do
          "active" <- head["state"],
          {:ok, snapshot} <- Repository.revision(principal.tenant, id, head["revision"], opts),
          %{"kind" => kind} = rule
-         when kind in ["promql_threshold", "logql_threshold", "expression_threshold", "promql_recording"] <-
+         when kind in ["promql_threshold", "logql_threshold", "expression_threshold" | @recording_kinds] <-
            snapshot["rule"] do
       now =
         Keyword.get_lazy(opts, :timestamp_ns, fn ->
@@ -34,13 +44,13 @@ defmodule Pulso.Alerting.Evaluator do
   defp evaluate_cadence(principal, id, rule, {head, etag}, now, opts) do
     previous = String.to_integer(head["completed_at_ns"])
     kind = rule["kind"]
-    fence = if kind == "promql_recording", do: String.to_integer(Map.get(head, "recording_fence_ns", "-1")), else: -1
+    fence = if kind in @recording_kinds, do: String.to_integer(Map.get(head, "recording_fence_ns", "-1")), else: -1
 
     cond do
       now <= max(previous, fence) or (previous >= 0 and now - previous < rule["cadence_ms"] * 1_000_000) ->
         {:error, :not_due}
 
-      kind == "promql_recording" and recording_blocked?(head, opts) ->
+      kind in @recording_kinds and recording_blocked?(head, opts) ->
         {:error, :recording_backlog}
 
       budget_skipped?(principal.tenant, id, head["revision"]["digest"], now, opts) ->
@@ -58,7 +68,11 @@ defmodule Pulso.Alerting.Evaluator do
 
   defp evaluate_due(principal, id, rule, {head, etag}, now, opts) do
     started = System.monotonic_time(:millisecond)
-    result = query(rule, principal.tenant, now, opts)
+
+    result =
+      if rule["kind"] == "promql_recording_group",
+        do: query_group(rule, principal.tenant, now, Map.get(head, "recording_series", []), opts),
+        else: query(rule, principal.tenant, now, opts)
 
     if System.monotonic_time(:millisecond) - started >= rule["cadence_ms"],
       do: skip(:overrun),
@@ -76,6 +90,23 @@ defmodule Pulso.Alerting.Evaluator do
 
   defp preview_rule(%{"kind" => "grafana", "original" => original}, tenant, now, _opts),
     do: GraphPreview.preview(original, tenant, now)
+
+  defp preview_rule(%{"kind" => "promql_recording_group"} = rule, tenant, now, opts) do
+    case query_group(rule, tenant, now, [], Keyword.put(opts, :query_class, :promql)) do
+      {:group, outcomes} ->
+        rules =
+          Enum.map(outcomes, fn
+            {record, {:ok, points}} -> %{"record" => record, "samples" => points}
+            {record, {:error, code}} -> %{"record" => record, "error" => code}
+          end)
+
+        with {:ok, result} <- Recording.group_transition(outcomes, now, []),
+             do: {:ok, %{"timestamp_ns" => Integer.to_string(now), "rules" => rules, "health" => group_health(result)}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
 
   defp preview_rule(%{"kind" => kind} = rule, tenant, now, opts)
        when kind in ["promql_threshold", "logql_threshold", "expression_threshold", "promql_recording"] do
@@ -108,13 +139,66 @@ defmodule Pulso.Alerting.Evaluator do
     query_opts = %{
       end_ts_ns: now,
       query_class: Keyword.get(opts, :query_class, :alerting),
-      require_fresh_manifest: true
+      require_fresh_manifest: true,
+      recorded: Keyword.get(opts, :recorded, [])
     }
 
     case fun.(query, tenant, query_opts) do
       {:ok, %{"data" => %{"resultType" => "vector", "result" => samples}}} -> {:ok, samples}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_query_result}
+    end
+  end
+
+  # Prometheus rule-group semantics: every rule evaluates at the same `now`, in
+  # order, and sees what earlier rules appended at `now` (samples and stale
+  # markers) as stored data, so chained recordings never lag a tick.
+  defp query_group(rule, tenant, now, previous, opts) do
+    rule["rules"]
+    |> Enum.reduce_while({[], []}, &group_rule(&1, &2, tenant, now, previous, opts))
+    |> case do
+      {:error, _} = error -> error
+      {outcomes, _recorded} -> {:group, Enum.reverse(outcomes)}
+    end
+  end
+
+  defp group_rule(item, {outcomes, recorded}, tenant, now, previous, opts) do
+    query_rule = %{"kind" => "promql_recording", "query" => item["expr"]}
+
+    case query(query_rule, tenant, now, Keyword.put(opts, :recorded, recorded)) do
+      {:error, reason} when reason in @transient ->
+        {:halt, {:error, reason}}
+
+      {:ok, samples} ->
+        case Recording.group_points(item, samples) do
+          {:ok, points} ->
+            recorded = recorded ++ Recording.overlay(item["record"], points, now, previous)
+            {:cont, {[{item["record"], {:ok, points}} | outcomes], recorded}}
+
+          {:error, reason} ->
+            failed(item, reason, outcomes, recorded)
+        end
+
+      {:error, reason} ->
+        failed(item, reason, outcomes, recorded)
+    end
+  end
+
+  # A failed rule appends nothing, not even stale markers, as in Prometheus.
+  defp failed(item, reason, outcomes, recorded),
+    do: {:cont, {[{item["record"], {:error, error_code(reason)}} | outcomes], recorded}}
+
+  defp error_code(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp error_code({reason, _}) when is_atom(reason), do: Atom.to_string(reason)
+  defp error_code(_), do: "query_error"
+
+  defp group_health(result) do
+    health = Enum.map(result["rule_health"], & &1["health"])
+
+    cond do
+      "error" in health -> "error"
+      Enum.all?(health, &(&1 == "no_data")) -> "no_data"
+      true -> "ok"
     end
   end
 
@@ -245,6 +329,13 @@ defmodule Pulso.Alerting.Evaluator do
     case Principal.authorize(principal, "alert:read", Recording.state_classification(head)) do
       :ok -> Map.put(result, "recording_pending", length(Map.get(head, "recording_queue", [])))
       {:error, _} -> result
+    end
+  end
+
+  defp evaluation({:group, outcomes}, _rule, head, now) do
+    case Recording.group_transition(outcomes, now, Map.get(head, "recording_series", [])) do
+      {:ok, result} -> {%{}, [], group_health(result), result}
+      {:error, _} -> {head["instances"], [], "error", nil}
     end
   end
 

@@ -100,6 +100,50 @@ defmodule PulsoWeb.AlertingControllerTest do
     assert restored["actor"]["id"] == "pedro"
   end
 
+  test "rule-file previews convert Prometheus recording groups for principals with alert:record", ctx do
+    yaml = """
+    groups:
+      - name: Kura Recording
+        interval: 1m
+        rules:
+          - record: kura:pod_region
+            expr: max by (cluster, pod, region) (kura_node_geo_info)
+    """
+
+    path = "/api/v1/alerting/import/rule-file/preview"
+    assert request(:post, path, %{"content" => yaml}) |> json_response(403)
+
+    recorder = %{
+      ctx.actor
+      | id: "recorder",
+        token_hash: Canonical.digest("record-token"),
+        capabilities: ctx.actor.capabilities ++ ["alert:record"]
+    }
+
+    Pulso.Runtime.put_env(:pulso, Pulso.Alerting, principals: [ctx.actor, recorder], store_config: ctx.config)
+    assert request(:post, path, %{"content" => "groups: ["}, "record-token") |> json_response(400)
+    body = request(:post, path, %{"content" => yaml}, "record-token") |> json_response(200)
+    assert [%{"id" => "kura-recording", "rule" => rule}] = body["rules"]
+    assert %{"kind" => "promql_recording_group", "enabled" => false, "cadence_ms" => 60_000} = rule
+
+    created =
+      request(
+        :post,
+        "/api/v1/alerting/rules/kura-recording",
+        %{"rule" => rule, "operation_id" => "import", "reason" => "Move kura recordings"},
+        "record-token"
+      )
+      |> json_response(200)
+
+    assert created["rule"]["rules"] == [
+             %{
+               "record" => "kura:pod_region",
+               "expr" => "max by (cluster, pod, region) (kura_node_geo_info)",
+               "labels" => %{}
+             }
+           ]
+  end
+
   test "unauthorized calls fail before malformed rule validation" do
     response = request(:post, "/api/v1/alerting/rules/backup", %{"rule" => "malformed"}, "wrong") |> json_response(401)
     assert response == %{"error" => "unauthorized"}

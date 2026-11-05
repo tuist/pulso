@@ -65,6 +65,7 @@ defmodule PulsoWeb.Router do
     get "/api/v1/admin/tenants/:tenant/usage", AdminController, :usage
 
     post "/api/v1/alerting/import/preview", AlertingController, :import_preview
+    post "/api/v1/alerting/import/rule-file/preview", AlertingController, :import_rule_file_preview
     get "/api/v1/alerting/rules", AlertingController, :index
     get "/api/v1/alerting/rules/:id", AlertingController, :show
     post "/api/v1/alerting/rules/:id", AlertingController, :create

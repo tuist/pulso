@@ -48,6 +48,8 @@ defmodule Pulso.MixProject do
       {:nimble_parsec, "~> 1.4"},
       {:rustler, "~> 0.38.0", optional: true},
       {:rustler_precompiled, "~> 0.8"},
+      # Prometheus and Grafana rule files are YAML (pure Erlang, no NIF).
+      {:yamerl, "~> 0.10.0"},
       # Test-only: an independent Snappy compressor for building Loki push
       # fixtures. Production decoding is in Rust.
       {:snappyer, "~> 1.2", only: :test},

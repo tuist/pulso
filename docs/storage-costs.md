@@ -108,6 +108,10 @@ the root writes. Add per tenant:
   its metric-grouped segments, rollups and one root write per settled hour, and
   [manifest backups](configuration.md#manifest-backups): one PUT per compacted
   prefix per backup interval;
+- [alerting](alerting.md#record-a-rule-group): every evaluation pass on every
+  evaluating instance LISTs the tenants and each tenant's rules (one Class A
+  request each per `PULSO_ALERTING_POLL_INTERVAL_MS`); a recording group tick adds
+  at most four Class A requests, a single recording rule five;
 - Class B: query segment and page GETs, compaction source GETs, and conditional
   root reads that return a changed root. `304 Not Modified` and `412` conflicts
   are free on Tigris.

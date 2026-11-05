@@ -48,6 +48,23 @@ defmodule Pulso.Alerting.Rule do
     end
   end
 
+  def validate(%{"kind" => "promql_recording_group"} = input) do
+    rule = Map.merge(Map.take(@defaults, ~w(enabled cadence_ms)), input)
+
+    with true <- Map.keys(input) -- ~w(kind name rules enabled cadence_ms) == [],
+         true <- text?(rule["name"], 256),
+         true <- is_boolean(rule["enabled"]),
+         true <- duration?(rule["cadence_ms"], 1_000, 86_400_000),
+         true <- is_list(rule["rules"]) and length(rule["rules"]) in 1..64,
+         {:ok, rules} <- group_rules(rule["rules"]),
+         rule = Map.put(rule, "rules", rules),
+         true <- byte_size(Canonical.encode(rule)) <= 65_536 do
+      {:ok, rule}
+    else
+      _ -> {:error, :invalid_rule}
+    end
+  end
+
   def validate(input) when is_map(input) do
     rule = Map.merge(@defaults, input)
 
@@ -73,6 +90,31 @@ defmodule Pulso.Alerting.Rule do
 
   def validate(_), do: {:error, :invalid_rule}
 
+  # Prometheus rule-file field names. Record names are unique within a group, so
+  # each recorded series has exactly one producing rule.
+  defp group_rules(rules) do
+    rules = Enum.map(rules, &group_rule/1)
+    names = Enum.map(rules, &(&1 && &1["record"]))
+
+    if Enum.all?(rules) and length(Enum.uniq(names)) == length(names),
+      do: {:ok, rules},
+      else: {:error, :invalid_rule}
+  end
+
+  defp group_rule(%{} = item) do
+    item = Map.merge(%{"labels" => %{}}, item)
+
+    with true <- Map.keys(item) -- ~w(record expr labels) == [],
+         true <- metric_name?(item["record"]) and text?(item["expr"], 16_384),
+         true <- labels?(item["labels"]) and not Map.has_key?(item["labels"], "__name__"),
+         true <- Enum.all?(Map.keys(item["labels"]), &label_name?/1),
+         {:ok, _} <- Parser.parse(item["expr"]),
+         do: item,
+         else: (_ -> nil)
+  end
+
+  defp group_rule(_), do: nil
+
   defp native_fields("expression_threshold"), do: (@native_fields -- ["query"]) ++ ~w(sources expression)
   defp native_fields(_), do: @native_fields
 
@@ -95,7 +137,10 @@ defmodule Pulso.Alerting.Rule do
   end
 
   def classification(%{"kind" => "grafana"}), do: ["alert:import"]
-  def classification(%{"kind" => "promql_recording"}), do: ["alert:record"]
+
+  def classification(%{"kind" => kind}) when kind in ["promql_recording", "promql_recording_group"],
+    do: ["alert:record"]
+
   def classification(_), do: []
 
   def labels?(labels) when is_map(labels) do

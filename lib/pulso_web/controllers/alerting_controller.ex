@@ -4,6 +4,7 @@ defmodule PulsoWeb.AlertingController do
   alias Pulso.Alerting
   alias Pulso.Alerting.{Evaluator, Principal}
   alias Pulso.Alerting.Importer
+  alias Pulso.Alerting.RuleFiles
 
   def index(conn, _params), do: run(conn, fn actor -> Alerting.list(actor) end)
 
@@ -12,6 +13,14 @@ defmodule PulsoWeb.AlertingController do
       with :ok <- Principal.authorize(actor, "alert:import"),
            {:ok, reports} <- Importer.preview(params["rules"]),
            do: {:ok, %{"rules" => reports}}
+    end)
+  end
+
+  def import_rule_file_preview(conn, params) do
+    run(conn, fn actor ->
+      with :ok <- Principal.authorize(actor, "alert:import"),
+           :ok <- Principal.authorize(actor, "alert:record"),
+           do: RuleFiles.preview(params["content"])
     end)
   end
 

@@ -7,21 +7,27 @@ defmodule Pulso.Alerting.Recording do
   alias Pulso.Storage
   alias Pulso.Storage.S3
 
-  @max_samples 128
-  @max_bytes 65_536
-  # Both a fresh set and retirement of that set must fit half the joint
-  # budget. A future tick can replace every series without getting stuck
-  # retrying an individually valid set plus oversized prior stale markers.
-  @set_bytes div(@max_bytes - 2048, 2)
+  # Single rules keep their original 64 KiB intent. Both a fresh set and
+  # retirement of that set must fit half the joint budget, so a future tick can
+  # replace every series without getting stuck retrying an individually valid
+  # set plus oversized prior stale markers. Groups share one larger intent and
+  # one metric segment per tick, so their bounds are per group, not per rule.
+  @single %{samples: 128, set: div(65_536 - 2048, 2), joint: 65_536 - 2048}
+  @group %{samples: 4096, set: 393_216, joint: 1_048_576 - 65_536}
+  @max_samples @group.samples
 
-  def result(rule, samples, timestamp) do
+  @doc false
+  def limits("promql_recording_group"), do: @group
+  def limits(_), do: @single
+
+  def result(rule, samples, timestamp), do: result(rule, samples, timestamp, @single)
+
+  defp result(rule, samples, timestamp, limits) do
     with true <- is_integer(timestamp) and timestamp in 0..9_223_372_036_854_775_807,
-         true <- is_list(samples) and length(samples) <= @max_samples,
+         true <- is_list(samples) and length(samples) <= limits.samples,
          {:ok, points} <- points(rule, samples),
          result = %{"timestamp_ns" => Integer.to_string(timestamp), "samples" => points},
-         true <- byte_size(Canonical.encode(result)) <= @set_bytes,
-         markers = retirement(Enum.map(points, & &1["labels"]), timestamp) |> Map.delete("next_series"),
-         true <- byte_size(Canonical.encode(markers)) <= @set_bytes do
+         :ok <- set_bounds(points, timestamp, limits) do
       {:ok, result}
     else
       {:error, _} = error -> error
@@ -29,20 +35,110 @@ defmodule Pulso.Alerting.Recording do
     end
   end
 
+  defp set_bounds(points, timestamp, limits) do
+    result = %{"timestamp_ns" => Integer.to_string(timestamp), "samples" => points}
+    markers = retirement(Enum.map(points, & &1["labels"]), timestamp) |> Map.delete("next_series")
+
+    if byte_size(Canonical.encode(result)) <= limits.set and byte_size(Canonical.encode(markers)) <= limits.set,
+      do: :ok,
+      else: {:error, :invalid_recording_result}
+  end
+
   def transition(rule, samples, timestamp, previous) do
     with {:ok, result} <- result(rule, samples, timestamp),
-         true <- is_list(previous) and length(previous) <= @max_samples and Enum.all?(previous, &Rule.labels?/1) do
-      next = Enum.map(result["samples"], & &1["labels"])
-      missing = Enum.reject(previous, &(&1 in next))
-      markers = Enum.map(missing, &%{"labels" => &1, "value" => "NaN", "stale" => true})
-      result = result |> Map.put("samples", result["samples"] ++ markers) |> Map.put("next_series", next)
-
-      if byte_size(Canonical.encode(Map.delete(result, "next_series"))) <= @max_bytes - 2048,
-        do: {:ok, result},
-        else: {:error, :invalid_recording_result}
+         true <- previous?(previous, @single) do
+      finish(result["samples"], Enum.map(result["samples"], & &1["labels"]), timestamp, previous, @single)
     else
       {:error, _} = error -> error
       _ -> {:error, :integrity_error}
+    end
+  end
+
+  @doc """
+  The rule's final points for one group member: `{"name": record, ...}`
+  shaped like a single recording, so identity and value rules are identical.
+  """
+  def group_points(%{"record" => record, "labels" => labels}, samples) when is_list(samples) do
+    if length(samples) <= @group.samples,
+      do: points(%{"name" => record, "labels" => labels}, samples),
+      else: {:error, :invalid_recording_result}
+  end
+
+  @doc """
+  One publication for a whole group tick. `outcomes` holds, in rule order,
+  `{record, {:ok, points}}` or `{record, {:error, code}}`. As in Prometheus, a
+  failed rule writes nothing and marks nothing stale: its previous series stay
+  current until a later successful tick drops them. Bounds apply to the group.
+  """
+  def group_transition(outcomes, timestamp, previous) do
+    failed = MapSet.new(for {record, {:error, _}} <- outcomes, do: record)
+
+    points =
+      Enum.flat_map(outcomes, fn {_, outcome} -> if match?({:ok, _}, outcome), do: elem(outcome, 1), else: [] end)
+
+    carried = Enum.filter(previous, &MapSet.member?(failed, &1["__name__"]))
+
+    with true <- previous?(previous, @group),
+         true <- length(points) <= @group.samples,
+         points = Enum.sort_by(points, &Canonical.encode(&1["labels"])),
+         :ok <- set_bounds(points, timestamp, @group),
+         next = Enum.map(points, & &1["labels"]) ++ carried,
+         true <- length(next) <= @group.samples,
+         :ok <- set_bounds(Enum.map(next, &%{"labels" => &1, "value" => "0"}), timestamp, @group) do
+      with {:ok, result} <- finish(points, next, timestamp, previous, @group),
+           do: {:ok, Map.put(result, "rule_health", Enum.map(outcomes, &rule_health/1))}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_recording_result}
+    end
+  end
+
+  defp rule_health({record, {:ok, []}}), do: %{"record" => record, "health" => "no_data", "series" => 0}
+  defp rule_health({record, {:ok, points}}), do: %{"record" => record, "health" => "ok", "series" => length(points)}
+  defp rule_health({record, {:error, code}}), do: %{"record" => record, "health" => "error", "error" => code}
+
+  defp previous?(previous, limits),
+    do: is_list(previous) and length(previous) <= limits.samples and Enum.all?(previous, &Rule.labels?/1)
+
+  defp finish(points, next, timestamp, previous, limits) do
+    next_set = MapSet.new(next)
+    missing = Enum.reject(previous, &MapSet.member?(next_set, &1))
+    markers = Enum.map(missing, &%{"labels" => &1, "value" => "NaN", "stale" => true})
+
+    result = %{
+      "timestamp_ns" => Integer.to_string(timestamp),
+      "samples" => points ++ markers,
+      "next_series" => next
+    }
+
+    if byte_size(Canonical.encode(Map.delete(result, "next_series"))) <= limits.joint,
+      do: {:ok, result},
+      else: {:error, :invalid_recording_result}
+  end
+
+  @doc """
+  What one group member appends at `timestamp`, as Prometheus's rule group does
+  before evaluating the next rule: its points, plus stale markers for its own
+  previous series that disappeared. Later rules read these as stored samples.
+  """
+  def overlay(record, points, timestamp, previous) do
+    current = MapSet.new(points, & &1["labels"])
+
+    markers =
+      for labels <- previous,
+          labels["__name__"] == record,
+          not MapSet.member?(current, labels),
+          do: %{"labels" => labels, "value" => "NaN", "stale" => true}
+
+    case points ++ markers do
+      [] ->
+        []
+
+      samples ->
+        {:ok, records} =
+          records(%{"schema_version" => 1, "timestamp_ns" => Integer.to_string(timestamp), "samples" => samples})
+
+        records
     end
   end
 
@@ -143,7 +239,7 @@ defmodule Pulso.Alerting.Recording do
   defp error_code(_), do: "storage_unavailable"
 
   defp publish(tenant, id, ref, opts) do
-    with {:ok, object} <- Repository.revision(tenant, id, ref, opts),
+    with {:ok, object} <- Repository.recording_object(tenant, id, ref, opts),
          {:ok, records} <- records(object) do
       case append(tenant, records, "pulso-recording-v1-" <> ref["digest"], opts) do
         :ok -> acknowledge(tenant, id, ref, object, "published", opts)

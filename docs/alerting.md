@@ -379,7 +379,7 @@ future-dated retirement intent waiting for the ingest future-time guard. Inspect
 `recording_fence_ns` when diagnosing `not_due`; clock-skew tolerance is not a
 cluster-clock guarantee.
 
-Limits are **128 current samples**, 32 final labels per series (including
+Limits for a single `promql_recording` are **128 current samples**, 32 final labels per series (including
 `__name__`), 128-byte label names, and 512-byte UTF-8 label values. The encoded
 current set and its potential stale markers must each fit **31 KiB**; their joint
 transition fits 62 KiB, with a 64 KiB immutable-object ceiling. Duplicate final
@@ -390,21 +390,109 @@ floor overtakes a pending intent, it is retired with a durable `recording_expire
 event requiring `alert:record` to read. Other permanent publication errors are
 not silently discarded.
 
-This native slice does **not** import or enable Grafana recordings, prove source
-residency, order recording groups, enforce same-tick dependency freshness, detect
-cross-rule metric ownership conflicts, or provide atomic multi-rule snapshots.
-Operators must explicitly establish producer order and input availability. Use
-unique recording metric names per producer; competing producers or direct ingest
-can otherwise write conflicting samples under the ordinary metric query rules.
+Separate recording rules are not ordered: a rule that reads another rule's
+metric sees it from an earlier tick, up to one cadence old per hop. Put chained
+recordings in one [recording group](#record-a-rule-group) instead. Pulso does not
+prove source residency, detect cross-rule metric ownership conflicts, or provide
+atomic multi-rule snapshots. Use unique recording metric names per producer;
+competing producers or direct ingest can otherwise write conflicting samples
+under the ordinary metric query rules.
 
-To move Grafana-managed recordings, recreate each one as a native
-`promql_recording` with the same query, name and cadence. Their queries
-evaluate like Prometheus. A rule whose result exceeds 128 series, or whose
-encoded samples exceed 31 KiB, fails every evaluation and cannot be recorded
-natively yet. Splitting it into several rules with the same metric name is
-not supported, because recording names must be unique per producer. Recordings that read other
-recordings see their inputs from earlier ticks, up to one cadence old per hop,
-because rules are not ordered within a group.
+## Record a rule group
+
+A `promql_recording_group` evaluates its rules the way a Prometheus rule group
+does: in order, all at the same evaluation timestamp, and each rule sees what
+earlier rules of the group recorded at that timestamp. Chained recordings
+therefore never lag. Results are compared with Prometheus 3.5.0 rule-group
+evaluation in the test suite.
+
+```json
+{
+  "operation_id": "<new UUID>",
+  "reason": "Record kura topology",
+  "rule": {
+    "kind": "promql_recording_group",
+    "name": "Kura Recording",
+    "enabled": true,
+    "cadence_ms": 60000,
+    "rules": [
+      {"record": "kura:pod_region", "expr": "max by (cluster, pod, region) (kura_node_geo_info)"},
+      {"record": "kura:pool_region", "expr": "max by (cluster, pool, region) (kura:pod_region)", "labels": {"source": "pulso"}}
+    ]
+  }
+}
+```
+
+Create it with `POST /api/v1/alerting/rules/<id>` like any rule. Each entry has
+`record`, `expr` and optional `labels`, with the same meaning as in a Prometheus
+rule file and the same naming and label rules as a single recording. A group
+holds 1 to 64 rules; record names must be unique within it. Rules read the
+recorded metrics of **earlier** rules at the current tick, including stale
+markers for series that disappeared; a rule that reads a later rule, or itself,
+sees that metric's previous tick, as in Prometheus.
+
+Evaluation follows Prometheus's failure rules per rule. A rule whose query fails
+(for example on many-to-many matching or a query budget) records nothing for
+that tick and marks none of its series stale; later rules that read it see its
+previous samples. The group's `health` is `error` when any rule failed,
+`no_data` when every rule returned nothing, and `ok` otherwise; state reports
+each rule's `health`, `series` count and `error` code in `recording_rules`.
+Capacity, timeout and manifest-freshness failures skip the whole tick and are
+retried, as for single rules.
+
+One tick of a group is **one publication**: one intent, one metric segment and
+one manifest update, however many rules it has. Limits apply per group: **4,096
+current series** across its rules, and the encoded current set and its potential
+stale markers must each fit **384 KiB**; their joint transition fits 960 KiB.
+Exceeding a limit fails the whole tick without publishing anything. Intents up to
+128 KiB travel inside the rule head's commit instead of a separate object.
+
+Object-store requests per group tick are one head write that commits the intent,
+one segment PUT, one manifest root write (shared with concurrent ingest
+publications when [ingest coalescing](configuration.md#ingest-coalescing) is on)
+and one head write acknowledging publication: at most **4 Class A requests**,
+independent of the number of rules and series. A one-minute group costs at most
+172,800 Class A requests per 30 days, about $0.86 at $5 per million. Separately
+declared rules cost five Class A requests each per tick. Polling rule heads is
+Class B, and each evaluation pass also LISTs tenants and their rules (Class A)
+once per `PULSO_ALERTING_POLL_INTERVAL_MS` on every evaluating instance.
+
+Upgrade every instance before creating a group: older versions cannot evaluate
+it and reject its rule head.
+
+## Import recording rules from Prometheus or Grafana
+
+`POST /api/v1/alerting/import/rule-file/preview` with `{"content": "<file>"}`
+converts the recording rules of a Prometheus rule file, or of a Grafana
+alert-rule export in provisioning format (YAML or JSON, at most 256 KiB), into
+disabled `promql_recording_group` rules. It needs `alert:import` and
+`alert:record` and writes nothing:
+
+```json
+{
+  "rules": [{"id": "kura-recording", "rule": {"kind": "promql_recording_group", "...": "..."}}],
+  "skipped": [{"group": "Kura Recording", "rule": "KuraDown", "reason": "alerting_rule_not_converted"}]
+}
+```
+
+Review each rule, set `enabled`, and create it with the normal create call.
+
+- **Prometheus:** each group becomes one native group with the group's
+  `interval` (default `1m`) and its recording rules in file order. Group
+  `labels` apply to every rule; rule labels win. Groups with a nonzero
+  `query_offset` or `limit` are skipped.
+- **Grafana:** each recording rule must record a single instant Prometheus query
+  (`record.from` naming a non-expression query with no time shift). Grafana
+  evaluates a group's recordings independently, so the converted rules are
+  ordered so that every rule follows the rules it reads.
+
+Alerting rules are reported in `skipped`, never converted.
+
+To move Grafana-managed recordings, export their rule group (or write the
+equivalent Prometheus rule file), convert it with this preview, and create the
+resulting group. Grafana evaluates recordings independently, so recordings that
+read other recordings lag up to one interval per hop there; in a Pulso group they
+read same-tick results instead.
 
 ## Management, preview and state
 

@@ -94,15 +94,22 @@ defmodule Pulso.Alerting.Worker do
         capabilities: ~w(alert:read alert:evaluate alert:import alert:record)
       }
 
-      if Keyword.get(opts, :evaluation_enabled, true) do
-        Recording.drain(tenant, id, opts)
-        Evaluator.evaluate(actor, id, Keyword.put(opts, :require_recording_drained, true))
-      end
+      if Keyword.get(opts, :evaluation_enabled, true), do: evaluate_and_publish(actor, tenant, id, opts)
 
       if Keyword.get(opts, :notifications_enabled, false), do: Notifier.run_once(tenant, id, opts)
       count + 1
     else
       count
+    end
+  end
+
+  defp evaluate_and_publish(actor, tenant, id, opts) do
+    Recording.drain(tenant, id, opts)
+
+    # Publish a fresh recording at once instead of one poll later.
+    case Evaluator.evaluate(actor, id, Keyword.put(opts, :require_recording_drained, true)) do
+      {:ok, %{"recording_pending" => pending}} when pending > 0 -> Recording.drain(tenant, id, opts)
+      _ -> :ok
     end
   end
 

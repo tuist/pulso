@@ -76,7 +76,8 @@ stores raw records, indefinitely unless event-time expiry is configured.
 - [Querying](querying.md): the Model Context Protocol tools, the Prometheus and
   Loki query APIs, the supported query subset, and query limits.
 - [Alerting](alerting.md): experimental native threshold/recording evaluation,
-  durable recording publication, dedicated credentials, rule management and
+  ordered recording groups, Prometheus/Grafana rule-file import, durable
+  recording publication, dedicated credentials, rule management and
   modification history, with explicit compatibility limits.
 - [Reliability assessments](reliability.md): opt-in cross-signal windows,
   budgeted Decisions judgments, durable MCP signals and capped external handoff.

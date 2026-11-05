@@ -127,7 +127,7 @@ defmodule Pulso.Alerting do
       {:ok,
        head
        |> Map.take(
-         ~w(id generation state completed_at_ns evaluation_revision health instances recording_last recording_error recording_fence_ns)
+         ~w(id generation state completed_at_ns evaluation_revision health instances recording_last recording_error recording_fence_ns recording_rules)
        )
        |> Map.put("recording_pending", length(Map.get(head, "recording_queue", [])))
        |> Map.put("notifications", notifications)}

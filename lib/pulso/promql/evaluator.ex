@@ -167,6 +167,9 @@ defmodule Pulso.PromQL.Evaluator do
     # Set this for every source in a batch so one source cannot change another's
     # default. Nested selectors and timestamp() share the current source's value.
     Process.put(:promql_lookback_ns, lookback)
+    # Samples an earlier rule of the same recording group appended at this
+    # evaluation time, not yet published. Storage reads see them as stored.
+    Process.put(:promql_recorded, Map.get(opts, :recorded, []))
     Process.put(:promql_infos, MapSet.new())
     Process.put(:promql_warnings, MapSet.new())
     Process.put(:promql_range_query, kind == :matrix)
@@ -999,7 +1002,48 @@ defmodule Pulso.PromQL.Evaluator do
         require_fresh_manifest: Process.get(:pulso_require_fresh_manifest, false)
       ]
 
-      tenant |> Storage.query_metric_selectors(requests, opts) |> charge_read(scan, samples)
+      tenant
+      |> Storage.query_metric_selectors(requests, opts)
+      |> add_recorded(requests, Process.get(:promql_recorded, []))
+      |> charge_read(scan, samples)
+    end
+  end
+
+  # Fold a recording group's same-tick samples into each request they match,
+  # exactly as if they had been read from storage with the other samples.
+  defp add_recorded({:ok, results, consumed}, requests, recorded) when recorded != [] do
+    {results, added} =
+      requests
+      |> Enum.zip(results)
+      |> Enum.map_reduce(0, fn {request, result}, added ->
+        [matchers, start, finish | _] = Tuple.to_list(request)
+
+        matching =
+          Enum.filter(recorded, fn sample ->
+            sample.timestamp_ns >= start and sample.timestamp_ns <= finish and
+              Enum.all?(matchers, &recorded_match?(&1, sample.labels))
+          end)
+
+        {add_recorded_points(result, matching), added + length(matching)}
+      end)
+
+    {:ok, results, Map.update(consumed, :records, added, &(&1 + added))}
+  end
+
+  defp add_recorded(result, _requests, _recorded), do: result
+
+  defp add_recorded_points(result, []), do: result
+  defp add_recorded_points({:tiered, series, rollups}, samples), do: {:tiered, fold_points(samples, series), rollups}
+  defp add_recorded_points(series, samples), do: fold_points(samples, series)
+
+  defp recorded_match?({name, op, value}, labels) do
+    label = Map.get(labels, name, "")
+
+    case op do
+      :eq -> label == value
+      :neq -> label != value
+      :re -> NIF.match_metric_regex(value, label)
+      :nre -> not NIF.match_metric_regex(value, label)
     end
   end
 
