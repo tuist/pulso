@@ -372,7 +372,7 @@ defmodule Pulso.PromQL.Operations do
 
   def call("histogram_quantile", [quantile, buckets], steps) do
     quantile = by_time(quantile)
-    buckets = by_time(buckets)
+    buckets = buckets |> Histogram.parse_buckets() |> by_time()
 
     at_steps(steps, fn ts ->
       q = value(at(quantile, ts))
@@ -381,7 +381,7 @@ defmodule Pulso.PromQL.Operations do
   end
 
   def call("histogram_quantiles", [vector, {:string, destination} | qs], steps) do
-    vector = by_time(vector)
+    vector = vector |> Histogram.parse_buckets() |> by_time()
     qs = Enum.map(qs, &by_time/1)
 
     at_steps(steps, fn ts ->
@@ -390,7 +390,7 @@ defmodule Pulso.PromQL.Operations do
   end
 
   def call("histogram_fraction", [lower, upper, vector], steps) do
-    {lower, upper, vector} = {by_time(lower), by_time(upper), by_time(vector)}
+    {lower, upper, vector} = {by_time(lower), by_time(upper), vector |> Histogram.parse_buckets() |> by_time()}
 
     at_steps(steps, fn ts ->
       {l, u} = {value(at(lower, ts)), value(at(upper, ts))}

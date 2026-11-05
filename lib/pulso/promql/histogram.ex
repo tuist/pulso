@@ -80,29 +80,44 @@ defmodule Pulso.PromQL.Histogram do
     Evaluator.info("PromQL info: input to " <> message <> metric_name(labels))
   end
 
-  # Keep metric names and native le labels until collision detection. Only
-  # successfully parsed classic buckets can conflict with a native histogram.
-  defp collect({labels, %Histogram{} = histogram}, groups) do
-    Map.update(groups, labels, {histogram, []}, fn {_, buckets} -> {histogram, buckets} end)
+  @doc """
+  Parses each series' `le` bound once, so the per-step functions above do
+  not parse and regroup every series again at every step. Series keep their
+  samples; their labels become `{:bucket, labels, group, bound}`.
+  """
+  def parse_buckets(series) do
+    for {labels, samples} <- series do
+      bound =
+        case FloatParser.parse(Map.get(labels, "le", "")) do
+          {:ok, bound} when bound != :nan -> bound
+          _ -> :invalid
+        end
+
+      {{:bucket, labels, Map.delete(labels, "le"), bound}, samples}
+    end
   end
 
-  defp collect({labels, count}, groups) do
-    text = Map.get(labels, "le", "")
+  # Keep metric names and native le labels until collision detection. Only
+  # successfully parsed classic buckets can conflict with a native histogram.
+  defp collect({{:bucket, labels, _, _}, %Histogram{} = histogram}, groups), do: collect({labels, histogram}, groups)
 
-    case FloatParser.parse(text) do
-      {:ok, bound} when bound != :nan ->
-        Map.update(groups, Map.delete(labels, "le"), {nil, [{bound, count}]}, fn {histogram, buckets} ->
-          {histogram, [{bound, count} | buckets]}
-        end)
+  defp collect({{:bucket, labels, _, :invalid}, _count}, groups) do
+    Evaluator.warning(
+      "PromQL warning: bucket label \"le\" is missing or has a malformed value of " <>
+        GoUnicode.quote(Map.get(labels, "le", "")) <> metric_name(labels)
+    )
 
-      _ ->
-        Evaluator.warning(
-          "PromQL warning: bucket label \"le\" is missing or has a malformed value of " <>
-            GoUnicode.quote(text) <> metric_name(labels)
-        )
+    groups
+  end
 
-        groups
-    end
+  defp collect({{:bucket, _labels, group, bound}, count}, groups) do
+    Map.update(groups, group, {nil, [{bound, count}]}, fn {histogram, buckets} ->
+      {histogram, [{bound, count} | buckets]}
+    end)
+  end
+
+  defp collect({labels, %Histogram{} = histogram}, groups) do
+    Map.update(groups, labels, {histogram, []}, fn {_, buckets} -> {histogram, buckets} end)
   end
 
   defp metric_name(labels) do
