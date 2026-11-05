@@ -46,31 +46,7 @@ sentry_projects =
   end
 
 # Alerting uses separate principal credentials; tenant-shared tokens never grant writes.
-alerting_principals =
-  case JSON.decode(env_var.("PULSO_ALERTING_PRINCIPALS_JSON", "[]")) do
-    {:ok, values} when is_list(values) and length(values) <= 256 ->
-      Enum.map(values, fn
-        %{"tenant" => tenant, "id" => id, "type" => type, "token_hash" => hash, "capabilities" => caps} = value ->
-          if Map.keys(value) -- ~w(tenant id type token_hash capabilities) == [] and
-               Principal.valid_id?(tenant) and Principal.valid_id?(id) and
-               type in ["human", "agent", "service"] and is_binary(hash) and
-               Regex.match?(~r/\A[0-9a-f]{64}\z/, hash) and is_list(caps) and
-               Enum.all?(
-                 caps,
-                 &(&1 in ~w(alert:read alert:rules:write alert:audit:read alert:preview alert:evaluate alert:import))
-               ) do
-            %{tenant: tenant, id: id, type: type, token_hash: hash, capabilities: caps}
-          else
-            raise "PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal"
-          end
-
-        _ ->
-          raise "PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal"
-      end)
-
-    _ ->
-      raise "PULSO_ALERTING_PRINCIPALS_JSON must be a JSON array of at most 256 principals"
-  end
+alerting_principals = Principal.parse_configured!(env_var.("PULSO_ALERTING_PRINCIPALS_JSON", "[]"))
 
 error_history_days =
   case Integer.parse(env_var.("PULSO_ERROR_HISTORY_DAYS", "1")) do
@@ -157,37 +133,6 @@ issuer_config =
       end
   end
 
-config :pulso, Issuer, issuer_config
-
-config :pulso, Pulso.Reliability,
-  enabled: reliability_enabled,
-  tenants: reliability_tenants,
-  interval_ms: 1000,
-  api_key: reliability_key,
-  price_valid_until: reliability_price_until,
-  max_input_tokens: 5000,
-  input_nano_usd_per_token: reliability_input_price,
-  assessment_budget_nano_usd:
-    reliability_integer.("PULSO_RELIABILITY_ASSESSMENT_BUDGET_USD", 500, 100_000) * 1_000_000_000,
-  object_budget_nano_usd: reliability_integer.("PULSO_RELIABILITY_OBJECT_BUDGET_USD", 100, 100_000) * 1_000_000_000,
-  investigation_budget_nano_usd:
-    reliability_integer.("PULSO_RELIABILITY_INVESTIGATION_BUDGET_USD", 1000, 100_000) * 1_000_000_000,
-  investigation_url: if(investigation_url != "", do: investigation_url),
-  investigation_token: investigation_token
-
-config :pulso, Pulso.Sentry, projects: sentry_projects
-config :pulso, WorkloadIdentity, trust: workload_trust
-
-for field <- [:id, :token_hash] do
-  keys =
-    Enum.map(alerting_principals, fn principal ->
-      if field == :id, do: {principal.tenant, principal.id}, else: principal.token_hash
-    end)
-
-  if length(Enum.uniq(keys)) != length(keys),
-    do: raise("PULSO_ALERTING_PRINCIPALS_JSON has duplicate identities or credentials")
-end
-
 alerting_poll_interval_ms =
   case Integer.parse(env_var.("PULSO_ALERTING_POLL_INTERVAL_MS", "5000")) do
     {value, ""} when value in 1000..60_000 -> value
@@ -209,6 +154,28 @@ alerting_targets =
   end
 
 identities = Enum.map(alerting_targets, &{&1["tenant"], &1["id"]})
+
+config :pulso, Issuer, issuer_config
+
+config :pulso, Pulso.Reliability,
+  enabled: reliability_enabled,
+  tenants: reliability_tenants,
+  interval_ms: 1000,
+  api_key: reliability_key,
+  price_valid_until: reliability_price_until,
+  max_input_tokens: 5000,
+  input_nano_usd_per_token: reliability_input_price,
+  assessment_budget_nano_usd:
+    reliability_integer.("PULSO_RELIABILITY_ASSESSMENT_BUDGET_USD", 500, 100_000) * 1_000_000_000,
+  object_budget_nano_usd: reliability_integer.("PULSO_RELIABILITY_OBJECT_BUDGET_USD", 100, 100_000) * 1_000_000_000,
+  investigation_budget_nano_usd:
+    reliability_integer.("PULSO_RELIABILITY_INVESTIGATION_BUDGET_USD", 1000, 100_000) * 1_000_000_000,
+  investigation_url: if(investigation_url != "", do: investigation_url),
+  investigation_token: investigation_token
+
+config :pulso, Pulso.Sentry, projects: sentry_projects
+config :pulso, WorkloadIdentity, trust: workload_trust
+
 if length(Enum.uniq(identities)) != length(identities), do: raise("Duplicate alert notification target IDs")
 
 alerting_source_bindings =

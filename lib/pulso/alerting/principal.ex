@@ -4,6 +4,48 @@ defmodule Pulso.Alerting.Principal do
   alias Pulso.Auth.Issuer
   alias Pulso.Runtime
 
+  # The only capabilities alerting authorizes. Configured principals, issuer
+  # scopes and `authorize/3` all read this list so they cannot drift apart.
+  @capabilities ~w(alert:read alert:rules:write alert:audit:read alert:preview alert:evaluate alert:import alert:record)
+
+  def capabilities, do: @capabilities
+
+  @doc """
+  Parses `PULSO_ALERTING_PRINCIPALS_JSON` (called from `config/runtime.exs`),
+  raising on any invalid, unknown-capability or duplicate principal.
+  """
+  def parse_configured!(json) do
+    principals =
+      case JSON.decode(json) do
+        {:ok, values} when is_list(values) and length(values) <= 256 -> Enum.map(values, &parse_configured_one!/1)
+        _ -> raise "PULSO_ALERTING_PRINCIPALS_JSON must be a JSON array of at most 256 principals"
+      end
+
+    for key <- [&{&1.tenant, &1.id}, & &1.token_hash] do
+      keys = Enum.map(principals, key)
+
+      if length(Enum.uniq(keys)) != length(keys),
+        do: raise("PULSO_ALERTING_PRINCIPALS_JSON has duplicate identities or credentials")
+    end
+
+    principals
+  end
+
+  defp parse_configured_one!(
+         %{"tenant" => tenant, "id" => id, "type" => type, "token_hash" => hash, "capabilities" => caps} = value
+       ) do
+    if Map.keys(value) -- ~w(tenant id type token_hash capabilities) == [] and
+         valid_id?(tenant) and valid_id?(id) and type in ["human", "agent", "service"] and
+         is_binary(hash) and Regex.match?(~r/\A[0-9a-f]{64}\z/, hash) and is_list(caps) and
+         Enum.all?(caps, &(&1 in @capabilities)) do
+      %{tenant: tenant, id: id, type: type, token_hash: hash, capabilities: caps}
+    else
+      raise "PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal"
+    end
+  end
+
+  defp parse_configured_one!(_), do: raise("PULSO_ALERTING_PRINCIPALS_JSON contains an invalid principal")
+
   @doc """
   Authenticates an alerting principal for `tenant`. A Tuist-issued credential
   maps its subject (with any delegating actor) and `alert:*` scopes onto the
@@ -22,7 +64,7 @@ defmodule Pulso.Alerting.Principal do
       tenant: principal.tenant,
       id: Issuer.actor_id(principal),
       type: principal.type,
-      capabilities: Enum.filter(principal.scopes, &String.starts_with?(&1, "alert:"))
+      capabilities: Enum.filter(principal.scopes, &(&1 in @capabilities))
     }
   end
 
@@ -61,7 +103,7 @@ defmodule Pulso.Alerting.Principal do
 
   def authorize(%{tenant: tenant, id: id, type: type, capabilities: caps}, capability, classification)
       when is_binary(id) and type in ["human", "agent", "service"] and is_list(caps) do
-    if valid_id?(tenant) and Enum.all?([capability | classification], &(&1 in caps)),
+    if valid_id?(tenant) and Enum.all?([capability | classification], &(&1 in @capabilities and &1 in caps)),
       do: :ok,
       else: {:error, :forbidden}
   end
